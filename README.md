@@ -4,13 +4,14 @@
 
 GalaxyTrader MK3 is a comprehensive trading automation mod that brings intelligent autonomous trading, skill progression, and fleet management to X4: Foundations. Ships equipped with this AI will learn, grow, and optimize their trading operations over time.
 
-## 🌟 Currently Implemented Features
+## 🌟 Features
 
 ### Advanced Trading AI ✅ **WORKING**
 - **Intelligent Route Selection**: Multi-factor optimization considering profit margins, travel time, risk, and market saturation
 - **Advanced Trade Search**: 30+ validation layers with cross-station trade evaluation
 - **Risk Management**: Configurable risk tolerance with automatic threat avoidance
 - **Standard Cargo Handling**: Proper cargo space calculations and loading
+- **Anti-Stuck Protection**: Prevents ships from getting stuck with invalid orders
 
 ### XP Progression System ✅ **WORKING**
 - **15 Skill Levels**: From Apprentice (Level 1) to Long-Distance Merchant (Level 15)
@@ -30,7 +31,7 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Auto-Renaming**: Ships display pilot rank, level, and XP in their names
 - **Pilot Tracking**: Experience tied to individual pilots, not ships
 - **Training Status**: Visual indicators for training requirements and progress
-- **German/English Localization**: Full translation support
+- **Full Localization**: English and German translations
 
 ### Threat Intelligence System ✅ **WORKING**
 - **Real-Time Threat Detection**: Monitors attacks, missiles, and ship destruction
@@ -38,66 +39,37 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **5-Level Threat Classification**: From minor threats to critical emergencies
 - **Sector Risk Assessment**: Automatic avoidance of recently threatened areas
 - **Smart Notifications**: Fleet alerts for high-threat situations
+- **Automatic Cleanup**: Time-based database expiry prevents performance issues
+
+### Fleet Coordination System ✅ **WORKING**
+- **Multi-Ship Management**: Coordinate entire trading fleets
+- **Route Conflict Prevention**: Automatic detection and prevention of duplicate routes
+- **Trade Reservations**: Ships reserve routes to avoid fleet oversaturation
+- **Fleet Statistics**: Track total profit and trades across all ships
+- **Automatic Cleanup**: Stale reservations are automatically removed
+
+### Mobile Satellite Intelligence ✅ **WORKING**
+- **Mobile Market Data**: Ships act as advanced satellites (75km radar range)
+- **Skill-Gated**: Only Level 9+ pilots can gather intelligence
+- **Real-Time Updates**: Fresh market data during trading operations
+- **Station Scanning**: Automatic trade offer updates for nearby stations
+- **Smart Cooldowns**: Per-station cooldown prevents excessive scanning
+
+### Auto-Repair System ✅ **WORKING**
+- **Automatic Hull Monitoring**: Ships check hull integrity after every trade
+- **Skill-Gated Access**: Only Level 12+ master traders can use auto-repair
+- **Configurable Threshold**: Default triggers at <95% hull (adjustable 50-99%)
+- **Smart Station Finding**: Finds nearest appropriate repair station within jump range
+- **Ship Class Aware**: S/M ships use wharfs/equipment docks, L/XL use shipyards
+- **Funds Management**: Full repair if affordable, partial repair if low on credits, notification if insufficient funds
+- **Automatic Resumption**: Ships automatically resume trading after repairs complete
 
 ### Performance Features ✅ **WORKING**
 - **Event-Driven Architecture**: 3-5x faster than polling-based systems
 - **Comprehensive Logging**: Detailed debug output and trade tracking
 - **Professional Integration**: Compatible logbook message system
 - **Save Game Safe**: No save game corruption or compatibility issues
-
-## 🚧 Planned Features (TODO)
-
-### Mobile Satellite Intelligence 🔄 **PARTIALLY IMPLEMENTED**
-- **Specification Complete**: Full technical design documented
-- **Mobile Market Data**: Ships act as advanced satellites (75km range)
-- **Skill-Gated**: Only Level 9+ pilots (3+ stars) can gather intelligence
-- **Fleet Network**: Multiple traders create comprehensive market coverage
-- **Real-Time Updates**: Fresh market data during trading operations
-
-### Skill-Based Bonus/Malus System 📋 **PLANNED**
-- **Progressive feature unlocks based on pilot level**
-- **Threat Intelligence access (Level 6+)**
-- **Mobile Satellite Intelligence (Level 9+)**
-- **Fleet Coordination access (Level 12+)**
-- **Advanced Analytics (Level 15 only)**
-
-### Trading Intelligence System 📋 **PLANNED**
-- **Experience-Based Trade Evaluation**: Pilot skill affects trading decision quality
-- **Progressive Analysis Speed**: From 5 seconds (Courier) to instant (Master)
-- **Profit Threshold Scaling**: Apprentices accept 0%+, Masters demand 45%+
-- **Technology Progression**: Advanced trading computers unlock with experience
-- **Realistic Trading Behavior**: Poor decisions → optimal trading strategies
-
-### Dynamic Ship Modifications 📋 **PLANNED**
-- **Certification-Based Improvements**: Ship performance only changes at training milestones
-- **Stable Performance Between Levels**: No gradual changes - pilots maintain current capabilities until next certification
-- **Training-Gated Bonuses**: Each certification (Levels 3, 6, 9, 12, 15) unlocks new performance tier
-- **Ship Class Awareness**: Different bonuses for S/M/L/XL ships based on certification level
-- **Severe Capital Ship Penalties**: Apprentices face -15% (L-class) and -25% (XL-class) penalties
-- **Meaningful Training Impact**: Each certification provides substantial and lasting improvements
-
-### Advanced Cargo Management 📋 **PLANNED**
-- **Multi-Commodity Trading**: Buy/sell multiple different wares per trip
-- **Cargo Mix Optimization**: Intelligent combination of wares for maximum profit
-- **Route Planning**: Multi-stop trips with different goods at each station
-
-### Fleet Coordination 🔄 **PARTIALLY IMPLEMENTED**
-- **Multi-Ship Management**: Coordinate entire trading fleets
-- **Route Conflict Prevention**: Automatic distribution to avoid oversaturation
-- **Territory Specialization**: Ships develop expertise in specific sectors
-- **Load Balancing**: Dynamic workload distribution across fleet
-
-### Market Intelligence 🔄 **PARTIALLY IMPLEMENTED**
-- **Real-Time Analysis**: Market trend prediction and opportunity identification
-- **Price History**: Track market volatility and timing
-- **Supply/Demand**: Advanced economic analysis
-- **Competitive Intelligence**: Monitor other traders and factions
-
-### Advanced Analytics 📋 **PLANNED**
-- **Profit Tracking**: Detailed performance metrics per ship
-- **Fleet Reports**: Periodic summaries of trading operations
-- **Session Statistics**: Track overall mod performance
-- **Territory Management**: 5-level expertise system with profit bonuses
+- **Optimized Performance**: Minimal CPU and memory footprint
 
 ## 📦 Installation
 
@@ -146,63 +118,137 @@ All settings are centralized in the mod's configuration system:
 - **XP Multiplier**: Adjust progression speed
 - **Training Mode**: Automatic or manual training control
 
+### Auto-Repair Settings
+- **Enable/Disable**: Toggle automatic repair system (default: enabled)
+- **Hull Threshold**: Trigger repair when hull drops below X% (default: 95%, range: 50-99%)
+- **Minimum Pilot Level**: Required skill level for auto-repair access (default: 12)
+
 ### Notifications
 - **Logbook Entries**: Enable professional trade messages
 - **Training Messages**: Immersive training start/completion notifications
 - **Level Up Alerts**: Pilot advancement announcements
-- **Debug Output**: Comprehensive logging levels (0-2)
+- **Repair Notifications**: Auto-repair status and fund warnings
+- **Debug Output**: Comprehensive logging levels (0-3)
 
-## 📊 Skill Progression & Feature Unlocks (UPDATED)
+## 📊 Skill Progression System
 
-| Level | Title | Max Distance | Training Required | Feature Unlocks | Ship Modifications | Trading Intelligence |
-|-------|-------|--------------|-------------------|-----------------|-------------------|-------------------|
-| 1-2 | Apprentice | 1 jump | No | Basic trading only | **Small**: 0% / **Medium**: -5% / **Large**: -15% / **XL**: -25% | **Takes first non-negative trade** (0%+ profit) |
-| 3 | Apprentice | 1 jump | **Yes** - Basic Certification | Training system unlocked | **Small**: +3% / **Medium**: 0% / **Large**: -8% / **XL**: -15% | **Takes first 5%+ profit trade** |
-| 4-5 | Courier | 3 jumps | No | Extended range trading | **Small**: +3% / **Medium**: 0% / **Large**: -8% / **XL**: -15% | **Manual comparison**: 5 sec/trade, 10%+ target |
-| 6 | Courier | 3 jumps | **Yes** - Advanced Trade | **Threat Intelligence Access** | **Small**: +6% / **Medium**: +3% / **Large**: 0% / **XL**: -8% | **Enhanced comparison**: 3 sec/trade, 15%+ target |
-| 7-8 | Supplier | 5 jumps | No | Regional trading expertise | **Small**: +6% / **Medium**: +3% / **Large**: 0% / **XL**: -8% | **Regional optimization**: 2 sec/trade, 20%+ target |
-| 9 | Supplier | 5 jumps | **Yes** - Expert Trader | **Mobile Satellite Intelligence** | **Small**: +9% / **Medium**: +6% / **Large**: +3% / **XL**: 0% | **Advanced computer**: 1 sec/trade, 25%+ target |
-| 10-11 | Trader | 10 jumps | No | Long-distance trading | **Small**: +9% / **Medium**: +6% / **Large**: +3% / **XL**: 0% | **Smart algorithms**: 0.5 sec/trade, 30%+ target |
-| 12 | Trader | 10 jumps | **Yes** - Master Certification | **Fleet Coordination Access** | **Small**: +12% / **Medium**: +9% / **Large**: +6% / **XL**: +3% | **Master computer**: Instant analysis, 35%+ target |
-| 13-14 | Merchant | 15 jumps | No | Cross-galaxy trading | **Small**: +12% / **Medium**: +9% / **Large**: +6% / **XL**: +3% | **Predictive analysis**: Instant, 40%+ target |
-| 15 | Long-Distance Merchant | 25 jumps | No | Maximum capabilities | **Small**: +15% / **Medium**: +12% / **Large**: +9% / **XL**: +6% | **AI-assisted trading**: Instant, 45%+ optimal |
+### **Level Progression Table**
 
-### **Ship Class Definitions:**
-- **Small**: Fighters, scouts, small traders (S-class)
-- **Medium**: Medium traders, corvettes (M-class)  
-- **Large**: Large traders, destroyers (L-class) - **Severe apprentice penalties**
-- **XL**: Capital traders, carriers (XL-class) - **Extreme apprentice penalties**
+| Level | XP Required | Title | Stars | Max Jump Distance | Training Required | What You Gain |
+|-------|-------------|-------|-------|-------------------|-------------------|---------------|
+| **1** | 0 XP | Apprentice | ⭐ | **1 jump** | No | • Starting level<br>• Local sector trading only<br>• Basic threat detection |
+| **2** | 100 XP | Apprentice | ⭐ | **1 jump** | No | • XP accumulation continues |
+| **3** | 250 XP | Apprentice | ⭐ | **1 jump** → **3 jumps** | **✅ TRAINING** | • **+200% jump range** (1→3 jumps)<br>• Training system unlocks<br>• Multi-sector trading begins |
+| **4** | 450 XP | Courier | ⭐⭐ | **3 jumps** | No | • 2-star rank title<br>• Extended trading range |
+| **5** | 700 XP | Courier | ⭐⭐ | **3 jumps** | No | • Continued progression |
+| **6** | 1,000 XP | Courier | ⭐⭐ | **3 jumps** → **5 jumps** | **✅ TRAINING** | • **+67% jump range** (3→5 jumps)<br>• Threat Intelligence access<br>• Regional trading unlocked |
+| **7** | 1,350 XP | Supplier | ⭐⭐⭐ | **5 jumps** | No | • 3-star rank title<br>• Regional specialist |
+| **8** | 1,750 XP | Supplier | ⭐⭐⭐ | **5 jumps** | No | • Approaching advanced features |
+| **9** | 2,200 XP | Supplier | ⭐⭐⭐ | **5 jumps** → **10 jumps** | **✅ TRAINING** | • **+100% jump range** (5→10 jumps)<br>• **Mobile Satellite Intelligence** 📡<br>• 75km radar market scanning<br>• Long-distance trading unlocked |
+| **10** | 2,700 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** | No | • 4-star rank title<br>• Cross-sector specialist |
+| **11** | 3,250 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** | No | • Approaching master level |
+| **12** | 3,850 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** → **15 jumps** | **✅ TRAINING** | • **+50% jump range** (10→15 jumps)<br>• **Advanced Fleet Coordination**<br>• **Auto-Repair System** 🔧<br>• Master trader certification<br>• Cross-galaxy trading |
+| **13** | 4,500 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • 5-star rank title<br>• Elite trader status |
+| **14** | 5,200 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • Near maximum capabilities |
+| **15** | 6,000 XP | Long-Distance Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** → **25 jumps** | No | • **+67% jump range** (15→25 jumps)<br>• **Maximum capabilities**<br>• True galaxy-wide trading<br>• Ultimate trader rank |
 
-### **Trading Intelligence Progression:**
-- **Apprentice (1-2)**: Takes any non-negative trade immediately - no analysis
-- **Basic Certified (3)**: Requires minimum 5% profit before accepting
-- **Courier (4-6)**: Manual trade comparison, 5 seconds per opportunity evaluation
-- **Advanced Trade (6)**: Enhanced comparison speed, 3 seconds per trade
-- **Supplier (7-9)**: Regional trading expertise, 2 seconds per trade analysis
-- **Expert Trader (9)**: Advanced trading computer access, 1 second per trade
-- **Master Trader (12+)**: Instant analysis with sophisticated algorithms
-- **Long-Distance Merchant (15)**: AI-assisted trading with predictive capabilities
+### **Key Skill Breakpoints**
 
-### **Feature Access Requirements:**
-- **Basic Trading**: All levels
-- **Threat Intelligence**: Level 6+ (Courier rank)
-- **Mobile Satellite Intelligence**: Level 9+ (Supplier rank)  
-- **Fleet Coordination**: Level 12+ (Trader rank)
-- **Advanced Analytics**: Level 15 (Long-Distance Merchant)
+#### 🎓 **Level 3 - Basic Certification**
+- **Jump Range**: 1 → **3 jumps** (+200%)
+- **Unlocks**: Training system, multi-sector trading
+- **Impact**: Can now trade across neighboring sectors
 
-### **Ship Performance Logic:**
-- **Certification-Based Changes**: Ship performance only changes at training milestones (Levels 3, 6, 9, 12, 15)
-- **Stable Performance Between Levels**: No gradual changes - pilots maintain current capabilities until next certification
-- **Training Impact**: Each certification unlocks meaningful ship handling improvements
-- **Capital Ship Penalties**: Severe penalties for apprentices on L-class (-15%), extreme penalties on XL-class (-25%)
-- **Realistic Progression**: Large capital ships require significant experience to operate effectively
+#### 🎓 **Level 6 - Advanced Trade Certification**  
+- **Jump Range**: 3 → **5 jumps** (+67%)
+- **Unlocks**: Full Threat Intelligence System access
+- **Impact**: Better risk assessment and sector-wide trading
 
-### **Trading Intelligence Logic:**
-- **Experience-Based Decision Making**: Pilot skill directly affects trade opportunity evaluation
-- **Progressive Analysis Speed**: Advanced pilots can evaluate trades faster (5 sec → instant)
-- **Profit Threshold Scaling**: Higher-level pilots demand better profit margins (0% → 45%)
-- **Technology Access**: Advanced trading computers unlock at higher certification levels
-- **Realistic Trading Behavior**: Apprentices make poor decisions, masters optimize perfectly
+#### 🎓 **Level 9 - Expert Trader Certification**
+- **Jump Range**: 5 → **10 jumps** (+100%)
+- **Unlocks**: **Mobile Satellite Intelligence** (75km radar scanning)
+- **Impact**: Ships become mobile market sensors, double trading range
+
+#### 🎓 **Level 12 - Master Trader Certification**
+- **Jump Range**: 10 → **15 jumps** (+50%)
+- **Unlocks**: Advanced fleet coordination features, **Auto-Repair System** 🔧
+- **Impact**: Cross-galaxy trading, fleet optimization, ships automatically repair damage
+- **Auto-Repair**: Ships monitor hull integrity and automatically dock for repairs when damaged
+
+#### 🏆 **Level 15 - Long-Distance Merchant (Maximum)**
+- **Jump Range**: 15 → **25 jumps** (+67%)
+- **Capabilities**: Can trade anywhere in the known universe
+- **Status**: Elite 5-star master trader
+
+### **How Progression Works:**
+- **XP Gain**: Ships earn XP from successful trades (buy + sell cycle)
+- **Distance Bonus**: Longer routes earn more XP (encourages challenging trades)
+- **Risk Bonus**: Trading in dangerous sectors earns bonus XP
+- **Jump Restrictions**: Ships can **only** find trades within their maximum jump distance
+- **Training Gates**: XP progression **completely stops** at levels 3, 6, 9, and 12 until training is completed
+- **Pilot-Based**: XP is tied to the individual pilot, not the ship (pilot retains XP if transferred)
+- **Star Rating**: Every 3 levels = 1 star (matches X4's skill system)
+
+### **Feature Unlocks by Level:**
+- **Level 1+**: Basic trading, local threat detection
+- **Level 3+**: Multi-sector trading (after training)
+- **Level 6+**: Full Threat Intelligence System access
+- **Level 9+**: Mobile Satellite Intelligence (radar-based market scanning)
+- **Level 12+**: Advanced fleet coordination, **Auto-Repair System**
+
+### **XP Calculation System**
+
+GalaxyTrader MK3 uses an advanced XP calculation system that rewards pilots based on trade quality, value, and difficulty:
+
+#### **XP Formula**
+```
+Base XP = 50 (configurable)
+
+Value Multiplier = Trade Value ÷ 10,000
+Quality Bonus = 1.0 + (X4 Trade Quality × 0.5)
+Distance Bonus = 1.0 + (min(Jumps, 10) ÷ 20)
+
+Final XP = Base XP × Value Multiplier × Quality Bonus × Distance Bonus
+Range: 10 - 1,000 XP per trade (clamped)
+```
+
+#### **XP Factors Explained**
+
+1. **Trade Value** 💰
+   - Higher value trades = more XP
+   - A 100,000 Cr trade gives 10× multiplier
+   - Encourages profitable trading over low-value runs
+
+2. **Trade Quality** ⭐
+   - Uses X4's native trade quality metric (-0.5 to +0.5)
+   - Good trades (buying low, selling high) earn up to +25% bonus XP
+   - Poor trades (buying high, selling low) earn less XP
+   - Rewards smart trading decisions
+
+3. **Distance Bonus** 🚀
+   - Longer routes earn more XP (up to 10 jumps counted)
+   - Each jump adds 5% more XP
+   - A 10-jump trade earns +50% bonus XP
+   - Encourages long-distance trading as pilots level up
+
+4. **Risk Bonus** ⚠️ (Future)
+   - Trading in dangerous sectors will earn extra XP
+   - Currently under development
+
+#### **Example XP Calculations**
+
+| Trade Type | Value | Quality | Distance | Final XP |
+|------------|-------|---------|----------|----------|
+| **Small Local Trade** | 10,000 Cr | 0.0 (average) | 1 jump | ~52 XP |
+| **Medium Regional Trade** | 50,000 Cr | +0.2 (good) | 3 jumps | ~315 XP |
+| **Large Long-Distance** | 200,000 Cr | +0.4 (excellent) | 10 jumps | **1,000 XP** (capped) |
+
+#### **Progression Speed**
+- **Level 1 → 3**: ~5-10 small trades (new pilots, local trading)
+- **Level 3 → 6**: ~15-25 medium trades (multi-sector trading)
+- **Level 6 → 9**: ~25-40 larger trades (regional specialist)
+- **Level 9 → 12**: ~35-50 long-distance trades (cross-galaxy expert)
+- **Level 12 → 15**: ~45-60 elite trades (master trader)
 
 ## 🛠️ Troubleshooting
 
@@ -246,10 +292,15 @@ Please report issues or suggestions through the mod's official channels:
 ## 🎮 Tips for Success
 
 1. **Start Small**: Begin with 1-2 ships to learn the system
-2. **Training Stations**: Position ships near shipyards/wharfs at levels 2, 5, 8, 11
-3. **Skill Progression**: Let pilots advance naturally through trading
-4. **Debug Logging**: Enable debug output to monitor system performance
-5. **Save Regularly**: While save-safe, regular saves are always recommended
+2. **Training Stations**: Ships will automatically find training stations at levels 3, 6, 9, and 12
+3. **Fleet Management**: Use multiple ships for better sector coverage and higher profits
+4. **Monitor Progress**: Watch ship names for rank, level, and XP updates
+5. **Debug Logging**: Enable debug output (level 2-3) to monitor system performance
+6. **Save Regularly**: While save-safe, regular saves are always recommended
+7. **Level 9+ Ships**: Gain bonus market intelligence through mobile satellite scanning
+8. **Level 12+ Auto-Repair**: Master traders automatically handle their own repairs - keep funds available
+9. **Hull Threshold**: Adjust auto-repair threshold (50-99%) based on your preferred risk tolerance
+10. **Combat Zones**: Ships trading in dangerous areas will benefit from auto-repair at level 12+
 
 ---
 
