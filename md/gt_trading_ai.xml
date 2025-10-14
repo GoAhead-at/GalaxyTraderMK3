@@ -1,0 +1,2318 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_TradingAI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- Trading AI System Initialization -->
+    <cue name="SystemInit" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.SystemInit"/>
+      </conditions>
+      <actions>
+        <debug_text text="'[GalaxyTrader MK3] Trading AI system initializing...'" chance="100"/>
+        
+        <!-- Initialize trading data structures -->
+        <set_value name="global.$GT_TradingData" exact="table[]"/>
+        <set_value name="global.$GT_TradingData.$ActiveTrades" exact="table[]"/>
+        <set_value name="global.$GT_TradingData.$RouteCache" exact="table[]"/>
+        <set_value name="global.$GT_TradingData.$LastUpdate" exact="player.age"/>
+        
+        <!-- Initialize trade cache (hierarchical structure: ware -> sellStation -> buyStation) -->
+        <set_value name="global.$GT_TradeCache" exact="table[]"/>
+        
+        <!-- Initialize queue system -->
+        <set_value name="global.$GT_TradingQueue" exact="table[]"/>
+        <set_value name="global.$GT_TradingQueue.$Ships" exact="[]"/>
+        <set_value name="global.$GT_TradingQueue.$Processing" exact="false"/>
+        
+        <debug_text text="'[GalaxyTrader MK3] Trading AI system initialized'" chance="100"/>
+      </actions>
+    </cue>
+    
+    <!-- AI Script Signal Handlers -->
+    <cue name="HandleAITradeRequest" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Find_Trade'"/>
+      </conditions>
+      <actions>
+        <set_value name="$requestData" exact="event.param2"/>
+        <set_value name="$ship" exact="$requestData.$Ship"/>
+        
+        <!-- Initialize search locks table if needed -->
+        <do_if value="not global.$GT_SearchLocks?">
+          <set_value name="global.$GT_SearchLocks" exact="table[]"/>
+        </do_if>
+        
+        <!-- Check if ship already has active search -->
+        <do_if value="global.$GT_SearchLocks.{$ship}?">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Trade search already in progress, ignoring duplicate request'" chance="100"/>
+          </do_if>
+          <!-- Skip duplicate request instead of using return -->
+        </do_if>
+        <do_else>
+          <!-- Set search lock for this ship and store for cleanup -->
+          <set_value name="this.$lockedShip" exact="$ship"/>
+          <set_value name="global.$GT_SearchLocks.{$ship}" exact="player.age"/>
+          
+          <!-- DEBUG: Trade request received -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI trade request received for ' + $ship.knownname + ' (MaxBuy: ' + $requestData.$MaxBuy + ', MaxSell: ' + $requestData.$MaxSell + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL FIX: Store AI script parameters for this ship -->
+          <do_if value="not global.$GT_AIParameters?">
+            <set_value name="global.$GT_AIParameters" exact="table[]"/>
+          </do_if>
+          
+          <!-- Store the AI script parameters for use in trade search -->
+          <set_value name="global.$GT_AIParameters.{$ship}" exact="table[
+            $HomeBase = $requestData.$HomeBase,
+            $MaxBuy = $requestData.$MaxBuy,
+            $MaxSell = $requestData.$MaxSell,
+            $CargoTarget = $requestData.$CargoTarget,
+            $WareBasket = $requestData.$WareBasket,
+            $AllowIllegal = $requestData.$AllowIllegal,
+            $RiskTolerance = $requestData.$RiskTolerance,
+            $DistancePenalty = $requestData.$DistancePenalty,
+            $FleetCoordination = $requestData.$FleetCoordination,
+            $RequestTime = player.age
+          ]"/>
+          
+          <!-- Add ship to trading queue -->
+          <do_if value="not global.$GT_TradingQueue?">
+            <set_value name="global.$GT_TradingQueue" exact="table[]"/>
+            <set_value name="global.$GT_TradingQueue.$Ships" exact="[]"/>
+            <set_value name="global.$GT_TradingQueue.$Processing" exact="false"/>
+          </do_if>
+          
+          <append_to_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
+          
+          <!-- Start processing if not already processing -->
+          <signal_cue cue="ProcessTradingQueue"/>
+        </do_else>
+      </actions>
+      
+      <cues>
+        <!-- CRITICAL FIX: Cleanup search lock on cue completion/cancellation -->
+        <cue name="CleanupLock" instantiate="true">
+          <conditions>
+            <event_cue_completed cue="parent"/>
+          </conditions>
+          <actions>
+            <do_if value="parent.$lockedShip? and global.$GT_SearchLocks.{parent.$lockedShip}?">
+              <remove_value name="global.$GT_SearchLocks.{parent.$lockedShip}"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-AI] Search lock auto-cleaned for ' + parent.$lockedShip.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+          </actions>
+        </cue>
+      </cues>
+    </cue>
+
+    <!-- AI Script Sell Request Handler -->
+    <cue name="HandleAISellRequest" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Find_Sell'" comment="Handle sell request from AI script"/>
+      </conditions>
+      <actions>
+        <set_value name="$requestData" exact="event.param2"/>
+        <set_value name="$ship" exact="$requestData.$Ship"/>
+        
+        <!-- DEBUG: AI sell request received -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI sell request received for ' + $ship.knownname + ' (cargo full)'" chance="100"/>
+        </do_if>
+        
+        <!-- Store AI parameters for sell request (similar to buy request) -->
+        <do_if value="not global.$GT_AIParameters?">
+          <set_value name="global.$GT_AIParameters" exact="table[]"/>
+        </do_if>
+        
+        <set_value name="global.$GT_AIParameters.{$ship}" exact="table[
+          $HomeBase = $requestData.$HomeBase,
+          $MaxSell = $requestData.$MaxSell,
+          $RiskTolerance = $requestData.$RiskTolerance,
+          $DistancePenalty = $requestData.$DistancePenalty,
+          $RequestTime = player.age
+        ]"/>
+        
+        <!-- Find best sell opportunities -->
+        <set_value name="global.$GT_CurrentShip" exact="$ship"/>
+        <set_value name="global.$GT_TradeSearchMaxDistance" exact="$requestData.$MaxSell"/>
+        <set_value name="global.$GT_TradeSearchMinProfit" exact="500Cr"/>
+        <signal_cue cue="SearchSellOpportunities"/>
+      </actions>
+    </cue>
+
+    <!-- AI Script Initialization Handler -->
+    <cue name="HandleAIStarted" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_AI_Started'" comment="Handle AI script startup"/>
+      </conditions>
+      <actions>
+        <set_value name="$initData" exact="event.param2"/>
+        <set_value name="$ship" exact="$initData.$Ship"/>
+        
+        <debug_text text="'[GalaxyTrader MK3] AI script started for ship ' + $ship.knownname + ' - registering with MD system'" chance="100"/>
+        
+        <!-- Register ship with GT system if not already registered -->
+        <do_if value="not global.$GT_Ships.{$ship}?">
+          <signal_objects object="player.galaxy" param="'GT_Register_Ship'" param2="table[
+            $Ship = $ship,
+            $Config = $initData.$Config
+          ]"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Ship Trading Order Handler (Legacy) -->
+    <cue name="ShipTradingOrder" instantiate="true">
+      <conditions>
+        <event_object_order_ready object="player.entity" comment="Detect when ship is ready for new order"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.object"/>
+        
+        <!-- DEBUG: Ship order ready -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship order ready: ' + $ship.knownname" chance="100"/>
+        </do_if>
+        
+        <!-- Validate ship is registered and ready for trading -->
+        <do_if value="global.$GT_Ships.{$ship}? and $ship.isplayerowned and $ship.primarypurpose == purpose.trade">
+          <!-- Check if PILOT XP is blocked (not ship) -->
+          <set_value name="$isBlocked" exact="false"/>
+          <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$XPBlocked?">
+            <set_value name="$isBlocked" exact="true"/>
+            <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' pilot ' + $ship.pilot.name + ' is blocked for training'" chance="100"/>
+          </do_if>
+          
+          <!-- Add to trading queue if not blocked -->
+          <do_if value="not $isBlocked">
+            <!-- DEBUG: Adding to queue -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Adding ' + $ship.knownname + ' to trading queue. Queue size: ' + global.$GT_TradingQueue.$Ships.count" chance="100"/>
+            </do_if>
+            
+            <append_to_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
+            <signal_cue cue="ProcessTradingQueue"/>
+          </do_if>
+          <do_else>
+            <!-- DEBUG: Ship blocked -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship ' + $ship.knownname + ' pilot ' + ($ship.pilot? and $ship.pilot.name or 'NONE') + ' is blocked from trading'" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        <do_else>
+          <!-- DEBUG: Ship not eligible -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship ' + $ship.knownname + ' not eligible for trading (registered: ' + (global.$GT_Ships.{$ship}? == true) + ', player owned: ' + $ship.isplayerowned + ', purpose: ' + $ship.primarypurpose + ')'" chance="100"/>
+          </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Trading Queue Processor -->
+    <cue name="ProcessTradingQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- DEBUG: Queue processing called -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] ProcessTradingQueue called. Queue size: ' + global.$GT_TradingQueue.$Ships.count + ', Processing: ' + global.$GT_TradingQueue.$Processing" chance="100"/>
+        </do_if>
+        
+        <!-- Prevent concurrent processing -->
+        <do_if value="not global.$GT_TradingQueue.$Processing and global.$GT_TradingQueue.$Ships.count gt 0">
+          <set_value name="global.$GT_TradingQueue.$Processing" exact="true"/>
+          
+          <!-- DEBUG: Starting batch processing -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] Starting batch processing of ' + global.$GT_TradingQueue.$Ships.count + ' ships'" chance="100"/>
+          </do_if>
+          
+          <!-- Process ships in batches -->
+          <set_value name="$batchSize" exact="3"/>
+          <set_value name="$processed" exact="0"/>
+          <set_value name="$toProcessCount" exact="[global.$GT_TradingQueue.$Ships.count, $batchSize].min"/>
+          
+          <do_while value="global.$GT_TradingQueue.$Ships.count gt 0 and $processed lt $batchSize">
+            <set_value name="$ship" exact="global.$GT_TradingQueue.$Ships.{1}"/>
+            <remove_from_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
+            
+            <!-- DEBUG: Processing individual ship -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Processing ship ' + ($processed + 1) + '/' + $toProcessCount + ': ' + $ship.knownname" chance="100"/>
+            </do_if>
+            
+            <!-- Process ship trading with optional skill-based pre-search delay -->
+            <do_if value="$ship.exists and $ship.isoperational">
+              <!-- Resolve pilot skill level -->
+              <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <set_value name="$skillLevel" exact="if $skillInfo? and $skillInfo.$Level? then $skillInfo.$Level else 1"/>
+
+              <!-- Map Level 1→4 to delays 8s/6s/4s/2s, Level 5+ → 0s -->
+              <set_value name="$penaltyDelay" exact="0s"/>
+              <do_if value="$skillLevel le 1">
+                <set_value name="$penaltyDelay" exact="30s"/>
+              </do_if>
+              <do_elseif value="$skillLevel == 2">
+                <set_value name="$penaltyDelay" exact="22.5s"/>
+              </do_elseif>
+              <do_elseif value="$skillLevel == 3">
+                <set_value name="$penaltyDelay" exact="15s"/>
+              </do_elseif>
+              <do_elseif value="$skillLevel == 4">
+                <set_value name="$penaltyDelay" exact="7.5s"/>
+              </do_elseif>
+
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skill-based trade search delay: ' + $penaltyDelay + ' (Skill: ' + $skillLevel + ')'" chance="100"/>
+              </do_if>
+
+              <do_if value="$penaltyDelay gt 0s">
+                <signal_cue_instantly cue="FindBestTrade_Delayed" param="table[$Ship = $ship, $Delay = $penaltyDelay]"/>
+              </do_if>
+              <do_else>
+                <set_value name="global.$GT_CurrentShip" exact="$ship"/>
+                <signal_cue cue="FindBestTrade"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <!-- DEBUG: Ship not operational -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship ' + $ship.knownname + ' is not operational (exists: ' + $ship.exists + ', operational: ' + $ship.isoperational + ')'" chance="100"/>
+              </do_if>
+            </do_else>
+            
+            <set_value name="$processed" exact="$processed + 1"/>
+          </do_while>
+          
+          <set_value name="global.$GT_TradingQueue.$Processing" exact="false"/>
+          
+          <!-- Continue processing if more ships in queue -->
+          <do_if value="global.$GT_TradingQueue.$Ships.count gt 0">
+            <!-- DEBUG: More ships to process -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] ' + global.$GT_TradingQueue.$Ships.count + ' ships remaining in queue, continuing processing'" chance="100"/>
+            </do_if>
+            
+            <signal_cue cue="ProcessTradingQueue"/>
+          </do_if>
+          <do_else>
+            <!-- DEBUG: Queue empty -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] Trading queue is now empty'" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        <do_else>
+          <!-- DEBUG: Queue already processing or empty -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] Queue already processing or empty (Processing: ' + global.$GT_TradingQueue.$Processing + ', Size: ' + global.$GT_TradingQueue.$Ships.count + ')'" chance="100"/>
+          </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Skill-based pre-search delay wrapper -->
+    <cue name="FindBestTrade_Delayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param"/>
+        <set_value name="$ship" exact="$data.$Ship"/>
+        <set_value name="$delayTime" exact="$data.$Delay"/>
+        <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Applying pre-search delay: ' + $delayTime" chance="100"/>
+        </do_if>
+      </actions>
+      <delay exact="$delayTime"/>
+      <actions>
+        <do_if value="$ship.exists and $ship.isoperational">
+          <set_value name="global.$GT_CurrentShip" exact="$ship"/>
+          <signal_cue cue="FindBestTrade"/>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping trade search after delay; ship no longer operational'" chance="100"/>
+          </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Find Best Trade for Ship -->
+    <cue name="FindBestTrade" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="global.$GT_CurrentShip"/>
+        
+        <!-- Validate ship -->
+        <run_actions ref="md.GT_Utilities.GT_ValidateShip" result="$shipValid">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <do_if value="$shipValid">
+          <!-- Get configuration values with safe defaults -->
+          <!-- FORCE MinROI to 0% (ignore saved config) -->
+          <set_value name="$minROI" exact="0"/> <!-- Accept any profit (0% ROI minimum) as integer -->
+          
+          <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$MinAbsoluteProfit?">
+            <set_value name="$minAbsoluteProfit" exact="@global.$GT_Config.$Trading.$MinAbsoluteProfit"/>
+          </do_if>
+          <do_else>
+            <set_value name="$minAbsoluteProfit" exact="10000"/> <!-- 100 Cr in RAW format -->
+          </do_else>
+          
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search parameters: MinROI=' + $minROI + '%, MinAbsoluteProfit=' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL FIX: Use AI script parameters if available, otherwise use pilot skill-based limits -->
+          <set_value name="$maxDistance" exact="15"/> <!-- Default fallback -->
+          
+          <!-- Check if we have stored AI parameters for this ship -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <set_value name="$aiParams" exact="global.$GT_AIParameters.{$ship}"/>
+            
+            <!-- Use the maximum of MaxBuy and MaxSell from AI script -->
+            <set_value name="$maxDistance" exact="[$aiParams.$MaxBuy, $aiParams.$MaxSell].max"/>
+            
+            <!-- DEBUG: Using AI script parameters -->
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using AI script distance limits: MaxBuy=' + $aiParams.$MaxBuy + ', MaxSell=' + $aiParams.$MaxSell + ', using max=' + $maxDistance + ' jumps'" chance="100"/>
+            </do_if>
+            
+            <!-- Clean up old parameters (older than 5 minutes) -->
+            <do_if value="(player.age - $aiParams.$RequestTime) gt 300s">
+              <remove_value name="global.$GT_AIParameters.{$ship}"/>
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cleaned up old AI parameters (age: ' + ((player.age - $aiParams.$RequestTime) / 1s) + 's)'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Fallback to pilot skill-based limits -->
+            <do_if value="$ship.pilot">
+              <!-- Get pilot's actual max jump capability -->
+              <set_value name="$pilotMaxJumps" exact="$ship.pilot.skill.piloting"/>
+              
+              <!-- Apply skill-based maximum distance with reasonable limits -->
+              <set_value name="$skillBasedMax" exact="[$pilotMaxJumps, 1].max"/> <!-- Minimum 1 jump -->
+              <set_value name="$configMax" exact="15"/> <!-- Default config maximum -->
+              
+              <!-- Check if config override exists -->
+              <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$MaxTradeDistance?">
+                <set_value name="$configMax" exact="@global.$GT_Config.$Trading.$MaxTradeDistance"/>
+              </do_if>
+              
+              <!-- Use the minimum of skill-based limit and config limit -->
+              <set_value name="$maxDistance" exact="[$skillBasedMax, $configMax].min"/>
+              
+              <!-- DEBUG: Pilot skill-based distance -->
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No AI params, using pilot ' + $ship.pilot.name + ' max jumps: ' + $pilotMaxJumps + ', trade distance: ' + $maxDistance + ' (config max: ' + $configMax + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- No pilot - use config or default -->
+              <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$MaxTradeDistance?">
+                <set_value name="$maxDistance" exact="@global.$GT_Config.$Trading.$MaxTradeDistance"/>
+              </do_if>
+              
+              <!-- DEBUG: No pilot fallback -->
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No pilot found, using fallback distance: ' + $maxDistance + ' jumps'" chance="100"/>
+              </do_if>
+            </do_else>
+          </do_else>
+          
+          <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$FactionPriority?">
+            <set_value name="$factionPriority" exact="@global.$GT_Config.$Trading.$FactionPriority"/>
+          </do_if>
+          <do_else>
+            <set_value name="$factionPriority" exact="'player'"/> <!-- Default to player faction -->
+          </do_else>
+          
+          <!-- Find trade opportunities -->
+          <set_value name="global.$GT_TradeSearchShip" exact="$ship"/>
+          <set_value name="global.$GT_TradeSearchMaxDistance" exact="$maxDistance"/>
+          <set_value name="global.$GT_TradeSearchMinROI" exact="$minROI"/>
+          <set_value name="global.$GT_TradeSearchMinAbsoluteProfit" exact="$minAbsoluteProfit"/>
+          <set_value name="global.$GT_TradeSearchFactionPriority" exact="$factionPriority"/>
+          <signal_cue cue="SearchTradeRoutes"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GalaxyTrader MK3] Invalid ship for trading: ' + $ship.knownname" chance="100"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Search for Trade Routes -->
+    <cue name="SearchTradeRoutes" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="@global.$GT_TradeSearchShip"/>
+        <set_value name="$maxDistance" exact="@global.$GT_TradeSearchMaxDistance"/>
+        
+        <!-- Load with fallback values to prevent property lookup errors -->
+        <set_value name="$minROI" exact="0.00"/>
+        <do_if value="global.$GT_TradeSearchMinROI?">
+          <set_value name="$minROI" exact="@global.$GT_TradeSearchMinROI"/>
+        </do_if>
+        
+        <set_value name="$minAbsoluteProfit" exact="0"/>
+        <do_if value="global.$GT_TradeSearchMinAbsoluteProfit?">
+          <set_value name="$minAbsoluteProfit" exact="@global.$GT_TradeSearchMinAbsoluteProfit"/>
+        </do_if>
+        
+        <set_value name="$factionPriority" exact="1"/>
+        <do_if value="global.$GT_TradeSearchFactionPriority?">
+          <set_value name="$factionPriority" exact="@global.$GT_TradeSearchFactionPriority"/>
+        </do_if>
+        
+        <!-- Create faction priority text for debug output -->
+        <set_value name="$factionPriorityText" exact="if $factionPriority == 0 then 'Player Only' else if $factionPriority == 1 then 'Foreign First' else 'Equal Priority'"/>
+        
+        <!-- Get distance penalty setting (0-100% converted to 0.0-2.0 multiplier) -->
+        <set_value name="$distancePenaltyMultiplier" exact="1.0"/> <!-- Default: 50% = 1.0 -->
+        <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$DistancePenalty?">
+          <!-- Convert 0-100% to 0.0-2.0: 0%=0.0, 50%=1.0, 100%=2.0 -->
+          <set_value name="$distancePenaltyMultiplier" exact="global.$GT_AIParameters.{$ship}.$DistancePenalty / 50.0"/>
+        </do_if>
+
+        <!-- Resolve pilot skill and apply feature gates + level-based thresholds -->
+        <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <set_value name="$skillLevel" exact="if $skillInfo? and $skillInfo.$Level? then $skillInfo.$Level else 1"/>
+
+        <!-- Feature gates by skill level -->
+        <set_value name="$gt_ThreatIntel" exact="$skillLevel ge 6"/>
+        <set_value name="$gt_SatelliteIntel" exact="$skillLevel ge 9"/>
+        <set_value name="$gt_FleetCoord" exact="$skillLevel ge 12"/>
+        <set_value name="$gt_AdvancedAnalytics" exact="$skillLevel ge 15"/>
+
+        <!-- Level-based ROI and Absolute Profit thresholds (0.5x @Lv1 → 2.0x @Lv15) -->
+        <set_value name="$roiMultiplier" exact="0.5 + (($skillLevel - 1) * (1.5 / 14))"/>
+        <set_value name="$profitMultiplier" exact="0.5 + (($skillLevel - 1) * (1.5 / 14))"/>
+        <set_value name="$minROI" exact="$minROI * $roiMultiplier"/>
+        <set_value name="$minAbsoluteProfit" exact="($minAbsoluteProfit * $profitMultiplier)i"/>
+        
+        <!-- DEBUG: Trade search start -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <set_value name="$pilotInfo" exact="'No Pilot'"/>
+          <do_if value="$ship.pilot">
+            <set_value name="$shownSkill" exact="1"/>
+            <do_if value="global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$Level?">
+              <set_value name="$shownSkill" exact="global.$GT_Pilots.{$ship.pilot}.$Level"/>
+            </do_if>
+            <do_elseif value="$ship.pilot.skill.management?">
+              <set_value name="$shownSkill" exact="$ship.pilot.skill.management"/>
+            </do_elseif>
+            <do_elseif value="$ship.pilot.skill.piloting?">
+              <set_value name="$shownSkill" exact="$ship.pilot.skill.piloting"/>
+            </do_elseif>
+            <set_value name="$pilotInfo" exact="$ship.pilot.name + ' (Skill: ' + $shownSkill + ')'"/>
+          </do_if>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === TRADE SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nPilot: ' + $pilotInfo + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin ROI: ' + $minROI + '%' + '\nMin Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr' + '\nShip Cargo: ' + ($ship.cargo.capacity.all - $ship.cargo.free.all) + '/' + $ship.cargo.capacity.all" chance="100"/>
+        </do_if>
+        
+        <set_value name="$bestTrade" exact="null"/>
+        <set_value name="$bestScore" exact="0"/>
+        <set_value name="$foundCachedTrade" exact="false"/>
+        
+        <!-- FLEET COORDINATION: Store top trades for conflict resolution -->
+        <set_value name="$topTrades" exact="[]"/>
+        <set_value name="$maxAlternatives" exact="10"/> <!-- Keep top 10 trades as alternatives -->
+        
+        <!-- ===== PHASE 1: CHECK TRADE CACHE WITH AGE VALIDATION ===== -->
+        <set_value name="$cacheAge" exact="999s"/>
+        <do_if value="global.$GT_TradeCache.$LastUpdate?">
+          <set_value name="$cacheAge" exact="player.age - global.$GT_TradeCache.$LastUpdate"/>
+        </do_if>
+        
+        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.keys.count gt 0">
+          <!-- DEBUG: Cache checking with age -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Checking trade cache (' + @global.$GT_TradeCache.keys.count + ' wares cached, age: ' + ($cacheAge/1s) + 's)'" chance="100"/>
+          </do_if>
+          
+          <set_value name="$validCachedTrades" exact="[]"/>
+          <set_value name="$cacheEntriesChecked" exact="0"/>
+          <set_value name="$bestCacheEfficiency" exact="0"/>
+          <set_value name="$cacheEarlyExit" exact="false"/>
+          <set_value name="$skipCacheValidation" exact="$cacheAge lt 30s"/>
+          
+          <!-- EARLY EXIT CACHE CHECKING: Check trades sorted by efficiency potential -->
+          <do_all exact="global.$GT_TradeCache.keys.count" counter="$wareIdx">
+            <set_value name="$wareKey" exact="global.$GT_TradeCache.keys.{$wareIdx}"/>
+            <set_value name="$wareCache" exact="global.$GT_TradeCache.{$wareKey}"/>
+            
+            <!-- Safety check: Ensure wareCache is valid -->
+            <do_if value="not $wareCache? or typeof $wareCache != datatype.table or not $wareCache.keys?">
+              <continue/>
+            </do_if>
+            
+            <do_all exact="$wareCache.keys.count" counter="$sellIdx">
+              <set_value name="$sellKey" exact="$wareCache.keys.{$sellIdx}"/>
+              <set_value name="$sellCache" exact="$wareCache.{$sellKey}"/>
+              
+              <!-- Safety check: Ensure sellCache is valid -->
+              <do_if value="not $sellCache? or typeof $sellCache != datatype.table or not $sellCache.keys?">
+                <continue/>
+              </do_if>
+              
+              <!-- CRITICAL: Get home sector for distance calculations -->
+              <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+              <do_if value="not $homeBase? or not $homeBase.exists">
+                <set_value name="$homeBase" exact="$ship.sector"/>
+              </do_if>
+              
+              <!-- Extract sector with fallback -->
+              <do_if value="$homeBase.isclass.station">
+                <set_value name="$homeSector" exact="$homeBase.sector"/>
+              </do_if>
+              <do_elseif value="$homeBase.isclass.sector">
+                <set_value name="$homeSector" exact="$homeBase"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$homeSector" exact="$ship.sector"/>
+              </do_else>
+              
+              <!-- Final validation -->
+              <do_if value="not $homeSector? or not $homeSector.exists">
+                <set_value name="$homeSector" exact="$ship.sector"/>
+              </do_if>
+              
+              <!-- EARLY EXIT: If sell station is too far FROM HOME, skip all buy stations for this sell station -->
+              <set_value name="$distanceToSell" exact="@$homeSector.gatedistance.{$sellKey}"/>
+              <do_if value="not $distanceToSell?">
+                <set_value name="$distanceToSell" exact="-1"/>
+              </do_if>
+              <do_if value="$distanceToSell gt $maxDistance">
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ CACHE EARLY EXIT: Sell station ' + $sellKey.knownname + ' too far (' + $distanceToSell + ' > ' + $maxDistance + '), skipping all routes from this station'" chance="100"/>
+                </do_if>
+                <continue/>
+              </do_if>
+              
+              <do_all exact="$sellCache.keys.count" counter="$buyIdx">
+                <set_value name="$buyKey" exact="$sellCache.keys.{$buyIdx}"/>
+                <set_value name="$cacheEntry" exact="$sellCache.{$buyKey}"/>
+                <set_value name="$cacheEntriesChecked" operation="add"/>
+                
+                <!-- PERFORMANCE: Early exit if we already have several good trades -->
+                <do_if value="$validCachedTrades.count ge 5 and $cacheEntriesChecked gt 20">
+                  <set_value name="$cacheEarlyExit" exact="true"/>
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ CACHE EARLY EXIT: Found ' + $validCachedTrades.count + ' good trades after checking ' + $cacheEntriesChecked + ' cache entries'" chance="100"/>
+                  </do_if>
+                  <break/>
+                </do_if>
+                
+                <!-- Validate cache entry with ROI system -->
+                <set_value name="$cacheValid" exact="true"/>
+                
+                <!-- Basic validation -->
+                <do_if value="not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Profit?">
+                  <set_value name="$cacheValid" exact="false"/>
+                </do_if>
+                
+                <!-- CRITICAL: Validate station owners still exist (prevents "nil" in logs and invalid trades) -->
+                <do_if value="$cacheValid">
+                  <do_if value="not $cacheEntry.$BuyOffer.owner? or not $cacheEntry.$BuyOffer.owner.exists or not $cacheEntry.$SellOffer.owner? or not $cacheEntry.$SellOffer.owner.exists">
+                    <set_value name="$cacheValid" exact="false"/>
+                    
+                    <!-- DELETE invalid cache entry (station destroyed/no longer exists) -->
+                    <remove_value name="global.$GT_TradeCache.{$wareKey}.{$sellKey}.{$buyKey}"/>
+                    
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                      <debug_text text="'[GT-CACHE] (' + $ship.idcode + ') ❌ Cached trade deleted (station no longer exists): ' + $wareKey.name + ' route invalidated'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- Quick distance check before expensive ROI calculation -->
+                <do_if value="$cacheValid">
+                  <!-- FIX: Check if both stations are in the same sector -->
+                  <do_if value="$cacheEntry.$SellOffer.owner.sector == $cacheEntry.$BuyOffer.owner.sector">
+                    <set_value name="$distanceFromSellToBuy" exact="0"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$distanceFromSellToBuy" exact="@$cacheEntry.$SellOffer.owner.sector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
+                    <do_if value="not $distanceFromSellToBuy?">
+                      <set_value name="$distanceFromSellToBuy" exact="-1"/>
+                    </do_if>
+                  </do_else>
+                  
+                  <do_if value="$distanceToSell lt 0 or $distanceFromSellToBuy lt 0 or $distanceToSell gt $maxDistance">
+                    <set_value name="$cacheValid" exact="false"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- ROI validation (only if distance passed) -->
+                <do_if value="$cacheValid">
+                  <set_value name="$cachedAmount" exact="$cacheEntry.$Amount"/>
+                  <set_value name="$cachedInvestment" exact="$cacheEntry.$BuyOffer.price * $cachedAmount"/>
+                  
+                  <!-- STANDARDIZED ROI CALCULATION using library -->
+                  <run_actions ref="md.GT_Utilities.GT_CalculateROI" result="$cachedROI">
+                    <param name="investment" value="$cachedInvestment"/>
+                    <param name="profit" value="$cacheEntry.$Profit"/>
+                  </run_actions>
+                  
+                  <!-- Verify trade meets CACHE profit threshold (not ship's personal threshold) -->
+                  <set_value name="$cacheProfitThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+                  <do_if value="$cachedROI lt $cacheProfitThreshold">
+                    <set_value name="$cacheValid" exact="false"/>
+                    
+                    <!-- DELETE invalid cache entry -->
+                    <remove_value name="global.$GT_TradeCache.{$wareKey}.{$sellKey}.{$buyKey}"/>
+                    
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                      <debug_text text="'[GT-CACHE] (' + $ship.idcode + ') ❌ Cached trade deleted (below threshold): ROI=' + $cachedROI + '% (need ' + $cacheProfitThreshold + '%), removing from cache'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- If valid, add to candidates with efficiency calculation -->
+                <do_if value="$cacheValid">
+                  <set_value name="$totalDistance" exact="$distanceToSell + $distanceFromSellToBuy"/>
+                  
+                  <!-- CRITICAL: Filter cached trades that exceed max distance -->
+                  <do_if value="$totalDistance gt $maxDistance">
+                    <set_value name="$cacheValid" exact="false"/>
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 3">
+                      <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⛔ CACHE: Trade route too long (' + $totalDistance + ' jumps > max ' + $maxDistance + ') - skipping cached trade'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <do_if value="$cacheValid">
+                  <!-- Apply distance penalty multiplier: 0%=no penalty, 50%=normal, 100%=2x penalty -->
+                  <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
+                  <set_value name="$efficiency" exact="$cacheEntry.$Profit / (1 + $adjustedDistance)"/>
+                  
+                  <!-- Track best efficiency for early exit decisions -->
+                  <do_if value="$efficiency gt $bestCacheEfficiency">
+                    <set_value name="$bestCacheEfficiency" exact="$efficiency"/>
+                  </do_if>
+                  
+                  <append_to_list name="$validCachedTrades" exact="table[
+                    $trade = $cacheEntry,
+                    $distance = $totalDistance,
+                    $efficiency = $efficiency
+                  ]"/>
+                </do_if>
+              </do_all>
+              
+              <!-- Break out of outer loops if early exit triggered -->
+              <do_if value="$cacheEarlyExit">
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <!-- Break out of outermost loop if early exit triggered -->
+            <do_if value="$cacheEarlyExit">
+              <break/>
+            </do_if>
+          </do_all>
+          
+          <!-- Sort cached trades by efficiency (profit per jump) -->
+          <do_if value="$validCachedTrades.count gt 0">
+            <!-- Simple selection of best efficiency trade -->
+            <set_value name="$bestCachedTrade" exact="null"/>
+            <set_value name="$bestEfficiency" exact="0"/>
+            
+            <do_all exact="$validCachedTrades.count" counter="$i">
+              <set_value name="$candidate" exact="$validCachedTrades.{$i}"/>
+              <do_if value="$candidate.$efficiency gt $bestEfficiency">
+                <set_value name="$bestEfficiency" exact="$candidate.$efficiency"/>
+                <set_value name="$bestCachedTrade" exact="$candidate.$trade"/>
+              </do_if>
+            </do_all>
+            
+            <!-- Dynamic efficiency threshold based on skill and config -->
+            <set_value name="$minEfficiency" exact="($minAbsoluteProfit / [1, $maxDistance].max)"/>
+            <!-- Apply skill-based modifier (higher skill = higher standards) -->
+            <set_value name="$skillModifier" exact="1.0 + (($skillLevel - 1) * 0.05)"/>
+            <set_value name="$minEfficiency" exact="$minEfficiency * $skillModifier"/>
+            
+            <!-- Use best cached trade if it meets dynamic threshold -->
+            <do_if value="$bestCachedTrade? and $bestEfficiency ge $minEfficiency">
+              <set_value name="$foundCachedTrade" exact="true"/>
+              <set_value name="$bestTrade" exact="$bestCachedTrade"/>
+              <set_value name="$bestScore" exact="$bestEfficiency"/>
+              
+              <!-- DEBUG: Using cached trade with enhanced details -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <set_value name="$distancePenaltyPercent" exact="($distancePenaltyMultiplier * 50)i"/>
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ CACHED TRADE SELECTED:' + '\n  📦 Ware: ' + $bestCachedTrade.$BuyOffer.ware.name + ' (x' + $bestCachedTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestCachedTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestCachedTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestCachedTrade.$SellOffer.owner.knownname + ' @ ' + ($bestCachedTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestCachedTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestCachedTrade.$Profit / 100) + ' Cr' + '\n  📊 Efficiency: ' + $bestEfficiency + ' (' + $distancePenaltyPercent + '%, threshold: ' + $minEfficiency + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- DEBUG: Cache performance metrics -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <set_value name="$totalCacheEntries" exact="0"/>
+            <do_all exact="global.$GT_TradeCache.keys.count" counter="$wareIdx">
+              <set_value name="$wareCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$wareIdx}}"/>
+              <do_if value="$wareCache? and typeof $wareCache == datatype.table and $wareCache.keys?">
+                <do_all exact="$wareCache.keys.count" counter="$sellIdx">
+                  <set_value name="$sellCache" exact="$wareCache.{$wareCache.keys.{$sellIdx}}"/>
+                  <do_if value="$sellCache? and typeof $sellCache == datatype.table and $sellCache.keys?">
+                    <set_value name="$totalCacheEntries" operation="add" exact="$sellCache.keys.count"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+            
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ CACHE PERFORMANCE: Checked ' + $cacheEntriesChecked + '/' + $totalCacheEntries + ' entries, found ' + $validCachedTrades.count + ' valid trades'" chance="100"/>
+            <do_if value="$cacheEarlyExit">
+              <set_value name="$cachePerfGain" exact="if $totalCacheEntries gt 0 then (($totalCacheEntries - $cacheEntriesChecked) * 100 / $totalCacheEntries) else 0"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ CACHE EARLY EXIT TRIGGERED: Performance boost of ' + $cachePerfGain + '% (saved ' + ($totalCacheEntries - $cacheEntriesChecked) + ' checks)'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- ===== PHASE 2: LIVE TRADE SEARCH (if no good cached trade) ===== -->
+        <do_if value="not $foundCachedTrade">
+          <!-- DEBUG: No cached trade, performing live search -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No suitable cached trade found, performing live market search'" chance="100"/>
+          </do_if>
+        
+        <!-- CRITICAL: DETERMINE HOME SECTOR FIRST (before station search!) -->
+        <!-- Try to get HomeBase from AI parameters first (passed from order) -->
+        <set_value name="$homeBase" exact="null"/>
+        <set_value name="$homeBaseSource" exact="'unknown'"/>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$HomeBase?">
+          <set_value name="$homeBase" exact="global.$GT_AIParameters.{$ship}.$HomeBase"/>
+          <set_value name="$homeBaseSource" exact="'order parameters'"/>
+        </do_if>
+        
+        <!-- Fallback chain: AI params -> defaultorder.$home -> ship.sector -> safe default -->
+        <do_if value="not $homeBase? or not $homeBase.exists">
+          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+          <do_if value="$homeBase? and $homeBase.exists">
+            <set_value name="$homeBaseSource" exact="'defaultorder'"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homeBase" exact="$ship.sector"/>
+            <set_value name="$homeBaseSource" exact="'ship.sector (fallback)'"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠ No home base set in AI params or order, using ship sector: ' + $ship.sector.knownname" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- Extract sector from home base (handle both sector and station) -->
+        <do_if value="$homeBase.isclass.station">
+          <set_value name="$homeSector" exact="$homeBase.sector"/>
+        </do_if>
+        <do_elseif value="$homeBase.isclass.sector">
+          <set_value name="$homeSector" exact="$homeBase"/>
+        </do_elseif>
+        <do_else>
+          <!-- Last resort fallback -->
+          <set_value name="$homeSector" exact="$ship.sector"/>
+          <debug_text text="'[GalaxyTrader MK3] ⚠ WARNING: Could not determine home sector for ' + $ship.knownname + ' (' + $ship.idcode + '), using current sector as fallback'" chance="100"/>
+        </do_else>
+        
+        <!-- Validate homeSector is actually set -->
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <set_value name="$homeSector" exact="$ship.sector"/>
+          <debug_text text="'[GalaxyTrader MK3] 🚨 CRITICAL: Home sector was null for ' + $ship.knownname + ' (' + $ship.idcode + '), forcing to current sector'" chance="100"/>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🏠 Home base: ' + @$homeBase.knownname + ' (sector: ' + $homeSector.knownname + ') [source: ' + $homeBaseSource + '], calculating distances from home'" chance="100"/>
+        </do_if>
+        
+        <!-- PERFORMANCE OPTIMIZATION: Get stations with faction priority sorting -->
+        
+        <!-- Phase 1: Get Foreign Faction Stations (sorted by distance FROM HOME) -->
+        <set_value name="$foreignStations" exact="[]"/>
+        <set_value name="$playerStations" exact="[]"/>
+        
+        <do_if value="$factionPriority != 0">  <!-- Skip if Player Only mode -->
+          <find_station space="player.galaxy" name="$foreignStations" multiple="true" knownto="$ship.owner" 
+                        checkoperational="true" sortbygatedistanceto="$homeSector">
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            <match canbuildships="false"/>
+            <match owner="faction.player" negate="true"/>
+          </find_station>
+        </do_if>
+        
+        <!-- Phase 2: Get Player-Owned Stations (always included, sorted by distance from HOME) -->
+        <find_station space="player.galaxy" name="$playerStations" multiple="true" owner="faction.player" 
+                      checkoperational="true" sortbygatedistanceto="$homeSector" knownto="$ship.owner">
+          <match canbuildships="false"/>
+        </find_station>
+        
+        <!-- Phase 3: Merge stations based on faction priority and RE-SORT BY DISTANCE -->
+        <set_value name="$stations" exact="[]"/>
+        
+        <do_if value="$factionPriority == 0">
+          <!-- Player stations only (already sorted) -->
+          <set_value name="$stations" exact="$playerStations"/>
+        </do_if>
+        <do_else>
+          <!-- Merge foreign and player stations, then sort by distance -->
+          <set_value name="$allStations" exact="[]"/>
+          
+          <!-- Add foreign stations if not in player-only mode -->
+          <do_if value="$factionPriority != 0">
+            <do_all exact="$foreignStations.count" counter="$fs">
+              <append_to_list name="$allStations" exact="$foreignStations.{$fs}"/>
+            </do_all>
+          </do_if>
+          
+          <!-- Add player stations -->
+          <do_all exact="$playerStations.count" counter="$ps">
+            <append_to_list name="$allStations" exact="$playerStations.{$ps}"/>
+          </do_all>
+          
+          <!-- CRITICAL FIX: Sort merged list by distance using pre-calculated distances -->
+          <!-- Build distance-sorted station list using simple insertion sort -->
+          <do_all exact="$allStations.count" counter="$i">
+            <set_value name="$currentStation" exact="$allStations.{$i}"/>
+            <!-- Safe distance lookup with fallback to -1 for unreachable sectors -->
+            <set_value name="$currentDistance" exact="@$homeSector.gatedistance.{$currentStation.sector}"/>
+            <do_if value="not $currentDistance?">
+              <set_value name="$currentDistance" exact="-1"/>
+            </do_if>
+            
+            <!-- Skip unreachable stations (negative distance) -->
+            <do_if value="$currentDistance ge 0">
+              <!-- Find insertion position in sorted list -->
+              <set_value name="$inserted" exact="false"/>
+              <do_all exact="$stations.count" counter="$j">
+                <do_if value="not $inserted">
+                  <set_value name="$compareDistance" exact="@$homeSector.gatedistance.{$stations.{$j}.sector}"/>
+                  <do_if value="not $compareDistance?">
+                    <set_value name="$compareDistance" exact="-1"/>
+                  </do_if>
+                  <do_if value="$currentDistance lt $compareDistance">
+                    <!-- Insert before this station -->
+                    <set_value name="$stations.{$j}" exact="$currentStation" operation="insert"/>
+                    <set_value name="$inserted" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <!-- If not inserted, append to end -->
+              <do_if value="not $inserted">
+                <append_to_list name="$stations" exact="$currentStation"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_else>
+        
+        <!-- DEBUG: Station search results (before distance filtering) -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Merged and sorted ' + $stations.count + ' stations, now filtering by distance (max: ' + $maxDistance + ' jumps from ' + $homeSector.knownname + ')'" chance="100"/>
+        </do_if>
+        
+        <!-- ===== CRITICAL FIX: Calculate distances for final sorted list (no pre-caching needed) ===== -->
+        <!-- Distance check will happen during iteration with early exit -->
+        
+        <!-- ===== COLLECT ALL TRADE OFFERS ===== -->
+        <set_value name="$stationsEvaluated" exact="0"/>
+        <set_value name="$offersFound" exact="0"/>
+        <set_value name="$validOffers" exact="0"/>
+        <set_value name="$allSellOffers" exact="[]"/>
+        <set_value name="$allBuyOffers" exact="[]"/>
+        <set_value name="$totalFilteredIllegal" exact="0"/>
+        
+        <!-- Get AI parameters for filtering -->
+        <set_value name="$wareBasket" exact="@global.$GT_AIParameters.{$ship}.$WareBasket"/>
+        <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+        
+        <!-- First pass: Collect all sell and buy offers from all stations WITH EARLY EXIT -->
+        <set_value name="$stationsSkipped" exact="0"/>
+        <do_all exact="$stations.count" counter="$i">
+          <set_value name="$station" exact="$stations.{$i}"/>
+          <!-- Calculate distance on-the-fly (stations are already sorted by distance) -->
+          <!-- CORRECTED: gatedistance syntax is just object.gatedistance.{destination} -->
+          <set_value name="$stationDistance" exact="@$homeSector.gatedistance.{$station.sector}"/>
+          <do_if value="not $stationDistance?">
+            <set_value name="$stationDistance" exact="-1"/>
+          </do_if>
+          
+          <do_if value="$stationDistance lt 0">
+            <set_value name="$stationsSkipped" operation="add"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⛔ Unreachable station (undiscovered route): ' + $station.knownname + ' in ' + $station.sector.knownname + ' - skipping'" chance="100"/>
+            </do_if>
+            <continue/>
+          </do_if>
+          
+          <!-- CRITICAL FIX: Stop searching when we exceed max distance (stations are sorted, so we can exit early) -->
+          <do_if value="$stationDistance gt $maxDistance">
+            <set_value name="$stationsSkipped" exact="$stationsSkipped + ($stations.count - $i + 1)"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ EARLY EXIT: Reached distance limit (' + $stationDistance + ' > ' + $maxDistance + ') at station ' + $i + '/' + $stations.count + ' (' + $station.knownname + ' in ' + $station.sector.knownname + ', ' + $stationDistance + ' jumps). Skipping remaining ' + ($stations.count - $i + 1) + ' stations.'" chance="100"/>
+            </do_if>
+            <break/>
+          </do_if>
+          
+          <!-- DEBUG: Station evaluation start -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Collecting offers from station ' + $i + '/' + $stations.count + ': ' + $station.knownname + ' (' + $station.idcode + ') in ' + $station.sector.knownname + ' (distance: ' + $stationDistance + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Check if station can trade -->
+          <run_actions ref="md.GT_Utilities.GT_ValidateStation" result="$stationValid">
+            <param name="station" value="$station"/>
+          </run_actions>
+          
+          <do_if value="$stationValid">
+            <set_value name="$stationsEvaluated" operation="add"/>
+            
+            <!-- Get station trade offers (no distance filter needed since we have early exit) -->
+            <find_buy_offer buyer="$station" result="$buyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner"/>
+            </find_buy_offer>
+            
+            <find_sell_offer seller="$station" result="$sellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner"/>
+            </find_sell_offer>
+            
+            <!-- DETAILED LOGGING: Show what offers we found -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 3 and ($buyOffers.count gt 0 or $sellOffers.count gt 0)">
+              <debug_text text="'[GT-OFFER-COLLECTION] Station: ' + $station.knownname + '\n  BuyOffers (station WANTS to buy): ' + $buyOffers.count + '\n  SellOffers (station WANTS to sell): ' + $sellOffers.count" chance="100"/>
+            </do_if>
+            
+            <set_value name="$stationOffers" exact="$buyOffers.count + $sellOffers.count"/>
+            <set_value name="$offersFound" exact="$offersFound + $stationOffers"/>
+            
+            <!-- CRITICAL FIX: Filter offers based on illegal ware policy (matches TaterTrader approach) -->
+            <set_value name="$filteredIllegalCount" exact="0"/>
+            
+            <do_all exact="$sellOffers.count" counter="$j">
+              <set_value name="$offer" exact="$sellOffers.{$j}"/>
+              
+              <!-- CRITICAL: Check if offer is valid (like TaterTrader does) -->
+              <set_value name="$isValid" exact="true"/>
+              <set_value name="$filterReason" exact="null"/>
+              
+              <!-- Exclude mission offers -->
+              <do_if value="$offer.ismission">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'mission offer'"/>
+              </do_if>
+              
+              <!-- Exclude ware exchange offers -->
+              <do_if value="$isValid and $offer.iswareexchange">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'ware exchange'"/>
+              </do_if>
+              
+              <!-- Check if offer is actually available -->
+              <do_if value="$isValid and not $offer.available">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'not available'"/>
+              </do_if>
+              
+              <!-- Check faction restrictions (MATCHES TATERTRADER - prevents internal-use-only offers) -->
+              <do_if value="$isValid and $offer.restriction.factions.count gt 0">
+                <set_value name="$isRestricted" exact="false"/>
+                <do_if value="$offer.restriction.inverted == 0">
+                  <!-- WHITELIST mode: Only allowed factions can trade -->
+                  <do_if value="not $offer.restriction.factions.indexof.{$ship.owner}">
+                    <set_value name="$isRestricted" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <!-- BLACKLIST mode: Restricted factions cannot trade -->
+                  <do_if value="$offer.restriction.factions.indexof.{$ship.owner}">
+                    <set_value name="$isRestricted" exact="true"/>
+                  </do_if>
+                </do_else>
+                
+                <do_if value="$isRestricted">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$filterReason" exact="'faction restricted (' + $offer.restriction.factions.count + ' restrictions)'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Check if ware is illegal in this specific trade context (MATCHES TATERTRADER LOGIC) -->
+              <set_value name="$isIllegal" exact="false"/>
+              <do_if value="$isValid and not $allowIllegal">
+                <!-- Check if ware is illegal to the station owner faction (the trading partner) -->
+                <!-- This matches TaterTrader: $offer.ware.illegalto.{$offer.seller.owner}.{this.ship.owner} -->
+                <do_if value="$offer.seller.owner and $offer.seller.owner != $ship.owner">
+                  <do_if value="$offer.ware.illegalto.{$offer.seller.owner}.{$ship.owner}">
+                    <set_value name="$isIllegal" exact="true"/>
+                    <set_value name="$filterReason" exact="'illegal to ' + (if $offer.seller.owner? then $offer.seller.owner.knownname else 'unknown')"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$isValid and not $isIllegal">
+                <append_to_list name="$allSellOffers" exact="$offer"/>
+              </do_if>
+              <do_else>
+                <set_value name="$filteredIllegalCount" operation="add"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GT-AI] ⛔ OFFER FILTERED: ' + $offer.ware.name + ' (SELL) from ' + $station.knownname + ' - Reason: ' + $filterReason" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_all>
+            
+            <do_all exact="$buyOffers.count" counter="$j">
+              <set_value name="$offer" exact="$buyOffers.{$j}"/>
+              
+              <!-- CRITICAL: Check if offer is valid (like TaterTrader does) -->
+              <set_value name="$isValid" exact="true"/>
+              <set_value name="$filterReason" exact="null"/>
+              
+              <!-- Exclude mission offers -->
+              <do_if value="$offer.ismission">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'mission offer'"/>
+              </do_if>
+              
+              <!-- Exclude ware exchange offers -->
+              <do_if value="$isValid and $offer.iswareexchange">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'ware exchange'"/>
+              </do_if>
+              
+              <!-- Check if offer is actually available -->
+              <do_if value="$isValid and not $offer.available">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$filterReason" exact="'not available'"/>
+              </do_if>
+              
+              <!-- Check faction restrictions (MATCHES TATERTRADER - prevents internal-use-only offers) -->
+              <do_if value="$isValid and $offer.restriction.factions.count gt 0">
+                <set_value name="$isRestricted" exact="false"/>
+                <do_if value="$offer.restriction.inverted == 0">
+                  <!-- WHITELIST mode: Only allowed factions can trade -->
+                  <do_if value="not $offer.restriction.factions.indexof.{$ship.owner}">
+                    <set_value name="$isRestricted" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <!-- BLACKLIST mode: Restricted factions cannot trade -->
+                  <do_if value="$offer.restriction.factions.indexof.{$ship.owner}">
+                    <set_value name="$isRestricted" exact="true"/>
+                  </do_if>
+                </do_else>
+                
+                <do_if value="$isRestricted">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$filterReason" exact="'faction restricted (' + $offer.restriction.factions.count + ' restrictions)'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Check if ware is illegal in this specific trade context (MATCHES TATERTRADER LOGIC) -->
+              <set_value name="$isIllegal" exact="false"/>
+              <do_if value="$isValid and not $allowIllegal">
+                <!-- Check if ware is illegal to the station owner faction (the trading partner) -->
+                <!-- This matches TaterTrader: $offer.ware.illegalto.{$offer.buyer.owner}.{this.ship.owner} -->
+                <do_if value="$offer.buyer.owner and $offer.buyer.owner != $ship.owner">
+                  <do_if value="$offer.ware.illegalto.{$offer.buyer.owner}.{$ship.owner}">
+                    <set_value name="$isIllegal" exact="true"/>
+                    <set_value name="$filterReason" exact="'illegal to ' + (if $offer.buyer.owner? then $offer.buyer.owner.knownname else 'unknown')"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$isValid and not $isIllegal">
+                <append_to_list name="$allBuyOffers" exact="$offer"/>
+              </do_if>
+              <do_else>
+                <set_value name="$filteredIllegalCount" operation="add"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GT-AI] ⛔ OFFER FILTERED: ' + $offer.ware.name + ' (BUY) from ' + $station.knownname + ' - Reason: ' + $filterReason" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_all>
+            
+            <!-- Track total filtered illegal offers and log per-station summary -->
+            <set_value name="$totalFilteredIllegal" exact="$totalFilteredIllegal + $filteredIllegalCount"/>
+            <do_if value="$filteredIllegalCount gt 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🚫 Filtered ' + $filteredIllegalCount + ' illegal ware offer(s) from ' + $station.knownname + ' (allowIllegal=false)'" chance="100"/>
+            </do_if>
+            
+            <!-- DEBUG: Station offers -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Station ' + $station.knownname + ' offers: ' + $sellOffers.count + ' sell, ' + $buyOffers.count + ' buy'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- DEBUG: Station validation failed -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Station validation failed for ' + $station.knownname" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_all>
+        
+        <!-- DEBUG: Total offers collected with performance and faction metrics -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ PERFORMANCE: Evaluated ' + $stationsEvaluated + '/' + $stations.count + ' stations (skipped ' + $stationsSkipped + ' due to distance/unreachable)'" chance="100"/>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🏛️ FACTION PRIORITY: Foreign=' + $foreignStations.count + ', Player=' + $playerStations.count + ', Total=' + $stations.count + ' (' + $factionPriorityText + ')'" chance="100"/>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Total offers collected: ' + $allSellOffers.count + ' sell offers, ' + $allBuyOffers.count + ' buy offers'" chance="100"/>
+          <do_if value="$totalFilteredIllegal gt 0">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🚫 ILLEGAL WARE FILTERING: Filtered ' + $totalFilteredIllegal + ' illegal ware offer(s) (allowIllegal=' + $allowIllegal + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Log illegal ware filtering summary at standard level if any were filtered -->
+        <do_if value="$totalFilteredIllegal gt 0 and not $allowIllegal">
+          <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' - Filtered ' + $totalFilteredIllegal + ' illegal ware offer(s) from trade search (allowIllegal=false)'" chance="100"/>
+        </do_if>
+        
+        <!-- ===== CROSS-STATION TRADE MATCHING (OPTIMIZED O(n) ALGORITHM) ===== -->
+        
+        <!-- Apply level-based evaluation delay per-offer: 30s at Lv1 → 0s at Lv9+ (linear) -->
+        <set_value name="$evalDelay" exact="[30s - ([$skillLevel - 1, 8].min * (30s / 8)), 0s].max"/>
+        <do_if value="$allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
+          <!-- DEBUG: Cross-station evaluation start -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === CROSS-STATION TRADE EVALUATION (OPTIMIZED) ===' + '\nSell offers: ' + $allSellOffers.count + '\nBuy offers: ' + $allBuyOffers.count + '\nMin ROI: ' + $minROI + '%' + '\nMin Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL OPTIMIZATION: Index offers by ware type (O(n²) → O(n)) -->
+          <set_value name="$sellOffersByWare" exact="table[]"/>
+          <set_value name="$buyOffersByWare" exact="table[]"/>
+          
+          <!-- Index sell offers by ware -->
+          <do_all exact="$allSellOffers.count" counter="$i">
+            <set_value name="$offer" exact="$allSellOffers.{$i}"/>
+            <do_if value="not $sellOffersByWare.{$offer.ware}?">
+              <set_value name="$sellOffersByWare.{$offer.ware}" exact="[]"/>
+            </do_if>
+            <append_to_list name="$sellOffersByWare.{$offer.ware}" exact="$offer"/>
+          </do_all>
+          
+          <!-- Index buy offers by ware -->
+          <do_all exact="$allBuyOffers.count" counter="$j">
+            <set_value name="$offer" exact="$allBuyOffers.{$j}"/>
+            <do_if value="not $buyOffersByWare.{$offer.ware}?">
+              <set_value name="$buyOffersByWare.{$offer.ware}" exact="[]"/>
+            </do_if>
+            <append_to_list name="$buyOffersByWare.{$offer.ware}" exact="$offer"/>
+          </do_all>
+          
+          <set_value name="$crossStationBestTrade" exact="null"/>
+          <set_value name="$crossStationBestScore" exact="0"/>
+          <set_value name="$tradesEvaluated" exact="0"/>
+          <set_value name="$tradesPassedProfit" exact="0"/>
+          <set_value name="$tradesPassedFilter" exact="0"/>
+          
+          <!-- ===== OPTIMIZED MATCHING: Only compare offers of the same ware ===== -->
+          <do_all exact="$sellOffersByWare.keys.count" counter="$wareIdx">
+            <set_value name="$ware" exact="$sellOffersByWare.keys.{$wareIdx}"/>
+            
+            <!-- Only process if we have both sell and buy offers for this ware -->
+            <do_if value="$buyOffersByWare.{$ware}?">
+              <set_value name="$sellOffersForWare" exact="$sellOffersByWare.{$ware}"/>
+              <set_value name="$buyOffersForWare" exact="$buyOffersByWare.{$ware}"/>
+              
+              <!-- Now compare only matching ware offers -->
+              <do_all exact="$sellOffersForWare.count" counter="$i">
+                <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
+                
+                <do_all exact="$buyOffersForWare.count" counter="$j">
+                  <set_value name="$buyOffer" exact="$buyOffersForWare.{$j}"/>
+                  
+                  <!-- CRITICAL: Ensure buy and sell are from DIFFERENT stations -->
+                  <do_if value="$sellOffer.owner != $buyOffer.owner">
+                <set_value name="$tradesEvaluated" operation="add"/>
+                
+                <!-- DETAILED LOGGING: Track what we're evaluating -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 3">
+                  <debug_text text="'[GT-TRADE-MATCH] Evaluating trade pair:' + '\n  SellOffer: ' + $sellOffer.owner.knownname + ' SELLS ' + $sellOffer.ware.name + ' @ ' + ($sellOffer.unitprice / 100) + ' Cr (Stock: ' + $sellOffer.amount + ')' + '\n  BuyOffer: ' + $buyOffer.owner.knownname + ' BUYS ' + $buyOffer.ware.name + ' @ ' + ($buyOffer.unitprice / 100) + ' Cr (Wants: ' + $buyOffer.amount + ')' + '\n  Trade Flow: We BUY from ' + $sellOffer.owner.knownname + ' and SELL to ' + $buyOffer.owner.knownname" chance="100"/>
+                </do_if>
+                
+                <!-- Calculate trade details -->
+                <set_value name="$buyPrice" exact="$sellOffer.unitprice"/>
+                <set_value name="$sellPrice" exact="$buyOffer.unitprice"/>
+                
+                <!-- CRITICAL FIX: Calculate available money (player or homebase station) -->
+                <set_value name="$availableMoney" exact="player.money"/>
+                <set_value name="$moneySource" exact="'player'"/>
+                
+                <!-- Check if ship has a homebase station - use station's money instead -->
+                <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+                <do_if value="$homeBase? and $homeBase.exists and $homeBase.isclass.station">
+                  <set_value name="$availableMoney" exact="$homeBase.money"/>
+                  <set_value name="$moneySource" exact="'homebase: ' + $homeBase.knownname"/>
+                </do_if>
+                
+                <!-- Calculate max affordable amount based on money -->
+                <set_value name="$maxAffordable" exact="99999"/>
+                <do_if value="$buyPrice gt 0">
+                  <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
+                </do_if>
+                
+                <!-- Include money limit in maxAmount calculation -->
+                <set_value name="$maxAmount" exact="[$sellOffer.amount, $buyOffer.amount, $ship.cargo.{$sellOffer.ware}.max, $maxAffordable].min"/>
+                
+                <!-- Skip if no cargo space or zero amounts -->
+                <do_if value="$maxAmount gt 0">
+                  <set_value name="$investment" exact="$buyPrice * $maxAmount"/>
+                  <set_value name="$revenue" exact="$sellPrice * $maxAmount"/>
+                  <set_value name="$profit" exact="$revenue - $investment"/>
+                  
+                  <!-- STANDARDIZED ROI CALCULATION using library -->
+                  <run_actions ref="md.GT_Utilities.GT_CalculateROI" result="$roi">
+                    <param name="investment" value="$investment"/>
+                    <param name="profit" value="$profit"/>
+                  </run_actions>
+                  
+                  <!-- Apply ROI and absolute profit filters (advanced analytics can slightly relax thresholds) -->
+                  <set_value name="$roiThreshold" exact="$minROI"/>
+                  <set_value name="$profitThreshold" exact="$minAbsoluteProfit"/>
+                  <do_if value="$gt_AdvancedAnalytics">
+                    <set_value name="$roiThreshold" exact="$roiThreshold * 0.95"/>
+                    <set_value name="$profitThreshold" exact="($profitThreshold * 0.95)i"/>
+                  </do_if>
+                  
+                  <!-- DEBUG: Log profit check details for ALL evaluated trades (useful for troubleshooting) -->
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 3">
+                    <set_value name="$passedCheck" exact="if ($roi ge $roiThreshold and $profit ge $profitThreshold) then '✅ PASSED' else '❌ REJECTED'"/>
+                    <debug_text text="'[GT-PROFIT-CHECK] ' + $passedCheck + '\n  Ware: ' + $sellOffer.ware.name + ' x' + $maxAmount + '\n  BUY: ' + $sellOffer.owner.knownname + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL: ' + $buyOffer.owner.knownname + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Investment: ' + ($investment / 100) + ' Cr' + '\n  Revenue: ' + ($revenue / 100) + ' Cr' + '\n  Profit: ' + ($profit / 100) + ' Cr (need: ' + ($profitThreshold / 100) + ' Cr)' + '\n  ROI: ' + $roi + '% (need: ' + $roiThreshold + '%)' + '\n  Result: ' + (if $roi ge $roiThreshold then 'ROI OK' else 'ROI TOO LOW') + ', ' + (if $profit ge $profitThreshold then 'PROFIT OK' else 'PROFIT TOO LOW')" chance="100"/>
+                  </do_if>
+                  
+                  <do_if value="$roi ge $roiThreshold and $profit ge $profitThreshold">
+                    <set_value name="$tradesPassedFilter" operation="add"/>
+                    
+                    <!-- Calculate distance-based score (on-the-fly) -->
+                    <set_value name="$buyDistance" exact="@$homeSector.gatedistance.{$sellOffer.owner.sector}"/>
+                    <do_if value="not $buyDistance?">
+                      <set_value name="$buyDistance" exact="-1"/>
+                    </do_if>
+                    
+                    <!-- FIX: Check if both stations are in the same sector -->
+                    <do_if value="$sellOffer.owner.sector == $buyOffer.owner.sector">
+                      <set_value name="$sellDistance" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$sellDistance" exact="@$sellOffer.owner.sector.gatedistance.{$buyOffer.owner.sector}"/>
+                      <do_if value="not $sellDistance?">
+                        <set_value name="$sellDistance" exact="-1"/>
+                      </do_if>
+                    </do_else>
+                    
+                    <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+                      <continue/>
+                    </do_if>
+                    <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
+                    
+                    <!-- CRITICAL: Filter trades that exceed max distance -->
+                    <do_if value="$totalDistance gt $maxDistance">
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 3">
+                        <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⛔ Trade route too long: ' + $sellOffer.ware + ' (' + $totalDistance + ' jumps > max ' + $maxDistance + ') - skipping'" chance="100"/>
+                      </do_if>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- THREAT AVOIDANCE: Analyze route threat for Level 6+ pilots -->
+                    <set_value name="$routeThreat" exact="null"/>
+                    <set_value name="$skipTradeForThreat" exact="false"/>
+                    
+                    <do_if value="$skillLevel ge 6 and global.$GT_GlobalSettings.$ThreatAvoidance? and global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled">
+                      <!-- Analyze threat along entire route -->
+                      <run_actions ref="md.GT_Utilities.GT_AnalyzeRouteThreat" result="$routeThreat">
+                        <param name="buyStation" value="$sellOffer.owner"/>
+                        <param name="sellStation" value="$buyOffer.owner"/>
+                        <param name="ship" value="$ship"/>
+                      </run_actions>
+                      
+                      <!-- Get ship's risk tolerance from AI parameters (0.0-1.0 scale) and convert to 0-4 scale -->
+                      <set_value name="$shipRiskTolerance" exact="0.5"/> <!-- Default to 0.5 (Normal) -->
+                      <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$RiskTolerance?">
+                        <set_value name="$shipRiskTolerance" exact="global.$GT_AIParameters.{$ship}.$RiskTolerance"/>
+                      </do_if>
+                      <!-- Convert 0.0-1.0 to 0-4 scale: 0.0=0(Very Safe), 0.25=1(Cautious), 0.5=2(Normal), 0.75=3(Aggressive), 1.0=4(Reckless) -->
+                      <set_value name="$riskTolerance" exact="($shipRiskTolerance * 4)i"/>
+                      
+                      <!-- Check if max threat exceeds tolerance -->
+                      <do_if value="$routeThreat? and $routeThreat.$MaxThreat?">
+                        <!-- Skip trade if threat is too high -->
+                        <do_if value="$routeThreat.$MaxThreat gt ($riskTolerance + 1)">
+                          <set_value name="$skipTradeForThreat" exact="true"/>
+                          
+                          <!-- Debug logging -->
+                          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$LogLevel ge 2">
+                            <set_value name="$threatSectorNames" exact="''"/>
+                            <do_all exact="$routeThreat.$ThreatSectors.count" counter="$ts">
+                              <set_value name="$threatSectorNames" exact="$threatSectorNames + $routeThreat.$ThreatSectors.{$ts}.$Sector.knownname + ' (L' + $routeThreat.$ThreatSectors.{$ts}.$ThreatLevel + '), '"/>
+                            </do_all>
+                            <debug_text text="'[GT-Threat] ' + $ship.knownname + ' - Trade REJECTED (threat too high)\n  Route: ' + $sellOffer.owner.knownname + ' -> ' + $buyOffer.owner.knownname + '\n  Sectors: ' + $routeThreat.$SectorCount + ' | MaxThreat: ' + $routeThreat.$MaxThreat + ' | Tolerance: ' + ($riskTolerance + 1) + '\n  Dangerous sectors: ' + $threatSectorNames" chance="100"/>
+                          </do_if>
+                        </do_if>
+                      </do_if>
+                    </do_if>
+                    
+                    <!-- Skip this trade if threat is too high -->
+                    <do_if value="$skipTradeForThreat">
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Apply distance penalty multiplier: 0%=no penalty, 50%=normal, 100%=2x penalty -->
+                    <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
+                    <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($profit / $adjustedDistance) else $profit"/>
+                    
+                    <!-- Apply threat penalty to efficiency if there are threats but within tolerance -->
+                    <do_if value="$routeThreat? and $routeThreat.$TotalThreatScore? and $routeThreat.$TotalThreatScore gt 0">
+                      <!-- Calculate penalty as integer percentage (threat score * 20%) then apply to money value -->
+                      <set_value name="$penaltyPercent" exact="($routeThreat.$TotalThreatScore * 20)i"/>
+                      <set_value name="$riskPenalty" exact="($efficiency * $penaltyPercent) / 100"/>
+                      <set_value name="$efficiency" exact="$efficiency - $riskPenalty"/>
+                      
+                      <!-- Debug logging -->
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$LogLevel ge 3">
+                        <debug_text text="'[GT-Threat] ' + $ship.knownname + ' - Trade PENALIZED\n  Route: ' + $sellOffer.owner.knownname + ' -> ' + $buyOffer.owner.knownname + '\n  TotalThreat: ' + $routeThreat.$TotalThreatScore + ' | Risk Penalty: -' + ($riskPenalty / 100) + ' Cr/jump\n  Efficiency: ' + ($efficiency / 100) + ' Cr/jump (after penalty)'" chance="100"/>
+                      </do_if>
+                    </do_if>
+                    
+                    <!-- Check if this is the best trade so far -->
+                    <do_if value="$efficiency gt $crossStationBestScore">
+                      <set_value name="$tradesPassedProfit" operation="add"/>
+                      <set_value name="$crossStationBestScore" exact="$efficiency"/>
+                      
+                      <!-- Create trade object -->
+                      <set_value name="$crossStationBestTrade" exact="table[]"/>
+                      <set_value name="$crossStationBestTrade.$BuyOffer" exact="$sellOffer"/>
+                      <set_value name="$crossStationBestTrade.$SellOffer" exact="$buyOffer"/>
+                      <set_value name="$crossStationBestTrade.$Amount" exact="$maxAmount"/>
+                      <set_value name="$crossStationBestTrade.$Profit" exact="$profit"/>
+                      <set_value name="$crossStationBestTrade.$ROI" exact="$roi"/>
+                      <set_value name="$crossStationBestTrade.$Score" exact="$efficiency"/>
+                      <set_value name="$crossStationBestTrade.$BuyPrice" exact="$buyPrice"/>
+                      <set_value name="$crossStationBestTrade.$SellPrice" exact="$sellPrice"/>
+                      <set_value name="$crossStationBestTrade.$Distance" exact="$totalDistance"/>
+                      <set_value name="$crossStationBestTrade.$Risk" exact="0"/>
+                      
+                      <!-- FLEET COORDINATION: Add to top trades list for conflict resolution -->
+                      <append_to_list name="$topTrades" exact="$crossStationBestTrade"/>
+                      
+                      <!-- Keep list sorted by score (descending) and limit size -->
+                      <do_if value="$topTrades.count gt 1">
+                        <!-- Simple bubble sort to maintain descending order -->
+                        <do_all exact="$topTrades.count - 1" counter="$sortI">
+                          <do_all exact="$topTrades.count - $sortI" counter="$sortJ">
+                            <do_if value="$topTrades.{$sortJ}.$Score lt $topTrades.{$sortJ + 1}.$Score">
+                              <set_value name="$tempTrade" exact="$topTrades.{$sortJ}"/>
+                              <set_value name="$topTrades.{$sortJ}" exact="$topTrades.{$sortJ + 1}"/>
+                              <set_value name="$topTrades.{$sortJ + 1}" exact="$tempTrade"/>
+                            </do_if>
+                          </do_all>
+                        </do_all>
+                      </do_if>
+                      
+                      <!-- Trim to max alternatives -->
+                      <do_while value="$topTrades.count gt $maxAlternatives">
+                        <remove_value name="$topTrades.{$topTrades.count}"/>
+                      </do_while>
+                      
+                      <!-- DEBUG: New best trade -->
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                        <set_value name="$distancePenaltyPercent" exact="($distancePenaltyMultiplier * 50)i"/>
+                        <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ NEW BEST CROSS-STATION TRADE:' + '\n  Ware: ' + $sellOffer.ware + '\n  Amount: ' + $maxAmount + '\n  BUY from: ' + $sellOffer.owner.knownname + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL to: ' + $buyOffer.owner.knownname + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Profit: ' + ($profit / 100) + ' Cr (' + $roi + '% ROI)' + '\n  Distance: ' + $totalDistance + ' jumps' + '\n  Efficiency: ' + ($efficiency / 100) + ' Cr/jump (' + $distancePenaltyPercent + '%)' + '\n  RAW DEBUG: buyPrice=' + $buyPrice + ', sellPrice=' + $sellPrice + ', investment=' + $investment + ', revenue=' + $revenue + ', profit=' + $profit + ', roi=' + $roi" chance="100"/>
+                      </do_if>
+                      
+                      <!-- FLEET COORDINATION: Cache trades for Level 12+ pilots -->
+                      <do_if value="$skillLevel ge 12 and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
+                        <!-- Check if trade meets cache profit threshold -->
+                        <set_value name="$cacheProfitThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+                        <do_if value="$roi ge $cacheProfitThreshold">
+                          <!-- Initialize cache structure if needed -->
+                          <do_if value="not global.$GT_TradeCache.{$sellOffer.ware}?">
+                            <set_value name="global.$GT_TradeCache.{$sellOffer.ware}" exact="table[]"/>
+                          </do_if>
+                          <do_if value="not global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}?">
+                            <set_value name="global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}" exact="table[]"/>
+                          </do_if>
+                          
+                          <!-- Cache the trade -->
+                          <set_value name="global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}.{$buyOffer.owner}" exact="table[
+                            $BuyOffer = $sellOffer,
+                            $SellOffer = $buyOffer,
+                            $Amount = $maxAmount,
+                            $Profit = $profit,
+                            $ROI = $roi,
+                            $BuyPrice = $buyPrice,
+                            $SellPrice = $sellPrice,
+                            $Distance = $totalDistance,
+                            $Timestamp = player.age
+                          ]"/>
+                          
+                          <!-- Update global cache timestamp -->
+                          <set_value name="global.$GT_TradeCache.$LastUpdate" exact="player.age"/>
+                          
+                          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                            <debug_text text="'[GT-CACHE] (' + $ship.idcode + ') ✅ Trade cached: ' + $sellOffer.ware.name + ' route (ROI=' + $roi + '%)'" chance="100"/>
+                          </do_if>
+                        </do_if>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                  </do_if>
+                </do_all>
+              </do_all>
+            </do_if>
+          </do_all>
+          
+          <!-- DEBUG: Evaluation summary -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === CROSS-STATION EVALUATION SUMMARY ===' + '\nTrades evaluated: ' + $tradesEvaluated + '\nPassed filter: ' + $tradesPassedFilter + '\nPassed profit: ' + $tradesPassedProfit + '\nBest score: ' + $crossStationBestScore" chance="100"/>
+          </do_if>
+          
+          <!-- Check if we found a better trade -->
+          <do_if value="$crossStationBestTrade and $crossStationBestScore gt $bestScore">
+            <set_value name="$validOffers" operation="add"/>
+            <set_value name="$bestTrade" exact="$crossStationBestTrade"/>
+            <set_value name="$bestScore" exact="$crossStationBestScore"/>
+            
+            <!-- DEBUG: Best trade found -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ Best cross-station trade found! Score: ' + $crossStationBestScore + ', Profit: ' + $crossStationBestTrade.$Profit + ' Cr'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- DEBUG: Search summary with performance metrics -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <set_value name="$stationsSkipped" exact="$stations.count - $stationsEvaluated"/>
+          <set_value name="$performanceGain" exact="if $stations.count gt 0 then (($stationsSkipped * 100) / $stations.count) else 0"/>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === TRADE SEARCH SUMMARY ===' + '\nTotal stations found: ' + $stations.count + '\nStations evaluated: ' + $stationsEvaluated + '\nStations skipped (distance): ' + $stationsSkipped + ' (' + $performanceGain + '% performance gain)' + '\nTotal offers found: ' + $offersFound + '\nValid trades: ' + $validOffers + '\nBest trade score: ' + $bestScore" chance="100"/>
+        </do_if>
+        
+        </do_if>  <!-- End of live trade search -->
+        
+        <!-- Execute best trade if found -->
+        <do_if value="$bestTrade">
+          <!-- DEBUG: Trade execution with full details -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $bestTrade.$BuyOffer.ware.name + ' (x' + $bestTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestTrade.$SellOffer.owner.knownname + ' @ ' + ($bestTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestTrade.$Profit / 100) + ' Cr' + '\n  📊 Score: ' + $bestTrade.$Score + '\n  ⚠ Risk: ' + $bestTrade.$Risk" chance="100"/>
+            <debug_text text="'[GT-TRADE-SELECTION] ═══ SELECTED TRADE DETAILS ═══' + '\n  BuyOffer Source: Station SELLS to us (we buy from them)' + '\n    Station: ' + $bestTrade.$BuyOffer.owner.knownname + '\n    Ware: ' + $bestTrade.$BuyOffer.ware.name + '\n    Amount Available: ' + $bestTrade.$BuyOffer.amount + '\n    Price: ' + ($bestTrade.$BuyOffer.unitprice / 100) + ' Cr' + '\n  ───────────────────────────────' + '\n  SellOffer Target: Station BUYS from us (we sell to them)' + '\n    Station: ' + $bestTrade.$SellOffer.owner.knownname + '\n    Ware: ' + $bestTrade.$SellOffer.ware.name + '\n    Amount Wanted: ' + $bestTrade.$SellOffer.amount + '\n    Price: ' + ($bestTrade.$SellOffer.unitprice / 100) + ' Cr'" chance="100"/>
+          </do_if>
+          
+          <!-- FLEET COORDINATION: Check for route conflicts and select alternatives -->
+          <!-- Check ship's individual fleet coordination setting (defaults to true if not set) -->
+          <set_value name="$shipFleetCoordination" exact="true"/>
+          <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$FleetCoordination?">
+            <set_value name="$shipFleetCoordination" exact="global.$GT_AIParameters.{$ship}.$FleetCoordination"/>
+          </do_if>
+          
+          <do_if value="$shipFleetCoordination">
+            <set_value name="$tradeReserved" exact="false"/>
+            <set_value name="$alternativeFound" exact="false"/>
+            
+            <!-- Initialize conflict tracking if needed -->
+            <do_if value="not global.$GT_ActiveTradeReservations?">
+              <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
+            </do_if>
+            
+            <!-- Try to find a non-conflicted trade from the top trades list -->
+            <do_if value="$topTrades.count gt 0">
+              <do_all exact="$topTrades.count" counter="$tradeIdx">
+                <set_value name="$candidateTrade" exact="$topTrades.{$tradeIdx}"/>
+                <set_value name="$candidateConflicted" exact="false"/>
+                
+                <!-- Check if this trade conflicts with any active reservation -->
+                <do_if value="global.$GT_ActiveTradeReservations.keys.count gt 0">
+                  <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$i">
+                    <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$i}"/>
+                    <set_value name="$otherTrade" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
+                    
+                    <!-- Check if same route (same stations and ware) -->
+                    <do_if value="$otherShip != $ship and $otherShip.exists">
+                      <do_if value="$otherTrade.$BuyStation == $candidateTrade.$BuyOffer.owner and $otherTrade.$SellStation == $candidateTrade.$SellOffer.owner and $otherTrade.$Ware == $candidateTrade.$BuyOffer.ware">
+                        <set_value name="$candidateConflicted" exact="true"/>
+                        <do_if value="$tradeIdx == 1">
+                          <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ⚠ Trade conflict detected: ' + $otherShip.knownname + ' already targeting best route. Searching alternatives...'" chance="100"/>
+                        </do_if>
+                        <break/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                
+                <!-- If this trade is not conflicted, use it -->
+                <do_if value="not $candidateConflicted">
+                  <set_value name="$bestTrade" exact="$candidateTrade"/>
+                  <set_value name="$bestScore" exact="$candidateTrade.$Score"/>
+                  <set_value name="$alternativeFound" exact="true"/>
+                  
+                  <do_if value="$tradeIdx gt 1">
+                    <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ✅ Alternative trade selected (#' + $tradeIdx + '/' + $topTrades.count + '): ' + $candidateTrade.$BuyOffer.ware.name + ' (Score: ' + ($candidateTrade.$Score / 100) + ')'" chance="100"/>
+                  </do_if>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- If no alternative found, use best trade anyway (accept overlap on high-value routes) -->
+            <do_if value="not $alternativeFound and $topTrades.count gt 0">
+              <set_value name="$bestTrade" exact="$topTrades.{1}"/>
+              <set_value name="$bestScore" exact="$topTrades.{1}.$Score"/>
+              <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ⚠ All ' + $topTrades.count + ' alternative trades are conflicted. Accepting best ROI trade with overlap: ' + $bestTrade.$BuyOffer.ware.name + ' (Score: ' + ($bestScore / 100) + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- Reserve trade for this ship if found -->
+            <do_if value="$bestTrade">
+              <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
+                $BuyStation = $bestTrade.$BuyOffer.owner,
+                $SellStation = $bestTrade.$SellOffer.owner,
+                $Ware = $bestTrade.$BuyOffer.ware,
+                $Timestamp = player.age
+              ]"/>
+              <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ✅ Trade reserved: ' + $bestTrade.$BuyOffer.ware.name + ' route'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Execute trade if not conflicted -->
+          <do_if value="$bestTrade">
+            <set_value name="global.$GT_ExecuteShip" exact="$ship"/>
+            <set_value name="global.$GT_ExecuteTrade" exact="$bestTrade"/>
+            <signal_cue cue="ExecuteTrade"/>
+          </do_if>
+          
+          <!-- Signal back to AI script: Trade Found -->
+          <signal_objects object="$ship" param="'GT_Trade_Found'"/>
+        </do_if>
+        <do_else>
+          <!-- DEBUG: No trades found - detailed analysis -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === NO TRADES FOUND ANALYSIS ===' + '\nShip: ' + $ship.knownname + '\nSector: ' + $ship.sector.knownname + '\nStations in range: ' + $stations.count + '\nStations evaluated: ' + $stationsEvaluated + '\nTotal offers: ' + $offersFound + '\nValid trades: ' + $validOffers + '\nSearch params: Dist=' + $maxDistance + ', MinROI=' + $minROI + '%, MinAbsoluteProfit=' + ($minAbsoluteProfit / 100) + ' Cr' + '\nShip cargo status: ' + ($ship.cargo.capacity.all - $ship.cargo.free.all) + '/' + $ship.cargo.capacity.all" chance="100"/>
+            
+            <!-- Additional checks for debugging -->
+            <set_value name="$nearbyStationsAll" exact="0"/>
+            <find_station name="$allStations" space="player.galaxy" multiple="true" knownto="$ship.owner">
+              <match_distance object="$ship" max="50km"/>
+            </find_station>
+            <set_value name="$nearbyStationsAll" exact="$allStations.count"/>
+            
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Additional info: ' + $nearbyStationsAll + ' stations within 50km of ship'" chance="100"/>
+          </do_if>
+          
+          <debug_text text="'[GalaxyTrader MK3] No profitable trades found for ' + $ship.knownname + ' (checked ' + $stationsEvaluated + ' stations, ' + $offersFound + ' offers)'" chance="100"/>
+          
+          <!-- Signal back to AI script: No Trade Found -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+        </do_else>
+        
+        <!-- CRITICAL: Release search lock for this ship -->
+        <do_if value="global.$GT_SearchLocks.{$ship}?">
+          <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search lock released'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CRITICAL: Clean up AI parameters for this ship -->
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+          <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI parameters cleaned up'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Execute Trade -->
+    <cue name="ExecuteTrade" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="global.$GT_ExecuteShip"/>
+        <set_value name="$trade" exact="global.$GT_ExecuteTrade"/>
+        
+        <!-- Enhanced execution logging with full trade details -->
+        <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($trade.$Profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $trade.$BuyOffer.ware.name + ' (x' + $trade.$Amount + ')' + '\n  📍 BUY from: ' + $trade.$BuyOffer.owner.knownname + ' @ ' + ($trade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $trade.$SellOffer.owner.knownname + ' @ ' + ($trade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $trade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($trade.$Profit / 100) + ' Cr' + '\n  📊 Score: ' + $trade.$Score" chance="100"/>
+        
+        <!-- CRITICAL FIX: Validate offers are still available before executing trade -->
+        <set_value name="$buyOfferValid" exact="$trade.$BuyOffer.available and $trade.$BuyOffer.amount gt 0"/>
+        <set_value name="$sellOfferValid" exact="$trade.$SellOffer.available and $trade.$SellOffer.amount gt 0"/>
+        <set_value name="$canExecute" exact="true"/>
+        
+        <!-- DETAILED VALIDATION: Check offer details -->
+        <debug_text text="'[GT-VALIDATION] ═══ TRADE OFFER VALIDATION ═══' + '\n  BuyOffer Type: ' + typeof $trade.$BuyOffer + '\n  BuyOffer Available: ' + $trade.$BuyOffer.available + '\n  BuyOffer Amount: ' + $trade.$BuyOffer.amount + '\n  BuyOffer Station: ' + $trade.$BuyOffer.owner.knownname + '\n  BuyOffer Ware: ' + $trade.$BuyOffer.ware.name + '\n  BuyOffer Price: ' + ($trade.$BuyOffer.unitprice / 100) + ' Cr' + '\n  ───────────────────────────────' + '\n  SellOffer Type: ' + typeof $trade.$SellOffer + '\n  SellOffer Available: ' + $trade.$SellOffer.available + '\n  SellOffer Amount: ' + $trade.$SellOffer.amount + '\n  SellOffer Station: ' + $trade.$SellOffer.owner.knownname + '\n  SellOffer Ware: ' + $trade.$SellOffer.ware.name + '\n  SellOffer Price: ' + ($trade.$SellOffer.unitprice / 100) + ' Cr' + '\n  ───────────────────────────────' + '\n  BuyOffer Valid: ' + $buyOfferValid + '\n  SellOffer Valid: ' + $sellOfferValid" chance="100"/>
+        
+        <do_if value="not $buyOfferValid or not $sellOfferValid">
+          <debug_text text="'[GalaxyTrader MK3] ⚠ Trade offer(s) no longer valid for ' + $ship.knownname + ' - BuyOffer valid: ' + $buyOfferValid + ', SellOffer valid: ' + $sellOfferValid" chance="100"/>
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          <set_value name="$canExecute" exact="false"/>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Verify both stations can actually trade this ware -->
+        <do_if value="$canExecute">
+          <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
+          <do_if value="$ship.cargo.{$ware}.max le 0">
+            <debug_text text="'[GalaxyTrader MK3] ⚠ Ship ' + $ship.knownname + ' cannot carry ware ' + $ware.name + ' - aborting trade'" chance="100"/>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <set_value name="$canExecute" exact="false"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Final check for illegal wares (safety net - context-aware) -->
+        <do_if value="$canExecute">
+          <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+          <do_if value="not $allowIllegal">
+          <!-- Check buy zone, sell zone, ship's current zone AND home zone for illegal status -->
+          <set_value name="$buyZone" exact="$trade.$BuyOffer.owner.zone"/>
+          <set_value name="$sellZone" exact="$trade.$SellOffer.owner.zone"/>
+          <set_value name="$shipZone" exact="$ship.zone"/>
+          <!-- Get ship's home zone (where it will return after trade) -->
+          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+          <set_value name="$homeZone" exact="null"/>
+          <do_if value="$homeBase? and $homeBase.exists">
+            <do_if value="$homeBase.isclass.station">
+              <set_value name="$homeZone" exact="$homeBase.zone"/>
+            </do_if>
+            <do_elseif value="$homeBase.isclass.sector">
+              <set_value name="$homeZone" exact="$homeBase"/>
+            </do_elseif>
+          </do_if>
+          <set_value name="$isIllegal" exact="false"/>
+          
+          <!-- Check ship's HOME zone (critical - ship will return here with cargo!) -->
+          <do_if value="$homeZone and $homeZone.policefaction and $homeZone.policefaction != $ship.owner">
+            <do_if value="$ware.illegalto.{$homeZone.policefaction}.{$ship.owner}">
+              <set_value name="$isIllegal" exact="true"/>
+              <set_value name="$illegalZone" exact="$homeZone"/>
+              <set_value name="$illegalContext" exact="'ship home zone'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Check ship's current zone -->
+          <do_if value="not $isIllegal and $shipZone.policefaction and $shipZone.policefaction != $ship.owner">
+            <do_if value="$ware.illegalto.{$shipZone.policefaction}.{$ship.owner}">
+              <set_value name="$isIllegal" exact="true"/>
+              <set_value name="$illegalZone" exact="$shipZone"/>
+              <set_value name="$illegalContext" exact="'ship current zone'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Check buy zone -->
+          <do_if value="not $isIllegal and $buyZone.policefaction and $buyZone.policefaction != $ship.owner">
+            <do_if value="$ware.illegalto.{$buyZone.policefaction}.{$ship.owner}">
+              <set_value name="$isIllegal" exact="true"/>
+              <set_value name="$illegalZone" exact="$buyZone"/>
+              <set_value name="$illegalContext" exact="'buy zone'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Check sell zone -->
+          <do_if value="not $isIllegal and $sellZone.policefaction and $sellZone.policefaction != $ship.owner">
+            <do_if value="$ware.illegalto.{$sellZone.policefaction}.{$ship.owner}">
+              <set_value name="$isIllegal" exact="true"/>
+              <set_value name="$illegalZone" exact="$sellZone"/>
+              <set_value name="$illegalContext" exact="'sell zone'"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$isIllegal">
+            <debug_text text="'[GalaxyTrader MK3] 🚫 ILLEGAL WARE BLOCKED: ' + $ship.knownname + ' attempted to trade ' + $ware.name + ' (illegal in ' + $illegalContext + ': ' + $illegalZone.knownname + ') with allowIllegal=false - trade aborted'" chance="100"/>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <set_value name="$canExecute" exact="false"/>
+          </do_if>
+          </do_if> <!-- End allowIllegal check -->
+        </do_if> <!-- End $canExecute check -->
+        
+        <!-- Only proceed with trade if all checks passed -->
+        <do_if value="$canExecute">
+        
+        <!-- Only proceed with trade if NOT illegal -->
+        
+        <!-- CRITICAL FIX: Verify ship has enough money to execute trade -->
+        <set_value name="$availableMoney" exact="player.money"/>
+        <set_value name="$moneySource" exact="'player'"/>
+        
+        <!-- Check if ship has a homebase station - use station's money instead -->
+        <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+        <do_if value="$homeBase? and $homeBase.exists and $homeBase.isclass.station">
+          <set_value name="$availableMoney" exact="$homeBase.money"/>
+          <set_value name="$moneySource" exact="'homebase: ' + $homeBase.knownname"/>
+        </do_if>
+        
+        <set_value name="$tradeCost" exact="$trade.$Amount * $trade.$BuyPrice"/>
+        <do_if value="$availableMoney lt $tradeCost">
+          <debug_text text="'[GalaxyTrader MK3] ⚠ INSUFFICIENT FUNDS: ' + $ship.knownname + ' needs ' + ($tradeCost / 100) + ' Cr but only has ' + ($availableMoney / 100) + ' Cr available (money source: ' + $moneySource + ') - trade aborted'" chance="100"/>
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          <set_value name="$canExecute" exact="false"/>
+        </do_if>
+        
+        <!-- REMOVED: Custom trade reservation system (X4 handles this natively via create_trade_order) -->
+        
+        <!-- Initialize TradingData if needed -->
+        <do_if value="not global.$GT_TradingData?">
+          <set_value name="global.$GT_TradingData" exact="table[]"/>
+          <set_value name="global.$GT_TradingData.$ActiveTrades" exact="table[]"/>
+          <set_value name="global.$GT_TradingData.$LastUpdate" exact="player.age"/>
+        </do_if>
+        <do_if value="not global.$GT_TradingData.$ActiveTrades?">
+          <set_value name="global.$GT_TradingData.$ActiveTrades" exact="table[]"/>
+        </do_if>
+        
+        <!-- Record trade in active trades -->
+        <set_value name="global.$GT_TradingData.$ActiveTrades.{$ship}" exact="table[]"/>
+        <set_value name="global.$GT_TradingData.$ActiveTrades.{$ship}.$StartTime" exact="player.age"/>
+        <set_value name="global.$GT_TradingData.$ActiveTrades.{$ship}.$Trade" exact="$trade"/>
+        
+        <!-- Create X4 native TradePerform orders for buy-sell cycle -->
+        <!-- CRITICAL: X4's create_trade_order with immediate="false" queues orders -->
+        <!-- Order 1: BUY from source (SellOffer = station SELLS to us) -->
+        <!-- Order 2: SELL to destination (BuyOffer = station BUYS from us) -->
+        <!-- X4 executes them in sequence automatically -->
+        <!-- DETAILED DEBUGGING: Show exact tradeoffer details before creating orders -->
+        <debug_text text="'[GT-ORDER-DEBUG] ═══ CREATING TRADE ORDERS ═══' + '\n  Order 1 (BUY): tradeoffer type=' + typeof $trade.$BuyOffer + '\n    Station: ' + $trade.$BuyOffer.owner.knownname + '\n    Ware: ' + $trade.$BuyOffer.ware.name + '\n    Amount: ' + $trade.$Amount + '\n    Available: ' + $trade.$BuyOffer.available + '\n    Offer Amount: ' + $trade.$BuyOffer.amount + '\n  ───────────────────────────────' + '\n  Order 2 (SELL): tradeoffer type=' + typeof $trade.$SellOffer + '\n    Station: ' + $trade.$SellOffer.owner.knownname + '\n    Ware: ' + $trade.$SellOffer.ware.name + '\n    Amount: ' + $trade.$Amount + '\n    Available: ' + $trade.$SellOffer.available + '\n    Offer Amount: ' + $trade.$SellOffer.amount" chance="100"/>
+        
+        <create_trade_order object="$ship" tradeoffer="$trade.$BuyOffer" amount="$trade.$Amount" immediate="false"/>
+        <create_trade_order object="$ship" tradeoffer="$trade.$SellOffer" amount="$trade.$Amount" immediate="false"/>
+        
+        <debug_text text="'[GT-AI] ✅ Trade orders created for ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+        
+        <!-- Log trade order to ship logbook (TaterTrader style) - only if enabled -->
+        <!-- Check logbook setting for both main ships and subordinate ships -->
+        <set_value name="$logbookEnabled" exact="false"/>
+        <do_if value="@$ship.defaultorder.id == 'GalaxyTraderMK3' and @$ship.defaultorder.$logbookentries">
+          <set_value name="$logbookEnabled" exact="true"/>
+        </do_if>
+        <do_elseif value="@$ship.defaultorder.id == 'Assist' and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3' and @$ship.commander.defaultorder.$logbookentries">
+          <set_value name="$logbookEnabled" exact="true"/>
+        </do_elseif>
+        
+        <do_if value="$logbookEnabled">
+          <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
+            $Ship = $ship,
+            $SellOffer = $trade.$BuyOffer,
+            $BuyOffer = $trade.$SellOffer,
+            $Amount = $trade.$Amount,
+            $Profit = $trade.$Profit,
+            $SellPrice = $trade.$BuyOffer.unitprice / 100,
+            $BuyPrice = $trade.$SellOffer.unitprice / 100
+          ]"/>
+        </do_if>
+        
+        <!-- DEBUG: Trade orders created -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') TradePerform orders created:' + '\n  BUY: ' + $trade.$Amount + ' ' + $trade.$BuyOffer.ware + ' from ' + $trade.$BuyOffer.owner.knownname + '\n  SELL: ' + $trade.$Amount + ' ' + $trade.$SellOffer.ware + ' to ' + $trade.$SellOffer.owner.knownname + '\n  Expected profit: ' + ($trade.$Profit / 100) + ' Cr'" chance="100"/>
+        </do_if>
+        
+        <!-- Update ship statistics -->
+        <do_if value="global.$GT_Ships.{$ship}?">
+          <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+        </do_if>
+        
+        </do_if> <!-- End of $canExecute check -->
+      </actions>
+    </cue>
+    
+    <!-- Trade Completion Handler - Updated to use same event as TaterTrader -->
+    <cue name="TradeCompleted" instantiate="true">
+      <conditions>
+        <event_player_trade_completed/>
+      </conditions>
+      <actions>
+        <set_value name="$trade" exact="event.param"/>
+        <set_value name="$buyer" exact="$trade.buyer"/>
+        <set_value name="$seller" exact="$trade.seller"/>
+        <set_value name="$price" exact="$trade.unitprice * $trade.transferredamount"/>
+        <set_value name="$gtShip" exact="null"/>
+        <set_value name="$isBuyTrade" exact="false"/>
+        
+        <!-- Check if buyer is a GalaxyTrader MK3 ship -->
+        <do_if value="$buyer.isoperational and $buyer.trueowner == faction.player and $buyer.isclass.ship and $buyer.defaultorder?">
+          <do_if value="@$buyer.defaultorder.id == 'GalaxyTraderMK3' or ((@$buyer.defaultorder.id == 'Assist') and (@$buyer.commander.defaultorder.id == 'GalaxyTraderMK3'))">
+            <set_value name="$gtShip" exact="$buyer"/>
+            <set_value name="$isBuyTrade" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Check if seller is a GalaxyTrader MK3 ship -->
+        <do_elseif value="$seller.isoperational and $seller.trueowner == faction.player and $seller.isclass.ship and $seller.defaultorder?">
+          <do_if value="@$seller.defaultorder.id == 'GalaxyTraderMK3' or ((@$seller.defaultorder.id == 'Assist') and (@$seller.commander.defaultorder.id == 'GalaxyTraderMK3'))">
+            <set_value name="$gtShip" exact="$seller"/>
+            <set_value name="$isBuyTrade" exact="false"/>
+          </do_if>
+        </do_elseif>
+        
+        <!-- Process trade completion if this is a GalaxyTrader MK3 ship -->
+        <do_if value="$gtShip">
+          <!-- Ensure ship is registered in GT_Ships registry (fallback registration) -->
+          <do_if value="not global.$GT_Ships.{$gtShip}?">
+            <debug_text text="'[GalaxyTrader MK3] FALLBACK: Registering ship ' + $gtShip.knownname + ' (' + $gtShip.idcode + ') in GT_Ships registry during trade completion'" chance="100"/>
+            <set_value name="global.$GT_Ships.{$gtShip}" exact="table[]"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$RegisterTime" exact="player.age"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$Level" exact="1"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$XP" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$TotalProfit" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$TradesCompleted" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$TotalTrades" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$LastTradeProfit" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$LastMoney" exact="$gtShip.money"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$TrainingCompleted" exact="[]"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$ThreatReports" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$LastThreatTime" exact="0"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$Territory" exact="null"/>
+            <set_value name="global.$GT_Ships.{$gtShip}.$LastUpdate" exact="player.age"/>
+          </do_if>
+          
+          <!-- Initialize active trades tracking if needed -->
+          <do_if value="not global.$GT_TradingData?">
+            <set_value name="global.$GT_TradingData" exact="table[]"/>
+            <set_value name="global.$GT_TradingData.$ActiveTrades" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_TradingData.$ActiveTrades?">
+            <set_value name="global.$GT_TradingData.$ActiveTrades" exact="table[]"/>
+          </do_if>
+          
+          <do_if value="$isBuyTrade">
+            <!-- Buying - subtract cost -->
+            <do_if value="global.$GT_Ships.{$gtShip}.$TotalProfit?">
+              <set_value name="global.$GT_Ships.{$gtShip}.$TotalProfit" exact="$price" operation="subtract"/>
+            </do_if>
+            <do_else>
+              <set_value name="global.$GT_Ships.{$gtShip}.$TotalProfit" exact="$price * -1"/>
+            </do_else>
+            
+            <debug_text text="'[GalaxyTrader MK3] ' + $gtShip.knownname + ' (' + $gtShip.idcode + ') BOUGHT ' + $trade.transferredamount + ' ' + $trade.ware + ' for ' + ($price / 100) + ' Cr'" chance="100"/>
+            
+            <!-- Mark buy phase complete for this ship -->
+            <do_if value="global.$GT_TradingData.$ActiveTrades.{$gtShip}?">
+              <set_value name="global.$GT_TradingData.$ActiveTrades.{$gtShip}.$BuyCompleted" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Selling - add revenue -->
+            <do_if value="global.$GT_Ships.{$gtShip}.$TotalProfit?">
+              <set_value name="global.$GT_Ships.{$gtShip}.$TotalProfit" exact="$price" operation="add"/>
+            </do_if>
+            <do_else>
+              <set_value name="global.$GT_Ships.{$gtShip}.$TotalProfit" exact="$price"/>
+            </do_else>
+            
+            <!-- Increment completed trades count on sell (completes the trade cycle) -->
+            <do_if value="global.$GT_Ships.{$gtShip}.$TradesCompleted?">
+              <set_value name="global.$GT_Ships.{$gtShip}.$TradesCompleted" exact="global.$GT_Ships.{$gtShip}.$TradesCompleted + 1"/>
+            </do_if>
+            <do_else>
+              <set_value name="global.$GT_Ships.{$gtShip}.$TradesCompleted" exact="1"/>
+            </do_else>
+            
+            <!-- Update session statistics -->
+            <do_if value="not global.$GT_SessionStats?">
+              <set_value name="global.$GT_SessionStats" exact="table[]"/>
+              <set_value name="global.$GT_SessionStats.$TotalProfit" exact="0"/>
+              <set_value name="global.$GT_SessionStats.$TradesCompleted" exact="0"/>
+            </do_if>
+            <set_value name="global.$GT_SessionStats.$TotalProfit" exact="$price" operation="add"/>
+            <set_value name="global.$GT_SessionStats.$TradesCompleted" operation="add"/>
+            
+            <debug_text text="'[GalaxyTrader MK3] ' + $gtShip.knownname + ' (' + $gtShip.idcode + ') SOLD ' + $trade.transferredamount + ' ' + $trade.ware + ' for ' + ($price / 100) + ' Cr (Trade #' + global.$GT_Ships.{$gtShip}.$TradesCompleted + ', Total Profit: ' + (global.$GT_Ships.{$gtShip}.$TotalProfit / 100) + ' Cr)'" chance="100"/>
+            
+            <!-- Mark sell phase complete and check if full trade cycle is done -->
+            <do_if value="global.$GT_TradingData.$ActiveTrades.{$gtShip}?">
+              <set_value name="global.$GT_TradingData.$ActiveTrades.{$gtShip}.$SellCompleted" exact="true"/>
+              
+              <!-- Check if both buy and sell are complete (full trade cycle) -->
+              <do_if value="global.$GT_TradingData.$ActiveTrades.{$gtShip}.$BuyCompleted? and global.$GT_TradingData.$ActiveTrades.{$gtShip}.$SellCompleted?">
+                <debug_text text="'[GalaxyTrader MK3] ' + $gtShip.knownname + ' (' + $gtShip.idcode + ') completed full trade cycle - signaling AI script'" chance="100"/>
+                
+                <!-- FLEET COORDINATION: Release trade reservation (if ship has coordination enabled) -->
+                <set_value name="$shipFleetCoordination" exact="true"/>
+                <do_if value="global.$GT_AIParameters.{$gtShip}? and global.$GT_AIParameters.{$gtShip}.$FleetCoordination?">
+                  <set_value name="$shipFleetCoordination" exact="global.$GT_AIParameters.{$gtShip}.$FleetCoordination"/>
+                </do_if>
+                
+                <do_if value="$shipFleetCoordination">
+                  <do_if value="global.$GT_ActiveTradeReservations.{$gtShip}?">
+                    <remove_value name="global.$GT_ActiveTradeReservations.{$gtShip}"/>
+                    <debug_text text="'[GT-FLEET] (' + $gtShip.idcode + ') ✅ Trade reservation released'" chance="100"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Signal AI script that trade is complete -->
+                <signal_objects object="$gtShip" param="'GT_Trade_Completed'"/>
+                
+                <!-- AUTO-REPAIR: Check if ship needs repairs after trade completion -->
+                <do_if value="$gtShip.hullpercentage lt 95">
+                  <debug_text text="'[GT-AutoRepair] (' + $gtShip.idcode + ') Trade completed - Hull at ' + $gtShip.hullpercentage + '% (damaged) - checking auto-repair eligibility'" chance="100"/>
+                  <!-- Signal auto-repair system to check and initiate repair -->
+                  <signal_objects object="player.galaxy" param="'GT_CheckAutoRepair'" param2="$gtShip"/>
+                </do_if>
+                <do_else>
+                  <debug_text text="'[GT-AutoRepair] (' + $gtShip.idcode + ') Trade completed - Hull at ' + $gtShip.hullpercentage + '% (healthy) - no repair needed'" chance="100"/>
+                </do_else>
+                
+                <!-- Clean up active trade data -->
+                <remove_value name="global.$GT_TradingData.$ActiveTrades.{$gtShip}"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- Handle case where sell happens without tracked buy (single sell operation) -->
+              <debug_text text="'[GalaxyTrader MK3] ' + $gtShip.knownname + ' (' + $gtShip.idcode + ') completed sell operation - signaling AI script'" chance="100"/>
+              <signal_objects object="$gtShip" param="'GT_Trade_Completed'"/>
+              
+              <!-- AUTO-REPAIR: Check if ship needs repairs after trade completion -->
+              <do_if value="$gtShip.hullpercentage lt 95">
+                <debug_text text="'[GT-AutoRepair] (' + $gtShip.idcode + ') Trade completed - Hull at ' + $gtShip.hullpercentage + '% (damaged) - checking auto-repair eligibility'" chance="100"/>
+                <!-- Signal auto-repair system to check and initiate repair -->
+                <signal_objects object="player.galaxy" param="'GT_CheckAutoRepair'" param2="$gtShip"/>
+              </do_if>
+              <do_else>
+                <debug_text text="'[GT-AutoRepair] (' + $gtShip.idcode + ') Trade completed - Hull at ' + $gtShip.hullpercentage + '% (healthy) - no repair needed'" chance="100"/>
+              </do_else>
+            </do_else>
+          </do_else>
+          
+          <!-- Update ship last activity -->
+          <set_value name="global.$GT_Ships.{$gtShip}.$LastUpdate" exact="player.age"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Periodic Cache Cleanup -->
+    <cue name="RouteCacheCleanup" instantiate="true" checkinterval="300s">
+      <conditions>
+        <check_value value="global.$GT_TradingData?"/>
+      </conditions>
+      <actions>
+        <!-- Clear outdated route cache entries -->
+        <set_value name="$cacheAge" exact="player.age - global.$GT_TradingData.$LastUpdate"/>
+        
+        <do_if value="$cacheAge gt 600s">
+          <set_value name="global.$GT_TradingData.$RouteCache" exact="table[]"/>
+          <set_value name="global.$GT_TradingData.$LastUpdate" exact="player.age"/>
+          <debug_text text="'[GalaxyTrader MK3] Route cache cleared'" chance="100"/>
+        </do_if>
+        
+        <!-- Clean trade cache (remove entries older than 10 minutes) -->
+        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.keys.count gt 0">
+          <set_value name="$cleanedEntries" exact="0"/>
+          <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
+          
+          <do_all exact="global.$GT_TradeCache.keys.count" counter="$wareIdx">
+            <set_value name="$wareKey" exact="global.$GT_TradeCache.keys.{$wareIdx}"/>
+            <set_value name="$wareCache" exact="global.$GT_TradeCache.{$wareKey}"/>
+            
+            <!-- Safety check: Ensure wareCache is valid -->
+            <do_if value="not $wareCache? or typeof $wareCache != datatype.table or not $wareCache.keys?">
+              <continue/>
+            </do_if>
+            
+            <do_all exact="$wareCache.keys.count" counter="$sellIdx">
+              <set_value name="$sellKey" exact="$wareCache.keys.{$sellIdx}"/>
+              <set_value name="$sellCache" exact="$wareCache.{$sellKey}"/>
+              
+              <!-- Safety check: Ensure sellCache is valid -->
+              <do_if value="not $sellCache? or typeof $sellCache != datatype.table or not $sellCache.keys?">
+                <continue/>
+              </do_if>
+              
+              <set_value name="$buyKeysToRemove" exact="[]"/>
+              <do_all exact="$sellCache.keys.count" counter="$buyIdx">
+                <set_value name="$buyKey" exact="$sellCache.keys.{$buyIdx}"/>
+                <set_value name="$cacheEntry" exact="$sellCache.{$buyKey}"/>
+                
+                <!-- Check if entry is too old (using Timestamp instead of CacheTime) -->
+                <do_if value="$cacheEntry.$Timestamp? and (player.age - $cacheEntry.$Timestamp) gt $cacheMaxAge">
+                  <append_to_list name="$buyKeysToRemove" exact="$buyKey"/>
+                  <set_value name="$cleanedEntries" operation="add"/>
+                </do_if>
+              </do_all>
+              
+              <!-- Remove old entries -->
+              <do_all exact="$buyKeysToRemove.count" counter="$i">
+                <remove_value name="$sellCache.{$buyKeysToRemove.{$i}}"/>
+              </do_all>
+            </do_all>
+          </do_all>
+          
+          <do_if value="$cleanedEntries gt 0">
+            <debug_text text="'[GalaxyTrader MK3] Trade cache cleanup: removed ' + $cleanedEntries + ' old entries'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clean up stale trade reservations (older than 5 minutes) -->
+        <do_if value="global.$GT_ActiveTradeReservations?">
+          <set_value name="$shipsToRemove" exact="[]"/>
+          <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$i">
+            <set_value name="$ship" exact="global.$GT_ActiveTradeReservations.keys.{$i}"/>
+            <set_value name="$reservation" exact="global.$GT_ActiveTradeReservations.{$ship}"/>
+            <set_value name="$age" exact="player.age - $reservation.$Timestamp"/>
+            
+            <!-- Remove if older than 5 minutes or ship no longer exists -->
+            <do_if value="$age gt 300s or not $ship.exists">
+              <append_to_list name="$shipsToRemove" exact="$ship"/>
+            </do_if>
+          </do_all>
+          
+          <do_all exact="$shipsToRemove.count" counter="$i">
+            <remove_value name="global.$GT_ActiveTradeReservations.{$shipsToRemove.{$i}}"/>
+            <set_value name="$cleanedEntries" operation="add"/>
+          </do_all>
+          
+          <do_if value="$shipsToRemove.count gt 0">
+            <debug_text text="'[GT-FLEET] Cleaned up ' + $shipsToRemove.count + ' stale trade reservations'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Search for Sell Opportunities -->
+    <cue name="SearchSellOpportunities" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="global.$GT_CurrentShip"/>
+        <set_value name="$maxDistance" exact="global.$GT_TradeSearchMaxDistance"/>
+        <set_value name="$minProfit" exact="global.$GT_TradeSearchMinProfit"/>
+        
+        <!-- DEBUG: Sell search start -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === SELL SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin Profit: ' + $minProfit + ' Cr'" chance="100"/>
+        </do_if>
+        
+        <!-- Find best sell location for current cargo -->
+        <set_value name="$bestOffer" exact="null"/>
+        <set_value name="$bestPrice" exact="0"/>
+        <set_value name="$bestAmount" exact="0"/>
+        
+        <!-- Get ship's current cargo -->
+        <set_value name="$currentCargo" exact="$ship.cargo.list"/>
+        
+        <do_if value="$currentCargo.count gt 0">
+          <!-- For each ware in cargo, find best sell location -->
+          <do_all exact="$currentCargo.count" counter="$i">
+            <set_value name="$ware" exact="$currentCargo.{$i}"/>
+            <set_value name="$amount" exact="$ship.cargo.{$ware}.count"/>
+            
+            <!-- Find buy offers for this ware (stations that want to buy what we're selling) -->
+            <find_buy_offer space="player.galaxy" result="$buyOffers" multiple="true" wares="$ware">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_gate_distance object="$ship" max="$maxDistance"/>
+              </match_buyer>
+            </find_buy_offer>
+            
+            <!-- Find best price -->
+            <do_all exact="$buyOffers.count" counter="$j">
+              <set_value name="$offer" exact="$buyOffers.{$j}"/>
+              <set_value name="$tradeAmount" exact="[$amount, $offer.amount].min"/>
+              <set_value name="$profit" exact="$offer.unitprice * $tradeAmount"/>
+              
+              <do_if value="$profit gt $bestPrice and $offer.available">
+                <set_value name="$bestOffer" exact="$offer"/>
+                <set_value name="$bestPrice" exact="$profit"/>
+                <set_value name="$bestAmount" exact="$tradeAmount"/>
+              </do_if>
+            </do_all>
+          </do_all>
+          
+          <!-- Execute best sell if found -->
+          <do_if value="$bestOffer and $bestPrice gt $minProfit">
+            <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' found sell opportunity: ' + $bestAmount + ' ' + $bestOffer.ware + ' for ' + $bestPrice + ' Cr at ' + $bestOffer.owner.knownname" chance="100"/>
+            
+            <!-- Create proper TradePerform order using X4 native create_trade_order (like TaterTrader) -->
+            <create_trade_order object="$ship" tradeoffer="$bestOffer" amount="$bestAmount" immediate="false"/>
+            
+            <!-- DEBUG: Trade order created -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') TradePerform order created for ' + $bestAmount + ' ' + $bestOffer.ware + ' at ' + $bestOffer.owner.knownname" chance="100"/>
+            </do_if>
+            
+            <!-- Signal back to AI script: Trade Found -->
+            <signal_objects object="$ship" param="'GT_Trade_Found'"/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' found no profitable sell opportunities (best price: ' + $bestPrice + ' vs min: ' + $minProfit + ')'" chance="100"/>
+            
+            <!-- Signal back to AI script: No Trade Found -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          </do_else>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' has no cargo to sell'" chance="100"/>
+          
+          <!-- Signal back to AI script: No Trade Found (no cargo) -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+        </do_else>
+        
+        <!-- CRITICAL: Clean up AI parameters for this ship -->
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+          <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI parameters cleaned up (sell search)'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Emergency Ship Recovery -->
+    <cue name="ShipRecovery" instantiate="true" checkinterval="60s">
+      <conditions>
+        <check_value value="global.$GT_Ships.keys.count gt 0"/>
+      </conditions>
+      <actions>
+        <!-- Check for stuck ships -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+          <do_all exact="$shipKeys.count" counter="$i">
+            <set_value name="$ship" exact="$shipKeys.{$i}"/>
+          
+          <do_if value="$ship.exists and $ship.isoperational">
+            <!-- Check if ship has been idle too long -->
+            <set_value name="$idleTime" exact="0s"/>
+            <do_if value="global.$GT_Ships.{$ship}.$LastUpdate?">
+              <set_value name="$idleTime" exact="player.age - global.$GT_Ships.{$ship}.$LastUpdate"/>
+            </do_if>
+            
+            <do_if value="$idleTime gt 300s and not $ship.order">
+              <debug_text text="'[GalaxyTrader MK3] Recovering idle ship: ' + $ship.knownname" chance="100"/>
+              
+              <!-- Add back to queue -->
+              <append_to_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
+              <signal_cue cue="ProcessTradingQueue"/>
+              
+              <!-- Update last activity -->
+              <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+            </do_if>
+                      </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Clean up stale search locks (older than 60 seconds) -->
+        <do_if value="global.$GT_SearchLocks?">
+          <set_value name="$staleLocks" exact="0"/>
+          <set_value name="$lockKeys" exact="global.$GT_SearchLocks.keys.list"/>
+          <do_all exact="$lockKeys.count" counter="$i">
+            <set_value name="$ship" exact="$lockKeys.{$i}"/>
+            <set_value name="$lockTime" exact="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="(player.age - $lockTime) gt 60s">
+              <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+              <set_value name="$staleLocks" operation="add"/>
+            </do_if>
+          </do_all>
+          <do_if value="$staleLocks gt 0">
+            <debug_text text="'[GalaxyTrader MK3] Cleaned up ' + $staleLocks + ' stale search locks'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Evaluate Station Offers (BACKUP APPROACH) -->
+    <cue name="EvaluateStationOffers" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="global.$GT_EvaluateShip"/>
+        <set_value name="$station" exact="global.$GT_EvaluateStation"/>
+        <set_value name="$buyOffers" exact="global.$GT_EvaluateBuyOffers"/>
+        <set_value name="$sellOffers" exact="global.$GT_EvaluateSellOffers"/>
+        <set_value name="$minROI" exact="global.$GT_EvaluateMinROI"/>
+        <set_value name="$minAbsoluteProfit" exact="global.$GT_EvaluateMinAbsoluteProfit"/>
+        
+        <!-- DEBUG: Station evaluation start -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+                      <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === EVALUATING OFFERS ===' + '\nStation: ' + $station.knownname + '\nSell offers: ' + $sellOffers.count + '\nBuy offers: ' + $buyOffers.count + '\nMin ROI: ' + $minROI + '% Min Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+        </do_if>
+        
+        <set_value name="$bestTrade" exact="null"/>
+        <set_value name="$bestScore" exact="0"/>
+        <set_value name="$tradesEvaluated" exact="0"/>
+        <set_value name="$tradesPassedProfit" exact="0"/>
+        <set_value name="$tradesPassedFilter" exact="0"/>
+        
+        <!-- ===== STATION-BY-STATION TRADE EVALUATION (BACKUP APPROACH) ===== -->
+        <set_value name="$stationsEvaluated" exact="0"/>
+        <set_value name="$offersFound" exact="0"/>
+        <set_value name="$validOffers" exact="0"/>
+        
+        <do_all exact="$stations.count" counter="$i">
+          <set_value name="$station" exact="$stations.{$i}"/>
+          
+          <!-- DEBUG: Station evaluation start -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Evaluating station ' + $i + '/' + $stations.count + ': ' + $station.knownname + ' (' + $station.idcode + ') in ' + $station.sector.knownname" chance="100"/>
+          </do_if>
+          
+          <!-- Check if station can trade -->
+          <run_actions ref="md.GT_Utilities.GT_ValidateStation" result="$stationValid">
+            <param name="station" value="$station"/>
+          </run_actions>
+          
+          <do_if value="$stationValid">
+            <set_value name="$stationsEvaluated" operation="add"/>
+            
+            <!-- Get station trade offers -->
+            <find_buy_offer buyer="$station" result="$buyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner"/>
+            </find_buy_offer>
+            
+            <find_sell_offer seller="$station" result="$sellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner"/>
+            </find_sell_offer>
+            
+            <set_value name="$stationOffers" exact="$buyOffers.count + $sellOffers.count"/>
+            <set_value name="$offersFound" exact="$offersFound + $stationOffers"/>
+            
+            <!-- DEBUG: Station offers -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Station ' + $station.knownname + ' offers: ' + $sellOffers.count + ' sell, ' + $buyOffers.count + ' buy'" chance="100"/>
+            </do_if>
+            
+            <!-- Evaluate offers within this station -->
+            <do_if value="($buyOffers.count + $sellOffers.count) gt 0">
+              <set_value name="global.$GT_EvaluateShip" exact="$ship"/>
+              <set_value name="global.$GT_EvaluateStation" exact="$station"/>
+              <set_value name="global.$GT_EvaluateBuyOffers" exact="$buyOffers"/>
+              <set_value name="global.$GT_EvaluateSellOffers" exact="$sellOffers"/>
+              <set_value name="global.$GT_EvaluateMinROI" exact="$minROI"/>
+              <set_value name="global.$GT_EvaluateMinAbsoluteProfit" exact="$minAbsoluteProfit"/>
+              <signal_cue cue="EvaluateStationOffers"/>
+              
+              <!-- Check if better than current best -->
+              <do_if value="global.$GT_EvaluateResult? and global.$GT_EvaluateResult.$Score gt $bestScore">
+                <set_value name="$validOffers" operation="add"/>
+                <set_value name="$bestTrade" exact="global.$GT_EvaluateResult"/>
+                <set_value name="$bestScore" exact="global.$GT_EvaluateResult.$Score"/>
+                
+                <!-- DEBUG: Better trade found -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Better trade found! Score: ' + global.$GT_EvaluateResult.$Score + ', Profit: ' + global.$GT_EvaluateResult.$Profit + ' Cr'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- DEBUG: Station validation failed -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Station validation failed for ' + $station.knownname" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_all>
+        
+        <!-- DEBUG: Evaluation summary -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and global.$GT_Config.$Debug.$LogLevel ge 2">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === STATION EVALUATION SUMMARY ===' + '\nTrades evaluated: ' + $tradesEvaluated + '\nPassed filter: ' + $tradesPassedFilter + '\nPassed profit: ' + $tradesPassedProfit + '\nBest score: ' + $bestScore" chance="100"/>
+        </do_if>
+        
+        <!-- Return result -->
+        <set_value name="global.$GT_EvaluateResult" exact="$bestTrade"/>
+      </actions>
+    </cue>
+  </cues>
+</mdscript> 

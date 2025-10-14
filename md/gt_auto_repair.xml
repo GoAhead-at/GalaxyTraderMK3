@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_AutoRepair" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    
+    <!-- Auto-Repair System Initialization -->
+    <cue name="SystemInit" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.SystemInit"/>
+      </conditions>
+      <actions>
+        <debug_text text="'[GalaxyTrader MK3] Auto-repair system initializing...'" chance="100"/>
+        
+        <!-- Initialize auto-repair tracking table (empty, config is in global settings) -->
+        <set_value name="global.$GT_AutoRepair" exact="table[]"/>
+        
+        <debug_text text="'[GalaxyTrader MK3] Auto-repair system initialized (Threshold: ' + global.$GT_GlobalSettings.$AutoRepair.$HullThreshold + '%, Min Pilot Level: ' + global.$GT_GlobalSettings.$AutoRepair.$MinPilotLevel + ', Enabled: ' + global.$GT_GlobalSettings.$AutoRepair.$Enabled + ')'" chance="100"/>
+      </actions>
+    </cue>
+    
+    <!-- Check if Ship Needs Repair -->
+    <cue name="CheckForRepairNeeded" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_CheckAutoRepair'"/>
+      </conditions>
+      <actions>
+        <!-- Extract ship from signal -->
+        <set_value name="$ship" exact="event.param2"/>
+        
+        <!-- Safety checks -->
+        <do_if value="$ship and $ship.exists and $ship.isoperational">
+          
+          <!-- Check if system is enabled -->
+          <do_if value="global.$GT_GlobalSettings.$AutoRepair.$Enabled">
+            
+            <!-- Get pilot level using ship management library -->
+            <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
+              <param name="ship" value="$ship"/>
+              <param name="use_md_system" value="true"/>
+            </run_actions>
+            
+            <set_value name="$pilotLevel" exact="$skillInfo.$Level"/>
+            
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Checking repair eligibility - Pilot: ' + @$ship.pilot.name + ', Level: ' + $pilotLevel + ', Hull: ' + $ship.hullpercentage + '%'" chance="100"/>
+            
+            <!-- Check if pilot level is sufficient -->
+            <do_if value="$pilotLevel ge global.$GT_GlobalSettings.$AutoRepair.$MinPilotLevel">
+        
+        <!-- Check hull percentage -->
+        <do_if value="$ship.hullpercentage lt global.$GT_GlobalSettings.$AutoRepair.$HullThreshold">
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Hull at ' + $ship.hullpercentage + '% (threshold: ' + global.$GT_GlobalSettings.$AutoRepair.$HullThreshold + '%) - initiating auto-repair'" chance="100"/>
+          
+          <!-- Get ship's max jump distance from AI parameters or calculate from pilot skill -->
+          <set_value name="$maxJumpDistance" exact="15"/> <!-- Default fallback -->
+          
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxDistance?">
+            <!-- Use AI parameter if available -->
+            <set_value name="$maxJumpDistance" exact="global.$GT_AIParameters.{$ship}.$MaxDistance"/>
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Using AI parameter max jump distance: ' + $maxJumpDistance + ' jumps'" chance="100"/>
+          </do_if>
+          <do_elseif value="$ship.pilot">
+            <!-- Calculate from pilot skill if no AI parameter -->
+            <run_actions ref="md.GT_Ship_Management.Calculate_Jump_Distance" result="$maxJumpDistance">
+              <param name="skill_level" value="$pilotLevel"/>
+            </run_actions>
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Using skill-based max jump distance: ' + $maxJumpDistance + ' jumps (pilot level ' + $pilotLevel + ')'" chance="100"/>
+          </do_elseif>
+          
+          <!-- Find appropriate repair station based on ship class -->
+          <run_actions ref="FindNearestRepairStation" result="$repairStation">
+            <param name="ship" value="$ship"/>
+            <param name="maxJumpDistance" value="$maxJumpDistance"/>
+          </run_actions>
+          
+          <do_if value="$repairStation and $repairStation.exists">
+            <!-- Ensure global repair tracking table exists -->
+            <do_if value="not global.$GT_AutoRepair?">
+              <set_value name="global.$GT_AutoRepair" exact="table[]"/>
+            </do_if>
+            
+            <!-- Store repair data for AI script -->
+            <set_value name="global.$GT_AutoRepair.{$ship}" exact="table[]"/>
+            <set_value name="global.$GT_AutoRepair.{$ship}.$Station" exact="$repairStation"/>
+            <set_value name="global.$GT_AutoRepair.{$ship}.$HullBefore" exact="$ship.hullpercentage"/>
+            <set_value name="global.$GT_AutoRepair.{$ship}.$InitiatedTime" exact="player.age"/>
+            
+            <!-- Check if player has sufficient funds for repairs -->
+            <set_value name="$estimatedCost" exact="$ship.repairprice"/>
+            <set_value name="$playerMoney" exact="player.money"/>
+            
+            <do_if value="$playerMoney ge $estimatedCost">
+              <!-- Player has enough money - proceed with full repair -->
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Player has sufficient funds (' + ($playerMoney/100) + ' Cr) for repair (cost: ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
+              
+              <!-- Log repair initiation -->
+              <signal_objects object="player.galaxy" param="'GT_AutoRepair_Log'" param2="table[
+                $Ship = $ship,
+                $Station = $repairStation,
+                $HullBefore = $ship.hullpercentage,
+                $PilotLevel = $pilotLevel
+              ]"/>
+              
+              <!-- Create repair order directly (more reliable than signaling AI script) -->
+              <!-- IMPORTANT: Repairs are paid from PLAYER's account (ships don't have individual money) -->
+              <create_order object="$ship" id="'Repair'" immediate="true">
+                <param name="destination" value="$repairStation"/>
+                <param name="hullpercent" value="100"/>
+                <param name="repairall" value="true"/>
+                <param name="acceptedcost" value="$estimatedCost"/>
+                <param name="internalorder" value="true"/>
+              </create_order>
+              
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Repair order created for ' + $repairStation.knownname + ' (target: 100% hull, repair all, cost: ' + ($estimatedCost/100) + ' Cr from player account) - ship will resume trading after repairs'" chance="100"/>
+            </do_if>
+            <do_elseif value="$playerMoney ge 5000Cr">
+              <!-- Player has some money but not enough for full repair - do partial repair -->
+              <set_value name="$affordableRepair" exact="$playerMoney"/>
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') ⚠️ Insufficient funds for full repair! Player: ' + ($playerMoney/100) + ' Cr, needed: ' + ($estimatedCost/100) + ' Cr - attempting partial repair'" chance="100"/>
+              
+              <!-- Log repair initiation with warning -->
+              <signal_objects object="player.galaxy" param="'GT_AutoRepair_Log'" param2="table[
+                $Ship = $ship,
+                $Station = $repairStation,
+                $HullBefore = $ship.hullpercentage,
+                $PilotLevel = $pilotLevel
+              ]"/>
+              
+              <!-- Create partial repair order with player's available money -->
+              <create_order object="$ship" id="'Repair'" immediate="true">
+                <param name="destination" value="$repairStation"/>
+                <param name="hullpercent" value="100"/>
+                <param name="repairall" value="true"/>
+                <param name="acceptedcost" value="$affordableRepair"/>
+                <param name="internalorder" value="true"/>
+              </create_order>
+              
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Partial repair order created (max cost: ' + ($affordableRepair/100) + ' Cr)'" chance="100"/>
+              
+              <!-- Notify player -->
+              <show_notification text="'⚠️ Auto-Repair: ' + $ship.knownname + ' needs repairs but insufficient funds!\nFull cost: ' + ($estimatedCost/100) + ' Cr, Available: ' + ($playerMoney/100) + ' Cr\nAttempting partial repair.'" timeout="10s" priority="8"/>
+            </do_elseif>
+            <do_else>
+              <!-- Player has insufficient money even for minimal repair - skip repair -->
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') ❌ INSUFFICIENT FUNDS: Cannot repair! Player: ' + ($playerMoney/100) + ' Cr, needed: ' + ($estimatedCost/100) + ' Cr (minimum 50 Cr required) - skipping repair'" chance="100"/>
+              
+              <!-- Notify player -->
+              <show_notification text="'❌ Auto-Repair FAILED: ' + $ship.knownname + ' needs repairs!\nCost: ' + ($estimatedCost/100) + ' Cr, Your funds: ' + ($playerMoney/100) + ' Cr\nShip will continue trading damaged. Please repair manually when funds available.'" timeout="10s" priority="9"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') No suitable repair station found - continuing with damage'" chance="100"/>
+          </do_else>
+              </do_if>
+              <do_else>
+                <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Hull at ' + $ship.hullpercentage + '% - no repair needed'" chance="100"/>
+              </do_else>
+              
+            </do_if><!-- End pilot level check -->
+            <do_else>
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Pilot level below minimum - auto-repair not available'" chance="100"/>
+            </do_else>
+            
+          </do_if><!-- End system enabled check -->
+          <do_else>
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Auto-repair system is disabled'" chance="100"/>
+          </do_else>
+          
+        </do_if><!-- End ship validity check -->
+        <do_else>
+          <debug_text text="'[GT-AutoRepair] Invalid ship object received'" chance="100"/>
+        </do_else>
+        
+      </actions>
+    </cue>
+    
+    <!-- Find Nearest Repair Station Library -->
+    <library name="FindNearestRepairStation" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship that needs repair"/>
+        <param name="maxJumpDistance" comment="Maximum jump distance to search for repair stations"/>
+      </params>
+      <actions>
+        <!-- Detect ship class using ship management library -->
+        <run_actions ref="md.GT_Ship_Management.Detect_Ship_Class" result="$classInfo">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Determine which station types to search for based on ship class -->
+        <!-- NOTE: Equipment Docks (Ausrüstungsdock) support ALL ship classes! -->
+        <set_value name="$searchWharfs" exact="false"/>
+        <set_value name="$searchShipyards" exact="false"/>
+        <set_value name="$searchEquipmentDocks" exact="false"/>
+        
+        <!-- S and M class ships → Wharfs (Raumdock) AND Equipment Docks (Ausrüstungsdock) -->
+        <do_if value="$classInfo.$IsSmall or $classInfo.$IsMedium">
+          <set_value name="$searchWharfs" exact="true"/>
+          <set_value name="$searchEquipmentDocks" exact="true"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Searching for Wharfs and Equipment Docks (ship class: ' + $classInfo.$Size + ')'" chance="100"/>
+        </do_if>
+        <!-- L and XL class ships → Shipyards (Schiffswerft) AND Equipment Docks (Ausrüstungsdock) -->
+        <do_elseif value="$classInfo.$IsLarge or $classInfo.$IsCapital">
+          <set_value name="$searchShipyards" exact="true"/>
+          <set_value name="$searchEquipmentDocks" exact="true"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Searching for Shipyards and Equipment Docks (ship class: ' + $classInfo.$Size + ')'" chance="100"/>
+        </do_elseif>
+        <do_else>
+          <!-- Fallback: search all types -->
+          <set_value name="$searchWharfs" exact="true"/>
+          <set_value name="$searchShipyards" exact="true"/>
+          <set_value name="$searchEquipmentDocks" exact="true"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Unknown ship class - searching all repair facilities'" chance="100"/>
+        </do_else>
+        
+        <!-- Find all potential repair stations in the universe -->
+        <create_list name="$potentialStations"/>
+        
+        <!-- Search for wharfs if needed (Raumdock - repairs S/M ships) -->
+        <!-- Sort by gate distance from ship - nearest first -->
+        <do_if value="$searchWharfs">
+          <set_value name="$wharfCountBefore" exact="$potentialStations.count"/>
+          <find_station name="$wharfs" space="player.galaxy" multiple="true" knownto="player.entity" checkoperational="true" sortbygatedistanceto="$ship">
+            <match class="class.station"/>
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+          </find_station>
+          
+          <do_all exact="$wharfs.count" counter="$i">
+            <set_value name="$station" exact="$wharfs.{$i}"/>
+            <do_if value="$station.iswharf">
+              <append_to_list name="$potentialStations" exact="$station"/>
+            </do_if>
+          </do_all>
+          
+          <set_value name="$wharfCount" exact="$potentialStations.count - $wharfCountBefore"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Found ' + $wharfCount + ' discovered wharfs (sorted by distance)'" chance="100"/>
+        </do_if>
+        
+        <!-- Search for shipyards if needed (Schiffswerft - repairs L/XL ships) -->
+        <!-- Sort by gate distance from ship - nearest first -->
+        <do_if value="$searchShipyards">
+          <set_value name="$shipyardCountBefore" exact="$potentialStations.count"/>
+          <find_station name="$shipyards" space="player.galaxy" multiple="true" knownto="player.entity" checkoperational="true" sortbygatedistanceto="$ship">
+            <match class="class.station"/>
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+          </find_station>
+          
+          <do_all exact="$shipyards.count" counter="$i">
+            <set_value name="$station" exact="$shipyards.{$i}"/>
+            <do_if value="$station.isshipyard">
+              <append_to_list name="$potentialStations" exact="$station"/>
+            </do_if>
+          </do_all>
+          
+          <set_value name="$shipyardCount" exact="$potentialStations.count - $shipyardCountBefore"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Found ' + $shipyardCount + ' discovered shipyards (sorted by distance)'" chance="100"/>
+        </do_if>
+        
+        <!-- Search for equipment docks if needed (Ausrüstungsdock - repairs ALL ship sizes) -->
+        <!-- Sort by gate distance from ship - nearest first -->
+        <do_if value="$searchEquipmentDocks">
+          <set_value name="$equipmentDockCountBefore" exact="$potentialStations.count"/>
+          <find_station name="$equipmentdocks" space="player.galaxy" multiple="true" knownto="player.entity" checkoperational="true" sortbygatedistanceto="$ship">
+            <match class="class.station"/>
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+          </find_station>
+          
+          <do_all exact="$equipmentdocks.count" counter="$i">
+            <set_value name="$station" exact="$equipmentdocks.{$i}"/>
+            <do_if value="$station.isequipmentdock">
+              <append_to_list name="$potentialStations" exact="$station"/>
+            </do_if>
+          </do_all>
+          
+          <set_value name="$equipmentDockCount" exact="$potentialStations.count - $equipmentDockCountBefore"/>
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Found ' + $equipmentDockCount + ' discovered equipment docks (sorted by distance)'" chance="100"/>
+        </do_if>
+        
+        <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Total potential repair stations: ' + $potentialStations.count + ' (all sorted by distance)'" chance="100"/>
+        
+        <!-- Early exit: Find first valid station (stations already sorted by distance, so first valid = nearest) -->
+        <set_value name="$nearestStation" exact="null"/>
+        
+        <do_all exact="$potentialStations.count" counter="$i">
+          <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <set_value name="$isValid" exact="true"/>
+          
+          <!-- Check if station is reachable (valid gate path exists) -->
+          <do_if value="$isValid">
+            <set_value name="$gateDistance" exact="$ship.sector.gatedistance.{$station.sector}"/>
+            <do_if value="$gateDistance lt 0">
+              <set_value name="$isValid" exact="false"/>
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - no valid path (distance: ' + $gateDistance + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Check if station is within max jump distance -->
+          <do_if value="$isValid">
+            <do_if value="$gateDistance gt $maxJumpDistance">
+              <set_value name="$isValid" exact="false"/>
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - beyond max jump distance (' + $gateDistance + ' jumps, max: ' + $maxJumpDistance + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Check if sector is excluded (from ship configuration) -->
+          <do_if value="$isValid and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$Config?">
+            <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors?">
+              <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors.indexof.{$station.sector}">
+                <set_value name="$isValid" exact="false"/>
+                <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - sector excluded in config'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- EARLY EXIT: First valid station found (already sorted by distance) -->
+          <do_if value="$isValid">
+            <set_value name="$nearestStation" exact="$station"/>
+            <set_value name="$nearestDistance" exact="$gateDistance"/>
+            <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') ✓ Found nearest repair station: ' + $nearestStation.knownname + ' (' + $nearestDistance + ' jumps away) - stopping search after checking ' + $i + '/' + $potentialStations.count + ' stations'" chance="100"/>
+            <break/>
+          </do_if>
+        </do_all>
+        
+        <do_if value="not $nearestStation">
+          <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') No suitable repair station found after checking all ' + $potentialStations.count + ' discovered stations'" chance="100"/>
+        </do_if>
+        
+        <!-- Return nearest station (or null if none found) -->
+        <return value="$nearestStation"/>
+      </actions>
+    </library>
+    
+    <!-- Monitor Ship Orders for Repair Completion -->
+    <cue name="MonitorRepairCompletion" instantiate="true" checkinterval="5s">
+      <conditions>
+        <check_value value="global.$GT_AutoRepair? and global.$GT_AutoRepair.keys.count gt 0"/>
+      </conditions>
+      <actions>
+        <!-- Check each ship that's tracking repair -->
+        <set_value name="$shipKeys" exact="global.$GT_AutoRepair.keys.list"/>
+        
+        <do_all exact="$shipKeys.count" counter="$i">
+          <set_value name="$ship" exact="$shipKeys.{$i}"/>
+          
+          <!-- Skip config entry -->
+          <do_if value="$ship == '$Config'">
+            <continue/>
+          </do_if>
+          
+          <!-- Check if ship exists and is operational -->
+          <do_if value="$ship.exists and $ship.isoperational">
+            <!-- Check if hull is now above threshold (repair completed) -->
+            <do_if value="$ship.hullpercentage ge global.$GT_GlobalSettings.$AutoRepair.$HullThreshold">
+              <debug_text text="'[GT-AutoRepair] (' + $ship.idcode + ') Repair completed - hull at ' + $ship.hullpercentage + '%'" chance="100"/>
+              
+              <!-- Signal AI script that repair is complete -->
+              <signal_objects object="$ship" param="'GT_RepairCompleted'"/>
+              
+              <!-- Clean up tracking data -->
+              <remove_value name="global.$GT_AutoRepair.{$ship}"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Ship no longer exists or operational - clean up -->
+            <remove_value name="global.$GT_AutoRepair.{$ship}"/>
+          </do_else>
+        </do_all>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>

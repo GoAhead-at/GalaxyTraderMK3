@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Trading_Intelligence" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- Trade Evaluation Library - Shared logic for trade analysis -->
+    
+    <!-- Performance Optimized Offer Filtering -->
+    <library name="FindProfitableOffers" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Trading ship"/>
+        <param name="maxRange" default="15" comment="Maximum jump range"/>
+        <param name="minROI" default="0.10" comment="Minimum ROI percentage (10% = 0.10)"/>
+        <param name="minAbsoluteProfit" default="10000" comment="Minimum absolute profit threshold (RAW format)"/>
+        <param name="config" default="global.$GT_Config" comment="Configuration reference"/>
+      </params>
+      <actions>
+        <set_value name="$profitableOffers" exact="table[]"/>
+        <set_value name="$offersFound" exact="0"/>
+        
+        <!-- Get ship cargo capacity and available wares -->
+        <set_value name="$shipCapacity" exact="$ship.cargo.capacity.max"/>
+        <set_value name="$shipFreeSpace" exact="$ship.cargo.capacity.free"/>
+        
+        <!-- Performance: Only check stations within jump range -->
+        <find_station name="$nearbyStations" space="player.galaxy" multiple="true">
+          <match_distance object="$ship" max="$maxRange"/>
+          <match_relation_to relation="neutral" object="faction.player"/>
+        </find_station>
+        
+        <!-- Analyze sell offers from nearby stations -->
+        <do_all exact="$nearbyStations.count" counter="$i">
+          <set_value name="$station" exact="$nearbyStations.{$i}"/>
+          
+          <!-- Performance: Skip if station is hostile -->
+          <do_if value="$station.relationtoplayer lt 0">
+            <continue/>
+          </do_if>
+          
+          <!-- Get all sell offers from this station -->
+          <do_all exact="$station.selloffers.count" counter="$j">
+            <set_value name="$sellOffer" exact="$station.selloffers.{$j}"/>
+            <set_value name="$ware" exact="$sellOffer.ware"/>
+            
+            <!-- Check if we can carry this ware -->
+            <set_value name="$wareVolume" exact="$ware.volume"/>
+            <set_value name="$maxAmount" exact="($shipFreeSpace / $wareVolume)i"/>
+            
+            <do_if value="$maxAmount gt 0 and $sellOffer.amount gt 0">
+              <!-- Find best buy offer for this ware -->
+              <set_value name="$bestBuyOffer" exact="null"/>
+              <set_value name="$bestProfit" exact="0"/>
+              
+              <!-- Search for buy offers -->
+              <do_all exact="$nearbyStations.count" counter="$k">
+                <set_value name="$buyStation" exact="$nearbyStations.{$k}"/>
+                
+                <!-- Skip same station -->
+                <do_if value="$buyStation == $station">
+                  <continue/>
+                </do_if>
+                
+                <!-- Performance: Skip hostile stations -->
+                <do_if value="$buyStation.relationtoplayer lt 0">
+                  <continue/>
+                </do_if>
+                
+                <!-- Check buy offers for this ware -->
+                <do_all exact="$buyStation.buyoffers.count" counter="$l">
+                  <set_value name="$buyOffer" exact="$buyStation.buyoffers.{$l}"/>
+                  
+                  <do_if value="$buyOffer.ware == $ware and $buyOffer.amount gt 0">
+                    <!-- Calculate potential profit -->
+                    <set_value name="$tradeAmount" exact="[$maxAmount, $sellOffer.amount, $buyOffer.amount].min"/>
+                    <set_value name="$profit" exact="($buyOffer.unitprice - $sellOffer.unitprice) * $tradeAmount"/>
+                    
+                    <!-- Calculate ROI and check thresholds -->
+                    <set_value name="$investment" exact="$sellOffer.unitprice * $tradeAmount"/>
+                    <set_value name="$roi" exact="if $investment gt 0 then (($profit * 1.0) / $investment) else 0.0"/>
+                    
+                    <do_if value="$roi ge $minROI and $profit ge $minAbsoluteProfit and $profit gt $bestProfit">
+                      <set_value name="$bestProfit" exact="$profit"/>
+                      <set_value name="$bestBuyOffer" exact="$buyOffer"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_all>
+              
+              <!-- Add profitable trade to results -->
+              <do_if value="$bestBuyOffer != null and $bestProfit ge $minAbsoluteProfit">
+                <set_value name="$profitableOffers.{$offersFound}" exact="table[
+                  $SellOffer = $sellOffer,
+                  $BuyOffer = $bestBuyOffer,
+                  $Profit = $bestProfit,
+                  $Ware = $ware,
+                  $Amount = [$maxAmount, $sellOffer.amount, $bestBuyOffer.amount].min,
+                  $SellStation = $station,
+                  $BuyStation = $bestBuyOffer.owner
+                ]"/>
+                <set_value name="$offersFound" exact="$offersFound + 1"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_all>
+        
+        <set_value name="this.$result" exact="$profitableOffers"/>
+      </actions>
+    </library>
+    
+    <!-- Trade Route Analysis -->
+    <library name="AnalyzeTradeRoute" purpose="run_actions">
+      <params>
+        <param name="sellOffer" comment="Sell offer"/>
+        <param name="buyOffer" comment="Buy offer"/>
+        <param name="ship" comment="Trading ship"/>
+        <param name="config" default="global.$GT_Config" comment="Configuration reference"/>
+      </params>
+      <actions>
+        <!-- Calculate distance -->
+        <set_value name="$jumps" exact="$ship.gatedistance.{$buyOffer.owner}"/>
+        <set_value name="$avgSecurity" exact="($ship.sector.security + $buyOffer.owner.sector.security) / 2"/>
+        
+        <!-- Calculate risk factors -->
+        <set_value name="$riskFactor" exact="1.0"/>
+        <do_if value="$avgSecurity lt 0.6">
+          <set_value name="$riskFactor" exact="1.5"/>  <!-- High risk routes -->
+        </do_if>
+        <do_elseif value="$avgSecurity lt 0.8">
+          <set_value name="$riskFactor" exact="1.2"/>  <!-- Medium risk routes -->
+        </do_elseif>
+        
+        <!-- Calculate travel time estimate -->
+        <set_value name="$estimatedTravelTime" exact="$jumps * 30s + 120s"/>  <!-- 30s per jump + 2min dock/undock -->
+        
+        <!-- Calculate profit per hour -->
+        <set_value name="$profit" exact="($buyOffer.unitprice - $sellOffer.unitprice) * $sellOffer.amount"/>
+        <set_value name="$profitPerHour" exact="($profit / $estimatedTravelTime) * 3600"/>
+        
+        <!-- Apply risk adjustment -->
+        <set_value name="$adjustedProfitPerHour" exact="$profitPerHour / $riskFactor"/>
+        
+        <!-- Return analysis -->
+        <set_value name="$analysis" exact="table[
+          $Jumps = $jumps,
+          $AvgSecurity = $avgSecurity,
+          $RiskFactor = $riskFactor,
+          $EstimatedTime = $estimatedTravelTime,
+          $Profit = $profit,
+          $ProfitPerHour = $profitPerHour,
+          $AdjustedProfitPerHour = $adjustedProfitPerHour,
+          $Priority = $adjustedProfitPerHour
+        ]"/>
+        
+        <set_value name="this.$result" exact="$analysis"/>
+      </actions>
+    </library>
+    
+    <!-- Trade Validation -->
+    <library name="ValidateTradeOffers" purpose="run_actions">
+      <params>
+        <param name="sellOffer" comment="Sell offer to validate"/>
+        <param name="buyOffer" comment="Buy offer to validate"/>
+        <param name="ship" comment="Trading ship"/>
+      </params>
+      <actions>
+        <set_value name="$isValid" exact="true"/>
+        <set_value name="$invalidReason" exact="''"/>
+        
+        <!-- Basic validation -->
+        <do_if value="not $sellOffer? or not $buyOffer?">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'Missing offers'"/>
+        </do_if>
+        <do_elseif value="$sellOffer.ware != $buyOffer.ware">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'Ware mismatch'"/>
+        </do_elseif>
+        <do_elseif value="$sellOffer.amount le 0 or $buyOffer.amount le 0">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'No stock/demand'"/>
+        </do_elseif>
+        <do_elseif value="$sellOffer.unitprice ge $buyOffer.unitprice">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'No profit'"/>
+        </do_elseif>
+        <do_elseif value="$sellOffer.owner.relationtoplayer lt 0 or $buyOffer.owner.relationtoplayer lt 0">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'Hostile stations'"/>
+        </do_elseif>
+        <do_elseif value="not $sellOffer.owner.canplayerdock or not $buyOffer.owner.canplayerdock">
+          <set_value name="$isValid" exact="false"/>
+          <set_value name="$invalidReason" exact="'Cannot dock'"/>
+        </do_elseif>
+        
+        <!-- Return validation result -->
+        <set_value name="$result" exact="table[
+          $IsValid = $isValid,
+          $Reason = $invalidReason
+        ]"/>
+        
+        <set_value name="this.$result" exact="$result"/>
+      </actions>
+    </library>
+    
+  </cues>
+</mdscript> 
