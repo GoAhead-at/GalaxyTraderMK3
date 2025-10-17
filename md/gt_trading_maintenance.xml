@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Trading_Maintenance" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- ========================================
+         GALAXY TRADER MK3 - MAINTENANCE TASKS
+         Background cleanup and ship recovery
+         ======================================== -->
+    
+    <!-- Periodic Cache Cleanup -->
+    <cue name="RouteCacheCleanup" instantiate="true" checkinterval="300s">
+      <conditions>
+        <check_value value="global.$GT_TradingData?"/>
+      </conditions>
+      <actions>
+        <!-- Clear outdated route cache entries -->
+        <set_value name="$cacheAge" exact="player.age - global.$GT_TradingData.$LastUpdate"/>
+        
+        <do_if value="$cacheAge gt 600s">
+          <set_value name="global.$GT_TradingData.$RouteCache" exact="table[]"/>
+          <set_value name="global.$GT_TradingData.$LastUpdate" exact="player.age"/>
+          <debug_text text="'[GalaxyTrader MK3] Route cache cleared'" chance="100"/>
+        </do_if>
+        
+        <!-- Clean trade cache (remove entries older than 10 minutes) -->
+        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.keys.count gt 0">
+          <set_value name="$cleanedEntries" exact="0"/>
+          <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
+          
+          <do_all exact="global.$GT_TradeCache.keys.count" counter="$wareIdx">
+            <set_value name="$wareKey" exact="global.$GT_TradeCache.keys.{$wareIdx}"/>
+            <set_value name="$wareCache" exact="global.$GT_TradeCache.{$wareKey}"/>
+            
+            <!-- Safety check -->
+            <do_if value="not $wareCache? or typeof $wareCache != datatype.table or not $wareCache.keys?">
+              <continue/>
+            </do_if>
+            
+            <do_all exact="$wareCache.keys.count" counter="$sellIdx">
+              <set_value name="$sellKey" exact="$wareCache.keys.{$sellIdx}"/>
+              <set_value name="$sellCache" exact="$wareCache.{$sellKey}"/>
+              
+              <!-- Safety check -->
+              <do_if value="not $sellCache? or typeof $sellCache != datatype.table or not $sellCache.keys?">
+                <continue/>
+              </do_if>
+              
+              <set_value name="$buyKeysToRemove" exact="[]"/>
+              <do_all exact="$sellCache.keys.count" counter="$buyIdx">
+                <set_value name="$buyKey" exact="$sellCache.keys.{$buyIdx}"/>
+                <set_value name="$cacheEntry" exact="$sellCache.{$buyKey}"/>
+                
+                <!-- Check if entry is too old -->
+                <do_if value="$cacheEntry.$Timestamp? and (player.age - $cacheEntry.$Timestamp) gt $cacheMaxAge">
+                  <append_to_list name="$buyKeysToRemove" exact="$buyKey"/>
+                  <set_value name="$cleanedEntries" operation="add"/>
+                </do_if>
+              </do_all>
+              
+              <!-- Remove old entries -->
+              <do_all exact="$buyKeysToRemove.count" counter="$i">
+                <remove_value name="$sellCache.{$buyKeysToRemove.{$i}}"/>
+              </do_all>
+            </do_all>
+          </do_all>
+          
+          <do_if value="$cleanedEntries gt 0">
+            <debug_text text="'[GalaxyTrader MK3] Trade cache cleanup: removed ' + $cleanedEntries + ' old entries'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clean up stale trade reservations (older than 5 minutes) -->
+        <do_if value="global.$GT_ActiveTradeReservations?">
+          <set_value name="$shipsToRemove" exact="[]"/>
+          <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$i">
+            <set_value name="$ship" exact="global.$GT_ActiveTradeReservations.keys.{$i}"/>
+            <set_value name="$reservation" exact="global.$GT_ActiveTradeReservations.{$ship}"/>
+            <set_value name="$age" exact="player.age - $reservation.$Timestamp"/>
+            
+            <!-- Remove if older than 5 minutes or ship no longer exists -->
+            <do_if value="$age gt 300s or not $ship.exists">
+              <append_to_list name="$shipsToRemove" exact="$ship"/>
+            </do_if>
+          </do_all>
+          
+          <do_all exact="$shipsToRemove.count" counter="$i">
+            <remove_value name="global.$GT_ActiveTradeReservations.{$shipsToRemove.{$i}}"/>
+          </do_all>
+          
+          <do_if value="$shipsToRemove.count gt 0">
+            <debug_text text="'[GT-FLEET] Cleaned up ' + $shipsToRemove.count + ' stale trade reservations'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Emergency Ship Recovery -->
+    <cue name="ShipRecovery" instantiate="true" checkinterval="60s">
+      <conditions>
+        <check_value value="global.$GT_Ships.keys.count gt 0"/>
+      </conditions>
+      <actions>
+        <!-- Check for stuck ships -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+          <do_all exact="$shipKeys.count" counter="$i">
+            <set_value name="$ship" exact="$shipKeys.{$i}"/>
+          
+            <do_if value="$ship.exists and $ship.isoperational">
+              <!-- Check if ship has been idle too long -->
+              <set_value name="$idleTime" exact="0s"/>
+              <do_if value="global.$GT_Ships.{$ship}.$LastUpdate?">
+                <set_value name="$idleTime" exact="player.age - global.$GT_Ships.{$ship}.$LastUpdate"/>
+              </do_if>
+              
+              <do_if value="$idleTime gt 300s and not $ship.order">
+                <!-- ✅ DEDUPLICATION FIX: Only add ship if not already in queue -->
+                <do_if value="not global.$GT_TradingQueue.$Ships.indexof.{$ship}">
+                  <debug_text text="'[GalaxyTrader MK3] Recovering idle ship: ' + $ship.knownname" chance="100"/>
+                  
+                  <!-- Add back to queue -->
+                  <append_to_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
+                  <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessTradingQueue"/>
+                </do_if>
+                
+                <!-- Update last activity -->
+                <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Clean up stale search locks (older than 60 seconds) -->
+        <do_if value="global.$GT_SearchLocks?">
+          <set_value name="$staleLocks" exact="0"/>
+          <set_value name="$lockKeys" exact="global.$GT_SearchLocks.keys.list"/>
+          <do_all exact="$lockKeys.count" counter="$i">
+            <set_value name="$ship" exact="$lockKeys.{$i}"/>
+            <set_value name="$lockTime" exact="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="(player.age - $lockTime) gt 60s">
+              <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+              <set_value name="$staleLocks" operation="add"/>
+            </do_if>
+          </do_all>
+          <do_if value="$staleLocks gt 0">
+            <debug_text text="'[GalaxyTrader MK3] Cleaned up ' + $staleLocks + ' stale search locks'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>
