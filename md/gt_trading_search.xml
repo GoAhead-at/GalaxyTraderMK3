@@ -71,10 +71,6 @@
         <set_value name="$bestScore" exact="0"/>
         <set_value name="$foundCachedTrade" exact="false"/>
         
-        <!-- FLEET COORDINATION: Store top trades for conflict resolution -->
-        <set_value name="$topTrades" exact="[]"/>
-        <set_value name="$maxAlternatives" exact="10"/> <!-- Keep top 10 trades as alternatives -->
-        
         <!-- ===== PHASE 1: CHECK TRADE CACHE WITH AGE VALIDATION ===== -->
         <signal_cue_instantly cue="SearchCachedTrades" param="table[
           $Ship = $ship,
@@ -82,8 +78,7 @@
           $MinROI = $minROI,
           $MinAbsoluteProfit = $minAbsoluteProfit,
           $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
-          $SkillLevel = $skillLevel,
-          $TopTrades = $topTrades
+          $SkillLevel = $skillLevel
         ]"/>
         
         <!-- Extract cache results from global return variable -->
@@ -110,14 +105,12 @@
             $SkillLevel = $skillLevel,
             $ThreatIntel = $gt_ThreatIntel,
             $FleetCoord = $gt_FleetCoord,
-            $AdvancedAnalytics = $gt_AdvancedAnalytics,
-            $TopTrades = $topTrades
+            $AdvancedAnalytics = $gt_AdvancedAnalytics
           ]"/>
           
           <!-- Extract live search results from global return variable -->
           <set_value name="$bestTrade" exact="@global.$GT_SearchResult.$BestTrade"/>
           <set_value name="$bestScore" exact="@global.$GT_SearchResult.$BestScore"/>
-          <set_value name="$topTrades" exact="@global.$GT_SearchResult.$TopTrades"/>
           <set_value name="$stationsEvaluated" exact="@global.$GT_SearchResult.$StationsEvaluated"/>
           <set_value name="$offersFound" exact="@global.$GT_SearchResult.$OffersFound"/>
         </do_if>  <!-- End of live trade search -->
@@ -129,18 +122,22 @@
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $bestTrade.$BuyOffer.ware.name + ' (x' + $bestTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestTrade.$SellOffer.owner.knownname + ' @ ' + ($bestTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestTrade.$Profit / 100) + ' Cr' + '\n  📊 Score: ' + $bestTrade.$Score + '\n  ⚠ Risk: ' + $bestTrade.$Risk" chance="100"/>
           </do_if>
           
-          <!-- FLEET COORDINATION: Check for route conflicts and select alternatives -->
-          <signal_cue_instantly cue="ResolveFleetConflicts" param="table[
-            $Ship = $ship,
-            $BestTrade = $bestTrade,
-            $BestScore = $bestScore,
-            $TopTrades = $topTrades
-          ]"/>
+          <!-- ✅ OPTIMIZED: Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
+          <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
+            <do_if value="not global.$GT_ActiveTradeReservations?">
+              <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
+            </do_if>
+            
+            <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
+              $BuyStation = $bestTrade.$BuyOffer.owner,
+              $SellStation = $bestTrade.$SellOffer.owner,
+              $Ware = $bestTrade.$BuyOffer.ware,
+              $Timestamp = player.age
+            ]"/>
+          </do_if>
           
-          <set_value name="$bestTrade" exact="@global.$GT_SearchResult.$SelectedTrade"/>
-          
-          <!-- Execute trade if not conflicted -->
-          <do_if value="$bestTrade">
+          <!-- Execute trade -->
+          <do_if value="true">
             <!-- Signal execution module -->
             <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
               $Ship = $ship,
@@ -252,7 +249,6 @@
         <set_value name="$gt_ThreatIntel" exact="$params.$ThreatIntel"/>
         <set_value name="$gt_FleetCoord" exact="$params.$FleetCoord"/>
         <set_value name="$gt_AdvancedAnalytics" exact="$params.$AdvancedAnalytics"/>
-        <set_value name="$topTrades" exact="$params.$TopTrades"/>
         
         <set_value name="$bestTrade" exact="null"/>
         <set_value name="$bestScore" exact="0"/>
@@ -317,53 +313,27 @@
           <match canbuildships="false"/>
         </find_station>
         
-        <!-- Merge and sort stations by distance -->
+        <!-- ✅ PERFORMANCE FIX: Merge stations without re-sorting (find_station already sorted them with sortbygatedistanceto) -->
         <set_value name="$stations" exact="[]"/>
         <do_if value="$factionPriority == 0">
+          <!-- Player only: use as-is (already sorted) -->
           <set_value name="$stations" exact="$playerStations"/>
         </do_if>
         <do_else>
-          <set_value name="$allStations" exact="[]"/>
+          <!-- Merge foreign (already sorted) + player (already sorted) = roughly sorted list -->
+          <!-- Both lists are pre-sorted by find_station with sortbygatedistanceto, so simple append is sufficient -->
           <do_if value="$factionPriority != 0">
             <do_all exact="$foreignStations.count" counter="$fs">
-              <append_to_list name="$allStations" exact="$foreignStations.{$fs}"/>
+              <append_to_list name="$stations" exact="$foreignStations.{$fs}"/>
             </do_all>
           </do_if>
           <do_all exact="$playerStations.count" counter="$ps">
-            <append_to_list name="$allStations" exact="$playerStations.{$ps}"/>
-          </do_all>
-          
-          <!-- Sort by distance -->
-          <do_all exact="$allStations.count" counter="$i">
-            <set_value name="$currentStation" exact="$allStations.{$i}"/>
-            <set_value name="$currentDistance" exact="@$homeSector.gatedistance.{$currentStation.sector}"/>
-            <do_if value="not $currentDistance?">
-              <set_value name="$currentDistance" exact="-1"/>
-            </do_if>
-            
-            <do_if value="$currentDistance ge 0">
-              <set_value name="$inserted" exact="false"/>
-              <do_all exact="$stations.count" counter="$j">
-                <do_if value="not $inserted">
-                  <set_value name="$compareDistance" exact="@$homeSector.gatedistance.{$stations.{$j}.sector}"/>
-                  <do_if value="not $compareDistance?">
-                    <set_value name="$compareDistance" exact="-1"/>
-                  </do_if>
-                  <do_if value="$currentDistance lt $compareDistance">
-                    <set_value name="$stations.{$j}" exact="$currentStation" operation="insert"/>
-                    <set_value name="$inserted" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_all>
-              <do_if value="not $inserted">
-                <append_to_list name="$stations" exact="$currentStation"/>
-              </do_if>
-            </do_if>
+            <append_to_list name="$stations" exact="$playerStations.{$ps}"/>
           </do_all>
         </do_else>
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Merged and sorted ' + $stations.count + ' stations'" chance="100"/>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Merged ' + $stations.count + ' stations (pre-sorted by distance)'" chance="100"/>
         </do_if>
         
         <!-- ===== COLLECT ALL TRADE OFFERS ===== -->
@@ -544,6 +514,10 @@
           <set_value name="$crossStationBestTrade" exact="null"/>
           <set_value name="$crossStationBestScore" exact="0"/>
           
+          <!-- ✅ OPTIMIZED: Dual-tracking for inline conflict resolution -->
+          <set_value name="$nonConflictedBestTrade" exact="null"/>
+          <set_value name="$nonConflictedBestScore" exact="0"/>
+          
           <!-- Match offers of same ware -->
           <do_all exact="$sellOffersByWare.keys.count" counter="$wareIdx">
             <set_value name="$ware" exact="$sellOffersByWare.keys.{$wareIdx}"/>
@@ -628,7 +602,7 @@
                         <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
                         <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($profit / $adjustedDistance) else $profit"/>
                         
-                        <!-- Check if best trade -->
+                        <!-- ✅ OPTIMIZED: Dual-tracking - always track best overall -->
                         <do_if value="$efficiency gt $crossStationBestScore">
                           <set_value name="$crossStationBestScore" exact="$efficiency"/>
                           
@@ -645,25 +619,29 @@
                             $Risk = 0
                           ]"/>
                           
-                          <!-- Add to top trades -->
-                          <append_to_list name="$topTrades" exact="$crossStationBestTrade"/>
-                          
-                          <!-- Sort and trim -->
-                          <do_if value="$topTrades.count gt 1">
-                            <do_all exact="$topTrades.count - 1" counter="$sortI">
-                              <do_all exact="$topTrades.count - $sortI" counter="$sortJ">
-                                <do_if value="$topTrades.{$sortJ}.$Score lt $topTrades.{$sortJ + 1}.$Score">
-                                  <set_value name="$tempTrade" exact="$topTrades.{$sortJ}"/>
-                                  <set_value name="$topTrades.{$sortJ}" exact="$topTrades.{$sortJ + 1}"/>
-                                  <set_value name="$topTrades.{$sortJ + 1}" exact="$tempTrade"/>
+                          <!-- ✅ OPTIMIZED: Inline conflict checking for fleet coordination -->
+                          <set_value name="$routeConflicted" exact="false"/>
+                          <do_if value="global.$GT_ActiveTradeReservations? and global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
+                            <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$resIdx">
+                              <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$resIdx}"/>
+                              <set_value name="$otherRoute" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
+                              
+                              <do_if value="$otherShip != $ship and $otherShip.exists">
+                                <do_if value="$otherRoute.$BuyStation == $sellOffer.owner and 
+                                              $otherRoute.$SellStation == $buyOffer.owner and 
+                                              $otherRoute.$Ware == $sellOffer.ware">
+                                  <set_value name="$routeConflicted" exact="true"/>
+                                  <break/>
                                 </do_if>
-                              </do_all>
+                              </do_if>
                             </do_all>
                           </do_if>
                           
-                          <do_while value="$topTrades.count gt 10">
-                            <remove_value name="$topTrades.{$topTrades.count}"/>
-                          </do_while>
+                          <!-- ✅ OPTIMIZED: Also track best non-conflicted trade (no bubble sort!) -->
+                          <do_if value="not $routeConflicted and $efficiency gt $nonConflictedBestScore">
+                            <set_value name="$nonConflictedBestScore" exact="$efficiency"/>
+                            <set_value name="$nonConflictedBestTrade" exact="$crossStationBestTrade"/>
+                          </do_if>
                           
                           <!-- Cache trade if Level 12+ -->
                           <do_if value="$skillLevel ge 12 and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
@@ -700,97 +678,31 @@
             </do_if>
           </do_all>
           
-          <!-- Use best cross-station trade if found -->
-          <do_if value="$crossStationBestTrade and $crossStationBestScore gt $bestScore">
+          <!-- ✅ OPTIMIZED: Smart trade selection - prefer non-conflicted, fallback to best overall -->
+          <do_if value="$nonConflictedBestTrade">
+            <set_value name="$bestTrade" exact="$nonConflictedBestTrade"/>
+            <set_value name="$bestScore" exact="$nonConflictedBestScore"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ✅ Selected non-conflicted trade (Score: ' + $nonConflictedBestScore + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$crossStationBestTrade">
             <set_value name="$bestTrade" exact="$crossStationBestTrade"/>
             <set_value name="$bestScore" exact="$crossStationBestScore"/>
-          </do_if>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ⚠️ Using best trade (Score: ' + $crossStationBestScore + ') - may conflict with active fleet routes'" chance="100"/>
+            </do_if>
+          </do_elseif>
         </do_if>
         
         <!-- Return results via global variable -->
         <set_value name="global.$GT_SearchResult" exact="table[
           $BestTrade = $bestTrade,
           $BestScore = $bestScore,
-          $TopTrades = $topTrades,
           $StationsEvaluated = $stationsEvaluated,
           $OffersFound = $offersFound
-        ]"/>
-      </actions>
-    </cue>
-    
-    <!-- Resolve Fleet Conflicts (Sub-module) -->
-    <cue name="ResolveFleetConflicts" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <actions>
-        <set_value name="$params" exact="event.param"/>
-        <set_value name="$ship" exact="$params.$Ship"/>
-        <set_value name="$bestTrade" exact="$params.$BestTrade"/>
-        <set_value name="$topTrades" exact="$params.$TopTrades"/>
-        
-        <!-- Check ship's individual fleet coordination setting -->
-        <set_value name="$shipFleetCoordination" exact="true"/>
-        <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$FleetCoordination?">
-          <set_value name="$shipFleetCoordination" exact="global.$GT_AIParameters.{$ship}.$FleetCoordination"/>
-        </do_if>
-        
-        <do_if value="$shipFleetCoordination">
-          <!-- Initialize conflict tracking if needed -->
-          <do_if value="not global.$GT_ActiveTradeReservations?">
-            <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
-          </do_if>
-          
-          <!-- Try to find a non-conflicted trade from the top trades list -->
-          <set_value name="$alternativeFound" exact="false"/>
-          <do_if value="$topTrades.count gt 0">
-            <do_all exact="$topTrades.count" counter="$tradeIdx">
-              <set_value name="$candidateTrade" exact="$topTrades.{$tradeIdx}"/>
-              <set_value name="$candidateConflicted" exact="false"/>
-              
-              <!-- Check if this trade conflicts with any active reservation -->
-              <do_if value="global.$GT_ActiveTradeReservations.keys.count gt 0">
-                <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$i">
-                  <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$i}"/>
-                  <set_value name="$otherTrade" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
-                  
-                  <!-- Check if same route (same stations and ware) -->
-                  <do_if value="$otherShip != $ship and $otherShip.exists">
-                    <do_if value="$otherTrade.$BuyStation == $candidateTrade.$BuyOffer.owner and $otherTrade.$SellStation == $candidateTrade.$SellOffer.owner and $otherTrade.$Ware == $candidateTrade.$BuyOffer.ware">
-                      <set_value name="$candidateConflicted" exact="true"/>
-                      <break/>
-                    </do_if>
-                  </do_if>
-                </do_all>
-              </do_if>
-              
-              <!-- If this trade is not conflicted, use it -->
-              <do_if value="not $candidateConflicted">
-                <set_value name="$bestTrade" exact="$candidateTrade"/>
-                <set_value name="$alternativeFound" exact="true"/>
-                
-                <do_if value="$tradeIdx gt 1">
-                  <debug_text text="'[GT-FLEET] (' + $ship.idcode + ') ✅ Alternative trade selected (#' + $tradeIdx + '/' + $topTrades.count + ')'" chance="100"/>
-                </do_if>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          
-          <!-- Reserve trade for this ship if found -->
-          <do_if value="$bestTrade">
-            <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
-              $BuyStation = $bestTrade.$BuyOffer.owner,
-              $SellStation = $bestTrade.$SellOffer.owner,
-              $Ware = $bestTrade.$BuyOffer.ware,
-              $Timestamp = player.age
-            ]"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Return selected trade via global variable -->
-        <set_value name="global.$GT_SearchResult" exact="table[
-          $SelectedTrade = $bestTrade
         ]"/>
       </actions>
     </cue>
