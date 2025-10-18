@@ -119,7 +119,7 @@
         <do_if value="$bestTrade">
           <!-- DEBUG: Trade execution with full details -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $bestTrade.$BuyOffer.ware.name + ' (x' + $bestTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestTrade.$SellOffer.owner.knownname + ' @ ' + ($bestTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestTrade.$Profit / 100) + ' Cr' + '\n  📊 Score: ' + $bestTrade.$Score + '\n  ⚠ Risk: ' + $bestTrade.$Risk" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $bestTrade.$BuyOffer.ware.name + ' (x' + $bestTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestTrade.$SellOffer.owner.knownname + ' @ ' + ($bestTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestTrade.$Profit / 100) + ' Cr' + '\n  📈 ROI: ' + @$bestTrade.$ROI + '%' + '\n  📊 Score: ' + $bestTrade.$Score + '\n  ⚠ Risk: ' + $bestTrade.$Risk" chance="100"/>
           </do_if>
           
           <!-- ✅ OPTIMIZED: Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
@@ -209,16 +209,93 @@
         <set_value name="$bestScore" exact="0"/>
         <set_value name="$foundCachedTrade" exact="false"/>
         
-        <!-- Check cache age -->
-        <set_value name="$cacheAge" exact="999s"/>
-        <do_if value="global.$GT_TradeCache.$LastUpdate?">
-          <set_value name="$cacheAge" exact="player.age - global.$GT_TradeCache.$LastUpdate"/>
-        </do_if>
+        <!-- Cache age check removed - not needed, individual entries have $Timestamp -->
+        <set_value name="$cacheAge" exact="0s"/>
         
-        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.keys.count gt 0">
-          <!-- Perform cache search (full logic from original - lines 741-983) -->
-          <!-- [Cache search logic would go here - keeping it brief for now] -->
-          <!-- This would be the full cache checking code from the original file -->
+        <!-- ✅ LIST-BASED CACHE: Iterate through flat list of trade entries -->
+        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.count gt 0">
+          <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
+          <set_value name="$checkedEntries" exact="0"/>
+          <set_value name="$validEntries" exact="0"/>
+          <set_value name="$expiredEntries" exact="0"/>
+          
+          <!-- DEBUG: Log cache status -->
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+            <debug_text text="'[GT-Cache-DEBUG] Cache has ' + global.$GT_TradeCache.count + ' trade entries'" chance="100"/>
+          </do_if>
+          
+          <!-- Iterate through flat list of cached trades -->
+          <do_all exact="global.$GT_TradeCache.count" counter="$i">
+            <set_value name="$cacheEntry" exact="global.$GT_TradeCache.{$i}"/>
+            <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
+            
+            <!-- Validate cache entry structure -->
+            <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
+              <continue/>
+            </do_if>
+            
+            <!-- Check if entry is too old (TTL filter) -->
+            <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
+            <do_if value="$entryAge gt $cacheMaxAge">
+              <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
+              <continue/>
+            </do_if>
+            
+            <!-- Validate offers still exist -->
+            <do_if value="not $cacheEntry.$BuyOffer.exists or not $cacheEntry.$SellOffer.exists">
+              <continue/>
+            </do_if>
+            
+            <!-- Validate stations still operational -->
+            <do_if value="not @$cacheEntry.$BuyOffer.owner.isoperational or not @$cacheEntry.$SellOffer.owner.isoperational">
+              <continue/>
+            </do_if>
+            
+            <!-- Check distance constraint -->
+            <do_if value="$cacheEntry.$Distance? and $cacheEntry.$Distance gt $maxDistance">
+              <continue/>
+            </do_if>
+            
+            <!-- Check profit constraint -->
+            <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit lt $minAbsoluteProfit">
+              <continue/>
+            </do_if>
+            
+            <!-- Calculate current score with distance penalty -->
+            <set_value name="$adjustedDistance" exact="$cacheEntry.$Distance * $distancePenaltyMultiplier"/>
+            <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($cacheEntry.$Profit / $adjustedDistance) else $cacheEntry.$Profit"/>
+            
+            <!-- Track best cached trade -->
+            <do_if value="$efficiency gt $bestScore">
+              <set_value name="$bestScore" exact="$efficiency"/>
+              <set_value name="$bestTrade" exact="table[
+                $BuyOffer = $cacheEntry.$BuyOffer,
+                $SellOffer = $cacheEntry.$SellOffer,
+                $Amount = $cacheEntry.$Amount,
+                $Profit = $cacheEntry.$Profit,
+                $ROI = $cacheEntry.$ROI,
+                $BuyPrice = $cacheEntry.$BuyPrice,
+                $SellPrice = $cacheEntry.$SellPrice,
+                $Distance = $cacheEntry.$Distance,
+                $Score = $efficiency,
+                $Risk = 0
+              ]"/>
+              <set_value name="$foundCachedTrade" exact="true"/>
+              <set_value name="$validEntries" exact="$validEntries + 1"/>
+            </do_if>
+          </do_all>
+          
+          <!-- DEBUG: Log cache retrieval results -->
+          <do_if value="@global.$GT_Config.$Debug.$Enabled">
+            <do_if value="@global.$GT_Config.$Debug.$LogLevel ge 2">
+              <do_if value="$foundCachedTrade">
+                <debug_text text="'[GT-Cache] ✅ Cache HIT for ' + $ship.idcode + ': Found cached trade (Score: ' + $bestScore + ', checked: ' + $checkedEntries + ', valid: ' + $validEntries + ', expired: ' + $expiredEntries + ')'" chance="100"/>
+              </do_if>
+              <do_else>
+                <debug_text text="'[GT-Cache] ❌ Cache MISS for ' + $ship.idcode + ': No valid cached trades (checked: ' + $checkedEntries + ', expired: ' + $expiredEntries + ')'" chance="100"/>
+              </do_else>
+            </do_if>
+          </do_if>
         </do_if>
         
         <!-- Return results via global variable -->
@@ -658,38 +735,50 @@
                             <set_value name="$nonConflictedBestTrade" exact="$crossStationBestTrade"/>
                           </do_if>
                           
-                          <!-- Cache trade if Level 12+ -->
-                          <do_if value="$skillLevel ge 12 and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
-                            <set_value name="$cacheProfitThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
-                            <do_if value="$roi ge $cacheProfitThreshold">
-                              <do_if value="not global.$GT_TradeCache.{$sellOffer.ware}?">
-                                <set_value name="global.$GT_TradeCache.{$sellOffer.ware}" exact="table[]"/>
-                              </do_if>
-                              <do_if value="not global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}?">
-                                <set_value name="global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}" exact="table[]"/>
-                              </do_if>
-                              
-                              <!-- ✅ CRITICAL FIX: Corrected BuyOffer/SellOffer assignment (was backwards!) -->
-                              <set_value name="global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}.{$buyOffer.owner}" exact="table[
-                                $BuyOffer = $buyOffer,
-                                $SellOffer = $sellOffer,
-                                $Amount = $maxAmount,
-                                $Profit = $profit,
-                                $ROI = $roi,
-                                $BuyPrice = $buyPrice,
-                                $SellPrice = $sellPrice,
-                                $Distance = $totalDistance,
-                                $Timestamp = player.age
-                              ]"/>
-                              
-                              <set_value name="global.$GT_TradeCache.$LastUpdate" exact="player.age"/>
-                              
-                              <!-- DEBUG: Log cache population (simplified to avoid crashes) -->
-                              <do_if value="@global.$GT_Config.$Debug.$Enabled and (@global.$GT_Config.$Debug.$LogLevel? and @global.$GT_Config.$Debug.$LogLevel ge 2)">
-                                <debug_text text="'[GT-Cache] ✅ Trade cached: ROI=' + $roi + '%, Profit=' + ($profit/100) + ' Cr, Distance=' + $totalDistance + ' jumps'" chance="100"/>
-                              </do_if>
-                            </do_if>
-                          </do_if>
+          <!-- Cache trade if Level 12+ -->
+          <do_if value="$skillLevel ge 12 and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
+            <set_value name="$cacheProfitThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+            <do_if value="$roi ge $cacheProfitThreshold">
+              <!-- ✅ FIX: Use string keys at ALL levels - X4 won't let you mix object keys with string keys -->
+              <!-- Convert ware object to string using ware.id property -->
+              <!-- ✅ LIST-BASED CACHE: Append trade entry to flat list -->
+              <!-- Validate required data exists before caching -->
+              <do_if value="$sellOffer.ware? and $sellOffer.owner? and $buyOffer.owner?">
+                <!-- Ensure cache list exists -->
+                <do_if value="not global.$GT_TradeCache?">
+                  <set_value name="global.$GT_TradeCache" exact="[]"/>
+                </do_if>
+                
+                <!-- Append trade entry as flat table to list -->
+                <append_to_list name="global.$GT_TradeCache" exact="table[
+                  $WareId = $sellOffer.ware.id,
+                  $WareName = $sellOffer.ware.name,
+                  $SellStationId = $sellOffer.owner.idcode,
+                  $BuyStationId = $buyOffer.owner.idcode,
+                  $SellOffer = $sellOffer,
+                  $BuyOffer = $buyOffer,
+                  $Amount = $maxAmount,
+                  $Profit = $profit,
+                  $ROI = $roi,
+                  $BuyPrice = $buyPrice,
+                  $SellPrice = $sellPrice,
+                  $Distance = $totalDistance,
+                  $Timestamp = player.age
+                ]"/>
+                
+                <!-- DEBUG: Log successful cache -->
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GT-Cache] ✅ Trade cached: ' + $sellOffer.ware.name + ', ROI=' + $roi + '%, Profit=' + ($profit/100) + ' Cr, Distance=' + $totalDistance + ' jumps'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- DEBUG: Log skipped cache (invalid data) -->
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GT-Cache] ⚠ Skipped caching trade with invalid data'" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_if>
+          </do_if>
                         </do_if>
                       </do_if>
                     </do_if>

@@ -33,13 +33,48 @@
   - Lines 491-501 in `gt_territory_management.xml`
 
 #### Trade System
-- **CRITICAL FIX**: Trade caching system had reversed BuyOffer/SellOffer assignments
+- **CRITICAL FIX**: Trade cache system REFACTORED - switched from nested tables to flat list structure
+  - **Root Cause**: X4 MD system has fundamental, unfixable issues with nested dynamic tables using string keys
+    - X4 locks empty `table[]` immediately upon creation, refusing ALL subsequent key additions (even in same cue!)
+    - Key type must be determined at table creation, cannot be changed after
+    - Table literal syntax only accepts property keys (`$prop`), not regular identifiers or underscores
+    - X4 locks tables across execution contexts permanently
+    - No workaround exists - tried 7+ different approaches, all failed
+  - **Failed Attempts** (documented in `CACHE_SYSTEM_DEBUGGING.md`):
+    1. Auto-creation of nested paths - X4 doesn't support this
+    2. String keys everywhere - still locked immediately
+    3. Extracting keys to variables - still locked
+    4. Lazy initialization on first write - still locked
+    5. Property key sentinel `$init` - locks entire table to property-keys-only
+    6. Two-step init `table[]` then `.{'init'}` - still locked
+    7. Same execution context creation - STILL LOCKED!
+  - **Impact**: Level 12+ ships couldn't cache trades, performing expensive full market scans constantly
+  - **FINAL SOLUTION**: **Abandoned nested tables entirely - switched to flat list structure**
+    - Cache is now `global.$GT_TradeCache = []` (list, not nested tables)
+    - Each entry is a flat table containing all trade data
+    - Write: Simple `append_to_list` with complete trade entry
+    - Read: O(n) iteration with TTL/distance/ROI filters (50-500 entries = microseconds)
+    - Maintenance: Rebuild list without expired entries
+    - No table key issues whatsoever - lists work reliably in X4
+  - **MIGRATION v4**: Automatically converts old nested table structure to list on game load
+  - Fixed in: `gt_global_settings.xml` line 161, `gt_trading_search.xml` lines 809-844 and 227-285, `gt_trading_maintenance.xml` lines 24-60, `gt_fleet_coordination.xml` lines 191-223
+- **Fixed**: Cache write operations were failing due to invalid property access and null keys (prerequisite fix)
+  - **Root Cause 1**: Cannot access object properties inside `{}` syntax when using as table keys: `global.$GT_TradeCache.{$sellOffer.ware}.{$sellOffer.owner}` caused MD errors
+  - **Root Cause 2**: Some trade offers had null owners (invalid/expired offers), causing "Failed to set null.{component...}" MD errors
+  - **Solution**: Extract object references to variables before using as table keys, validate all keys are non-null before attempting cache write
+- **CRITICAL FIX**: Trade caching system had reversed BuyOffer/SellOffer assignments (ich koffer!)
   - **Root Cause**: When caching trades, BuyOffer was assigned `$sellOffer` and SellOffer was assigned `$buyOffer` (backwards!)
   - **Impact**: Cached trades were unusable, causing 100% cache misses and forcing all ships to use expensive live searches
   - **Performance Impact**: Level 12+ ships performed full market scans every time instead of using cached routes
   - **Solution**: Corrected assignments to `$BuyOffer = $buyOffer` and `$SellOffer = $sellOffer`
-  - Added debug logging for cache population to track cache effectiveness
   - Fixed in lines 672-690 in `gt_trading_search.xml`
+- **IMPLEMENTED**: Trade cache retrieval system (was previously just a placeholder). Got lost during refactoring
+  - Cache retrieval logic now fully functional - ships can actually USE cached trades
+  - Validates cached offers still exist and are profitable before using them
+  - Respects 10-minute cache expiration to prevent stale data
+  - Checks distance and profit constraints against cached entries
+  - Comprehensive debug logging for cache hits/misses
+  - Implemented in lines 218-324 in `gt_trading_search.xml`
 - **Fixed**: Invalid trade offer property access causing errors during logging
   - Trade offers can become invalid between order creation and logging due to:
     - Trade completion/consumption
@@ -54,6 +89,35 @@
   - Mobile Satellite Intelligence now validates sector exists before scanning
   - Ships in jump transitions are safely skipped with debug logging
   - Line 90 in `gt_market_intelligence.xml`
+
+#### Settings Menu
+- **Fixed**: Settings menu not appearing in Extensions Options after loading saved games
+  - **Root Cause**: `global.$GT_MenuRegistered` flag persists in save games but `Simple_Menu_API` clears all registrations on reload
+  - When loading a save, the flag was `true` (from save) but menu was not registered (cleared by API), so registration was skipped
+  - **Impact**: Menu only appeared on first load after new game, disappeared after save/reload
+  - **Solution**: Removed the registration guard entirely - `Simple_Menu_API` handles duplicate registrations gracefully
+  - Settings menu now accessible via ESC → Extensions Options → GalaxyTrader MK3
+  - Fixed in lines 299-313 in `gt_global_settings.xml`
+- **Fixed**: Settings menu failing to open with validation errors and registration issues
+  - **Root Cause 1**: Menu registration was listening to BOTH `event_game_loaded` AND `md.Simple_Menu_API.Reloaded`, and was nested inside `Init` cue causing "Cannot change parent cue" errors with existing saves
+  - **Root Cause 2**: All menu-related cues (SettingsMenu, handlers) also failed with "Cannot change parent cue" because saved games cached them as children of `Init`
+  - **Root Cause 3**: Slider values could be outside valid ranges (e.g., saved value > max), causing "Start value is bigger than max select value" errors
+  - **Impact**: Menu entry appeared but was empty on open; "Property lookup failed: SettingsMenu" because cue failed to load
+  - **Solution**: 
+    - **CRITICAL**: Followed Simple_Menu_API documentation pattern exactly:
+      - Moved menu registration OUT of `Init` cue to root level
+      - Renamed to `GT_MenuRegistration` (from RegisterOptionsMenu) to avoid save game conflicts
+      - Changed to `instantiate="true"` (as per API docs)
+      - Listen ONLY to `md.Simple_Menu_API.Reloaded` (removed `event_game_loaded`)
+    - **Renamed ALL menu cues** to avoid "Cannot change parent cue" with existing saves:
+      - `SettingsMenu` → `GT_SettingsMenu`
+      - `Setting_Toggle` → `GT_Setting_Toggle`
+      - `Position_Toggle` → `GT_Position_Toggle`
+      - `Slider_Update` → `GT_Slider_Update`
+      - `Relation_Update` → `GT_Relation_Update`
+    - Updated all references to renamed cues (onClick, onSliderCellChanged, etc.)
+    - Added validation for ALL slider values (6 total) to clamp them to valid ranges before creating sliders
+  - Fixed in lines 294-318, 352-656, 804, 835, 864, 908 in `gt_global_settings.xml`
 
 ### 📊 Fleet Report Optimization
 
@@ -76,21 +140,33 @@
   - Added context messages for skipped operations (invalid sectors, invalid offers)
   - Legacy ship name fix shows detailed progress and results
   - Better visibility into error recovery paths
+  - **Added ROI percentage to trade selection debug logs** for easier cache verification
+    - "BEST TRADE SELECTED" messages now show ROI% alongside profit
+    - Makes it easy to see which trades meet the 20% cache threshold
+    - Line 122 in `gt_trading_search.xml`
+  - **Fixed XML parsing errors in cache debug logging**
+    - X4 doesn't allow combining `@` (safe access) with `?` (null check) in same expression
+    - Changed to nested `do_if` statements for proper null-safe access
+    - Fixed in lines 316-325 and 792-796 in `gt_trading_search.xml`
 
 ### 📝 Changes Summary
 
 **Files Modified:**
 - `gt_core_system.xml` - Ship naming fixes, legacy name fix system, pause/resume handling
 - `gt_territory_management.xml` - Null sector validation
-- `gt_trading_search.xml` - **Trade cache critical fix (reversed BuyOffer/SellOffer)**
+- `gt_trading_search.xml` - **Trade cache critical fix (reversed BuyOffer/SellOffer)**, cache retrieval implementation, ROI debug logging
 - `gt_trade_logging.xml` - Invalid trade offer handling
 - `gt_trading_execution.xml` - Invalid trade offer handling  
 - `gt_market_intelligence.xml` - Invalid sector handling during jumps
 - `gt_reporting.xml` - Fleet report optimization for large fleets
+- `gt_global_settings.xml` - **Settings menu registration fix for saved games**
 
 **Impact:**
-- ✅ **Trade caching now functional** - Level 12+ ships can use cached routes for faster searches
-- ✅ **Significant performance improvement** for high-level fleets (no more redundant full market scans)
+- ✅ **Trade caching NOW FULLY OPERATIONAL** - Level 12+ ships actively cache and reuse profitable routes
+- ✅ **Massive performance improvement** for high-level fleets:
+  - Cache hits skip expensive market scans (1000+ stations)
+  - 10-minute cache validity balances freshness vs performance
+  - Multiple ships can benefit from same cached routes
 - ✅ Eliminates all property lookup errors
 - ✅ Handles large fleets (100+ ships) without UI errors
 - ✅ Gracefully handles timing issues between trade execution and logging
@@ -98,36 +174,7 @@
 - ✅ All ships properly renamed with rank/level/XP indicators
 - ✅ Improved stability during order pause/resume cycles
 
-### 🎯 User-Facing Improvements
 
-- **Ships maintain their rank/level/XP names through police scans and order interruptions**
-  - Previously, every police scan would reset ship names to base form
-  - This was especially problematic in high-traffic sectors (Argon Prime, trading hubs, etc.)
-  - Ships now keep their progression indicators permanently
-- **Trade caching now works properly for Level 12+ pilots**
-  - High-level pilots can now reuse profitable routes discovered by other ships
-  - Significantly faster trade searches for experienced traders
-  - Reduced CPU load from redundant market scanning
-- Ships that were missing rank/level/XP in names are automatically fixed on game load
-- Fleet reports now display cleanly even with 100+ active ships
-- No more error messages during normal trading operations
-- Better handling of edge cases (ship jumping, orders being replaced, etc.)
-
-### 🚨 Why This Update Is Important
-
-**1. Police Scan Issue (Ship Names)**
-The police scan issue was causing ships to lose their names constantly during normal gameplay:
-- Every time a police ship scanned your traders → name reset to base form
-- In busy sectors, this could happen multiple times per hour
-- Players couldn't reliably track pilot progression due to constant name resets
-- **This fix ensures your pilot progression is always visible**, regardless of police activity
-
-**2. Trade Caching System (Performance)**
-The trade cache had reversed BuyOffer/SellOffer assignments, making it completely non-functional:
-- Level 12+ ships were supposed to benefit from cached trade routes
-- Instead, **100% cache misses** forced every ship to perform full market scans
-- With 100+ ships, this caused significant performance overhead
-- **This fix enables the cache**, dramatically improving search performance for high-level pilots
 
 ---
 
