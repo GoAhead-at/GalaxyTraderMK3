@@ -370,8 +370,8 @@
                   </do_if>
                   
                   <!-- Update ship name with current status -->
-                  <do_if value="$pilotData.$OriginalShipName?">
-                    <set_value name="$originalName" exact="$pilotData.$OriginalShipName"/>
+                  <do_if value="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+                    <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
                   </do_if>
                   <do_else>
                     <set_value name="$originalName" exact="$ship.knownname"/>
@@ -520,22 +520,13 @@
         <debug_text text="'[GalaxyTrader MK3] Ship order paused for ' + $ship.knownname + ': ' + $reason + ' (preserving XP: ' + $preserveData + ')'" chance="100"/>
         
         <!-- ============================================= -->
-        <!-- SHIP NAME RESTORATION (PRESERVE ORIGINAL)    -->
+        <!-- SHIP NAME PRESERVATION (DO NOT RESTORE)      -->
         <!-- ============================================= -->
+        <!-- NOTE: When pausing (not aborting), we KEEP the current ship name with rank/level/XP.
+             Name restoration to original only happens on permanent order removal (HandleShipOrderAborted).
+             This preserves the player's view of their pilot's progression even during order changes. -->
         
-        <set_value name="$originalName" exact="$pauseData.$OriginalName"/>
-        <do_if value="$originalName">
-          <set_object_name object="$ship" name="$originalName"/>
-          <debug_text text="'[GalaxyTrader MK3] Ship name restored from pauseData: ' + $originalName + ' (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
-        </do_if>
-        <do_elseif value="$pilot and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-          <set_value name="$storedOriginalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
-          <set_object_name object="$ship" name="$storedOriginalName"/>
-          <debug_text text="'[GalaxyTrader MK3] Ship name restored from pilot registry: ' + $storedOriginalName + ' (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
-        </do_elseif>
-        <do_else>
-          <debug_text text="'[GalaxyTrader MK3] WARNING: No original ship name found to restore for ' + $ship.knownname + ' (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
-        </do_else>
+        <debug_text text="'[GalaxyTrader MK3] Ship name PRESERVED during pause: ' + $ship.knownname + ' (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
         
         <!-- ============================================= -->
         <!-- SHIP MODIFICATION CLEANUP (PAUSE)           -->
@@ -704,8 +695,8 @@
               </do_if>
               
               <!-- Get original ship name and build new name -->
-              <do_if value="$pilotData.$OriginalShipName?">
-                <set_value name="$originalName" exact="$pilotData.$OriginalShipName"/>
+              <do_if value="global.$GT_Pilots.{$currentPilot}.$OriginalShipName?">
+                <set_value name="$originalName" exact="global.$GT_Pilots.{$currentPilot}.$OriginalShipName"/>
               </do_if>
               <do_else>
                 <set_value name="$originalName" exact="$ship.knownname"/>
@@ -719,11 +710,11 @@
               <do_if value="global.$GT_GlobalSettings.$ShipNaming.$DisplayStatus">
                 <set_value name="$statusText" exact="''"/>
                 <!-- ADVANCE takes priority - pilot is eligible for advancement exam -->
-                <do_if value="$pilotData.$XPBlocked?">
+                <do_if value="global.$GT_Pilots.{$currentPilot}.$XPBlocked?">
                   <set_value name="$statusText" exact="'ADVANCE'"/>
                 </do_if>
                 <!-- TRAINING only shown for non-advancement training -->
-                <do_elseif value="$pilotData.$TrainingInProgress? and not $pilotData.$XPBlocked?">
+                <do_elseif value="global.$GT_Pilots.{$currentPilot}.$TrainingInProgress? and not global.$GT_Pilots.{$currentPilot}.$XPBlocked?">
                   <set_value name="$statusText" exact="'[TRAINING]'"/>
                 </do_elseif>
                 
@@ -817,8 +808,9 @@
               <!-- New pilot is not registered - restore original name -->
               <debug_text text="'[GalaxyTrader MK3] New pilot is not registered GalaxyTrader - restoring original ship name'" chance="100"/>
               
-              <do_if value="$pilotData.$OriginalShipName?">
-                <set_value name="$originalName" exact="$pilotData.$OriginalShipName"/>
+              <!-- Get original name from the old pilot's data (being replaced) -->
+              <do_if value="$registeredPilotData.$Data.$OriginalShipName?">
+                <set_value name="$originalName" exact="$registeredPilotData.$Data.$OriginalShipName"/>
               </do_if>
               <do_else>
                 <set_value name="$originalName" exact="$ship.knownname"/>
@@ -836,6 +828,96 @@
       </actions>
     </cue>
 
+    <!-- One-Time Legacy Ship Name Fix (for ships active before fixes were applied) -->
+    <cue name="LegacyShipNameFix" instantiate="true">
+      <conditions>
+        <event_game_loaded/>
+        <check_value value="global.$GT_Initialized and not global.$GT_LegacyShipNamesFixed?"/>
+      </conditions>
+      <actions>
+        <!-- Mark as fixed so this only runs once -->
+        <set_value name="global.$GT_LegacyShipNamesFixed" exact="true"/>
+        <debug_text text="'[GalaxyTrader MK3] Running one-time legacy ship name fix...'" chance="100"/>
+        
+        <set_value name="$fixedCount" exact="0"/>
+        <set_value name="$skippedCount" exact="0"/>
+        
+        <!-- Check all registered GT ships -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+          <do_all exact="$shipKeys.count" counter="$i">
+            <set_value name="$ship" exact="$shipKeys.{$i}"/>
+            
+            <!-- Skip if ship no longer exists -->
+            <do_if value="not $ship.exists or not $ship.isoperational or not $ship.pilot">
+              <continue/>
+            </do_if>
+            
+            <!-- Check if pilot exists in registry -->
+            <do_if value="global.$GT_Pilots.{$ship.pilot}?">
+              <set_value name="$pilotData" exact="global.$GT_Pilots.{$ship.pilot}"/>
+              
+              <!-- Check if ship needs name update - ONLY if name is EXACTLY the original base name -->
+              <set_value name="$needsUpdate" exact="false"/>
+              
+              <!-- Ship needs update if it has the exact original name (no rank/level/XP added yet) -->
+              <do_if value="$pilotData.$OriginalShipName? and $ship.knownname == $pilotData.$OriginalShipName and $pilotData.$XP? and $pilotData.$XP gt 0">
+                <set_value name="$needsUpdate" exact="true"/>
+                <debug_text text="'[GT-Legacy] Ship ' + $ship.idcode + ' needs update: name matches original exactly'" chance="100"/>
+              </do_if>
+              <do_else>
+                <set_value name="$skippedCount" exact="$skippedCount + 1"/>
+              </do_else>
+              
+              <do_if value="$needsUpdate">
+                <!-- Store original name if not already stored -->
+                <do_if value="not $pilotData.$OriginalShipName?">
+                  <set_value name="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName" exact="$ship.knownname"/>
+                </do_if>
+                
+                <!-- Calculate current skill level from XP -->
+                <set_value name="$currentXP" exact="$pilotData.$XP"/>
+                <set_value name="$currentSkillLevel" exact="1"/>
+                <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds?">
+                  <do_all exact="15" counter="$level">
+                    <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$level}">
+                      <set_value name="$currentSkillLevel" exact="$level"/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                
+                <!-- Get rank title -->
+                <set_value name="$rankTitle" exact="'Lehrling'"/>
+                <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
+                  <set_value name="$rankIndex" exact="($currentSkillLevel / 3)i + 1"/>
+                  <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+                    <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+                  </do_if>
+                  <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+                    <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Update ship name -->
+                <do_if value="$pilotData.$XPBlocked?">
+                  <set_value name="$blockedLevel" exact="$pilotData.$BlockedLevel"/>
+                  <signal_cue_instantly cue="md.GT_XP_Training.UpdateShipName" param="table[$ship=$ship, $pilot=$ship.pilot, $xp=$currentXP, $level=$blockedLevel, $rank=$rankTitle, $nameType='blocked']"/>
+                </do_if>
+                <do_else>
+                  <signal_cue_instantly cue="md.GT_XP_Training.UpdateShipName" param="table[$ship=$ship, $pilot=$ship.pilot, $xp=$currentXP, $level=$currentSkillLevel, $rank=$rankTitle, $nameType='trader']"/>
+                </do_else>
+                
+                <set_value name="$fixedCount" exact="$fixedCount + 1"/>
+                <debug_text text="'[GalaxyTrader MK3] Fixed ship name: ' + $ship.idcode + ' (Pilot: ' + $ship.pilot.name + ', Level: ' + $currentSkillLevel + ', XP: ' + $currentXP + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <debug_text text="'[GalaxyTrader MK3] Legacy ship name fix complete: ' + $fixedCount + ' ships updated, ' + $skippedCount + ' ships already properly named'" chance="100"/>
+      </actions>
+    </cue>
+    
     <!-- Update All Ship Names Based on Configuration -->
     <cue name="UpdateAllShipNames" instantiate="true">
       <conditions>
