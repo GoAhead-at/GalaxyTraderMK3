@@ -212,6 +212,17 @@
         <!-- Cache age check removed - not needed, individual entries have $Timestamp -->
         <set_value name="$cacheAge" exact="0s"/>
         
+        <!-- ✅ CACHE REPLENISHMENT: Force live search if cache too small -->
+        <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.count lt 10">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
+            <debug_text text="'[GT-Cache] ⚠ Cache too small (' + global.$GT_TradeCache.count + ' entries) - forcing live search to replenish'" chance="100"/>
+          </do_if>
+          
+          <!-- Return null to trigger live search -->
+          <signal_cue_instantly cue="$params.$ResultCue" param="$bestTrade"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
         <!-- ✅ LIST-BASED CACHE: Iterate through flat list of trade entries -->
         <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.count gt 0">
           <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
@@ -241,8 +252,18 @@
               <continue/>
             </do_if>
             
-            <!-- Validate offers still exist -->
+            <!-- Validate offers still exist and are available -->
             <do_if value="not $cacheEntry.$BuyOffer.exists or not $cacheEntry.$SellOffer.exists">
+              <continue/>
+            </do_if>
+            
+            <!-- CRITICAL: Validate offers are still available (not out of stock) -->
+            <do_if value="not $cacheEntry.$BuyOffer.available or not $cacheEntry.$SellOffer.available">
+              <continue/>
+            </do_if>
+            
+            <!-- CRITICAL: Validate offers have sufficient amount -->
+            <do_if value="$cacheEntry.$BuyOffer.amount lt $cacheEntry.$Amount or $cacheEntry.$SellOffer.amount lt $cacheEntry.$Amount">
               <continue/>
             </do_if>
             
@@ -250,6 +271,11 @@
             <do_if value="not @$cacheEntry.$BuyOffer.owner.isoperational or not @$cacheEntry.$SellOffer.owner.isoperational">
               <continue/>
             </do_if>
+            
+            <!-- CRITICAL: Validate prices haven't changed unfavorably (allow 10% variance) -->
+            <!-- ❌ REMOVED: Stale price check was filtering out valid entries before querying fresh offers!
+                 The old logic read prices from cached tradeoffer objects which are stale.
+                 We should only validate against fresh prices AFTER querying fresh offers. -->
             
             <!-- Check distance constraint -->
             <do_if value="$cacheEntry.$Distance? and $cacheEntry.$Distance gt $maxDistance">
@@ -265,23 +291,109 @@
             <set_value name="$adjustedDistance" exact="$cacheEntry.$Distance * $distancePenaltyMultiplier"/>
             <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($cacheEntry.$Profit / $adjustedDistance) else $cacheEntry.$Profit"/>
             
-            <!-- Track best cached trade -->
+            <!-- ✅ DEBUG: Log each entry being considered -->
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+              <set_value name="$willQuery" exact="if $efficiency gt $bestScore then 'YES' else 'NO'"/>
+              <debug_text text="'[GT-Cache-DEBUG] Entry ' + $i + ': Ware=' + @$cacheEntry.$WareName + ', CachedEff=' + $efficiency + ', BestScore=' + $bestScore + ', WillQuery=' + $willQuery" chance="100"/>
+            </do_if>
+            
+            <!-- ✅ CACHE AS HINT: Re-query FRESH trade offers from the cached stations -->
             <do_if value="$efficiency gt $bestScore">
-              <set_value name="$bestScore" exact="$efficiency"/>
-              <set_value name="$bestTrade" exact="table[
-                $BuyOffer = $cacheEntry.$BuyOffer,
-                $SellOffer = $cacheEntry.$SellOffer,
-                $Amount = $cacheEntry.$Amount,
-                $Profit = $cacheEntry.$Profit,
-                $ROI = $cacheEntry.$ROI,
-                $BuyPrice = $cacheEntry.$BuyPrice,
-                $SellPrice = $cacheEntry.$SellPrice,
-                $Distance = $cacheEntry.$Distance,
-                $Score = $efficiency,
-                $Risk = 0
-              ]"/>
-              <set_value name="$foundCachedTrade" exact="true"/>
-              <set_value name="$validEntries" exact="$validEntries + 1"/>
+              <!-- ✅ CRITICAL FIX: Get ware and station objects from cached IDs, not stale tradeoffer references! -->
+              <!-- Ware objects don't go stale, so we can use the cached ware object directly -->
+              <set_value name="$ware" exact="$cacheEntry.$BuyOffer.ware"/>
+              
+              <!-- Stations: Try using cached station references first (faster) -->
+              <set_value name="$buyStation" exact="$cacheEntry.$BuyOffer.owner"/>
+              <set_value name="$sellStation" exact="$cacheEntry.$SellOffer.owner"/>
+              
+              <!-- Validate stations still exist and are operational -->
+              <do_if value="$buyStation.exists and $buyStation.isoperational and $sellStation.exists and $sellStation.isoperational and $ware">
+                <!-- Query FRESH sell offer from buy station (ship buys from their sell offer) -->
+                <find_sell_offer seller="$buyStation" wares="$ware" result="$freshBuyOffer">
+                  <match_seller tradesknownto="$ship.owner"/>
+                </find_sell_offer>
+                
+                <!-- Query FRESH buy offer from sell station (ship sells to their buy offer) -->
+                <find_buy_offer buyer="$sellStation" wares="$ware" result="$freshSellOffer">
+                  <match_buyer tradesknownto="$ship.owner"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <!-- Stations or ware no longer exist/operational - skip this entry -->
+                <set_value name="$freshBuyOffer" exact="null"/>
+                <set_value name="$freshSellOffer" exact="null"/>
+                
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <set_value name="$buyExists" exact="if $buyStation.exists then '1' else '0'"/>
+                  <set_value name="$sellExists" exact="if $sellStation.exists then '1' else '0'"/>
+                  <debug_text text="'[GT-Cache] ⚠ Cached stations no longer valid: Buy=' + $buyExists + ', Sell=' + $sellExists" chance="100"/>
+                </do_if>
+              </do_else>
+              
+              <!-- Validate fresh offers exist and are available -->
+              <do_if value="$freshBuyOffer and $freshBuyOffer.available and $freshSellOffer and $freshSellOffer.available">
+                <!-- Calculate fresh prices and profit -->
+                <set_value name="$freshBuyPrice" exact="$freshBuyOffer.unitprice"/>
+                <set_value name="$freshSellPrice" exact="$freshSellOffer.unitprice"/>
+                <set_value name="$freshMaxAmount" exact="[$freshBuyOffer.amount, $freshSellOffer.amount, $ship.cargo.free.all].min"/>
+                
+                <!-- Skip if no tradeable amount -->
+                <do_if value="$freshMaxAmount gt 0">
+                  <set_value name="$freshProfit" exact="($freshSellPrice - $freshBuyPrice) * $freshMaxAmount"/>
+                  
+                  <!-- ✅ CORRECT LOGIC: Calculate fresh ROI and check if it meets cache threshold -->
+                  <do_if value="$freshProfit gt 0">
+                    <!-- Calculate fresh ROI as percentage -->
+                    <set_value name="$freshROI" exact="(($freshSellPrice - $freshBuyPrice) * 100) / $freshBuyPrice"/>
+                    
+                    <!-- Get cache threshold from global settings (default 20%) -->
+                    <set_value name="$cacheThreshold" exact="20"/>
+                    <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+                      <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+                    </do_if>
+                    
+                    <!-- Check if fresh ROI still meets or exceeds cache threshold -->
+                    <do_if value="$freshROI ge $cacheThreshold and $freshProfit ge $minAbsoluteProfit">
+                      <!-- ✅ CACHE HIT: Fresh trade still meets acceptance criteria! -->
+                      <set_value name="$bestScore" exact="$efficiency"/>
+                      <set_value name="$bestTrade" exact="table[
+                        $BuyOffer = $freshBuyOffer,
+                        $SellOffer = $freshSellOffer,
+                        $Amount = $freshMaxAmount,
+                        $Profit = $freshProfit,
+                        $ROI = $freshROI,
+                        $BuyPrice = $freshBuyPrice,
+                        $SellPrice = $freshSellPrice,
+                        $Distance = $cacheEntry.$Distance,
+                        $Score = $efficiency,
+                        $Risk = 0
+                      ]"/>
+                      <set_value name="$foundCachedTrade" exact="true"/>
+                      <set_value name="$validEntries" exact="$validEntries + 1"/>
+                      
+                      <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                        <debug_text text="'[GT-Cache] ✅ FRESH offers validated for cached trade: ' + $ware.name + ' (CachedROI=' + $cacheEntry.$ROI + '%, FreshROI=' + $freshROI + '%, Threshold=' + $cacheThreshold + '%, Profit=' + ($freshProfit/100) + ' Cr)'" chance="100"/>
+                      </do_if>
+                    </do_if>
+                    <do_else>
+                      <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                        <debug_text text="'[GT-Cache] ⚠ Fresh trade below threshold: ' + $ware.name + ' (FreshROI=' + $freshROI + '%, Threshold=' + $cacheThreshold + '%, Profit=' + ($freshProfit/100) + ' Cr)'" chance="100"/>
+                      </do_if>
+                    </do_else>
+                  </do_if>
+                  <do_else>
+                    <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                      <debug_text text="'[GT-Cache] ⚠ Fresh trade not profitable: ' + $ware.name + ' (Profit=' + ($freshProfit/100) + ' Cr)'" chance="100"/>
+                    </do_if>
+                  </do_else>
+                </do_if>
+              </do_if>
+              <do_else>
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                  <debug_text text="'[GT-Cache] ⚠ Fresh offers not available for cached trade: ' + $ware.name" chance="100"/>
+                </do_if>
+              </do_else>
             </do_if>
           </do_all>
           
@@ -750,13 +862,16 @@
                 </do_if>
                 
                 <!-- Append trade entry as flat table to list -->
+                <!-- ✅ CRITICAL: Store from SHIP's perspective!
+                     Ship BUYS from station's SELL offer
+                     Ship SELLS to station's BUY offer -->
                 <append_to_list name="global.$GT_TradeCache" exact="table[
                   $WareId = $sellOffer.ware.id,
                   $WareName = $sellOffer.ware.name,
-                  $SellStationId = $sellOffer.owner.idcode,
-                  $BuyStationId = $buyOffer.owner.idcode,
-                  $SellOffer = $sellOffer,
-                  $BuyOffer = $buyOffer,
+                  $SellStationId = $buyOffer.owner.idcode,
+                  $BuyStationId = $sellOffer.owner.idcode,
+                  $BuyOffer = $sellOffer,
+                  $SellOffer = $buyOffer,
                   $Amount = $maxAmount,
                   $Profit = $profit,
                   $ROI = $roi,
