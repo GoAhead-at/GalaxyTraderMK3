@@ -4,553 +4,119 @@ GalaxyTrader MK3 - Changelog
 Version 0.4.0 - 2025-10-18
 --------------------------
 
-MAJOR REFACTOR: Diff Patch Trade System Migration
-  - ISSUE: Complex event monitoring system causing maintenance problems
-    - event_player_trade_completed monitoring required complex buyer/seller matching
-    - global.$GT_TradingData.$ActiveTrades tracking with BuyCompleted/SellCompleted state machine
-    - Stale entry cleanup code needed to prevent memory leaks
-    - Limited trade data available (only basic price/amount)
-    - Difficult to debug and maintain
-  
-  - ROOT CAUSE: Relying on X4 game events instead of native trade order system
-    - event_player_trade_completed fires AFTER trade completes (reactive)
-    - Must manually match trades to ships using buyer/seller checks
-    - No access to internal trade data (quality, exact failure reasons, etc.)
-    - Race conditions with stale tracking data
-  
-  - SOLUTION: Diff patch X4's native order.trade.perform.xml
-    - Inject signal code directly into X4's native trade execution
-    - Signals fire immediately when trades complete or fail
-    - Full access to internal trade data from X4 engine
-    - No tracking tables needed - everything event-driven
-  
-  - IMPLEMENTATION PHASES:
-    
-    Phase 1: Enhanced Diff Patch (aiscripts/order.trade.perform.xml)
-      - Added trade failure signal detection (before finish label)
-        - Captures all 14+ X4 failure reasons (ERR_TRADEPARTNER_DESTROYED, etc.)
-        - Includes failure text, ware, partner station, buy/sell phase
-        - Queues failure data in global.$GT_TradeFailureQueue
-      - Added buy completion signal (analytics)
-        - Tracks buy phase separately for future trade timing analysis
-        - Includes transferred amount, unit price, partner, timestamp
-        - Queues buy data in global.$GT_BuyCompleteQueue
-      - Enhanced sell completion signal (existing XP system)
-        - Already working for XP calculation
-        - Includes quality bonus, distance bonus, value multiplier
-    
-    Phase 2: Unified Signal Listener (md/gt_trading_signals.xml - NEW FILE)
-      - ProcessTradeSuccess: Routes completed trades to all systems
-        - XP Training: ProcessSingleXPEvent for immediate XP award
-        - Trade Logging: LogCompletedTrade with rich data
-        - Fleet Coordination: Release trade reservations
-        - Auto-Repair: Check hull percentage and trigger repairs
-        - AI Notification: Signal ship that trade is complete
-      - ProcessTradeFailure: Routes failed trades to handlers
-        - Failure Handler: Logs failure, notifies AI, releases reservations
-        - Cargo Safety: Detects destroyed sell stations, triggers recovery
-      - Event-driven architecture (0.05s checkinterval, negligible overhead)
-    
-    Phase 3: Updated Trade Logging (md/gt_trade_logging.xml)
-      - New LogCompletedTrade cue for diff patch data
-      - Uses rich trade data: transferredAmount, quality bonus, distance bonus
-      - Updates global statistics: global.$GT_TradeStats.$TotalTrades/Profit
-      - Clean integration with existing logbook system
-    
-    Phase 4: Cleanup Old System (md/gt_trading_execution.xml)
-      - Removed ActiveTrades tracking (lines 121-130)
-        - No longer initializing global.$GT_TradingData.$ActiveTrades
-        - No longer recording $StartTime, $Trade per ship
-        - Diff patch signals make this obsolete
-      - Removed TradeCompleted event cue (140+ lines, lines 188-326)
-        - Complex buyer/seller matching logic removed
-        - BuyCompleted/SellCompleted state machine removed
-        - Stale entry cleanup code removed
-        - All functionality replaced by gt_trading_signals.xml
-    
-    Phase 5: AI Script Updates (aiscripts/order.trade.galaxytrader.xml)
-      - Added GT_Trade_Failed interrupt handler (lines 655-665)
-        - Captures event.param2 as $failureReason
-        - Logs failure with full reason text
-        - Sets $tradeFailed flag and resumes main loop
-      - Enhanced GT_Trade_Completed interrupt (lines 645-653)
-        - Sets $tradeComplete flag for future logic branches
-        - Better debug logging
-      - Both signals resume to same label (trade_completed) for unified handling
-  
-  - BENEFITS GAINED:
-    
-    Removed Complexity:
-      - ✅ No more global.$GT_TradingData.$ActiveTrades tracking table
-      - ✅ No more BuyCompleted/SellCompleted state machine
-      - ✅ No more buyer/seller matching logic
-      - ✅ No more stale entry cleanup code
-      - ✅ ~140 lines of complex event monitoring removed
-    
-    New Features:
-      - ✅ Rich trade data from X4 internals (actual transferred amounts, quality, etc.)
-      - ✅ Exact failure reasons (14+ error codes: destroyed, blacklisted, insufficient funds, etc.)
-      - ✅ Immediate signal on completion (no polling, no delay)
-      - ✅ Natural integration with Cargo Safety system (detects destroyed stations)
-      - ✅ Better logging with real trade statistics
-      - ✅ Buy/Sell phase analytics available for future features
-    
-    Performance:
-      - ✅ Reduced global state (no ActiveTrades table)
-      - ✅ Event-driven (0.05s checkinterval vs constant polling)
-      - ✅ Cleaner code flow (signal → route → process)
-      - ✅ Easier to debug (signals fire at exact moment of completion/failure)
-  
-  - MIGRATION NOTES:
-    - Old saves: ActiveTrades data will remain in save but is harmless (unused)
-    - No save game breaking changes
-    - Immediate benefits on next trade completion
-    - Cargo Safety system ready for future implementation
-  
-  - FILES CHANGED:
-    - Modified: aiscripts/order.trade.perform.xml (added failure & buy signals)
-    - Created: md/gt_trading_signals.xml (centralized signal router)
-    - Modified: md/gt_trade_logging.xml (added LogCompletedTrade cue)
-    - Modified: md/gt_trading_execution.xml (removed ActiveTrades & TradeCompleted)
-    - Modified: md/gt_xp_training.xml (removed DirectTradeComplete, now uses gt_trading_signals)
-    - Modified: aiscripts/order.trade.galaxytrader.xml (added failure interrupt)
-  
-  - CRITICAL FIX 1: Removed DirectTradeComplete Race Condition
-    - The old DirectTradeComplete cue in gt_xp_training.xml was competing with the new
-      gt_trading_signals.xml ProcessTradeSuccess cue for the same queue
-    - Both were checking global.$GT_DirectTradePending with different intervals (0.1s vs 0.05s)
-    - Old cue was winning and consuming the queue before new routing could happen
-    - Removed DirectTradeComplete (60 lines) - ProcessTradeSuccess now routes directly to ProcessSingleXPEvent
-    - Ensures gt_trading_signals.xml properly handles all routing (XP, logging, fleet, auto-repair, AI)
-  
-  - CRITICAL FIX 2: Inlined Signal Handlers for Proper Execution
-    - Issue: HandleFleetCoordination, HandleAutoRepair, HandleAINotification cues were not executing
-    - Root cause: signal_cue_instantly with instantiate="true" cues doesn't work as expected
-    - The separate handler cues were never being triggered properly
-    - Solution: Inlined all handler logic directly into ProcessTradeSuccess and ProcessTradeFailure
-    - Benefits:
-      - All signals now execute reliably (fleet, AI, logging, auto-repair)
-      - Better performance (no intermediate cue instantiation)
-      - Simpler debugging (all logic in one place)
-      - Reduced MD overhead
-    - Removed 80+ lines of obsolete handler cues
-    - Now produces complete log output: [GT-Fleet], [GT-AI], [GT-Failure] messages
-  
-  - CRITICAL FIX 3: Trade Logging Subordinate Inheritance
-    - Issue: Subordinate ships not logging trades even when commander has logbook enabled
-    - Root cause: LogCompletedTrade only checked ship's direct order, not commander's settings
-    - Code only checked: @$ship.defaultorder.id == 'GalaxyTraderMK3' and @$ship.defaultorder.$logbookentries
-    - Subordinates have defaultorder.id == 'Assist', so check failed
-    - Solution: Added subordinate inheritance check
-      - Now also checks: @$ship.defaultorder.id == 'Assist' and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'
-      - Subordinates now inherit logbookentries setting from their commander
-    - Expected result: All subordinate ships will now log trades when commander has logbook enabled
-    - Fixed in: gt_trade_logging.xml lines 223-225
+MAJOR: Trade Completion System Refactor
+  - Replaced event_player_trade_completed monitoring with diff patch system
+  - Created aiscripts/order.trade.perform.xml (diff patch for X4 native trade orders)
+  - Created md/gt_trading_signals.xml (centralized signal router)
+  - Removed ~140 lines of complex event monitoring from gt_trading_execution.xml
+  - Trade completion/failure now detected via direct X4 engine signals
+  - Better trade data (exact amounts, quality, failure reasons)
+  - Better performance (event-driven, no polling)
+  - Fixed: Subordinate ships now log trades correctly
 
 Version 0.3.8 - 2025-10-18
 --------------------------
 
-Training System - Removed Testing Mode Duration
-  - ISSUE: AI training script still using hardcoded 30s testing duration
-    - Log showed: "Level 6 training duration: 30s (TESTING MODE - dynamic calculation ready but disabled)"
-    - MD script properly calculated production durations (10-20 minutes based on level)
-    - AI script ignored MD-calculated duration and used hardcoded 30s
-  - ROOT CAUSE: Forgotten test code in AI script
-    - Lines 146-165 in order.dock.train.xml had commented-out production code
-    - Active code used `$trainingDuration = 30` hardcoded value
-    - Wait statement used `exact="30s"` instead of `exact="$trainingDuration"`
-  - SOLUTION: Use duration calculated and stored by MD script
-    - MD script calculates duration based on config (gt_xp_training.xml lines 1217-1225)
-    - Duration stored in `global.$GT_Pilots.{pilot}.$TrainingDuration`
-    - AI script now reads this stored value
-    - Fallback to 10 minutes if value not set (should never happen)
-    - Wait statement uses variable duration: `exact="$trainingDuration"`
-  - Benefits:
-    - ✅ Training duration now matches configuration
-    - ✅ Progressive difficulty: higher levels = longer training
-    - ✅ Consistent with MD script calculation
-    - ✅ No more misleading "TESTING MODE" messages
-  - Fixed in: aiscripts/order.dock.train.xml lines 145-157
+Training System
+  - Fixed: Training duration now uses configured values (not hardcoded 30s)
+  - Fixed in: order.dock.train.xml
 
-Trade Cache - Cache Replenishment System
-  - ISSUE: Cache degradation over time leading to performance loss
-    - Initial state: Cache has many entries → Fast cache hits ✓
-    - Problem: Cache hits don't trigger live searches → No new entries added
-    - Degradation: Entries expire (TTL) or consumed → Cache shrinks over time
-    - End state: Cache becomes empty → 100% live searches → No benefit!
-  - ROOT CAUSE: Cache-only approach leads to starvation
-    - Ships always check cache first
-    - Cache hits prevent live searches
-    - No mechanism to replenish expired/consumed entries
-    - Cache gradually depletes until empty
-  - SOLUTION: Minimum cache size threshold
-    - Before checking cache, verify cache has at least 10 entries
-    - If cache.count < 10: Skip cache, force live search
-    - Live search replenishes cache with new profitable routes
-    - Simple, predictable behavior
-  - Implementation:
-    - Added check at start of SearchCachedTrades (lines 215-224)
-    - Threshold: 10 entries minimum
-    - Debug logging: Shows when cache replenishment triggered
-    - Returns null immediately to trigger live search
-  - Benefits:
-    - ✅ Self-sustaining cache - Never fully depletes
-    - ✅ Automatic replenishment when cache gets low
-    - ✅ Maintains performance - Most searches still use cache
-    - ✅ Simple logic - Easy to understand and predict
-    - ✅ No complex probabilistic refresh needed
-  - Expected behavior:
-    - Cache starts with 0 entries → Ships do live searches → Cache fills
-    - Cache reaches 10+ entries → Ships use cache → Fast!
-    - Cache drops below 10 → Live searches resume → Cache refills
-    - Steady state: Cache maintains 10-30 entries automatically
-  - Fixed in: gt_trading_search.xml lines 215-224
+Trade Cache
+  - Added: Cache replenishment system (forces live search if cache < 10 entries)
+  - Cache now self-sustaining and never fully depletes
+  - Fixed in: gt_trading_search.xml
 
-========================================
+Version 0.3.7 - 2025-10-18
+--------------------------
 
-Version 0.3.7 - 2025-10-18 (MULTIPLE ITERATIONS)
--------------------------------------------------
-
-Trade Cache - CRITICAL FIX: Stale Tradeoffer Objects Causing Order Failures (Final Fix)
-  - CRITICAL: Cached trades failing with "unzureichende Geldmittel" (insufficient funds) error
-  - CRITICAL: Ships repeatedly getting same cached trade, orders fail instantly, infinite restart loop
-  - CRITICAL: Cache lookup errors: "Evaluated value 'faction.player' is not of type component"
-  - ROOT CAUSE 1: Cache stored actual tradeoffer objects which become STALE
-    - X4 internally invalidates old tradeoffer references
-    - Prices change but cached tradeoffer objects hold old prices
-    - X4 rejects stale tradeoffer objects with misleading error messages
-  - ROOT CAUSE 2: Wrong parameter type in find_sell_offer/find_buy_offer calls
-    - Used tradepartner="$ship.owner" (faction) instead of match_seller child element
-    - X4 expects tradepartner to be a component (station), not a faction
-    - Caused all cache queries to fail with type errors
-  - SYMPTOMS:
-    - Manual trade orders work fine (use fresh tradeoffers from UI)
-    - Cached trades fail instantly even when stations accessible & prices good
-    - Log shows "CurrentPrice: 440 Cr, CACHED: 547 Cr" (outdated references)
-    - Ships loop: assign trade → fail → reassign same trade → fail → repeat
-    - Cache lookups fail: "Fresh offers not available" for all cached trades
-    - MD errors: "faction.player is not of type component" (2 per cache lookup)
-  - SOLUTION: Cache as HINT + correct tradeoffer query syntax + smart validation
-    - Cache stores: Station IDs, Ware ID, Expected ROI (metadata only, as hint)
-    - When using cache: Re-query FRESH trade offers from cached stations
-    - Use <match_seller tradesknownto="$ship.owner"/> child element (NOT tradepartner attribute)
-    - Validate fresh offers using acceptance criteria (NOT comparing to cached values):
-      * Fresh ROI >= cache threshold? (e.g. if threshold=5%, accept 9% even if cached was 10%)
-      * Fresh profit >= minimum absolute profit?
-      * Fresh offers exist and available?
-    - If validation passes: CACHE HIT with fresh, valid tradeoffer objects
-    - Create orders with FRESH tradeoffer objects, not stale cached references
-  - Implementation:
-    - Lines 290-355 in gt_trading_search.xml: SearchCachedTrades cue
-    - Extract station/ware from cache entry
-    - Query fresh offers with correct syntax:
-      <find_sell_offer seller="$station" wares="$ware" result="$offer">
-        <match_seller tradesknownto="$ship.owner"/>
-      </find_sell_offer>
-    - Calculate fresh ROI from fresh prices
-    - Validate: fresh ROI >= cache threshold (e.g. 9% >= 5% = accept!)
-    - Validate: fresh profit >= minimum absolute profit
-    - Use fresh tradeoffer objects with fresh prices in $bestTrade table
-    - Result: Cache HIT with updated but still valid conditions
-  - Benefits:
-    - Cache provides performance boost (hints about profitable routes)
-    - Orders always use current, valid tradeoffer references
-    - Eliminates "insufficient funds" errors caused by stale references
-    - Eliminates type errors in cache lookups
-    - Ships can successfully execute cached trades
-    - Smart validation: cached 10% ROI → fresh 9% ROI → still accepted if threshold=5%
-    - Cache hits still work even when market conditions change slightly
-  - Debug logging: Shows cached ROI, fresh ROI, and threshold comparison
-  - Fixed in: gt_trading_search.xml lines 290-370
-  
-  - ITERATION 2: Station Validation Fix (INCOMPLETE)
-    - ISSUE: Cache was still showing "Fresh offers not available" for all entries
-    - DISCOVERY: Only 1 out of 26 cached entries was reaching the fresh offer query stage
-      * Most entries filtered out early (expired TTL, distance, profit constraints)
-      * The one remaining entry kept failing to query fresh offers
-    - ROOT CAUSE: Initial fix tried to look up stations by IDCode, but X4 doesn't support find_object with idcode
-    - ACTUAL FIX: Station objects in cache don't go stale (unlike tradeoffer objects)
-      * Stations can be safely reused from cache: $cacheEntry.$BuyOffer.owner
-      * Wares can be safely reused from cache: $cacheEntry.$BuyOffer.ware
-      * Only tradeoffers themselves go stale!
-    - SOLUTION: Validate cached station objects still exist and are operational
-      * Check $buyStation.exists and $buyStation.isoperational
-      * Check $sellStation.exists and $sellStation.isoperational
-      * If valid, query fresh offers using those stations
-      * If invalid, skip entry (station was destroyed or deactivated)
-    - Added debug logging to show entry-by-entry evaluation:
-      * Entry number, ware name, cached efficiency, best score, will query?
-      * Helps diagnose which entries pass filters and which get queried
-    - Fixed in: gt_trading_search.xml lines 298-328
-  
-  - ITERATION 3: Removed Stale Price Pre-Filter
-    - ISSUE: Only 1 out of 23-37 cache entries was passing filters to reach fresh offer queries
-    - DISCOVERY: Lines 265-274 had a pre-filter checking prices from cached tradeoffer objects
-      * `$cacheEntry.$BuyOffer.unitprice` and `$cacheEntry.$SellOffer.unitprice`
-      * These are STALE tradeoffer objects with outdated prices!
-      * Pre-filter rejected entries if current price < 90% of cached price
-      * But "current" price was actually the STALE cached price, not live price
-    - ROOT CAUSE: Price validation was happening BEFORE querying fresh offers
-      * Most cache entries have price changes > 10% (market is dynamic)
-      * Pre-filter eliminated 22 out of 23 entries based on stale data
-      * Only entries with unchanged prices reached fresh offer queries
-      * Defeated the entire purpose of "cache as hint" architecture
-    - SOLUTION: Removed stale price pre-filter entirely (lines 265-274 deleted)
-      * Distance and profit constraints still apply (using cached metadata)
-      * TTL check still applies (removes old entries)
-      * But NO price validation until AFTER fresh offers are queried
-      * Fresh offer validation happens at lines 330-370 using live prices
-    - EXPECTED RESULT: All non-expired, in-range cache entries will now query fresh offers
-      * More entries reach the fresh offer query stage
-      * More chances for cache hits even when prices change
-      * Cache truly acts as "hint" about profitable routes
-      * Fresh validation ensures only executable trades are used
-    - Fixed in: gt_trading_search.xml lines 265-268 (removed stale price check)
-  
-  - ITERATION 4 (FINAL): Fixed Swapped BuyOffer/SellOffer in Cache
-    - ISSUE: Cache says "Fresh offers not available" for Verbundwerkstoffe, Elektronikkomponenten, etc.
-      * Then live search immediately finds and caches THE SAME WARES!
-      * User reported: "it states no fresh offers available. but then in the live market search it writes those into the cache"
-      * User insight: "could it be you swapped the buy and sell station for the cache query validation?"
-    - DISCOVERY: BuyOffer/SellOffer were stored with inconsistent perspective
-      * Cache WRITE (lines 877-881):
-        - `$BuyOffer = $buyOffer` (station's buy offer = where ship SELLS)
-        - `$SellOffer = $sellOffer` (station's sell offer = where ship BUYS)
-      * Cache READ (lines 296-297):
-        - `$buyStation = $cacheEntry.$BuyOffer.owner` (expected buy station, got sell station!)
-        - `$sellStation = $cacheEntry.$SellOffer.owner` (expected sell station, got buy station!)
-    - ROOT CAUSE: Naming convention confusion between station perspective vs ship perspective
-      * Station's "buy offer" = station BUYS from ship = ship SELLS to station
-      * Station's "sell offer" = station SELLS to ship = ship BUYS from station
-      * Cache write used station perspective, cache read expected ship perspective
-      * Result: We queried the WRONG STATIONS for the WRONG OFFER TYPES!
-        - Asked buy station (actually sell station) for sell offers ❌
-        - Asked sell station (actually buy station) for buy offers ❌
-    - SOLUTION: Store cache entries from SHIP's perspective consistently
-      * Cache write now stores (lines 880-881):
-        - `$BuyOffer = $sellOffer` (ship buys from station's sell offer)
-        - `$SellOffer = $buyOffer` (ship sells to station's buy offer)
-        - `$BuyStationId = $sellOffer.owner.idcode` (station where ship buys)
-        - `$SellStationId = $buyOffer.owner.idcode` (station where ship sells)
-      * Cache read unchanged - now correctly queries:
-        - `$buyStation` → get sell offers (ship buys from station's sell offer) ✓
-        - `$sellStation` → get buy offers (ship sells to station's buy offer) ✓
-    - SIDE EFFECT: The multiple-offer query workaround (Iteration 4, first attempt) was unnecessary
-      * Real problem was asking wrong stations, not single-result query limitation
-      * Reverted to simpler single-result queries with specific ware filter
-      * Now works correctly because we're querying the right stations
-    - EXPECTED RESULT: Cache lookups will now find the same offers as live search
-      * Queries correct stations with correct offer types
-      * No more "Fresh offers not available" for wares that exist
-      * Cache hits for all cached wares!
-    - Fixed in: gt_trading_search.xml lines 872-881 (cache write), 301-309 (cache read)
-
-========================================
+Trade Cache - CRITICAL: Stale Tradeoffer Fix
+  - Fixed: Cached trades failing with "insufficient funds" error
+  - Fixed: Ships stuck in infinite restart loop
+  - Cache now acts as "hint" - re-queries fresh offers from cached stations
+  - Fixed: Corrected find_sell_offer/find_buy_offer syntax (tradepartner vs match_seller)
+  - Fixed: Removed stale price pre-filter
+  - Fixed: Swapped BuyOffer/SellOffer perspective (ship vs station)
+  - Cache hits now work reliably
+  - Fixed in: gt_trading_search.xml
 
 Version 0.3.6 - 2025-10-18 (REVERTED)
 --------------------------
 
-Subordinate Ships - CRITICAL FIX: Trade Orders Failing Instantly for Ships in Assist Mode
-  - CRITICAL: Subordinate ships (assigned to commander) getting infinite loop of failed trade orders
-  - ROOT CAUSE: Using immediate="false" for ALL ships, but subordinates need immediate="true"
-  - SYMPTOMS:
-    - Ship in Assist mode mimicking commander's GalaxyTrader order
-    - Trade orders created but fail instantly
-    - AI order terminates 0.02s after creating orders
-    - AI order restarts 1-2s later → infinite loop
-    - Ship floating idle with all orders showing "failed" status
-  - PROBLEM: X4's subordinate behavior interferes with queued orders (immediate="false")
-    - Queued orders on subordinates get cancelled by the Assist order logic
-    - Orders fail before they can execute
-    - Failed orders trigger AI order restart
-  - SOLUTION: Detect subordinates and use immediate="true" for their trade orders
-    - Check if ship.defaultorder.id == 'Assist' AND commander has GalaxyTrader order
-    - Subordinates: immediate="true" (execute now, bypass queue)
-    - Regular ships: immediate="false" (queue normally)
-  - Benefits:
-    - Subordinate ships can now trade successfully
-    - No more infinite restart loops for ships in Assist mode
-    - Maintains fleet hierarchy while allowing independent trading
-  - Fixed in: gt_trading_execution.xml lines 132-147
-
-========================================
+Subordinate Ships
+  - Attempted fix for subordinate trade order failures (reverted)
 
 Version 0.3.5 - 2025-10-18
 --------------------------
 
-Trade Loop - CRITICAL FIX: Prevent Rapid Order Abort/Restart Cycle
-  - CRITICAL: AI order being aborted and restarted every 1-2 seconds
-  - CRITICAL: Ships accumulating 7+ trade orders (5 failed + 2 valid)
-  - ROOT CAUSE 1: AI script was NOT checking for existing trade orders before requesting new trades
-  - ROOT CAUSE 2: X4 reuses AI context IDs on rapid restart, causing stale flags to persist
-  - SYMPTOMS:
-    - Order starts → creates trade orders → 0.05s later order terminates
-    - New order starts 1s later → creates MORE orders → cycle repeats
-    - "training transition: 1" flag incorrectly set despite pilot not needing training
-  - SOLUTION 1 (AI Script Prevention):
-    - Added trade order check BEFORE sending request to MD system
-    - If ship has pending trade orders → wait 10s instead of requesting more
-    - Prevents MD system from even being invoked unnecessarily
-  - SOLUTION 2 (Stale Flag Cleanup):
-    - Clear training flags at start of main loop if pilot not XP blocked
-    - Handles case where X4 reuses AI context with stale instance variables
-  - Result: Ships execute one trade at a time, no order accumulation
-  - Fixed in: order.trade.galaxytrader.xml lines 537-583, 393-403
-
-========================================
+Trade Loop
+  - Fixed: AI order rapid abort/restart cycle
+  - Fixed: Ships accumulating multiple trade orders
+  - Added: Check for existing orders before requesting new trades
+  - Added: Clear stale training flags on order start
+  - Fixed in: order.trade.galaxytrader.xml
 
 Version 0.3.4 - 2025-10-18
 --------------------------
 
-Trade Queue - CRITICAL FIX: Prevent Ship Overloading with Multiple Trade Orders
-  - CRITICAL: Ships accumulating multiple failed trade orders (5 failed + 2 valid = 7 orders!)
-  - ROOT CAUSE: Busy check was running TOO LATE in the process
-  - OLD FLOW (Broken):
-    1. AI requests trade
-    2. Ship added to queue
-    3. Ship IMMEDIATELY dequeued
-    4. Busy check runs (but trade orders from previous trade not in queue yet!)
-    5. Trade search proceeds
-    6. New trade assigned
-    7. Trade orders pile up (accumulating instead of replacing!)
-  - NEW FLOW (Fixed):
-    1. AI requests trade
-    2. Busy check runs BEFORE queueing:
-       ✅ Has trade orders? → Reject and signal AI "no trade"
-       ✅ Has training order? → Reject and signal AI "no trade"
-       ✅ Neither? → Add to queue
-    3. Ship processes ONE trade at a time
-  - Benefits:
-    - Ships can't accumulate multiple trade orders
-    - Prevents race condition where orders pile up
-    - AI script properly notified when ship is busy
-  - Result: Ships execute one trade at a time, cleanly
-  - Fixed in: gt_trading_ai.xml lines 112-154
-
-========================================
+Trade Queue
+  - Fixed: Ships getting multiple trade orders simultaneously
+  - Moved busy check to run BEFORE queueing (not after)
+  - Ships now execute one trade at a time
+  - Fixed in: gt_trading_ai.xml
 
 Version 0.3.3 - 2025-10-18
 --------------------------
 
-Trade System - Major Refactor: Separated Availability from XP Tracking
-  - CRITICAL: Complete rewrite of ship availability checking
-  - CRITICAL: Ships blocked from finding trades due to complex validation
-  - ROOT CAUSE: Conflated two separate concerns into one system
-    1. XP Tracking: Need $ActiveTrades to store trade data for XP calculation
-    2. Availability: Need to know if ship can accept NEW trade assignment
-  - OLD APPROACH (Complex & Unreliable):
-    - Validated $ActiveTrades with cargo/dock/time checks
-    - Tried to "guess" if ship still trading from stale data
-    - Dock check: $ship.dock? returned false positives
-    - Cargo check: ANY cargo = "trading" forever
-    - Time limits: arbitrary 2-5 minute windows
-  - NEW APPROACH (Simple & Direct):
-    - Separated the two concerns entirely
-    - XP tracking: Keep $ActiveTrades (unchanged)
-    - Availability: Check ship's ACTUAL CURRENT STATE
-      ✅ Has trade orders? → Busy
-      ✅ Has training order? → Busy
-      ✅ Neither? → Available for new trade
-  - Benefits:
-    - No more complex validation logic
-    - No more time limits or cargo checks
-    - No more stale data guessing
-    - Real-time ship status only
-  - Result: Ships always get correct availability status
-  - Fixed: All blocking issues, duplicate trades, stale checks
-  - Fixed in: gt_trading_queue.xml lines 151-168, 232-249, 346-366
-  - Also fixed: Float multiplication warnings in cache validation
-
-========================================
+Trade System
+  - Major refactor: Separated XP tracking from ship availability checking
+  - Simplified availability check (only checks: has trade orders? has training order?)
+  - Removed complex cargo/dock/time validation
+  - Ships no longer blocked from trading
+  - Fixed in: gt_trading_queue.xml
 
 Version 0.3.2 - 2025-10-18
 --------------------------
 
-Trade Cache - Fixed Stale Offer Validation
-  - CRITICAL: Ships no longer get failed trade orders from cache
-  - Added comprehensive validation for cached trade offers
-  - Problem: Cached offers became stale/invalid (out of stock, price changes)
-  - Solution: 4-layer validation before using cached trades
-    1. Check offers are available (not just exists)
-    2. Check sufficient stock amount
-    3. Validate prices haven't changed unfavorably (90% threshold)
-    4. Skip invalid cache entries
-  - Fixed in: gt_trading_search.xml lines 249-273
-
-========================================
+Trade Cache
+  - Added 4-layer validation for cached offers (availability, stock, prices)
+  - Ships no longer get failed orders from stale cache
+  - Fixed in: gt_trading_search.xml
 
 Version 0.3.1 - 2025-10-18
 --------------------------
 
 Settings Menu
   - Removed unused "Notification Level" slider
-  - Cleaned up settings menu
-
-========================================
 
 Version 0.3.0 - 2025-10-18
 --------------------------
 
-Training System & Settings
-  - Removed testing mode - production training durations
-  - Improved slider ranges (ROI 1-30%, XP 10-100%)
-
-========================================
+Training & Settings
+  - Removed testing mode (production durations active)
+  - Updated slider ranges (ROI: 1-30%, XP: 10-100%)
 
 Version 0.2.1 - 2025-10-18
 --------------------------
 
 FIXES:
-
-Ship Names
-  - Ship names now stay during police scans and interruptions
-  - Ships keep their rank/level/XP display properly
-  - Fixed ships losing names when orders pause/resume
-  - Added automatic fix for old improperly named ships
-
-Trade Cache System
-  - FIXED: Complete rewrite of trade caching system
-  - Cache now works reliably for high-level ships (Level 12+)
-  - Ships can now share and reuse profitable trade routes
-  - Much better performance - less market scanning needed
-  - Cache stores trades for 10 minutes before expiring
-  - Fixed reversed buy/sell assignments that broke cache
-  - Fixed all table key errors that prevented cache writes
-
-Settings Menu
-  - Settings menu now appears correctly in Extensions Options
-  - Menu works after loading saved games
-  - Fixed validation errors when opening menu
-  - All sliders now work properly
-
-Other Fixes
-  - Fixed ships in null/empty sectors causing errors
-  - Fixed invalid trade offers causing logging errors
-  - Fixed ships jumping between sectors causing scan errors
-  - Fleet report optimized for large fleets (100+ ships)
+  - Ship names now persist through interruptions
+  - Trade cache system completely rewritten and working
+  - Settings menu now appears correctly
+  - Fixed table key errors in cache writes
+  - Fixed reversed buy/sell assignments
   - Better error handling throughout
 
 FILES CHANGED:
-  gt_core_system.xml
-  gt_territory_management.xml
-  gt_trading_search.xml
-  gt_trade_logging.xml
-  gt_trading_execution.xml
-  gt_market_intelligence.xml
-  gt_reporting.xml
-  gt_global_settings.xml
-  gt_trading_maintenance.xml
-  gt_fleet_coordination.xml
-
-RESULT:
-  - Trade caching fully operational
-  - Better performance for high-level ships
-  - More stable overall
-  - Settings menu accessible
-  - No more property lookup errors
-
-
-========================================
+  - gt_core_system.xml
+  - gt_territory_management.xml
+  - gt_trading_search.xml
+  - gt_trade_logging.xml
+  - gt_trading_execution.xml
+  - gt_market_intelligence.xml
+  - gt_reporting.xml
+  - gt_global_settings.xml
+  - gt_trading_maintenance.xml
+  - gt_fleet_coordination.xml
 
 Version 0.2.0 - 2024-01-01
 --------------------------
@@ -561,29 +127,15 @@ FEATURES:
   - Advanced Trading AI with smart route selection
   - XP Progression System (15 levels)
   - Training requirements at levels 3, 6, 9, and 12
-  - Fleet Coordination to prevent route conflicts
+  - Fleet Coordination
   - Mobile Satellite Intelligence (Level 9+)
   - Threat Intelligence System
   - Auto-Repair System (Level 12+)
   - Ship Management and automatic renaming
-  - Configuration system with debug options
-
-TRAINING LEVELS:
-  - Level 3: Basic Certification
-  - Level 6: Advanced Trade Certification
-  - Level 9: Expert Trader (unlocks satellite scanning)
-  - Level 12: Master Trader (unlocks advanced features)
+  - Configuration system
 
 REQUIREMENTS:
-  - SirNukes Mod Support APIs (required)
-  - X4 version 6.0 or higher
-  - All DLCs supported (optional)
-
-PERFORMANCE:
-  - Low CPU usage (less than 1%)
-  - Works with large fleets
-  - Event-driven (instant response)
-  - Save game compatible
+  - SirNukes Mod Support APIs
+  - X4 version 6.0+
 
 Author: GoAhead
-

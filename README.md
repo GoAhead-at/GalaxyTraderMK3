@@ -1,3 +1,6 @@
+# IMPORTANT
+## new releases are available on  [Nexusmods](https://www.nexusmods.com/x4foundations/mods/1857) only
+
 # GalaxyTrader MK3
 
 **The Ultimate Trading AI for X4: Foundations**
