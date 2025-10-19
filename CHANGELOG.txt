@@ -1,6 +1,152 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.4.0 - 2025-10-18
+--------------------------
+
+MAJOR REFACTOR: Diff Patch Trade System Migration
+  - ISSUE: Complex event monitoring system causing maintenance problems
+    - event_player_trade_completed monitoring required complex buyer/seller matching
+    - global.$GT_TradingData.$ActiveTrades tracking with BuyCompleted/SellCompleted state machine
+    - Stale entry cleanup code needed to prevent memory leaks
+    - Limited trade data available (only basic price/amount)
+    - Difficult to debug and maintain
+  
+  - ROOT CAUSE: Relying on X4 game events instead of native trade order system
+    - event_player_trade_completed fires AFTER trade completes (reactive)
+    - Must manually match trades to ships using buyer/seller checks
+    - No access to internal trade data (quality, exact failure reasons, etc.)
+    - Race conditions with stale tracking data
+  
+  - SOLUTION: Diff patch X4's native order.trade.perform.xml
+    - Inject signal code directly into X4's native trade execution
+    - Signals fire immediately when trades complete or fail
+    - Full access to internal trade data from X4 engine
+    - No tracking tables needed - everything event-driven
+  
+  - IMPLEMENTATION PHASES:
+    
+    Phase 1: Enhanced Diff Patch (aiscripts/order.trade.perform.xml)
+      - Added trade failure signal detection (before finish label)
+        - Captures all 14+ X4 failure reasons (ERR_TRADEPARTNER_DESTROYED, etc.)
+        - Includes failure text, ware, partner station, buy/sell phase
+        - Queues failure data in global.$GT_TradeFailureQueue
+      - Added buy completion signal (analytics)
+        - Tracks buy phase separately for future trade timing analysis
+        - Includes transferred amount, unit price, partner, timestamp
+        - Queues buy data in global.$GT_BuyCompleteQueue
+      - Enhanced sell completion signal (existing XP system)
+        - Already working for XP calculation
+        - Includes quality bonus, distance bonus, value multiplier
+    
+    Phase 2: Unified Signal Listener (md/gt_trading_signals.xml - NEW FILE)
+      - ProcessTradeSuccess: Routes completed trades to all systems
+        - XP Training: ProcessSingleXPEvent for immediate XP award
+        - Trade Logging: LogCompletedTrade with rich data
+        - Fleet Coordination: Release trade reservations
+        - Auto-Repair: Check hull percentage and trigger repairs
+        - AI Notification: Signal ship that trade is complete
+      - ProcessTradeFailure: Routes failed trades to handlers
+        - Failure Handler: Logs failure, notifies AI, releases reservations
+        - Cargo Safety: Detects destroyed sell stations, triggers recovery
+      - Event-driven architecture (0.05s checkinterval, negligible overhead)
+    
+    Phase 3: Updated Trade Logging (md/gt_trade_logging.xml)
+      - New LogCompletedTrade cue for diff patch data
+      - Uses rich trade data: transferredAmount, quality bonus, distance bonus
+      - Updates global statistics: global.$GT_TradeStats.$TotalTrades/Profit
+      - Clean integration with existing logbook system
+    
+    Phase 4: Cleanup Old System (md/gt_trading_execution.xml)
+      - Removed ActiveTrades tracking (lines 121-130)
+        - No longer initializing global.$GT_TradingData.$ActiveTrades
+        - No longer recording $StartTime, $Trade per ship
+        - Diff patch signals make this obsolete
+      - Removed TradeCompleted event cue (140+ lines, lines 188-326)
+        - Complex buyer/seller matching logic removed
+        - BuyCompleted/SellCompleted state machine removed
+        - Stale entry cleanup code removed
+        - All functionality replaced by gt_trading_signals.xml
+    
+    Phase 5: AI Script Updates (aiscripts/order.trade.galaxytrader.xml)
+      - Added GT_Trade_Failed interrupt handler (lines 655-665)
+        - Captures event.param2 as $failureReason
+        - Logs failure with full reason text
+        - Sets $tradeFailed flag and resumes main loop
+      - Enhanced GT_Trade_Completed interrupt (lines 645-653)
+        - Sets $tradeComplete flag for future logic branches
+        - Better debug logging
+      - Both signals resume to same label (trade_completed) for unified handling
+  
+  - BENEFITS GAINED:
+    
+    Removed Complexity:
+      - ✅ No more global.$GT_TradingData.$ActiveTrades tracking table
+      - ✅ No more BuyCompleted/SellCompleted state machine
+      - ✅ No more buyer/seller matching logic
+      - ✅ No more stale entry cleanup code
+      - ✅ ~140 lines of complex event monitoring removed
+    
+    New Features:
+      - ✅ Rich trade data from X4 internals (actual transferred amounts, quality, etc.)
+      - ✅ Exact failure reasons (14+ error codes: destroyed, blacklisted, insufficient funds, etc.)
+      - ✅ Immediate signal on completion (no polling, no delay)
+      - ✅ Natural integration with Cargo Safety system (detects destroyed stations)
+      - ✅ Better logging with real trade statistics
+      - ✅ Buy/Sell phase analytics available for future features
+    
+    Performance:
+      - ✅ Reduced global state (no ActiveTrades table)
+      - ✅ Event-driven (0.05s checkinterval vs constant polling)
+      - ✅ Cleaner code flow (signal → route → process)
+      - ✅ Easier to debug (signals fire at exact moment of completion/failure)
+  
+  - MIGRATION NOTES:
+    - Old saves: ActiveTrades data will remain in save but is harmless (unused)
+    - No save game breaking changes
+    - Immediate benefits on next trade completion
+    - Cargo Safety system ready for future implementation
+  
+  - FILES CHANGED:
+    - Modified: aiscripts/order.trade.perform.xml (added failure & buy signals)
+    - Created: md/gt_trading_signals.xml (centralized signal router)
+    - Modified: md/gt_trade_logging.xml (added LogCompletedTrade cue)
+    - Modified: md/gt_trading_execution.xml (removed ActiveTrades & TradeCompleted)
+    - Modified: md/gt_xp_training.xml (removed DirectTradeComplete, now uses gt_trading_signals)
+    - Modified: aiscripts/order.trade.galaxytrader.xml (added failure interrupt)
+  
+  - CRITICAL FIX 1: Removed DirectTradeComplete Race Condition
+    - The old DirectTradeComplete cue in gt_xp_training.xml was competing with the new
+      gt_trading_signals.xml ProcessTradeSuccess cue for the same queue
+    - Both were checking global.$GT_DirectTradePending with different intervals (0.1s vs 0.05s)
+    - Old cue was winning and consuming the queue before new routing could happen
+    - Removed DirectTradeComplete (60 lines) - ProcessTradeSuccess now routes directly to ProcessSingleXPEvent
+    - Ensures gt_trading_signals.xml properly handles all routing (XP, logging, fleet, auto-repair, AI)
+  
+  - CRITICAL FIX 2: Inlined Signal Handlers for Proper Execution
+    - Issue: HandleFleetCoordination, HandleAutoRepair, HandleAINotification cues were not executing
+    - Root cause: signal_cue_instantly with instantiate="true" cues doesn't work as expected
+    - The separate handler cues were never being triggered properly
+    - Solution: Inlined all handler logic directly into ProcessTradeSuccess and ProcessTradeFailure
+    - Benefits:
+      - All signals now execute reliably (fleet, AI, logging, auto-repair)
+      - Better performance (no intermediate cue instantiation)
+      - Simpler debugging (all logic in one place)
+      - Reduced MD overhead
+    - Removed 80+ lines of obsolete handler cues
+    - Now produces complete log output: [GT-Fleet], [GT-AI], [GT-Failure] messages
+  
+  - CRITICAL FIX 3: Trade Logging Subordinate Inheritance
+    - Issue: Subordinate ships not logging trades even when commander has logbook enabled
+    - Root cause: LogCompletedTrade only checked ship's direct order, not commander's settings
+    - Code only checked: @$ship.defaultorder.id == 'GalaxyTraderMK3' and @$ship.defaultorder.$logbookentries
+    - Subordinates have defaultorder.id == 'Assist', so check failed
+    - Solution: Added subordinate inheritance check
+      - Now also checks: @$ship.defaultorder.id == 'Assist' and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'
+      - Subordinates now inherit logbookentries setting from their commander
+    - Expected result: All subordinate ships will now log trades when commander has logbook enabled
+    - Fixed in: gt_trade_logging.xml lines 223-225
+
 Version 0.3.8 - 2025-10-18
 --------------------------
 
