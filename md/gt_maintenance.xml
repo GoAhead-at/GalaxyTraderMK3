@@ -1,0 +1,783 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Maintenance" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/x4Original/libraries/md.xsd">
+  <cues>
+    <!-- ============================================================================= -->
+    <!-- GALAXY TRADER MK3 - UNIFIED MAINTENANCE SYSTEM                                -->
+    <!-- Handles ALL ship maintenance (repair + equipment) in one place                -->
+    <!-- Pattern: AI script signals → MD processes EVERYTHING → signals completion    -->
+    <!-- ============================================================================= -->
+    
+    <!-- Main Maintenance Handler -->
+    <cue name="DoMaintenance" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_DoMaintenance'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param2"/>
+        
+        <debug_text text="'[GT-Maintenance] 🔧 Starting maintenance check for ' + $ship.idcode" chance="100"/>
+        
+        <!-- Check if ship is on resupply cooldown (prevents spam after failed attempts) -->
+        <!-- Get pilot level -->
+        <set_value name="$pilotLevel" exact="0"/>
+        <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}?">
+          <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$ship.pilot}.$Level"/>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- RESUPPLY COOLDOWN (SAFETY NET - CAN BE REMOVED LATER)                    -->
+        <!-- ========================================================================= -->
+        <!-- 
+          TODO: This cooldown is a safety net to prevent infinite resupply loops.
+          
+          WHY IT EXISTS:
+          - Prevents ship from immediately requesting resupply again after undocking
+          - Safety net in case station can't fulfill complete order
+          
+          IDEAL BEHAVIOR (without cooldown):
+          1. Ship checks equipment → needs CM or Units
+          2. Maintenance triggered → requests BOTH CM and Units in ONE order
+          3. Ship docks, gets resupplied, undocks
+          4. Ship checks equipment → BOTH above threshold → proceeds to trade
+          
+          WHEN TO REMOVE:
+          - After confirming ships don't loop after resupply
+          - When "will restock BOTH" logic is proven stable
+          - Look for: No "Creating Resupply build order" immediately after undocking
+          
+          TO REMOVE: Delete this entire cooldown block (lines ~27-40) and the 
+          cooldown-setting code in ExecuteMaintenance (search for GT_LastResupplyTime)
+        -->
+        <set_value name="$resupplyCooldownMinutes" exact="15"/> <!-- 15 minute grace period after resupply -->
+        <set_value name="$lastResupplyTime" exact="@global.$GT_LastResupplyTime.{$ship}"/>
+        <set_value name="$timeSinceResupply" exact="if $lastResupplyTime? then (player.age - $lastResupplyTime) else 99999"/>
+        
+        <do_if value="$timeSinceResupply lt ($resupplyCooldownMinutes * 60)">
+          <!-- Ship on cooldown - skip all maintenance checks -->
+          <set_value name="$minutesRemaining" exact="(($resupplyCooldownMinutes * 60) - $timeSinceResupply) / 60"/>
+          <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' ⏰ On resupply cooldown (' + $minutesRemaining + 'm remaining) - skipping maintenance'" chance="100"/>
+          <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+        </do_if>
+        <do_else>
+          <!-- Not on cooldown - proceed with normal maintenance checks -->
+          
+        <!-- Flags for what needs to be done -->
+        <set_value name="$needsRepair" exact="false"/>
+        <set_value name="$needsEquipment" exact="false"/>
+        
+        <!-- ========================================================================= -->
+        <!-- 1. CHECK REPAIR (Level 12+)                                              -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$pilotLevel ge 12 and @global.$GT_GlobalSettings.$AutoRepair.$Enabled">
+          <set_value name="$hullPercentage" exact="$ship.hullpercentage"/>
+          <set_value name="$repairThreshold" exact="@global.$GT_GlobalSettings.$AutoRepair.$HullThreshold"/>
+          
+          <do_if value="$hullPercentage lt $repairThreshold">
+            <set_value name="$needsRepair" exact="true"/>
+            <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs repair (hull: ' + $hullPercentage + '%, threshold: ' + $repairThreshold + '%)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- 2. CHECK EQUIPMENT (Level 15+)                                           -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$pilotLevel ge 15 and @global.$GT_Config.$Defense.$Enabled and @global.$GT_GlobalSettings.$DefensiveEquipment.$Enabled">
+          <!-- Check countermeasures and deployables -->
+          <set_value name="$countermeasureCapacity" exact="@$ship.ammostorage.countermeasure.capacity"/>
+          <set_value name="$currentCountermeasures" exact="@$ship.ammostorage.countermeasure.count"/>
+          <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+          
+          <set_value name="$deployableCapacity" exact="@$ship.ammostorage.deployable.capacity"/>
+          <set_value name="$currentDeployables" exact="@$ship.ammostorage.deployable.count"/>
+          <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployables * 100) / $deployableCapacity else 100"/>
+          
+          <!-- Also check UNITS (drones in docking bays) -->
+        <set_value name="$unitsCapacity" exact="@$ship.units.maxcount"/>
+        <set_value name="$currentUnits" exact="@$ship.units.count"/>
+        <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnits * 100) / $unitsCapacity else 100"/>
+        
+        <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' storage check: CM cap=' + $countermeasureCapacity + ', Deployables cap=' + $deployableCapacity + ', Units maxcount=' + $unitsCapacity" chance="100"/>
+        <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' current: CM=' + $currentCountermeasures + ', Deployables=' + $currentDeployables + ', Units=' + $currentUnits" chance="100"/>
+          
+          <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+          <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+          
+          <!-- Check if restocking needed -->
+          <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
+          <!-- NOTE: Don't check deployables (mines/satellites) here - only restock if ship's loadout explicitly defines them -->
+          <set_value name="$needsDeployables" exact="false"/>
+          <!-- NOTE: For units, check if below threshold to trigger maintenance -->
+          <set_value name="$needsUnits" exact="$unitsCapacity gt 0 and $unitsPercentage lt $unifiedThreshold"/>
+          
+          <do_if value="$needsCountermeasures or $needsUnits">
+            <set_value name="$needsEquipment" exact="true"/>
+            <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs equipment (CM: ' + $countermeasurePercentage + '%, Units: ' + $unitsPercentage + '% - will restock BOTH CM and units in one order)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- 3. EXECUTE MAINTENANCE                                                    -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="not $needsRepair and not $needsEquipment">
+          <!-- No maintenance needed -->
+          <debug_text text="'[GT-Maintenance] ✅ ' + $ship.idcode + ' no maintenance needed'" chance="100"/>
+          <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+        </do_if>
+        <do_else>
+          <!-- Trigger maintenance execution -->
+          <signal_cue_instantly cue="ExecuteMaintenance" param="table[
+            $Ship = $ship,
+            $PilotLevel = $pilotLevel,
+            $NeedsRepair = $needsRepair,
+            $NeedsEquipment = $needsEquipment
+          ]"/>
+        </do_else>
+        </do_else><!-- End: not on cooldown -->
+      </actions>
+    </cue>
+    
+    <!-- Execute Maintenance Orders -->
+    <cue name="ExecuteMaintenance" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        <set_value name="$pilotLevel" exact="$params.$PilotLevel"/>
+        <set_value name="$needsRepair" exact="$params.$NeedsRepair"/>
+        <set_value name="$needsEquipment" exact="$params.$NeedsEquipment"/>
+        
+        <!-- Get max jump distance -->
+        <set_value name="$maxJumpDistance" exact="15"/>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxDistance?">
+          <set_value name="$maxJumpDistance" exact="global.$GT_AIParameters.{$ship}.$MaxDistance"/>
+        </do_if>
+        
+        <!-- Track orders created -->
+        <set_value name="$repairOrderCreated" exact="false"/>
+        <set_value name="$equipmentOrderCreated" exact="false"/>
+        
+        <!-- ========================================================================= -->
+        <!-- REPAIR FIRST (Priority)                                                  -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$needsRepair">
+          <debug_text text="'[GT-Maintenance] 🔧 Finding repair station for ' + $ship.idcode" chance="100"/>
+          
+          <!-- Find repair station -->
+          <run_actions ref="md.GT_Auto_Repair.FindNearestRepairStation" result="$repairStation">
+            <param name="ship" value="$ship"/>
+            <param name="maxJumpDistance" value="$maxJumpDistance"/>
+          </run_actions>
+          
+          <do_if value="$repairStation and $repairStation.exists">
+            <!-- Calculate cost -->
+            <set_value name="$estimatedCost" exact="$ship.maxhull - $ship.hull"/>
+            <set_value name="$playerMoney" exact="player.money"/>
+            
+            <do_if value="$playerMoney ge $estimatedCost">
+              <!-- Prepare repair data for AI script -->
+              <debug_text text="'[GT-Maintenance] ✅ Repair data prepared for ' + $ship.idcode + ' at ' + $repairStation.knownname + ' (cost: ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
+              
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
+              
+              <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
+                $Station = $repairStation,
+                $AcceptedCost = $estimatedCost
+              ]"/>
+              
+              <set_value name="$repairOrderCreated" exact="true"/>
+            </do_if>
+            <do_elseif value="$playerMoney ge 5000Cr">
+              <!-- Prepare partial repair data -->
+              <debug_text text="'[GT-Maintenance] ✅ Partial repair data prepared for ' + $ship.idcode + ' (max: ' + ($playerMoney/100) + ' Cr)'" chance="100"/>
+              
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
+              
+              <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
+                $Station = $repairStation,
+                $AcceptedCost = $playerMoney
+              ]"/>
+              
+              <set_value name="$repairOrderCreated" exact="true"/>
+              
+              <show_notification text="'⚠️ ' + $ship.knownname + ' needs repairs but insufficient funds!\nCost: ' + ($estimatedCost/100) + ' Cr, Available: ' + ($playerMoney/100) + ' Cr\nAttempting partial repair.'" timeout="10s" priority="8"/>
+            </do_elseif>
+            <do_else>
+              <debug_text text="'[GT-Maintenance] ❌ Insufficient funds for repair (' + ($playerMoney/100) + ' Cr available, need ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
+              <show_notification text="'❌ ' + $ship.knownname + ' needs repairs but insufficient funds!\nCost: ' + ($estimatedCost/100) + ' Cr, Available: ' + ($playerMoney/100) + ' Cr'" timeout="10s" priority="9"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-Maintenance] ❌ No repair station found for ' + $ship.idcode" chance="100"/>
+          </do_else>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- EQUIPMENT SECOND                                                          -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$needsEquipment">
+          <debug_text text="'[GT-Maintenance] 🛡️ Finding equipment station for ' + $ship.idcode" chance="100"/>
+          
+          <!-- Detect ship class using ship management library -->
+          <run_actions ref="md.GT_Ship_Management.Detect_Ship_Class" result="$classInfo">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <!-- Determine which station types to search for based on ship class -->
+          <!-- NOTE: Equipment Docks (Ausrüstungsdock) support ALL ship classes! -->
+          <set_value name="$searchShipyards" exact="$classInfo.$IsLarge or $classInfo.$IsXL"/>
+          <set_value name="$searchEquipmentDocks" exact="true"/> <!-- Equipment docks support all sizes -->
+          
+          <debug_text text="'[GT-Maintenance] Ship class: ' + $classInfo.$Class + ' | S=' + @$classInfo.$IsSmall + ', M=' + @$classInfo.$IsMedium + ', L=' + @$classInfo.$IsLarge + ', XL=' + @$classInfo.$IsXL" chance="100"/>
+          <debug_text text="'[GT-Maintenance] Will search: Equipment Docks=' + $searchEquipmentDocks + ', Shipyards=' + $searchShipyards" chance="100"/>
+          
+          <!-- Build list of potential stations based on ship class -->
+          <set_value name="$potentialStations" exact="[]"/>
+          
+          <!-- Search for shipyards if needed (L/XL ships) -->
+          <do_if value="$searchShipyards">
+            <find_station name="$shipyards" space="player.galaxy" multiple="true" knownto="player.entity" checkoperational="true" sortbygatedistanceto="$ship">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <do_all exact="$shipyards.count" counter="$i">
+              <set_value name="$station" exact="$shipyards.{$i}"/>
+              <do_if value="$station.isshipyard">
+                <append_to_list name="$potentialStations" exact="$station"/>
+              </do_if>
+            </do_all>
+            
+            <debug_text text="'[GT-Maintenance] Found ' + $potentialStations.count + ' shipyards'" chance="100"/>
+          </do_if>
+          
+          <!-- Search for equipment docks (ALL ship sizes) -->
+          <do_if value="$searchEquipmentDocks">
+            <find_station name="$equipmentdocks" space="player.galaxy" multiple="true" knownto="player.entity" checkoperational="true" sortbygatedistanceto="$ship">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <do_all exact="$equipmentdocks.count" counter="$i">
+              <set_value name="$station" exact="$equipmentdocks.{$i}"/>
+              <do_if value="$station.isequipmentdock">
+                <append_to_list name="$potentialStations" exact="$station"/>
+              </do_if>
+            </do_all>
+            
+            <debug_text text="'[GT-Maintenance] Found ' + $potentialStations.count + ' total stations (including equipment docks)'" chance="100"/>
+          </do_if>
+          
+          <!-- ============================================================= -->
+          <!-- Find first station within distance that has STOCK           -->
+          <!-- Try stations in order (sorted by distance), skip those      -->
+          <!-- with no stock, take first one with ANY stock available      -->
+          <!-- ============================================================= -->
+          <set_value name="$equipmentStation" exact="null"/>
+          <set_value name="$stationsChecked" exact="0"/>
+          <set_value name="$stationsWithNoStock" exact="0"/>
+          
+          <do_all exact="$potentialStations.count" counter="$i">
+            <set_value name="$station" exact="$potentialStations.{$i}"/>
+            <set_value name="$distance" exact="@$ship.gatedistance.{$station}"/>
+            
+            <debug_text text="'[GT-Maintenance] 🔍 Checking ' + $station.knownname + ' (distance=' + $distance + ', isequipmentdock=' + $station.isequipmentdock + ', isshipyard=' + $station.isshipyard + ')'" chance="100"/>
+            
+            <!-- Skip if distance is null (unreachable) or too far -->
+            <do_if value="$distance? and $distance le $maxJumpDistance">
+              <set_value name="$stationsChecked" operation="add"/>
+              
+              <!-- Recalculate what equipment is actually needed for stock check -->
+              <set_value name="$countermeasureCapacity" exact="@$ship.ammostorage.countermeasure.capacity"/>
+              <set_value name="$currentCountermeasures" exact="@$ship.ammostorage.countermeasure.count"/>
+              <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+              
+              <set_value name="$deployableCapacity" exact="@$ship.ammostorage.deployable.capacity"/>
+              <set_value name="$currentDeployables" exact="@$ship.ammostorage.deployable.count"/>
+              <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployables * 100) / $deployableCapacity else 100"/>
+              
+              <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+              <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+              
+              <!-- Recalculate needs inside loop (check units too!) -->
+              <set_value name="$unitsCapacity" exact="@$ship.units.maxcount"/>
+              
+              <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
+              <!-- Don't check deployables (mines/satellites) for trading ships -->
+              <set_value name="$needsDeployables" exact="false"/>
+              <!-- For units, always check loadout (ship may have more than loadout wants) -->
+              <set_value name="$needsUnits" exact="$unitsCapacity gt 0"/>
+              
+              <debug_text text="'[GT-Maintenance]   Ship needs: CM=' + $needsCountermeasures + ', Units=' + $needsUnits + ' (will check loadout)'" chance="100"/>
+              
+              <!-- Check if station can equip this ship class AND has stock (like vanilla) -->
+              <set_value name="$canSupply" exact="false"/>
+              
+              <!-- Check if station is an equipment dock/shipyard that can service this ship class -->
+              <do_if value="$station.isequipmentdock or $station.isshipyard">
+                <set_value name="$canEquipShip" exact="$station.canequipclass.{$ship.class}"/>
+                <debug_text text="'[GT-Maintenance]   Station can equip ' + $ship.class + ': ' + $canEquipShip" chance="100"/>
+                
+                <do_if value="$canEquipShip">
+                  <!-- Build evaluation tables like vanilla does to check stock -->
+                  <set_value name="$evalammotable" exact="null"/>
+                  <set_value name="$evalunittable" exact="null"/>
+                  
+                  <!-- Check countermeasures stock -->
+                  <do_if value="$needsCountermeasures">
+                    <set_value name="$availableCM" exact="@$station.buildequipment.countermeasures.list"/>
+                    <do_if value="@$availableCM.count gt 0">
+                      <!-- Create evaluation table with quantity=1 for each ware (vanilla pattern) -->
+                      <set_value name="$evalammotable" exact="table[]"/>
+                      <do_all exact="$availableCM.count" counter="$j">
+                        <set_value name="$evalammotable.{$availableCM.{$j}}" exact="1"/>
+                      </do_all>
+                      <debug_text text="'[GT-Maintenance]   Eval ammo table has ' + @$evalammotable.keys.count + ' types'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- NOTE: Deployables (mines/satellites) are NOT checked for trading ships -->
+                  
+                  <!-- Now check stock using vanilla's exact logic -->
+                  <!-- Check each category we need, station passes if it has stock for ALL needed categories -->
+                  <set_value name="$hasAmmoStock" exact="true"/>
+                  <set_value name="$hasUnitDroneStock" exact="true"/>
+                  
+                  <do_if value="$needsCountermeasures and $evalammotable">
+                    <set_value name="$canBuildAmmo" exact="$station.canbuildequipment.{$evalammotable.keys.list}"/>
+                    <set_value name="$hasAmmoResources" exact="$station.hasresourcesfor.{$evalammotable}"/>
+                    <set_value name="$hasAmmoStock" exact="$canBuildAmmo and $hasAmmoResources"/>
+                    <debug_text text="'[GT-Maintenance]   Ammo check: canBuild=' + $canBuildAmmo + ', hasResources=' + $hasAmmoResources + ', result=' + $hasAmmoStock" chance="100"/>
+                  </do_if>
+                  <do_elseif value="$needsCountermeasures and not $evalammotable">
+                    <!-- Need CM but no eval table - fail -->
+                    <set_value name="$hasAmmoStock" exact="false"/>
+                    <debug_text text="'[GT-Maintenance]   Ammo check: no eval table, result=false'" chance="100"/>
+                  </do_elseif>
+                  
+                  <!-- Check for UNITS (defense drones, laser towers, etc.) -->
+                  <do_if value="$needsUnits">
+                    <!-- For units/drones, just check if station is a shipyard that can build ships/units -->
+                    <!-- Vanilla resupply will handle the complex unit selection -->
+                    <set_value name="$hasUnitDroneStock" exact="$station.isshipyard or ($station.isequipmentdock and $station.canequipclass.{$ship.class})"/>
+                    <debug_text text="'[GT-Maintenance]   Units/Drones check: isShipyard=' + $station.isshipyard + ', canEquip=' + $station.canequipclass.{$ship.class} + ', result=' + $hasUnitDroneStock" chance="100"/>
+                  </do_if>
+                  
+                  <!-- Station passes if it has stock for ALL needed categories (all must be true) -->
+                  <set_value name="$canSupply" exact="$hasAmmoStock and $hasUnitDroneStock"/>
+                  <debug_text text="'[GT-Maintenance]   Final: hasAmmoStock=' + $hasAmmoStock + ', hasUnitDroneStock=' + $hasUnitDroneStock + ', canSupply=' + $canSupply" chance="100"/>
+                  
+                  <do_if value="$canSupply">
+                    <debug_text text="'[GT-Maintenance]   ✅ Station has stock for required items'" chance="100"/>
+                  </do_if>
+                  <do_else>
+                    <debug_text text="'[GT-Maintenance]   ⚠️ Station has no stock for any required items'" chance="100"/>
+                  </do_else>
+                </do_if>
+                <do_else>
+                  <debug_text text="'[GT-Maintenance]   ⚠️ Station cannot equip ' + $ship.class" chance="100"/>
+                </do_else>
+              </do_if>
+              <do_else>
+                <debug_text text="'[GT-Maintenance]   ⚠️ Not an equipment dock or shipyard'" chance="100"/>
+              </do_else>
+              
+              <!-- If this station can supply, use it! -->
+              <do_if value="$canSupply">
+              <set_value name="$equipmentStation" exact="$station"/>
+              <debug_text text="'[GT-Maintenance] ✅ Selected: ' + $equipmentStation.knownname + ' (' + $distance + ' jumps)'" chance="100"/>
+                <break/> <!-- Found a good station, stop searching -->
+              </do_if>
+              <do_else>
+                <!-- Station cannot supply, try next one -->
+                <set_value name="$stationsWithNoStock" operation="add"/>
+                <debug_text text="'[GT-Maintenance] ⚠️ Skipping ' + $station.knownname + ' (' + $distance + ' jumps) - cannot supply required items'" chance="100"/>
+              </do_else>
+            </do_if>
+          </do_all>
+          
+          <do_if value="$stationsChecked gt 0 and not $equipmentStation">
+            <debug_text text="'[GT-Maintenance] ℹ️ Checked ' + $stationsChecked + ' station(s), none can supply equipment - will retry after next trade'" chance="100"/>
+          </do_if>
+          
+          <do_if value="$equipmentStation and $equipmentStation.exists">
+            <!-- Station found - build shopping list using vanilla's pattern -->
+            <debug_text text="'[GT-Maintenance] ✅ Building shopping list for ' + $ship.idcode + ' at ' + $equipmentStation.knownname" chance="100"/>
+            
+            <!-- Save current equipment levels to compare after resupply -->
+            <set_value name="$currentDeployables" exact="@$ship.ammostorage.deployable.count"/>
+            <set_value name="$currentCM" exact="@$ship.ammostorage.countermeasure.count"/>
+            <set_value name="$currentUnitsCount" exact="@$ship.units.count"/>
+            
+            <!-- Recalculate what ship needs (for shopping list) -->
+            <set_value name="$countermeasureCapacity" exact="@$ship.ammostorage.countermeasure.capacity"/>
+            <set_value name="$currentCountermeasures" exact="@$ship.ammostorage.countermeasure.count"/>
+            <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+            
+            <set_value name="$deployableCapacity" exact="@$ship.ammostorage.deployable.capacity"/>
+            <set_value name="$currentDeployablesPercentage" exact="@$ship.ammostorage.deployable.count"/>
+            <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployablesPercentage * 100) / $deployableCapacity else 100"/>
+            
+            <set_value name="$unitsCapacity" exact="@$ship.units.maxcount"/>
+            <set_value name="$currentUnits" exact="@$ship.units.count"/>
+            <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnits * 100) / $unitsCapacity else 100"/>
+            
+            <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+            <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+            
+            <!-- ========================================================================= -->
+            <!-- CORE FIX: Always restock BOTH CM and Units when maintenance triggered    -->
+            <!-- ========================================================================= -->
+            <!-- 
+              This is the REAL fix to prevent resupply loops!
+              
+              When maintenance is triggered (because EITHER CM or Units is low):
+              - Build shopping lists for BOTH CM AND Units (if ship has capacity)
+              - This ensures ONE trip gets everything
+              - After resupply, BOTH will be above threshold → no immediate re-trigger
+              
+              NOTE: We don't recheck thresholds here because we want to top up everything
+              in one trip, preventing multiple dock/undock cycles.
+            -->
+            <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0"/>
+            <set_value name="$needsDeployables" exact="false"/>
+            <set_value name="$needsUnits" exact="$unitsCapacity gt 0"/>
+            
+            <debug_text text="'[GT-Maintenance]   Ship needs: CM=' + $needsCountermeasures + ' (' + $countermeasurePercentage + '%), Units=' + $needsUnits + ' (' + $unitsPercentage + '%) - will restock BOTH'" chance="100"/>
+            
+            <!-- Build ammo/unit tables like vanilla does -->
+            <set_value name="$ammotable" exact="null"/>
+            <set_value name="$unittable" exact="null"/>
+            
+            <!-- Get loadout level (determines what equipment to buy) -->
+            <set_value name="$loadoutlevel" exact="$ship.loadoutlevel"/>
+            <debug_text text="'[GT-Maintenance]   Loadout level: ' + $loadoutlevel" chance="100"/>
+            
+            <!-- Evaluate what UNITS ship needs (drones/towers) using Balance Profile -->
+            <!-- ALWAYS build unit list if ship has unit capacity - this ensures we restock EVERYTHING in one trip -->
+            <do_if value="$ship.units.maxcount gt 0">
+              <!-- Use Balance Profile to determine unit distribution -->
+              <set_value name="$balanceProfile" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$BalanceProfile"/>
+              <do_if value="not $balanceProfile?">
+                <set_value name="$balanceProfile" exact="2"/> <!-- Default: Trading-Focused -->
+              </do_if>
+              
+              <!-- Get distribution percentages from Balance Profile -->
+              <set_value name="$distribution" exact="table[
+                $DefenseDrones = 20,
+                $TradeDrones = 50,
+                $LaserTowers = 20,
+                $RepairDrones = 10
+              ]"/>
+              
+              <do_if value="$balanceProfile == 0">
+                <!-- Balanced -->
+                <set_value name="$distribution.$DefenseDrones" exact="35"/>
+                <set_value name="$distribution.$TradeDrones" exact="35"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_if>
+              <do_elseif value="$balanceProfile == 1">
+                <!-- Defensive -->
+                <set_value name="$distribution.$DefenseDrones" exact="50"/>
+                <set_value name="$distribution.$TradeDrones" exact="20"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <do_elseif value="$balanceProfile == 3">
+                <!-- Heavy Defense -->
+                <set_value name="$distribution.$DefenseDrones" exact="40"/>
+                <set_value name="$distribution.$TradeDrones" exact="30"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <do_elseif value="$balanceProfile == 4">
+                <!-- Tower Support -->
+                <set_value name="$distribution.$DefenseDrones" exact="30"/>
+                <set_value name="$distribution.$TradeDrones" exact="30"/>
+                <set_value name="$distribution.$LaserTowers" exact="30"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <!-- Default is already set: Profile 2 = Trading-Focused -->
+              
+              <debug_text text="'[GT-Maintenance]   Balance Profile ' + $balanceProfile + ': Defense=' + $distribution.$DefenseDrones + '%, Trade=' + $distribution.$TradeDrones + '%, Towers=' + $distribution.$LaserTowers + '%, Repair=' + $distribution.$RepairDrones + '%'" chance="100"/>
+              
+              <!-- Calculate target quantities based on capacity and percentages -->
+              <set_value name="$totalCapacity" exact="$ship.units.maxcount"/>
+              <set_value name="$targetDefense" exact="(($totalCapacity * $distribution.$DefenseDrones) / 100)i"/>
+              <set_value name="$targetTrade" exact="(($totalCapacity * $distribution.$TradeDrones) / 100)i"/>
+              <set_value name="$targetTowers" exact="(($totalCapacity * $distribution.$LaserTowers) / 100)i"/>
+              <set_value name="$targetRepair" exact="(($totalCapacity * $distribution.$RepairDrones) / 100)i"/>
+              
+              <debug_text text="'[GT-Maintenance]   Targets (capacity=' + $totalCapacity + '): Defense=' + $targetDefense + ', Trade=' + $targetTrade + ', Towers=' + $targetTowers + ', Repair=' + $targetRepair" chance="100"/>
+              
+              <!-- Build unit shopping list using Balance Profile (like vanilla does in interrupt.restock line 603) -->
+              <set_value name="$unittable" exact="table[]"/>
+              
+              <!-- Use hardcoded macro references (EXACTLY like vanilla) - macro.XXX.ware works at runtime! -->
+              <do_if value="$targetDefense gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockDefenseDrones">
+                <set_value name="$unittable.{macro.ship_gen_s_fightingdrone_01_a_macro.ware}" exact="$targetDefense"/>
+                <debug_text text="'[GT-Maintenance]   - Request: Defense Drones x' + $targetDefense" chance="100"/>
+              </do_if>
+              
+              <do_if value="$targetTrade gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockTradeDrones">
+                <set_value name="$unittable.{macro.ship_gen_xs_cargodrone_empty_01_a_macro.ware}" exact="$targetTrade"/>
+                <debug_text text="'[GT-Maintenance]   - Request: Trade Drones x' + $targetTrade" chance="100"/>
+              </do_if>
+              
+              <do_if value="$targetTowers gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockLaserTowers">
+                <set_value name="$unittable.{macro.ship_gen_xs_lasertower_01_a_macro.ware}" exact="$targetTowers"/>
+                <debug_text text="'[GT-Maintenance]   - Request: Laser Towers x' + $targetTowers" chance="100"/>
+              </do_if>
+              
+              <do_if value="$targetRepair gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockRepairDrones">
+                <set_value name="$unittable.{macro.ship_gen_xs_repairdrone_01_a_macro.ware}" exact="$targetRepair"/>
+                <debug_text text="'[GT-Maintenance]   - Request: Repair Drones x' + $targetRepair" chance="100"/>
+              </do_if>
+              
+              <debug_text text="'[GT-Maintenance]   Shopping list has ' + @$unittable.keys.count + ' unit types'" chance="100"/>
+            </do_if>
+            
+            <!-- NOTE: Deployables (mines, satellites) are NOT restocked for trading ships -->
+            <!-- Only combat ships with loadout configs defining deployables will get them via vanilla resupply -->
+            
+            <!-- Evaluate what countermeasures ship needs -->
+            <!-- ALWAYS build CM list if ship has CM capacity - this ensures we restock EVERYTHING in one trip -->
+            <do_if value="$ship.ammostorage.countermeasure.capacity gt 0">
+              <!-- For countermeasures, just get what station has -->
+              <set_value name="$availableCM" exact="@$equipmentStation.buildequipment.countermeasures.list"/>
+              <do_if value="@$availableCM.count gt 0">
+                <set_value name="$ammotable" exact="table[]"/>
+                <set_value name="$cmNeeded" exact="$ship.ammostorage.countermeasure.free"/>
+                <set_value name="$cmPerType" exact="($cmNeeded / $availableCM.count)i"/>
+                <do_all exact="$availableCM.count" counter="$j">
+                  <set_value name="$ammotable.{$availableCM.{$j}}" exact="$cmPerType"/>
+                  <debug_text text="'[GT-Maintenance]   - Shopping list: ' + $availableCM.{$j} + ' x' + $cmPerType" chance="100"/>
+                </do_all>
+              </do_if>
+            </do_if>
+            
+            <!-- Store shopping list for AI script -->
+            <do_if value="not global.$GT_ResupplyOrders?">
+              <set_value name="global.$GT_ResupplyOrders" exact="table[]"/>
+            </do_if>
+            
+            <set_value name="global.$GT_ResupplyOrders.{$ship}" exact="table[
+              $Station = $equipmentStation,
+              $AmmoTable = $ammotable,
+              $UnitTable = $unittable,
+              $DeployablesBefore = $currentDeployables,
+              $CountermeasuresBefore = $currentCM,
+              $UnitsBefore = $currentUnitsCount
+            ]"/>
+            
+            <set_value name="$equipmentOrderCreated" exact="true"/>
+            
+            <!-- Set resupply cooldown timestamp to prevent immediate re-stocking -->
+            <!-- TODO: SAFETY NET - Can be removed once "will restock BOTH" logic is proven stable -->
+            <!-- This timestamp is checked at the start of DoMaintenance to skip equipment checks -->
+            <do_if value="not global.$GT_LastResupplyTime?">
+              <set_value name="global.$GT_LastResupplyTime" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_LastResupplyTime.{$ship}" exact="player.age"/>
+            <debug_text text="'[GT-Maintenance] ⏰ Resupply cooldown set for ' + $ship.idcode + ' (15 minutes)'" chance="100"/>
+            
+            <!-- Write logbook entry -->
+            <write_to_logbook category="upkeep" title="'Defensive Equipment Auto-Replenishment'" text="'Level ' + $pilotLevel + ' ' + $ship.knownname + ' is restocking defensive equipment at ' + $equipmentStation.knownname + '.'" interaction="showonmap" object="$equipmentStation"/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-Maintenance] ❌ No equipment station found for ' + $ship.idcode" chance="100"/>
+            <write_to_logbook category="upkeep" title="'Defensive Equipment Auto-Replenishment Failed'" text="'Level ' + $pilotLevel + ' ' + $ship.knownname + ' needs equipment but no suitable station found within ' + $maxJumpDistance + ' jumps.'" interaction="showonmap" object="$ship"/>
+          </do_else>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- MONITOR COMPLETION                                                        -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$repairOrderCreated or $equipmentOrderCreated">
+          <!-- Track in global table for event-driven monitoring -->
+          <do_if value="not global.$GT_MaintenanceOrders?">
+            <set_value name="global.$GT_MaintenanceOrders" exact="table[]"/>
+          </do_if>
+          
+          <set_value name="global.$GT_MaintenanceOrders.{$ship}" exact="table[
+            $Ship = $ship,
+            $StartTime = player.age,
+            $WaitingForRepair = $repairOrderCreated,
+            $WaitingForEquipment = $equipmentOrderCreated,
+            $DeployablesBefore = @global.$GT_ResupplyOrders.{$ship}.$DeployablesBefore,
+            $CountermeasuresBefore = @global.$GT_ResupplyOrders.{$ship}.$CountermeasuresBefore
+          ]"/>
+          
+          <debug_text text="'[GT-Maintenance] ⏳ Tracking maintenance for ' + $ship.idcode + ' (Repair: ' + $repairOrderCreated + ', Equipment: ' + $equipmentOrderCreated + ')'" chance="100"/>
+        </do_if>
+        <do_else>
+          <!-- No orders created - proceed to trading, will retry after next trade -->
+          <debug_text text="'[GT-Maintenance] ℹ️ No maintenance orders created for ' + $ship.idcode + ' (no stations with stock or no work needed), proceeding to trading'" chance="100"/>
+          <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Process Resupply Completion (Event-Driven from diff patch) -->
+    <cue name="ProcessResupplyComplete" instantiate="true" checkinterval="0.05s">
+      <conditions>
+        <check_value value="global.$GT_ResupplyCompletePending?"/>
+      </conditions>
+      <actions>
+        <remove_value name="global.$GT_ResupplyCompletePending"/>
+        
+        <do_if value="global.$GT_ResupplyCompleteQueue? and global.$GT_ResupplyCompleteQueue.count gt 0">
+          <do_while value="global.$GT_ResupplyCompleteQueue.count gt 0">
+            <set_value name="$data" exact="global.$GT_ResupplyCompleteQueue.{1}"/>
+            <remove_from_list name="global.$GT_ResupplyCompleteQueue" exact="$data"/>
+            <set_value name="$ship" exact="$data.$ship"/>
+            
+            <!-- Check if equipment order actually succeeded -->
+            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+              <!-- Get current equipment levels -->
+              <set_value name="$currentDeployables" exact="@$ship.ammostorage.deployable.count"/>
+              <set_value name="$currentCM" exact="@$ship.ammostorage.countermeasure.count"/>
+              <set_value name="$currentUnitsCount" exact="@$ship.units.count"/>
+              <set_value name="$deployableCapacity" exact="@$ship.ammostorage.deployable.capacity"/>
+              <set_value name="$cmCapacity" exact="@$ship.ammostorage.countermeasure.capacity"/>
+              <set_value name="$unitsCapacity" exact="@$ship.units.maxcount"/>
+              
+              <!-- Get levels from before resupply -->
+              <set_value name="$beforeDeployables" exact="@global.$GT_MaintenanceOrders.{$ship}.$DeployablesBefore"/>
+              <set_value name="$beforeCM" exact="@global.$GT_MaintenanceOrders.{$ship}.$CountermeasuresBefore"/>
+              <set_value name="$beforeUnits" exact="@global.$GT_MaintenanceOrders.{$ship}.$UnitsBefore"/>
+              
+              <!-- Check if we actually got something meaningful -->
+              <!-- Accept partial restocking: if we got at least 2 of anything, that's good enough -->
+              <!-- This prevents ships from cruising the entire universe trying to get fully stocked -->
+              <!-- If station had limited stock, we take what we can and proceed with trading -->
+              <set_value name="$deployablesGained" exact="$currentDeployables - $beforeDeployables"/>
+              <set_value name="$cmGained" exact="$currentCM - $beforeCM"/>
+              <set_value name="$unitsGained" exact="$currentUnitsCount - $beforeUnits"/>
+              <set_value name="$minAcceptable" exact="2"/> <!-- Minimum items to consider resupply successful -->
+              
+              <set_value name="$gotEnoughDeployables" exact="$deployablesGained ge $minAcceptable"/>
+              <set_value name="$gotEnoughCM" exact="$cmGained ge $minAcceptable"/>
+              <set_value name="$gotEnoughUnits" exact="$unitsGained ge $minAcceptable"/>
+              <set_value name="$resupplySuccessful" exact="$gotEnoughDeployables or $gotEnoughCM or $gotEnoughUnits"/>
+              
+              <debug_text text="'[GT-Maintenance] 📊 Resupply result for ' + $ship.idcode + ': CM +' + $cmGained + ' (' + $beforeCM + '→' + $currentCM + '), Deployables +' + $deployablesGained + ' (' + $beforeDeployables + '→' + $currentDeployables + '), Units +' + $unitsGained + ' (' + $beforeUnits + '→' + $currentUnitsCount + ') - ' + if $resupplySuccessful then '✅ Acceptable' else '❌ Insufficient'" chance="100"/>
+              
+              <do_if value="$resupplySuccessful">
+                <!-- Resupply was successful -->
+              <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment" exact="false"/>
+                <debug_text text="'[GT-Maintenance] ✅ Resupply successful for ' + $ship.idcode" chance="100"/>
+              
+              <!-- Check if all maintenance complete -->
+              <set_value name="$waitingForRepair" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair"/>
+              <do_if value="not $waitingForRepair">
+                <!-- All done! -->
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+                <debug_text text="'[GT-Maintenance] ✅ All maintenance complete for ' + $ship.idcode" chance="100"/>
+              </do_if>
+              </do_if>
+              <do_else>
+                <!-- Resupply failed (got less than minimum acceptable) - add cooldown to prevent immediate retry -->
+                <debug_text text="'[GT-Maintenance] ⚠️ Resupply insufficient for ' + $ship.idcode + ' - got less than ' + $minAcceptable + ' items, adding cooldown before retry'" chance="100"/>
+                
+                <!-- Add to failed resupply tracking with cooldown (prevents immediate retry) -->
+                <do_if value="not global.$GT_MaintenanceFailedResupply?">
+                  <set_value name="global.$GT_MaintenanceFailedResupply" exact="table[]"/>
+                </do_if>
+                
+                <!-- Set cooldown: 300 seconds (5 minutes) before allowing another resupply attempt -->
+                <set_value name="global.$GT_MaintenanceFailedResupply.{$ship}" exact="player.age + 300s"/>
+                <debug_text text="'[GT-Maintenance] 🕒 Cooldown set for ' + $ship.idcode + ' until ' + (player.age + 300s) + ' (5 minutes from now)'" chance="100"/>
+                
+                <!-- Clear the waiting flag and remove order so ship can proceed to trading -->
+                <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment" exact="false"/>
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                
+                <!-- Signal ship to proceed -->
+                <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+              </do_else>
+            </do_if>
+          </do_while>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Process Repair Completion (Event-Driven from diff patch) -->
+    <cue name="ProcessRepairComplete" instantiate="true" checkinterval="0.05s">
+      <conditions>
+        <check_value value="global.$GT_RepairCompletePending?"/>
+      </conditions>
+      <actions>
+        <remove_value name="global.$GT_RepairCompletePending"/>
+        
+        <do_if value="global.$GT_RepairCompleteQueue? and global.$GT_RepairCompleteQueue.count gt 0">
+          <do_while value="global.$GT_RepairCompleteQueue.count gt 0">
+            <set_value name="$data" exact="global.$GT_RepairCompleteQueue.{1}"/>
+            <remove_from_list name="global.$GT_RepairCompleteQueue" exact="$data"/>
+            <set_value name="$ship" exact="$data.$ship"/>
+            
+            <!-- Mark repair order as complete in tracking -->
+            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+              <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair" exact="false"/>
+              <debug_text text="'[GT-Maintenance] ✅ Repair complete for ' + $ship.idcode + ' (from diff patch signal)'" chance="100"/>
+              
+              <!-- Check if all maintenance complete -->
+              <set_value name="$waitingForEquipment" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment"/>
+              <do_if value="not $waitingForEquipment">
+                <!-- All done! -->
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+                <debug_text text="'[GT-Maintenance] ✅ All maintenance complete for ' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_while>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Monitor Timeouts (Fallback in case orders fail silently) -->
+    <cue name="MonitorMaintenanceTimeouts" instantiate="true" checkinterval="5s">
+      <conditions>
+        <check_value value="global.$GT_MaintenanceOrders?"/>
+      </conditions>
+      <actions>
+        <!-- Check for timeouts -->
+        <do_if value="global.$GT_MaintenanceOrders.keys.count gt 0">
+          <set_value name="$shipsToTimeout" exact="[]"/>
+          
+          <do_for_each name="$ship" valuename="$orderData" in="global.$GT_MaintenanceOrders">
+            <set_value name="$startTime" exact="$orderData.$StartTime"/>
+            <set_value name="$timeout" exact="600s"/>
+            <set_value name="$elapsed" exact="player.age - $startTime"/>
+            
+            <do_if value="$elapsed ge $timeout">
+              <!-- Timeout -->
+              <debug_text text="'[GT-Maintenance] ⏱️ TIMEOUT for ' + $ship.idcode + ' after ' + ($elapsed/1s) + 's - proceeding anyway'" chance="100"/>
+              <append_to_list name="$shipsToTimeout" exact="$ship"/>
+              <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
+            </do_if>
+          </do_for_each>
+          
+          <!-- Clean up timed out ships -->
+          <do_all exact="$shipsToTimeout.count" counter="$i">
+            <remove_value name="global.$GT_MaintenanceOrders.{$shipsToTimeout.{$i}}"/>
+          </do_all>
+        </do_if>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>
