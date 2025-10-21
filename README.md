@@ -1,5 +1,6 @@
 # IMPORTANT
-## new releases are available on  [Nexusmods](https://www.nexusmods.com/x4foundations/mods/1857) only
+## New releases are available on [Nexusmods](https://www.nexusmods.com/x4foundations/mods/1857)
+## Source code and development: [GitHub](https://github.com/GoAhead-at/GalaxyTraderMK3)
 
 # GalaxyTrader MK3
 
@@ -40,9 +41,12 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Real-Time Threat Detection**: Monitors attacks, missiles, and ship destruction
 - **Fleet-Wide Intelligence**: Ships share threat information across the fleet
 - **5-Level Threat Classification**: From minor threats to critical emergencies
-- **Sector Risk Assessment**: Automatic avoidance of recently threatened areas
+- **Dynamic Blacklist System**: Automatic sector blacklisting based on threat levels
+- **Vanilla Pathfinding Integration**: X4's native pathfinding automatically respects blacklists
+- **Commander-Based Application**: Blacklists applied to fleet commanders (subordinates inherit)
+- **Configurable Thresholds**: Set threat level required for blacklisting (default: 3)
 - **Smart Notifications**: Fleet alerts for high-threat situations
-- **Automatic Cleanup**: Time-based database expiry prevents performance issues
+- **Automatic Cleanup**: Time-based database expiry and blacklist updates
 
 ### Fleet Coordination System ✅ **WORKING**
 - **Multi-Ship Management**: Coordinate entire trading fleets
@@ -66,6 +70,17 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Ship Class Aware**: S/M ships use wharfs/equipment docks, L/XL use shipyards
 - **Funds Management**: Full repair if affordable, partial repair if low on credits, notification if insufficient funds
 - **Automatic Resumption**: Ships automatically resume trading after repairs complete
+
+### Defensive Equipment Auto-Replenishment ✅ **WORKING**
+- **Skill-Gated Access**: Only Level 15 elite traders unlock this feature
+- **Countermeasures Restocking**: Flares and chaff automatically replenished
+- **Deployable Units**: Defense drones, cargo drones, repair drones, laser towers
+- **Configurable Thresholds**: Set when restocking triggers (default: 50% CM, 70% units)
+- **Equipment Balance Profiles**: 5 presets from defense-focused to balanced loadouts
+- **Individual Toggles**: Enable/disable specific equipment types
+- **Combined Maintenance**: Repair + equipment restocking in single station visit
+- **Initial Safety Check**: Ships verify equipment before entering dangerous sectors
+- **Failure Handling**: Monitors resupply completion, continues trading if items unavailable
 
 ### Performance Features ✅ **WORKING**
 - **Event-Driven Architecture**: 3-5x faster than polling-based systems
@@ -102,7 +117,8 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - Ships will automatically notify you when training is required
 - Training is **mandatory** at levels 3, 6, 9, and 12
 - Ships automatically find and travel to training stations
-- Training duration is currently fixed at 30 seconds (configurable in future)
+- Training duration: 10+ minutes (base 10 min + skill-based multiplier)
+- Immersive training messages with professional logbook entries
 - Ship resumes trading after certification with increased capabilities
 
 ## ⚙️ Configuration
@@ -118,18 +134,37 @@ All settings are centralized in the mod's configuration system:
 ### XP System
 - **Enable/Disable**: Toggle the progression system
 - **Base XP**: XP awarded per trade (default: 50)
-- **XP Multiplier**: Adjust progression speed
+- **XP Multiplier**: Adjust progression speed from 50% to 200% (default: 100%)
 - **Training Mode**: Automatic or manual training control
+- **Balanced Progression**: ~500 trades needed to reach max level at 100% multiplier
 
 ### Auto-Repair Settings
 - **Enable/Disable**: Toggle automatic repair system (default: enabled)
 - **Hull Threshold**: Trigger repair when hull drops below X% (default: 95%, range: 50-99%)
 - **Minimum Pilot Level**: Required skill level for auto-repair access (default: 12)
 
+### Threat Avoidance Settings
+- **Dynamic Blacklist**: Toggle automatic sector blacklisting (default: enabled)
+- **Blacklist Threshold**: Threat level required for blacklisting (default: 3, range: 1-5)
+- **Fleet-Wide Intelligence**: Ships share and coordinate threat data
+- **Automatic Updates**: Blacklists update every 5 seconds based on active threats
+
+### Defensive Equipment Settings (Level 15+)
+- **Enable/Disable**: Toggle auto-replenishment system
+- **Equipment Balance Profile**: Choose from 5 presets (Balanced, Defense-Focused, etc.)
+- **Countermeasure Threshold**: Trigger restocking at X% (default: 50%)
+- **Deployable Threshold**: Trigger restocking at X% (default: 70%)
+- **Individual Equipment Toggles**: Enable/disable specific equipment types
+- **Combined with Repairs**: Equipment restocking happens during repair visits
+
 ### Notifications
-- **Logbook Entries**: Enable professional trade messages
-- **Training Messages**: Immersive training start/completion notifications
-- **Level Up Alerts**: Pilot advancement announcements
+- **Organized Logbook Categories**: 
+  - **News**: Level-up notifications and achievements
+  - **Tips**: Trade orders and route information
+  - **Upkeep**: Training notices and maintenance alerts
+  - **Alerts**: Critical threats and errors
+- **Training Messages**: Immersive 10+ minute training sessions with professional notifications
+- **Equipment Notifications**: Restocking status and availability warnings
 - **Repair Notifications**: Auto-repair status and fund warnings
 - **Debug Output**: Comprehensive logging levels (0-3)
 
@@ -153,7 +188,7 @@ All settings are centralized in the mod's configuration system:
 | **12** | 3,850 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** → **15 jumps** | **✅ TRAINING** | • **+50% jump range** (10→15 jumps)<br>• **Advanced Fleet Coordination**<br>• **Auto-Repair System** 🔧<br>• Master trader certification<br>• Cross-galaxy trading |
 | **13** | 4,500 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • 5-star rank title<br>• Elite trader status |
 | **14** | 5,200 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • Near maximum capabilities |
-| **15** | 6,000 XP | Long-Distance Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** → **25 jumps** | No | • **+67% jump range** (15→25 jumps)<br>• **Maximum capabilities**<br>• True galaxy-wide trading<br>• Ultimate trader rank |
+| **15** | 6,000 XP | Long-Distance Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** → **25 jumps** | No | • **+67% jump range** (15→25 jumps)<br>• **Defensive Equipment Auto-Replenishment** 🛡️<br>• Automatic countermeasure & unit restocking<br>• **Maximum capabilities**<br>• True galaxy-wide trading<br>• Ultimate trader rank |
 
 ### **Key Skill Breakpoints**
 
@@ -180,8 +215,10 @@ All settings are centralized in the mod's configuration system:
 
 #### 🏆 **Level 15 - Long-Distance Merchant (Maximum)**
 - **Jump Range**: 15 → **25 jumps** (+67%)
-- **Capabilities**: Can trade anywhere in the known universe
-- **Status**: Elite 5-star master trader
+- **Unlocks**: **Defensive Equipment Auto-Replenishment** 🛡️
+- **Auto-Equipment**: Ships automatically restock countermeasures and deployable units
+- **Capabilities**: Can trade anywhere in the known universe with full defensive autonomy
+- **Status**: Elite 5-star master trader with maximum combat readiness
 
 ### **How Progression Works:**
 - **XP Gain**: Ships earn XP from successful trades (buy + sell cycle)
@@ -195,9 +232,10 @@ All settings are centralized in the mod's configuration system:
 ### **Feature Unlocks by Level:**
 - **Level 1+**: Basic trading, local threat detection
 - **Level 3+**: Multi-sector trading (after training)
-- **Level 6+**: Full Threat Intelligence System access
+- **Level 6+**: Full Threat Intelligence System access, Dynamic Blacklist avoidance
 - **Level 9+**: Mobile Satellite Intelligence (radar-based market scanning)
 - **Level 12+**: Advanced fleet coordination, **Auto-Repair System**
+- **Level 15+**: **Defensive Equipment Auto-Replenishment** (countermeasures & units)
 
 ### **XP Calculation System**
 
@@ -247,11 +285,18 @@ Range: 10 - 1,000 XP per trade (clamped)
 | **Large Long-Distance** | 200,000 Cr | +0.4 (excellent) | 10 jumps | **1,000 XP** (capped) |
 
 #### **Progression Speed**
-- **Level 1 → 3**: ~5-10 small trades (new pilots, local trading)
-- **Level 3 → 6**: ~15-25 medium trades (multi-sector trading)
-- **Level 6 → 9**: ~25-40 larger trades (regional specialist)
-- **Level 9 → 12**: ~35-50 long-distance trades (cross-galaxy expert)
-- **Level 12 → 15**: ~45-60 elite trades (master trader)
+The system is balanced to require approximately **500 trades** to reach Level 15 with the default 100% XP multiplier:
+
+- **Level 1 → 3**: ~25-30 trades (local trading, learning phase)
+- **Level 3 → 6**: ~50-75 trades (multi-sector trading)
+- **Level 6 → 9**: ~100-125 trades (regional specialist, market intelligence)
+- **Level 9 → 12**: ~125-150 trades (long-distance expert, auto-repair unlocked)
+- **Level 12 → 15**: ~150-200 trades (master trader, equipment replenishment)
+
+**XP Multiplier Impact:**
+- **50% Multiplier**: ~1000 trades to reach Level 15 (hardcore progression)
+- **100% Multiplier**: ~500 trades to reach Level 15 (balanced, default)
+- **200% Multiplier**: ~250 trades to reach Level 15 (faster progression)
 
 ## 🛠️ Troubleshooting
 
@@ -282,28 +327,37 @@ Range: 10 - 1,000 XP per trade (clamped)
 ## 📝 Credits
 
 - **Author**: GoAhead
-- **Version**: 1.0.0
+- **Version**: 0.5.0
 - **License**: MIT (see LICENSE.md)
+- **Special Thanks**: 
+  - TheBaldNord (Nexus Mods) - Logbook organization suggestion
+  - Community testers and feedback contributors
 
 ## 🐛 Bug Reports & Suggestions
 
 Please report issues or suggestions through the mod's official channels:
+- **GitHub Issues**: [https://github.com/GoAhead-at/GalaxyTraderMK3/issues](https://github.com/GoAhead-at/GalaxyTraderMK3/issues) (preferred)
+- **Nexus Mods**: [https://www.nexusmods.com/x4foundations/mods/1857](https://www.nexusmods.com/x4foundations/mods/1857)
 - Steam Workshop discussions
 - Egosoft forums mod thread
-- GitHub issues (if applicable)
 
 ## 🎮 Tips for Success
 
 1. **Start Small**: Begin with 1-2 ships to learn the system
 2. **Training Stations**: Ships will automatically find training stations at levels 3, 6, 9, and 12
-3. **Fleet Management**: Use multiple ships for better sector coverage and higher profits
-4. **Monitor Progress**: Watch ship names for rank, level, and XP updates
-5. **Debug Logging**: Enable debug output (level 2-3) to monitor system performance
-6. **Save Regularly**: While save-safe, regular saves are always recommended
-7. **Level 9+ Ships**: Gain bonus market intelligence through mobile satellite scanning
-8. **Level 12+ Auto-Repair**: Master traders automatically handle their own repairs - keep funds available
-9. **Hull Threshold**: Adjust auto-repair threshold (50-99%) based on your preferred risk tolerance
-10. **Combat Zones**: Ships trading in dangerous areas will benefit from auto-repair at level 12+
+3. **XP Multiplier**: Adjust from 50-200% in settings to match your preferred progression speed
+4. **Fleet Management**: Use multiple ships for better sector coverage and higher profits
+5. **Monitor Progress**: Watch ship names for rank, level, and XP updates
+6. **Debug Logging**: Enable debug output (level 2-3) to monitor system performance
+7. **Save Regularly**: While save-safe, regular saves are always recommended
+8. **Level 6+ Threat Avoidance**: Ships automatically avoid blacklisted dangerous sectors
+9. **Level 9+ Intelligence**: Gain bonus market intelligence through mobile satellite scanning
+10. **Level 12+ Auto-Repair**: Master traders automatically handle their own repairs - keep funds available
+11. **Level 15 Equipment**: Elite traders auto-restock countermeasures and defensive units
+12. **Organized Logbook**: Level-ups in News, trades in Tips, training/maintenance in Upkeep
+13. **Threat Threshold**: Adjust blacklist threshold (1-5) based on your risk tolerance
+14. **Combat Zones**: Level 15+ ships are fully autonomous with auto-repair and auto-equipment
+15. **Fleet Commanders**: Blacklists apply to commanders; subordinates inherit automatically
 
 ---
 

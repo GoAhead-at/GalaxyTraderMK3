@@ -49,6 +49,7 @@ ffi.cdef[[
     void SetControllableBlacklist(uint64_t controllableid, BlacklistID id, const char* listtype, bool value);
     BlacklistID GetControllableBlacklistID(uint64_t controllableid, const char* listtype, const char* defaultgroup);
     bool IsComponentBlacklisted(uint64_t componentid, const char* listtype, const char* defaultgroup, uint64_t controllableid);
+    bool GetBlacklistInfo2(BlacklistInfo2* info, BlacklistID id);
     
     // Component lookup
     uint64_t ConvertStringTo64Bit(const char* idcode);
@@ -73,6 +74,7 @@ local GT_Blacklist = {
     dynamic_blacklists = {},  -- { ship_id -> blacklist_id }
     blacklisted_sectors = {}, -- { sector_name -> { threat_level, timestamp } }
     fleet_blacklist_id = nil, -- Shared fleet-wide blacklist ID
+    relation_value = "",      -- Stored relation value: "enemy" or ""
     last_update = 0,
     initialized = false,
 }
@@ -115,8 +117,12 @@ end
 -- =============================================================================
 
 --- Create or update the fleet-wide dynamic blacklist
-local function updateFleetBlacklist(threatened_macro_list)
-    debugLog(string.format("Updating fleet blacklist with %d threatened sector macros", #threatened_macro_list))
+--- @param threatened_macro_list table List of sector macros with direct threats
+--- @param relation_value string "enemy" to block enemy factions, "" to disable
+local function updateFleetBlacklist(threatened_macro_list, relation_value)
+    local relation_display = (relation_value == "enemy") and '"enemy"' or 'disabled'
+    debugLog(string.format("Updating fleet blacklist with %d threatened sector macros, faction blocking: %s", 
+             #threatened_macro_list, relation_display))
     
     -- MD already sent us the macros, so we can use them directly!
     local macro_strings = {}  -- Keep references to prevent garbage collection
@@ -125,14 +131,14 @@ local function updateFleetBlacklist(threatened_macro_list)
         if macro_name and macro_name ~= "" and macro_name ~= "nil" then
             -- Store FFI string to prevent GC
             table.insert(macro_strings, ffi.new("char[?]", #macro_name + 1, macro_name))
-            debugLog(string.format("  → Added macro: %s", macro_name))
+            debugLog(string.format("  → Added threatened sector macro: %s", macro_name))
         else
             debugLog(string.format("WARNING: Skipping invalid macro: '%s'", tostring(macro_name)), "WARN")
         end
     end
     
     -- Allow empty blacklist (0 sectors) - this is intentional for "clear all threats"
-    debugLog(string.format("Processed %d valid sector macros", #macro_strings))
+    debugLog(string.format("Processed %d valid threatened sector macros", #macro_strings))
     
     -- Prepare FFI array of string pointers (handle empty case)
     local macros_array = nil
@@ -143,11 +149,22 @@ local function updateFleetBlacklist(threatened_macro_list)
         end
     end
     
+    -- Set up relation value for automatic faction blocking
+    -- X4 expects the literal string "enemy" to block enemy factions
+    --   "enemy" = block all sectors owned by enemy factions
+    --   ""      = disabled (no faction blocking)
+    local relation_str = ffi.new("char[?]", #relation_value + 1, relation_value)
+    
+    if relation_value == "enemy" then
+        debugLog("✅ Faction-based blocking: ENABLED (blocks all enemy faction sectors)")
+    else
+        debugLog("⚠️ Faction-based blocking: DISABLED")
+    end
+    
     -- Create blacklist info structure
     local blacklist_name = GT_Blacklist.CONFIG.BLACKLIST_NAME_PREFIX .. "Fleet"
     local name_str = ffi.new("char[?]", #blacklist_name + 1, blacklist_name)
     local type_str = ffi.new("char[?]", 13, "sectortravel")  -- 12 chars + null
-    local relation_str = ffi.new("char[?]", 1, "")  -- Empty string
     
     local info = ffi.new("BlacklistInfo2")
     info.name = name_str
@@ -156,21 +173,68 @@ local function updateFleetBlacklist(threatened_macro_list)
     info.macros = macros_array
     info.numfactions = 0
     info.factions = nil
-    info.relation = relation_str
+    info.relation = relation_str  -- X4 will automatically block sectors owned by hostile factions!
     info.hazardous = false
     info.usemacrowhitelist = false
     info.usefactionwhitelist = false
+    
+    -- Log what we're creating/updating
+    debugLog("========== BLACKLIST CONFIGURATION ==========")
+    debugLog(string.format("  name: %s", blacklist_name))
+    debugLog(string.format("  type: %s", ffi.string(type_str)))
+    debugLog(string.format("  nummacros: %d", #macro_strings))
+    debugLog(string.format("  numfactions: %d", info.numfactions))
+    debugLog(string.format("  relation: '%s' (length: %d)", ffi.string(relation_str), #ffi.string(relation_str)))
+    debugLog(string.format("  hazardous: %s", tostring(info.hazardous)))
+    debugLog(string.format("  usemacrowhitelist: %s", tostring(info.usemacrowhitelist)))
+    debugLog(string.format("  usefactionwhitelist: %s", tostring(info.usefactionwhitelist)))
+    debugLog("=============================================")
     
     -- Create or update blacklist
     if not GT_Blacklist.fleet_blacklist_id then
         debugLog(string.format("Creating new fleet blacklist: %s", blacklist_name))
         GT_Blacklist.fleet_blacklist_id = C.CreateBlacklist2(info)
-        debugLog(string.format("✅ Fleet blacklist created with ID: %d", GT_Blacklist.fleet_blacklist_id))
+        debugLog(string.format("🛡️ ✅ Fleet blacklist created with ID: %d", GT_Blacklist.fleet_blacklist_id))
     else
-        debugLog(string.format("Updating existing fleet blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
-        info.id = GT_Blacklist.fleet_blacklist_id
-        C.UpdateBlacklist2(info)
-        debugLog("✅ Fleet blacklist updated")
+        -- Try to verify blacklist still exists before updating (player might have deleted it manually)
+        local blacklist_still_exists = false
+        
+        -- Check if GetBlacklistInfo2 is available (might be restricted by X4 security)
+        if type(C.GetBlacklistInfo2) == "cdata" then
+            local verify_buf = ffi.new("BlacklistInfo2")
+            local success, exists = pcall(function() return C.GetBlacklistInfo2(verify_buf, GT_Blacklist.fleet_blacklist_id) end)
+            
+            if success then
+                blacklist_still_exists = exists
+                if not exists then
+                    debugLog(string.format("⚠️ Blacklist ID %d no longer exists (manually deleted?)", GT_Blacklist.fleet_blacklist_id))
+                end
+            else
+                -- Function failed (likely restricted) - assume blacklist exists
+                debugLog("⚠️ GetBlacklistInfo2 is restricted - cannot verify blacklist existence", "WARN")
+                blacklist_still_exists = true -- Assume it exists
+            end
+        else
+            -- Function not available - assume blacklist exists
+            debugLog("⚠️ GetBlacklistInfo2 not available - cannot verify blacklist existence", "WARN")
+            blacklist_still_exists = true -- Assume it exists
+        end
+        
+        if not blacklist_still_exists then
+            -- Blacklist was deleted - recreate it
+            debugLog("🔄 Recreating deleted blacklist...")
+            GT_Blacklist.fleet_blacklist_id = C.CreateBlacklist2(info)
+            debugLog(string.format("🛡️ ✅ Fleet blacklist recreated with new ID: %d", GT_Blacklist.fleet_blacklist_id))
+            
+            -- Notify MD to update the stored ID
+            AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
+        else
+            -- Blacklist exists (or we can't verify) - update it
+            debugLog(string.format("Updating existing fleet blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
+            info.id = GT_Blacklist.fleet_blacklist_id
+            C.UpdateBlacklist2(info)
+            debugLog("✅ Fleet blacklist updated")
+        end
     end
     
     return true
@@ -268,10 +332,12 @@ end
 -- =============================================================================
 
 --- Parse threat data from MD script format
+--- @param threat_data_string string Format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
+--- @return table threatened_macros List of sector macros to blacklist
 local function parseThreatData(threat_data_string)
     debugLog(string.format("Parsing threat data: %s", threat_data_string))
     
-    -- Format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
+    -- Simple format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
     local threatened_macros = {}
     
     for sector_entry in string.gmatch(threat_data_string, "([^|]+)") do
@@ -338,16 +404,52 @@ local function onInitialize(_, event_data)
         return false
     end
     
-    -- Create empty blacklist at startup (avoids creation lag on first threat)
-    debugLog("Creating empty fleet blacklist at startup...")
-    local empty_sectors = {}
-    local success = updateFleetBlacklist(empty_sectors)
+    -- Parse init data: "relation|existing_id"
+    -- relation is "enemy" (enabled) or "" (disabled)
+    debugLog(string.format("🔍 Received event_data from MD: '%s' (type: %s, length: %d)", 
+             tostring(event_data), type(event_data), event_data and #event_data or 0))
     
-    if success then
-        debugLog("✅ Empty fleet blacklist created successfully")
-    else
-        debugLog("⚠️ Failed to create empty blacklist, will retry on first threat", "WARN")
+    local relation_value, existing_id = "", 0
+    if event_data and event_data ~= "" then
+        local parts = {}
+        for part in string.gmatch(event_data, "[^|]+") do
+            table.insert(parts, part)
+        end
+        debugLog(string.format("🔍 Parsed parts: [1]='%s', [2]='%s'", 
+                 tostring(parts[1] or "nil"), tostring(parts[2] or "nil")))
+        relation_value = parts[1] or ""
+        existing_id = tonumber(parts[2]) or 0
     end
+    
+    GT_Blacklist.relation_value = relation_value
+    
+    -- Check if we're reusing an existing blacklist or creating new
+    local faction_blocking_status = (relation_value == "enemy") and '"enemy"' or 'disabled'
+    if existing_id > 0 then
+        debugLog(string.format("♻️ Reusing existing blacklist ID: %d (faction blocking: %s)", existing_id, faction_blocking_status))
+        GT_Blacklist.fleet_blacklist_id = existing_id
+        -- No need to notify MD - it already knows the ID
+    else
+        debugLog(string.format("🆕 Creating NEW fleet blacklist (faction blocking: %s)", faction_blocking_status))
+    end
+    
+    -- Create/Update blacklist with relation value
+    -- X4 will automatically block all sectors owned by enemy factions if relation="enemy"
+    local empty_sectors = {}
+    local success = updateFleetBlacklist(empty_sectors, GT_Blacklist.relation_value)
+    
+    if not success then
+        debugLog("⚠️ Failed to create/update blacklist", "WARN")
+        return false
+    end
+    
+    -- If we created a NEW blacklist, notify MD to store the ID
+    if existing_id == 0 and GT_Blacklist.fleet_blacklist_id then
+        debugLog(string.format("📤 Notifying MD of new blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
+        AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
+    end
+    
+    debugLog("✅ Fleet blacklist initialized with faction-based blocking enabled")
     
     GT_Blacklist.initialized = true
     debugLog("✅ Dynamic Blacklist System initialized successfully")
@@ -372,8 +474,8 @@ local function onUpdateBlacklist(_, event_data)
         debugLog("No threat data provided - updating blacklist to empty")
     end
     
-    -- Update fleet blacklist (will update to empty if no threats)
-    return updateFleetBlacklist(threatened_sectors)
+    -- Update fleet blacklist with threatened sectors AND relation value (must pass it every time!)
+    return updateFleetBlacklist(threatened_sectors, GT_Blacklist.relation_value)
 end
 
 --- Apply blacklist to GT fleet ships
@@ -445,6 +547,17 @@ local function onRemoveFromShip(_, event_data)
     return removeBlacklistFromShip(ship_id)
 end
 
+--- Force recreate the blacklist (bypasses initialized check)
+local function onRecreateBlacklist(_, event_data)
+    debugLog("🔄 FORCE RECREATE: Resetting blacklist system...")
+    
+    -- Reset initialized flag to allow recreation
+    GT_Blacklist.initialized = false
+    
+    -- Call the normal initialize function
+    return onInitialize(_, event_data)
+end
+
 -- =============================================================================
 -- MODULE INITIALIZATION
 -- =============================================================================
@@ -467,6 +580,7 @@ local function init()
         { name = "GT_Blacklist.ApplyToFleet",    handler = onApplyToFleet },
         { name = "GT_Blacklist.CleanupExpired",  handler = onCleanupExpired },
         { name = "GT_Blacklist.RemoveFromShip",  handler = onRemoveFromShip },
+        { name = "GT_Blacklist.Recreate",        handler = onRecreateBlacklist },
     }
     
     for _, event in ipairs(events) do

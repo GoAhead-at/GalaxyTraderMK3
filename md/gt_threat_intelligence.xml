@@ -74,6 +74,9 @@
           <do_if value="$threatLevel ge 3">
             <show_notification text="'⚠️ FLEET ALERT: High threat activity in ' + $currentSector.knownname + ' - All traders advised to avoid'" timeout="10s"/>
           </do_if>
+          
+          <!-- Immediately update blacklist when threat is detected -->
+          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         </do_if>
       </actions>
     </cue>
@@ -105,6 +108,9 @@
           
           <!-- Always notify for missile threats -->
           <show_notification text="'🚀 MISSILE ALERT: Hostile missile detected in ' + $currentSector.knownname + ' - Fleet advised extreme caution'" timeout="8s"/>
+          
+          <!-- Immediately update blacklist when threat is detected -->
+          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         </do_if>
       </actions>
     </cue>
@@ -574,14 +580,46 @@
       </conditions>
       <actions>
         <!-- Initialize Lua blacklist manager -->
-        <raise_lua_event name="'GT_Blacklist.Initialize'" param="'startup'"/>
+        <!-- Pass relation threshold AND existing blacklist ID (if any) to Lua -->
+        <!-- Only pass relation threshold if BlockEnemyFactions is enabled (default: true) -->
+        <set_value name="$blockEnemyFactions" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$BlockEnemyFactions"/>
+        <do_if value="not $blockEnemyFactions?">
+          <set_value name="$blockEnemyFactions" exact="true"/> <!-- Default: enabled -->
+        </do_if>
         
-        <debug_text text="'[GalaxyTrader MK3] Initializing dynamic blacklist integration...'" chance="100"/>
+        <debug_text text="'[GT-Blacklist] BlockEnemyFactions setting: ' + $blockEnemyFactions" chance="100"/>
         
-        <!-- Perform initial sync of threat data -->
-        <signal_cue_instantly cue="SyncThreatsToBlacklist"/>
+        <set_value name="$relationValue" exact="''"/>
+        <do_if value="$blockEnemyFactions">
+          <set_value name="$relationValue" exact="'enemy'"/>
+          <debug_text text="'[GT-Blacklist] Enemy faction blocking ENABLED (X4 relation field = &quot;enemy&quot;)'" chance="100"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Blacklist] Enemy faction blocking DISABLED (X4 relation field = &quot;&quot;)'" chance="100"/>
+        </do_else>
         
-        <!-- Start fleet application cycle -->
+        <!-- Check if we have a saved blacklist ID from previous session -->
+        <set_value name="$existingBlacklistID" exact="@global.$GT_BlacklistID"/>
+        <do_if value="not $existingBlacklistID?">
+          <set_value name="$existingBlacklistID" exact="0"/> <!-- 0 = create new -->
+        </do_if>
+        
+        <!-- Pass both relation value ("enemy" or "") and existing ID (format: "relation|id") -->
+        <set_value name="$initData" exact="$relationValue + '|' + $existingBlacklistID"/>
+        <debug_text text="'[GT-Blacklist] Passing to Lua: &quot;' + $initData + '&quot; (relation=' + $relationValue + ', id=' + $existingBlacklistID + ')'" chance="100"/>
+        <raise_lua_event name="'GT_Blacklist.Initialize'" param="$initData"/>
+        
+        <do_if value="$existingBlacklistID == 0">
+          <debug_text text="'[GT-Blacklist] Creating NEW blacklist...'" chance="100"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Blacklist] Reusing EXISTING blacklist ID: ' + $existingBlacklistID" chance="100"/>
+        </do_else>
+        
+        <!-- Load existing threats into blacklist immediately after creation -->
+        <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+        
+        <!-- Start fleet application cycle (blacklist updates are now event-driven when threats occur) -->
         <signal_cue_instantly cue="ApplyBlacklistToFleet"/>
         
         <!-- Start cleanup cycle -->
@@ -589,17 +627,29 @@
       </actions>
     </cue>
     
-    <!-- Periodic sync of threat data to Lua blacklist manager -->
-    <cue name="SyncThreatsToBlacklist" instantiate="true">
+    <!-- Store blacklist ID after Lua creates/confirms it -->
+    <cue name="StoreBlacklistID" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'gt_blacklist_manager'" control="'BlacklistCreated'" />
+      </conditions>
+      <actions>
+        <!-- Store the blacklist ID in global variable so it persists across saves -->
+        <!-- event.param3 contains the third parameter passed to AddUITriggeredEvent -->
+        <set_value name="global.$GT_BlacklistID" exact="event.param3"/>
+        <debug_text text="'[GT-Blacklist] Stored blacklist ID: ' + global.$GT_BlacklistID" chance="100"/>
+      </actions>
+    </cue>
+    
+    <!-- Update blacklist immediately when threat is detected (event-driven, no polling) -->
+    <cue name="UpdateBlacklistOnThreat" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <delay exact="5s"/> <!-- Sync every 5 seconds -->
       <actions>
-        <!-- Only sync if dynamic blacklist is enabled -->
+        <!-- Only update if dynamic blacklist is enabled -->
         <do_if value="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
           <do_if value="global.$GT_ThreatIntelligence?">
-            <!-- Build threat data string for Lua -->
+            <!-- Build list of threatened sector macros -->
             <set_value name="$threatDataString" exact="''"/>
             <set_value name="$threatCount" exact="0"/>
             
@@ -608,8 +658,7 @@
               <set_value name="$threatData" exact="global.$GT_ThreatIntelligence.{$sector}"/>
               
               <do_if value="$threatData.$ThreatLevel? and $threatData.$Timestamp?">
-                <!-- Format: "sector_macro:level:timestamp|" (send macro directly for Lua) -->
-                <set_value name="$sectorMacro" exact="@$sector.macro.id"/> <!-- Get sector's macro ID -->
+                <set_value name="$sectorMacro" exact="@$sector.macro.id"/>
                 <set_value name="$entry" exact="$sectorMacro + ':' + $threatData.$ThreatLevel + ':' + $threatData.$Timestamp"/>
                 
                 <do_if value="$threatDataString == ''">
@@ -623,31 +672,12 @@
               </do_if>
             </do_all>
             
-            <!-- Send to Lua blacklist manager -->
-            <do_if value="$threatCount gt 0">
-              <raise_lua_event name="'GT_Blacklist.Update'" param="$threatDataString"/>
-              
-              <debug_text text="'[GT-Blacklist] Synced ' + $threatCount + ' threats to Lua manager'" chance="0"/>
-            </do_if>
-            <do_else>
-              <!-- No threats - clear blacklist -->
-              <raise_lua_event name="'GT_Blacklist.Update'" param="''"/>
-            </do_else>
+            <!-- Send to Lua immediately (no delay, event-driven) -->
+            <raise_lua_event name="'GT_Blacklist.Update'" param="$threatDataString"/>
+            <debug_text text="'[GT-Blacklist] Updated ' + $threatCount + ' threatened sectors (event-driven)'" chance="0"/>
           </do_if>
         </do_if>
       </actions>
-      <cues>
-        <cue name="SyncThreatsToBlacklist_Delay">
-          <conditions>
-            <event_cue_signalled/>
-          </conditions>
-          <delay exact="5s"/>
-          <actions>
-            <!-- Continue syncing -->
-            <signal_cue_instantly cue="SyncThreatsToBlacklist"/>
-          </actions>
-        </cue>
-      </cues>
     </cue>
     
     <!-- Apply blacklist to all GT ships automatically -->
@@ -745,6 +775,9 @@
           
           <!-- Signal Lua to cleanup -->
           <raise_lua_event name="'GT_Blacklist.CleanupExpired'" param="$currentTime + ':' + $expiryTime"/>
+          
+          <!-- Update blacklist after cleanup (event-driven: some threats may have expired) -->
+          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         </do_if>
       </actions>
       <cues>
