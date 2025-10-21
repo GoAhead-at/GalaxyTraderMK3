@@ -211,6 +211,11 @@
         <set_value name="$bestScore" exact="0"/>
         <set_value name="$foundCachedTrade" exact="false"/>
         
+        <!-- ===== GET BLACKLIST GROUP FOR DISTANCE VALIDATION ===== -->
+        <set_value name="$blacklistgroup" exact="blacklisttype.objectactivity"/>
+        <set_value name="$blacklistgroup" exact="if $ship.primarypurpose == purpose.fight then blacklisttype.sectortravel else $blacklistgroup"/>
+        <set_value name="$blacklistgroup" exact="if $ship.primarypurpose == purpose.mine then blacklisttype.mining else $blacklistgroup"/>
+        
         <!-- Cache age check removed - not needed, individual entries have $Timestamp -->
         <set_value name="$cacheAge" exact="0s"/>
         
@@ -274,41 +279,51 @@
               <continue/>
             </do_if>
             
-            <!-- ✅ THREAT AVOIDANCE: Check if sectors are safe enough for this ship -->
-            <do_if value="@global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled">
-              <set_value name="$skipThreat" exact="false"/>
-              <set_value name="$riskTolerance" exact="@global.$GT_AIParameters.{$ship}.$RiskTolerance"/>
-              <do_if value="not $riskTolerance?">
-                <set_value name="$riskTolerance" exact="0"/> <!-- Default: avoid all threats -->
-              </do_if>
-              
-              <!-- Check buy station sector -->
-              <set_value name="$buySectorMacro" exact="@$cacheEntry.$BuyOffer.owner.sector.macro.id"/>
-              <do_if value="$buySectorMacro and global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$buySectorMacro}?">
-                <set_value name="$threatLevel" exact="@global.$GT_ThreatIntelligence.{$buySectorMacro}.$ThreatLevel"/>
-                <do_if value="$threatLevel gt $riskTolerance">
-                  <set_value name="$skipThreat" exact="true"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Check sell station sector -->
-              <do_if value="not $skipThreat">
-                <set_value name="$sellSectorMacro" exact="@$cacheEntry.$SellOffer.owner.sector.macro.id"/>
-                <do_if value="$sellSectorMacro and global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$sellSectorMacro}?">
-                  <set_value name="$threatLevel" exact="@global.$GT_ThreatIntelligence.{$sellSectorMacro}.$ThreatLevel"/>
-                  <do_if value="$threatLevel gt $riskTolerance">
-                    <set_value name="$skipThreat" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_if>
-              
-              <!-- Skip cached trade if either sector is too dangerous -->
-              <do_if value="$skipThreat">
-                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
-                  <debug_text text="'[GT-Cache] ⛔ Skipping cached trade (dangerous sector, threat exceeds risk tolerance)'" chance="100"/>
-                </do_if>
-                <continue/>
-              </do_if>
+            <!-- 
+              BLACKLIST-AWARE DISTANCE VALIDATION
+              - Recalculate distance using blacklist group (may differ from cached distance)
+              - gatedistance.{$blacklistgroup} returns actual distance avoiding blacklisted sectors
+              - Returns -1 if no valid path exists (trade is unreachable)
+              - Must check CURRENT distance, not cached distance, as blacklist state may have changed
+            -->
+            <set_value name="$buyDistance" exact="@$ship.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$sellDistance" exact="@$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}.{$blacklistgroup}.{$ship}"/>
+            
+            <!-- Safe defaults for null values -->
+            <do_if value="not $buyDistance?">
+              <set_value name="$buyDistance" exact="-1"/>
+            </do_if>
+            <do_if value="not $sellDistance?">
+              <set_value name="$sellDistance" exact="-1"/>
+            </do_if>
+            
+            <!-- Filter unreachable trades -->
+            <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+              <!-- BLACKLIST HIT: Trade blocked by blacklist routing -->
+              <debug_text text="'[GT-Cache] ⛔ BLACKLIST HIT: Cached trade unreachable' + 
+                '\n  Ware: ' + @$cacheEntry.$BuyOffer.ware.name + 
+                '\n  Buy: ' + @$cacheEntry.$BuyOffer.owner.knownname + ' (sector: ' + @$cacheEntry.$BuyOffer.owner.sector.knownname + ')' +
+                '\n  Sell: ' + @$cacheEntry.$SellOffer.owner.knownname + ' (sector: ' + @$cacheEntry.$SellOffer.owner.sector.knownname + ')' +
+                '\n  Distance (blacklist-aware): Buy=' + $buyDistance + ' jumps, Sell=' + $sellDistance + ' jumps' +
+                '\n  Cached distance (old): ' + @$cacheEntry.$Distance + ' jumps' +
+                '\n  → Trade filtered: No safe route exists through non-blacklisted sectors'" 
+                chance="100"/>
+              <continue/>
+            </do_if>
+            
+            <!-- Calculate total distance using blacklist-aware routing -->
+            <set_value name="$currentDistance" exact="$buyDistance + $sellDistance"/>
+            
+            <!-- LOG: Detect alternative routing due to blacklist -->
+            <do_if value="$cacheEntry.$Distance? and $currentDistance gt $cacheEntry.$Distance">
+              <debug_text text="'[GT-Cache] ⚠️ ALTERNATIVE ROUTE: Blacklist forcing detour' + 
+                '\n  Ware: ' + @$cacheEntry.$BuyOffer.ware.name + 
+                '\n  Buy: ' + @$cacheEntry.$BuyOffer.owner.knownname + 
+                '\n  Sell: ' + @$cacheEntry.$SellOffer.owner.knownname + 
+                '\n  Original distance: ' + $cacheEntry.$Distance + ' jumps' +
+                '\n  Blacklist-aware distance: ' + $currentDistance + ' jumps' +
+                '\n  Detour: +' + ($currentDistance - $cacheEntry.$Distance) + ' jumps (avoiding blacklisted sectors)'" 
+                chance="100"/>
             </do_if>
             
             <!-- ✅ ILLEGAL WARE FILTER: Skip illegal wares if ship doesn't allow illegal trades -->
@@ -324,8 +339,11 @@
                  The old logic read prices from cached tradeoffer objects which are stale.
                  We should only validate against fresh prices AFTER querying fresh offers. -->
             
-            <!-- Check distance constraint -->
-            <do_if value="$cacheEntry.$Distance? and $cacheEntry.$Distance gt $maxDistance">
+            <!-- Check distance constraint (use current blacklist-aware distance) -->
+            <do_if value="$currentDistance gt $maxDistance">
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                <debug_text text="'[GT-Cache] ⛔ Trade exceeds max distance (' + $currentDistance + ' > ' + $maxDistance + ')'" chance="100"/>
+              </do_if>
               <continue/>
             </do_if>
             
@@ -334,8 +352,8 @@
               <continue/>
             </do_if>
             
-            <!-- Calculate current score with distance penalty -->
-            <set_value name="$adjustedDistance" exact="$cacheEntry.$Distance * $distancePenaltyMultiplier"/>
+            <!-- Calculate current score with distance penalty (use blacklist-aware distance) -->
+            <set_value name="$adjustedDistance" exact="$currentDistance * $distancePenaltyMultiplier"/>
             <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($cacheEntry.$Profit / $adjustedDistance) else $cacheEntry.$Profit"/>
             
             <!-- ✅ DEBUG: Log each entry being considered -->
@@ -491,6 +509,18 @@
         <set_value name="$stationsEvaluated" exact="0"/>
         <set_value name="$offersFound" exact="0"/>
         
+        <!-- ===== GET BLACKLIST GROUP FOR DISTANCE CALCULATION ===== -->
+        <!-- 
+          CRITICAL: Use blacklist-aware distance for accurate efficiency calculation
+          - gatedistance.{$blacklistgroup} returns actual distance avoiding blacklisted sectors
+          - Returns -1 if no valid path exists (trade is unreachable)
+          - Ensures efficiency scores reflect REAL travel distance, not theoretical shortest path
+          - Without this, trades may look profitable but be inefficient due to long detours
+        -->
+        <set_value name="$blacklistgroup" exact="blacklisttype.objectactivity"/>
+        <set_value name="$blacklistgroup" exact="if $ship.primarypurpose == purpose.fight then blacklisttype.sectortravel else $blacklistgroup"/>
+        <set_value name="$blacklistgroup" exact="if $ship.primarypurpose == purpose.mine then blacklisttype.mining else $blacklistgroup"/>
+        
         <!-- ===== DETERMINE HOME SECTOR ===== -->
         <set_value name="$homeBase" exact="null"/>
         <set_value name="$homeBaseSource" exact="'unknown'"/>
@@ -605,7 +635,7 @@
             <break/>
           </do_if>
           
-          <!-- Validate station (includes threat avoidance check) -->
+          <!-- Validate station (threat avoidance now handled by vanilla pathfinding) -->
           <run_actions ref="md.GT_Utilities.GT_ValidateStation" result="$stationValid">
             <param name="station" value="$station"/>
             <param name="ship" value="$ship"/>
@@ -737,18 +767,20 @@
             <set_value name="$availableMoney" exact="$homeBase.money"/>
           </do_if>
           
-          <!-- ✅ OPTIMIZATION: Pre-calculate station distances to avoid repeated lookups -->
+          <!-- ✅ OPTIMIZATION: Pre-calculate blacklist-aware station distances to avoid repeated lookups -->
           <set_value name="$stationDistanceCache" exact="table[]"/>
           <do_all exact="$allSellOffers.count" counter="$i">
             <set_value name="$sellStation" exact="$allSellOffers.{$i}.owner"/>
             <do_if value="not $stationDistanceCache.{$sellStation}?">
-              <set_value name="$stationDistanceCache.{$sellStation}" exact="@$homeSector.gatedistance.{$sellStation.sector}"/>
+              <!-- Use blacklist-aware distance for accurate routing calculation -->
+              <set_value name="$stationDistanceCache.{$sellStation}" exact="@$homeSector.gatedistance.{$sellStation.sector}.{$blacklistgroup}.{$ship}"/>
             </do_if>
           </do_all>
           <do_all exact="$allBuyOffers.count" counter="$i">
             <set_value name="$buyStation" exact="$allBuyOffers.{$i}.owner"/>
             <do_if value="not $stationDistanceCache.{$buyStation}?">
-              <set_value name="$stationDistanceCache.{$buyStation}" exact="@$homeSector.gatedistance.{$buyStation.sector}"/>
+              <!-- Use blacklist-aware distance for accurate routing calculation -->
+              <set_value name="$stationDistanceCache.{$buyStation}" exact="@$homeSector.gatedistance.{$buyStation.sector}.{$blacklistgroup}.{$ship}"/>
             </do_if>
           </do_all>
           
@@ -853,6 +885,14 @@
                         </do_else>
                         
                         <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+                          <!-- BLACKLIST HIT: Trade blocked by blacklist routing -->
+                          <debug_text text="'[GT-Search] ⛔ BLACKLIST HIT: Live trade unreachable' + 
+                            '\n  Ware: ' + @$sellOffer.ware.name + 
+                            '\n  Buy: ' + @$sellOffer.owner.knownname + ' (sector: ' + @$sellOffer.owner.sector.knownname + ')' +
+                            '\n  Sell: ' + @$buyOffer.owner.knownname + ' (sector: ' + @$buyOffer.owner.sector.knownname + ')' +
+                            '\n  Distance (blacklist-aware): Buy=' + $buyDistance + ' jumps, Sell=' + $sellDistance + ' jumps' +
+                            '\n  → Trade filtered: No safe route exists through non-blacklisted sectors'" 
+                            chance="100"/>
                           <continue/>
                         </do_if>
                         <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
@@ -1063,8 +1103,9 @@
           <do_if value="$bestOffer and $bestPrice gt $minProfit">
             <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' found sell opportunity'" chance="100"/>
             
-            <!-- Create trade order -->
-            <create_trade_order object="$ship" tradeoffer="$bestOffer" amount="$bestAmount" immediate="false"/>
+            <!-- Create trade order with blacklist routing enabled -->
+            <!-- internal="true" ensures pathfinding routes around blacklisted sectors -->
+            <create_trade_order object="$ship" tradeoffer="$bestOffer" amount="$bestAmount" immediate="false" internal="true"/>
             
             <!-- Signal back to AI script: Trade Found -->
             <signal_objects object="$ship" param="'GT_Trade_Found'"/>
