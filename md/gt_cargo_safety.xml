@@ -1,0 +1,311 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_CargoSafety" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/x4Original/libraries/md.xsd">
+  
+  <!-- ============================================================================= -->
+  <!-- GALAXY TRADER MK3 - CARGO SAFETY AND RECOVERY SYSTEM                         -->
+  <!-- Handles orphaned cargo from any cause: pre-existing, station destruction,    -->
+  <!-- mid-flight threats, etc.                                                      -->
+  <!-- Pattern: MD prepares data → AI executes vanilla trade orders                 -->
+  <!-- ============================================================================= -->
+  
+  <cues>
+    
+    <!-- ========================================================================= -->
+    <!-- SIGNAL RELAY: GT_Find_Alternative_Sell                                    -->
+    <!-- Receives signal from AI script and triggers FindAlternativeSellStation   -->
+    <!-- ========================================================================= -->
+    
+    <cue name="AlternativeSellSignalRelay" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Find_Alternative_Sell'"/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param2"/>
+        <debug_text text="'[GT-Safety] Received GT_Find_Alternative_Sell signal from AI - relaying to FindAlternativeSellStation'" chance="100"/>
+        <signal_cue_instantly cue="FindAlternativeSellStation" param="$params"/>
+      </actions>
+    </cue>
+    
+    <!-- ========================================================================= -->
+    <!-- SIGNAL RELAY: GT_Recheck_Cargo                                            -->
+    <!-- Receives signal from AI script to recheck cargo after sale completion    -->
+    <!-- ========================================================================= -->
+    
+    <cue name="RecheckCargoSignalRelay" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Recheck_Cargo'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param2"/>
+        <debug_text text="'[GT-Safety] Received GT_Recheck_Cargo signal from AI - re-triggering emergency dump for ' + $ship.idcode" chance="100"/>
+        <signal_cue_instantly cue="EmergencyCargoDump" param="$ship"/>
+      </actions>
+    </cue>
+    
+    <!-- ========================================================================= -->
+    <!-- EMERGENCY CARGO DUMP                                                      -->
+    <!-- Handles orphaned cargo when ship has cargo but no active trade context   -->
+    <!-- ========================================================================= -->
+    
+    <cue name="EmergencyCargoDump" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param"/>
+        
+        <!-- Validate ship exists and is operational -->
+        <do_if value="$ship? and @$ship.exists and @$ship.isoperational">
+          <debug_text text="'[GT-Safety] ' + $ship.idcode + ': Emergency cargo dump triggered'" chance="100"/>
+        
+        <!-- Get all cargo wares (using @ operator) -->
+        <set_value name="$cargoWares" exact="[]"/>
+        <set_value name="$cargoList" exact="@$ship.cargo.list"/>
+        <do_if value="$cargoList?">
+          <do_all exact="$cargoList.count" counter="$i">
+            <set_value name="$ware" exact="$cargoList.{$i}"/>
+            <set_value name="$wareCount" exact="@$ship.cargo.{$ware}.count"/>
+            <do_if value="$wareCount? and $wareCount gt 0">
+              <append_to_list name="$cargoWares" exact="$ware"/>
+              <debug_text text="'[GT-Safety]   - Found cargo: ' + $ware.name + ' x' + $wareCount" chance="100"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <do_if value="$cargoWares.count == 0">
+          <debug_text text="'[GT-Safety] ' + $ship.idcode + ': No cargo found, skipping'" chance="100"/>
+          <signal_objects object="$ship" param="'GT_Emergency_Cargo_Complete'"/>
+        </do_if>
+        <do_else>
+          <!-- For each ware, find emergency sell location -->
+          <do_all exact="$cargoWares.count" counter="$i">
+          <set_value name="$ware" exact="$cargoWares.{$i}"/>
+          <set_value name="$amount" exact="@$ship.cargo.{$ware}.count"/>
+          
+          <debug_text text="'[GT-Safety] ' + $ship.idcode + ': Finding buyer for ' + $ware.name + ' x' + $amount" chance="100"/>
+          
+          <!-- VANILLA-FIRST: Use find_buy_offer to validate station capability -->
+          <find_buy_offer space="player.galaxy" wares="[$ware]" result="$allBuyOffers" multiple="true">
+            <match_buyer tradesknownto="$ship.owner"/>
+          </find_buy_offer>
+          
+          <!-- Find best offer (nearest + operational) -->
+          <set_value name="$bestOffer" exact="null"/>
+          <set_value name="$bestDistance" exact="999999"/>
+          
+          <do_if value="@$allBuyOffers.count gt 0">
+            <do_all exact="$allBuyOffers.count" counter="$j">
+              <set_value name="$offer" exact="$allBuyOffers.{$j}"/>
+              <set_value name="$station" exact="@$offer.owner"/>
+              
+              <!-- SAFE: Validate station exists and is operational -->
+              <do_if value="$station? and @$station.exists and @$station.isoperational">
+                <!-- Calculate distance (basic gatedistance respects blacklists automatically) -->
+                <set_value name="$distance" exact="@$ship.gatedistance.{@$station.sector}"/>
+                <do_if value="$distance ge 0 and $distance lt $bestDistance">
+                  <set_value name="$bestDistance" exact="$distance"/>
+                  <set_value name="$bestOffer" exact="$offer"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- Prepare emergency sale data for AI script to execute -->
+          <do_if value="$bestOffer?">
+            <do_if value="not global.$GT_EmergencySales?">
+              <set_value name="global.$GT_EmergencySales" exact="table[]"/>
+            </do_if>
+            
+            <!-- Store sale data in global variable -->
+            <set_value name="global.$GT_EmergencySales.{$ship}" exact="table[]"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$Ware" exact="$ware"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$Station" exact="$bestOffer.owner"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$BuyOffer" exact="$bestOffer"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$Amount" exact="$amount"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$BuyPrice" exact="0"/> <!-- Unknown for orphaned cargo -->
+            
+            <!-- Store German logbook data for AI to create entry -->
+            <set_value name="global.$GT_EmergencySales.{$ship}.$LogbookData" exact="table[]"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$LogbookData.$Title" exact="'Notverkauf: Unerwartete Fracht'"/>
+            <set_value name="global.$GT_EmergencySales.{$ship}.$LogbookData.$Text" exact="'Ich habe ' + $amount + ' Einheiten ' + $ware.name + ' verkauft, die ich beim Zuweisen in meinem Frachtraum gefunden habe. Die Ware wurde an ' + $bestOffer.owner.knownname + ' verkauft.'"/>
+            
+            <debug_text text="'[GT-Safety] Emergency buyer found: ' + $bestOffer.owner.knownname + ' (' + $bestDistance + ' jumps, price: ' + @$bestOffer.unitprice + ' Cr)'" chance="100"/>
+            
+            <!-- Signal AI script to execute the sale using vanilla trade order -->
+            <signal_objects object="$ship" param="'GT_Emergency_Cargo_Sale'"/>
+            
+            <!-- Only handle first ware - AI will signal back when complete to trigger next ware -->
+            <debug_text text="'[GT-Safety] Waiting for AI to complete sale of ' + $ware.name + ' before processing remaining wares'" chance="100"/>
+            <break/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-Safety] CRITICAL: No buyer found for ' + $ware.name + ' - ship ' + $ship.idcode + ' stuck!'" chance="100"/>
+            <show_notification text="'CRITICAL: Trader ' + $ship.idcode + ' has ' + $amount + ' ' + $ware.name + ' with NO BUYERS!'" timeout="10s"/>
+            
+            <!-- Still try next ware even if this one failed -->
+          </do_else>
+        </do_all>
+        </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- ========================================================================= -->
+    <!-- ALTERNATIVE SELL STATION FINDER                                           -->
+    <!-- Smart alternative buyer selection with profit prioritization             -->
+    <!-- Handles: station destroyed, inaccessible, threats                        -->
+    <!-- ========================================================================= -->
+    
+    <cue name="FindAlternativeSellStation" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="@$params.$Ship"/>
+        <set_value name="$ware" exact="@$params.$Ware"/>
+        <set_value name="$amount" exact="@$params.$Amount"/>
+        <set_value name="$buyPrice" exact="@$params.$BuyPrice"/>
+        <set_value name="$originalStation" exact="@$params.$OriginalStationName"/>
+        <set_value name="$reason" exact="@$params.$Reason"/>
+        
+        <!-- SAFE: Validate inputs and ship status -->
+        <do_if value="$ship? and $ware? and $amount? and @$ship.exists and @$ship.isoperational">
+          <debug_text text="'[GT-Safety] ' + $ship.idcode + ': Finding alternative for ' + $ware.name + ' x' + $amount + ' (paid: ' + $buyPrice + ' Cr)'" chance="100"/>
+        
+        <!-- VANILLA-FIRST: Query all potential buyers -->
+        <find_buy_offer space="player.galaxy" wares="[$ware]" result="$allBuyOffers" multiple="true">
+          <match_buyer tradesknownto="$ship.owner"/>
+        </find_buy_offer>
+        
+        <!-- Find best alternative based on user strategy -->
+        <set_value name="$bestOffer" exact="null"/>
+        <set_value name="$bestProfit" exact="-999999999"/>
+        
+        <do_if value="@$allBuyOffers.count gt 0">
+          <debug_text text="'[GT-Safety]   Found ' + $allBuyOffers.count + ' potential buyers, evaluating...'" chance="100"/>
+          
+          <do_all exact="$allBuyOffers.count" counter="$i">
+            <set_value name="$offer" exact="$allBuyOffers.{$i}"/>
+            <set_value name="$station" exact="@$offer.owner"/>
+            
+            <!-- SAFE: Validate station is operational and accessible -->
+            <do_if value="$station? and @$station.exists and @$station.isoperational">
+              <!-- Calculate distance (basic gatedistance respects blacklists automatically) -->
+              <set_value name="$distance" exact="@$ship.gatedistance.{@$station.sector}"/>
+              
+              <do_if value="$distance ge 0">
+                <!-- Calculate profit/loss for this alternative -->
+                <set_value name="$sellPrice" exact="@$offer.unitprice"/>
+                <do_if value="$sellPrice? and $buyPrice?">
+                  <set_value name="$profit" exact="($sellPrice - $buyPrice) * $amount"/>
+                  
+                  <!-- User priority: Best profit/loss ratio -->
+                  <do_if value="$profit gt $bestProfit">
+                    <set_value name="$bestProfit" exact="$profit"/>
+                    <set_value name="$bestOffer" exact="$offer"/>
+                    
+                    <debug_text text="'[GT-Safety]     - ' + @$station.knownname + ': ' + $sellPrice + ' Cr/unit, profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Decision logic based on best alternative found -->
+        <do_if value="$bestOffer?">
+          <set_value name="$sellPrice" exact="@$bestOffer.unitprice"/>
+          <set_value name="$profitCr" exact="$bestProfit / 100"/>
+          
+          <do_if value="$bestProfit gt 0">
+            <debug_text text="'[GT-Safety] Alternative found with PROFIT: ' + @$bestOffer.owner.knownname + ' (Profit: +' + $profitCr + ' Cr)'" chance="100"/>
+          </do_if>
+          <do_elseif value="$bestProfit == 0">
+            <debug_text text="'[GT-Safety] Alternative found, BREAK EVEN: ' + @$bestOffer.owner.knownname" chance="100"/>
+          </do_elseif>
+          <do_elseif value="$buyPrice? and $bestProfit ge ($buyPrice * $amount * -0.1)">
+            <debug_text text="'[GT-Safety] Alternative found, SMALL LOSS: ' + @$bestOffer.owner.knownname + ' (Loss: ' + $profitCr + ' Cr)'" chance="100"/>
+          </do_elseif>
+          <do_else>
+            <debug_text text="'[GT-Safety] Warning: Large loss unavoidable - ' + @$bestOffer.owner.knownname + ' (Loss: ' + $profitCr + ' Cr)'" chance="100"/>
+            <show_notification text="'Trader ' + $ship.idcode + ' forced to sell ' + $ware.name + ' at loss (' + $profitCr + ' Cr) - original sell station unavailable'" timeout="8s"/>
+          </do_else>
+          
+          <!-- Prepare data for AI script to execute -->
+          <do_if value="not global.$GT_AlternativeSales?">
+            <set_value name="global.$GT_AlternativeSales" exact="table[]"/>
+          </do_if>
+          
+          <set_value name="global.$GT_AlternativeSales.{$ship}" exact="table[]"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$Ware" exact="$ware"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$Station" exact="$bestOffer.owner"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$BuyOffer" exact="$bestOffer"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$Amount" exact="$amount"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$BuyPrice" exact="$buyPrice"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$SellPrice" exact="$sellPrice"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$Profit" exact="$profitCr"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$OriginalStation" exact="$originalStation"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$Reason" exact="$reason"/>
+          
+          <!-- Build reason text (German) -->
+          <set_value name="$reasonText" exact="'nicht mehr verfügbar'"/>
+          <do_if value="$reason == 'destroyed'">
+            <set_value name="$reasonText" exact="'zerstört wurde'"/>
+          </do_if>
+          <do_elseif value="$reason == 'inaccessible'">
+            <set_value name="$reasonText" exact="'nicht erreichbar war'"/>
+          </do_elseif>
+          <do_elseif value="$reason == 'threat_detected'">
+            <set_value name="$reasonText" exact="'aufgrund feindlicher Aktivität gemieden werden musste'"/>
+          </do_elseif>
+          
+          <!-- Build outcome text based on profit/loss -->
+          <set_value name="$outcomeText" exact="''"/>
+          <do_if value="$bestProfit gt 0">
+            <set_value name="$outcomeText" exact="'Glücklicherweise konnte ich einen alternativen Käufer finden und sogar noch ' + $profitCr + ' Cr Gewinn erzielen.'"/>
+          </do_if>
+          <do_elseif value="$bestProfit == 0">
+            <set_value name="$outcomeText" exact="'Ich konnte einen alternativen Käufer finden und die Ware ohne Verlust verkaufen.'"/>
+          </do_elseif>
+          <do_elseif value="$buyPrice? and $bestProfit ge ($buyPrice * $amount * -0.1)">
+            <set_value name="$outcomeText" exact="'Ich musste die Ware an einen alternativen Käufer mit einem kleinen Verlust von ' + $profitCr + ' Cr verkaufen.'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$outcomeText" exact="'Ich musste die Ware mit einem erheblichen Verlust von ' + $profitCr + ' Cr an einen Notkäufer verkaufen.'"/>
+          </do_else>
+          
+          <!-- Store logbook data -->
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$LogbookData" exact="table[]"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$LogbookData.$ReasonText" exact="$reasonText"/>
+          <set_value name="global.$GT_AlternativeSales.{$ship}.$LogbookData.$OutcomeText" exact="$outcomeText"/>
+          
+          <!-- Signal AI script to execute the alternative sale -->
+          <signal_objects object="$ship" param="'GT_Alternative_Cargo_Sale'"/>
+        </do_if>
+        <do_else>
+          <!-- CRITICAL: No buyers found at all! -->
+          <debug_text text="'[GT-Safety] CRITICAL: No buyers found for ' + $ware.name + ' - ship ' + $ship.idcode + ' stuck with cargo!'" chance="100"/>
+          <show_notification text="'CRITICAL: Trader ' + $ship.idcode + ' has ' + $amount + ' ' + $ware.name + ' with NO BUYERS available!'" timeout="10s"/>
+          
+          <!-- Critical logbook entry -->
+          <set_value name="$reasonText" exact="'nicht mehr verfügbar'"/>
+          <do_if value="$reason == 'destroyed'">
+            <set_value name="$reasonText" exact="'zerstört wurde'"/>
+          </do_if>
+          <do_elseif value="$reason == 'inaccessible'">
+            <set_value name="$reasonText" exact="'nicht erreichbar war'"/>
+          </do_elseif>
+          <do_elseif value="$reason == 'threat_detected'">
+            <set_value name="$reasonText" exact="'aufgrund feindlicher Aktivität gemieden werden musste'"/>
+          </do_elseif>
+          
+          <write_to_logbook category="alerts" title="'KRITISCH: Ware nicht verkaufbar'" text="'Ich konnte meine ' + $amount + ' Einheiten ' + $ware.name + ' nicht loswerden, da die ursprüngliche Station ' + $originalStation + ' ' + $reasonText + '. Es gibt KEINE alternativen Käufer für diese Ware im gesamten Universum! Manuelle Unterstützung des Kommandanten erforderlich. Ich bin mit dieser Fracht gestrandet.'"
+                          interaction="showonmap" object="$ship"/>
+        </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>
