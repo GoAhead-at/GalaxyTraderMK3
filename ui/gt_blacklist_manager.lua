@@ -532,7 +532,7 @@ local function onCleanupExpired(_, event_data)
         table.insert(threatened_sectors, sector_name)
     end
     
-    updateFleetBlacklist(threatened_sectors)
+    updateFleetBlacklist(threatened_sectors, GT_Blacklist.relation_value)
     
     return true
 end

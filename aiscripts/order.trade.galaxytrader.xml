@@ -129,6 +129,21 @@
       </actions>
     </handler>
     
+    <!-- ✅ Subordinate Resync Handler: Listen for commander order changes (like vanilla order.assist) -->
+    <handler comment="Subordinate resync on commander order change">
+      <conditions>
+        <check_all>
+          <event_object_order_ready object="this.ship.commander" check="false" comment="Commander's order ready"/>
+          <check_value value="event.param == event.object.defaultorder" comment="It's the default order"/>
+        </check_all>
+      </conditions>
+      <actions>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔄 Commander order changed - restarting to resync settings'" chance="100"/>
+        <!-- Use abort_called_scripts like vanilla - forcefully restart at init label -->
+        <abort_called_scripts resume="init"/>
+      </actions>
+    </handler>
+    
     <handler>
       <conditions>
         <event_object_signalled object="this.ship" param="'GT_Training_Complete'"/>
@@ -404,6 +419,23 @@
   
   <attention min="unknown">
     <actions>
+      
+      <!-- ✅ SUBORDINATE REINITIALIZATION: Jump here to restart and re-inherit commander settings -->
+      <label name="init"/>
+      
+      <!-- Re-inherit settings from commander if this is a subordinate -->
+      <do_if value="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship">
+        <set_value name="$commanderOrder" exact="this.ship.commander.defaultorder"/>
+        <do_if value="$commanderOrder?">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔄 Re-inheriting settings from commander ' + this.ship.commander.idcode" chance="100"/>
+          <!-- Re-inherit all commander settings -->
+          <do_if value="$commanderOrder.$fleetcoordination?"><set_value name="$effectiveFleetCoordination" exact="$commanderOrder.$fleetcoordination"/></do_if>
+          <do_if value="$commanderOrder.$allowillegal?"><set_value name="$effectiveAllowIllegal" exact="$commanderOrder.$allowillegal"/></do_if>
+          <do_if value="$commanderOrder.$risktolerance?"><set_value name="$effectiveRiskTolerance" exact="$commanderOrder.$risktolerance"/></do_if>
+          <do_if value="$commanderOrder.$home?"><set_value name="$effectiveHome" exact="$commanderOrder.$home"/></do_if>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Settings re-inherited successfully'" chance="100"/>
+        </do_if>
+      </do_if>
       
       <!-- =============================================== -->
       <!-- MAIN TRADING LOOP (Modularized)                -->
@@ -686,7 +718,16 @@
       </do_else>
       
       <!-- Wait and check again - training is mandatory -->
-      <wait exact="10s"/>
+      <wait max="10s">
+        <interrupt>
+          <conditions>
+            <event_object_signalled object="this.ship" param="'GT_Training_Station_Found'"/>
+          </conditions>
+          <actions>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Training station found during wait - proceeding immediately'" chance="$debugchance"/>
+          </actions>
+        </interrupt>
+      </wait>
       <resume label="main_loop"/>
       
       <!-- ========================================= -->
@@ -712,7 +753,19 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ Ship already has ' + this.ship.tradeorders.count + ' trade orders - waiting for completion'" chance="100"/>
         
         <!-- Wait for trade completion -->
-        <wait exact="10s"/>
+        <wait max="10s">
+          <interrupt>
+            <conditions>
+              <check_any>
+                <event_object_signalled object="this.ship" param="'GT_Trade_Completed'"/>
+                <event_object_signalled object="this.ship" param="'GT_Trade_Failed'"/>
+              </check_any>
+            </conditions>
+            <actions>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade order completed early - checking status immediately'" chance="100"/>
+            </actions>
+          </interrupt>
+        </wait>
         <resume label="main_loop"/>
       </do_if>
       <do_else>
@@ -721,6 +774,7 @@
           <!-- Look for buy opportunities -->
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Looking for trade opportunities...'" chance="$debugchance"/>
           
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📤 SENDING GT_Find_Trade signal to MD at game time ' + player.age" chance="100"/>
           <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
             $Ship = this.ship,
             $HomeBase = this.$effectiveHome,
@@ -733,6 +787,7 @@
             $DistancePenalty = $effectiveDistancePenalty,
             $FleetCoordination = $effectiveFleetCoordination
           ]"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📤 GT_Find_Trade signal SENT, now at game time ' + player.age" chance="100"/>
         </do_if>
         <do_else>
           <!-- Ship is full, look for sell opportunities -->
@@ -749,10 +804,11 @@
         </do_else>
       </do_else>
       
-      <!-- Wait for MD system response with single interrupt -->
-      <!-- Timeout accounts for: max pre-search delay (30s) + search time (5s) + buffer (25s) = 60s -->
+      <!-- Wait for MD system response with interrupt -->
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🕐 Entering wait state for MD response at game time ' + player.age" chance="100"/>
       <label name="wait_for_response"/>
-      <wait exact="60s" comment="Wait for MD system response">
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 👂 Wait interrupt handler ACTIVE at game time ' + player.age" chance="100"/>
+      <wait max="60s" comment="Wait for MD system response">
         <interrupt>
           <conditions>
             <check_any>
@@ -762,12 +818,14 @@
           </conditions>
           <actions>
             <do_if value="event.param == 'GT_Trade_Found'">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade found by MD system - proceeding with execution'" chance="$debugchance"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📥 INTERRUPT FIRED: GT_Trade_Found received at game time ' + player.age" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Trade found by MD system - proceeding with execution'" chance="100"/>
               <!-- Reset retry counter on successful trade -->
               <set_value name="this.$searchFailed" exact="0"/>
               <resume label="trade_found"/>
             </do_if>
             <do_elseif value="event.param == 'GT_No_Trade_Found'">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📥 INTERRUPT FIRED: GT_No_Trade_Found received at game time ' + player.age" chance="100"/>
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📨 RECEIVED GT_No_Trade_Found signal - starting retry logic'" chance="100"/>
               <resume label="no_trade_retry"/>
             </do_elseif>
@@ -776,13 +834,213 @@
       </wait>
       
       <!-- Timeout fallback - treat as no trade found -->
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MD system response timeout - assuming no trades'" chance="$debugchance"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏰ TIMEOUT: MD system response timeout at game time ' + player.age + ' - assuming no trades'" chance="100"/>
       <resume label="no_trade_retry"/>
       
       <!-- ========================================= -->
-      <!-- TRADE FOUND - EXECUTE AND UPDATE XP      -->
+      <!-- TRADE FOUND - VALIDATE BLACKLIST FIRST   -->
       <!-- ========================================= -->
       <label name="trade_found"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🎯 REACHED trade_found label - starting blacklist validation at game time ' + player.age" chance="100"/>
+      
+      <!-- ✅ NEW: Iterate through trade list and validate each one -->
+      <!-- MD provided a list of up to 20 trades - we try each until we find a valid one -->
+      <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
+        <set_value name="$tradeList" exact="global.$GT_PendingTrades.{this.ship}"/>
+        
+        <!-- Ensure it's a list -->
+        <do_if value="typeof $tradeList != datatype.list">
+          <!-- Backward compat: single trade stored as table -->
+          <set_value name="$tradeList" exact="[$tradeList]"/>
+        </do_if>
+        
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📋 Received ' + $tradeList.count + ' trades to validate'" chance="100"/>
+        
+        <set_value name="$validTradeFound" exact="false"/>
+        <set_value name="$pendingTrade" exact="null"/>
+        <set_value name="$buyStation" exact="null"/>
+        <set_value name="$sellStation" exact="null"/>
+        <set_value name="$tradesChecked" exact="0"/>
+        <set_value name="$tradesBlacklisted" exact="0"/>
+        
+        <!-- Iterate through trade list -->
+        <do_all exact="$tradeList.count" counter="$tradeIdx">
+          <set_value name="$currentTrade" exact="$tradeList.{$tradeIdx}"/>
+          <set_value name="$tradesChecked" operation="add"/>
+          
+          <!-- Extract stations from trade (handle both new list format and old single-trade format) -->
+          <do_if value="$currentTrade.$BuyStation?">
+            <set_value name="$buyStation" exact="$currentTrade.$BuyStation"/>
+          </do_if>
+          <do_else>
+            <set_value name="$buyStation" exact="@$currentTrade.$BuyOffer.owner"/>
+          </do_else>
+          
+          <do_if value="$currentTrade.$SellStation?">
+            <set_value name="$sellStation" exact="$currentTrade.$SellStation"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellStation" exact="@$currentTrade.$SellOffer.owner"/>
+          </do_else>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 Validating trade ' + $tradeIdx + '/' + $tradeList.count + ': ' + @$currentTrade.$BuyOffer.ware.name + ' (' + @$buyStation.knownname + ' → ' + @$sellStation.knownname + ')'" chance="100"/>
+        
+        <!-- Determine ship's blacklistgroup (same logic as vanilla's lib.define.blacklistgroup) -->
+        <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+        <do_if value="(@this.assignedcontrolled.primarypurpose == purpose.fight) or (@this.assignedcontrolled.primarypurpose == purpose.auxiliary)">
+          <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+        </do_if>
+        
+        <!-- Check if buy station OR its sector is blacklisted (matches vanilla's order.trade.perform) -->
+        <set_value name="$buyBlacklisted" exact="false"/>
+        <do_if value="$blacklistgroup?">
+          <!-- Check station itself (objectactivity) -->
+          <set_value name="$buyStationBlacklisted" exact="@$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <!-- Check sector (sectoractivity AND sectortravel - same as vanilla) -->
+          <set_value name="$buySectorActivityBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$buySectorTravelBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$buyBlacklisted" exact="$buyStationBlacklisted or $buySectorActivityBlacklisted or $buySectorTravelBlacklisted"/>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 BUY blacklist check:' + 
+            '\n  Station: ' + @$buyStation.knownname + 
+            '\n  Sector: ' + @$buyStation.sector.knownname + 
+            '\n  Station (objectactivity): ' + $buyStationBlacklisted + 
+            '\n  Sector (sectoractivity): ' + $buySectorActivityBlacklisted + 
+            '\n  Sector (sectortravel): ' + $buySectorTravelBlacklisted + 
+            '\n  Final result: ' + $buyBlacklisted" 
+            chance="100"/>
+        </do_if>
+        
+        <!-- Check if sell station OR its sector is blacklisted (matches vanilla's order.trade.perform) -->
+        <set_value name="$sellBlacklisted" exact="false"/>
+        <do_if value="$blacklistgroup?">
+          <!-- Check station itself (objectactivity) -->
+          <set_value name="$sellStationBlacklisted" exact="@$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <!-- Check sector (sectoractivity AND sectortravel - same as vanilla) -->
+          <set_value name="$sellSectorActivityBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$sellSectorTravelBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$sellBlacklisted" exact="$sellStationBlacklisted or $sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted"/>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 SELL blacklist check:' + 
+            '\n  Station: ' + @$sellStation.knownname + 
+            '\n  Sector: ' + @$sellStation.sector.knownname + 
+            '\n  Station (objectactivity): ' + $sellStationBlacklisted + 
+            '\n  Sector (sectoractivity): ' + $sellSectorActivityBlacklisted + 
+            '\n  Sector (sectortravel): ' + $sellSectorTravelBlacklisted + 
+            '\n  Final result: ' + $sellBlacklisted" 
+            chance="100"/>
+        </do_if>
+        
+          <!-- Check if trade is blacklisted -->
+          <do_if value="$buyBlacklisted or $sellBlacklisted">
+            <!-- BLACKLISTED - Skip to next trade in list -->
+            <set_value name="$tradesBlacklisted" operation="add"/>
+            <set_value name="$blacklistedStation" exact="if $buyBlacklisted then $buyStation else $sellStation"/>
+            <set_value name="$tradeType" exact="if $buyBlacklisted then 'BUY' else 'SELL'"/>
+            
+            <!-- Determine what was blacklisted (station or sector) -->
+            <set_value name="$blacklistReason" exact="'Unknown'"/>
+            <do_if value="$buyBlacklisted">
+              <do_if value="$buyStationBlacklisted">
+                <set_value name="$blacklistReason" exact="'Station (objectactivity)'"/>
+              </do_if>
+              <do_elseif value="$buySectorActivityBlacklisted">
+                <set_value name="$blacklistReason" exact="'Sector (sectoractivity)'"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$blacklistReason" exact="'Sector (sectortravel)'"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <do_if value="$sellStationBlacklisted">
+                <set_value name="$blacklistReason" exact="'Station (objectactivity)'"/>
+              </do_if>
+              <do_elseif value="$sellSectorActivityBlacklisted">
+                <set_value name="$blacklistReason" exact="'Sector (sectoractivity)'"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$blacklistReason" exact="'Sector (sectortravel)'"/>
+              </do_else>
+            </do_else>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ Trade ' + $tradeIdx + '/' + $tradeList.count + ' BLACKLISTED:' + 
+              '\n  Station: ' + @$blacklistedStation.knownname + 
+              '\n  Sector: ' + @$blacklistedStation.sector.knownname + 
+              '\n  Type: ' + $tradeType + 
+              '\n  Reason: ' + $blacklistReason + 
+              '\n  → Trying next trade in list...'" 
+              chance="100"/>
+            
+            <!-- Record failed sector for future filtering -->
+            <signal_objects object="player.galaxy" param="'GT_Trade_Failed'" param2="table[
+              $Ship = this.ship,
+              $Reason = 'TRADEPARTNER_BLACKLISTED',
+              $FailureText = 'Trade partner is blacklisted (pre-validation)',
+              $Partner = $blacklistedStation,
+              $IsBuying = $buyBlacklisted,
+              $Ware = @$currentTrade.$Ware
+            ]"/>
+            
+            <!-- Continue to next trade in list -->
+            <continue/>
+          </do_if>
+          <do_else>
+            <!-- ✅ VALIDATION PASSED - This trade is valid! -->
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Trade ' + $tradeIdx + '/' + $tradeList.count + ' is VALID - using this trade!'" chance="100"/>
+            <set_value name="$validTradeFound" exact="true"/>
+            <set_value name="$pendingTrade" exact="$currentTrade"/>
+            <!-- Break out of loop - we found a valid trade -->
+            <break/>
+          </do_else>
+        </do_all>
+        
+        <!-- After loop: Check if we found a valid trade -->
+        <do_if value="$validTradeFound">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Blacklist validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
+          
+          <!-- Create X4 native TradePerform orders with blacklist routing -->
+          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$pendingTrade.$Amount" immediate="false" internal="true"/>
+          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$pendingTrade.$Amount" immediate="false" internal="true"/>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📋 Trade orders created:' +
+            '\n  BUY: ' + @$buyStation.knownname + ' → ' + @$pendingTrade.$Ware.name + ' (x' + $pendingTrade.$Amount + ')' +
+            '\n  SELL: ' + @$sellStation.knownname"
+            chance="100"/>
+          
+          <!-- Log to ship logbook if enabled (moved from MD execution to after validation) -->
+          <set_value name="$logbookEnabled" exact="false"/>
+          <do_if value="@this.ship.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.defaultorder.$logbookentries">
+            <set_value name="$logbookEnabled" exact="true"/>
+          </do_if>
+          <do_elseif value="@this.ship.defaultorder.id == 'Assist' and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.commander.defaultorder.$logbookentries">
+            <set_value name="$logbookEnabled" exact="true"/>
+          </do_elseif>
+          
+          <do_if value="$logbookEnabled">
+            <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
+              $Ship = this.ship,
+              $BuyOffer = $pendingTrade.$BuyOffer,
+              $SellOffer = $pendingTrade.$SellOffer,
+              $Amount = $pendingTrade.$Amount,
+              $Profit = $pendingTrade.$Profit,
+              $BuyPrice = $pendingTrade.$BuyPrice / 100,
+              $SellPrice = $pendingTrade.$SellPrice / 100
+            ]"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📝 Logbook entry queued'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- All trades in list were blacklisted - request new search -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ ALL ' + $tradeList.count + ' trades were blacklisted - entering retry logic'" chance="100"/>
+          <resume label="no_trade_retry"/>
+        </do_else>
+      </do_if>
+      <do_else>
+        <!-- No pending trade data - this shouldn't happen -->
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ GT_Trade_Found received but no pending trade data!'" chance="100"/>
+        <wait exact="5s"/>
+        <resume label="main_loop"/>
+      </do_else>
       
       <!-- Non-blocking XP update signal -->
       <do_if value="$gt_enablexp and this.ship.pilot">
@@ -802,6 +1060,7 @@
             <check_any>
               <event_object_signalled object="this.ship" param="'GT_Trade_Completed'"/>
               <event_object_signalled object="this.ship" param="'GT_Trade_Failed'"/>
+              <event_object_signalled object="this.ship" param="'GT_Try_Next_Trade'"/>
             </check_any>
           </conditions>
           <actions>
@@ -815,6 +1074,13 @@
               <debug_text text="'[GT-AI] ❌ Trade failed for ' + this.ship.idcode + ': ' + this.$failureReason" chance="100"/>
               <set_value name="this.$tradeFailed" exact="true"/>
             </do_elseif>
+            <do_elseif value="event.param == 'GT_Try_Next_Trade'">
+              <set_value name="this.$failureReason" exact="event.param2"/>
+              <debug_text text="'[GT-AI] 🔄 Pathfinding failed for ' + this.ship.idcode + ': ' + this.$failureReason + ' - trying next cached alternative'" chance="100"/>
+              <!-- Mark as failed but with special retry flag -->
+              <set_value name="this.$tradeFailed" exact="true"/>
+              <set_value name="this.$tryNextTrade" exact="true"/>
+            </do_elseif>
             <resume label="trade_completed"/>
           </actions>
         </interrupt>
@@ -825,11 +1091,31 @@
       
       <label name="trade_completed"/>
       
+      <!-- Check if this is a pathfinding retry (try next cached alternative) -->
+      <do_if value="this.$tryNextTrade?">
+        <remove_value name="this.$tryNextTrade"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔄 Immediately requesting next trade (cache will skip failed trades)'" chance="100"/>
+        <!-- Skip market update wait - immediately try next cached trade -->
+        <resume label="main_loop"/>
+      </do_if>
+      
       <!-- NOTE: Auto-repair check has been moved to MD system (gt_trading_ai.xml TradeCompleted cue) -->
       <!-- This ensures it runs even when the order is aborted/replaced during trade execution -->
       
       <!-- Update market data interval -->
-      <wait exact="$gt_marketupdatefreq"/>
+      <wait max="$gt_marketupdatefreq">
+        <interrupt>
+          <conditions>
+            <check_any>
+              <event_object_signalled object="this.ship" param="'GT_Trade_Found'" comment="New trade found"/>
+              <event_object_signalled object="this.ship" param="'GT_No_Trade_Found'" comment="Wake-up signal"/>
+            </check_any>
+          </conditions>
+          <actions>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Signal received during market update wait - resuming immediately'" chance="100"/>
+          </actions>
+        </interrupt>
+      </wait>
       <resume label="main_loop"/>
       
       <!-- ========================================= -->
@@ -843,20 +1129,35 @@
       <!-- Calculate escalating wait time: 10s, 20s, 30s, 40s, 50s, 60s (max) -->
       <set_value name="$waitTime" exact="[this.$searchFailed * 10s, 60s].min"/>
       
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No profitable trades found (attempt ' + this.$searchFailed + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="$debugchance"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No profitable trades found (attempt ' + this.$searchFailed + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>
       
       <!-- Set ship to waiting state -->
       <set_command command="command.wait"/>
       <set_command_action commandaction="commandaction.standingby"/>
       
       <!-- Wait with escalating delay -->
-      <wait exact="$waitTime"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏸️ Entering wait for ' + ($waitTime/1s) + 's at game time ' + player.age" chance="100"/>
+      <wait max="$waitTime" comment="Use max to allow interrupt">
+        <interrupt>
+          <conditions>
+            <check_any>
+              <event_object_signalled object="this.ship" param="'GT_Trade_Found'" comment="MD found a trade"/>
+              <event_object_signalled object="this.ship" param="'GT_No_Trade_Found'" comment="Wake-up signal from load recovery"/>
+            </check_any>
+          </conditions>
+          <actions>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔔 Wake-up signal received during retry wait - resuming immediately'" chance="100"/>
+          </actions>
+        </interrupt>
+      </wait>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Wait completed at game time ' + player.age + ' - resuming main loop'" chance="100"/>
       
       <!-- Reset command state and resume search -->
       <set_command command="command.searchtrades"/>
       <set_command_action commandaction="commandaction.searchingtrades"/>
       
       <!-- Resume main trading loop -->
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔄 Resuming main_loop label'" chance="100"/>
       <resume label="main_loop"/>
       
       <!-- ========================================= -->

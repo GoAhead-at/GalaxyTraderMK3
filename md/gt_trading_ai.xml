@@ -15,7 +15,10 @@
     <!-- Trading AI System Initialization -->
     <cue name="SystemInit">
       <conditions>
-        <event_cue_signalled cue="md.Setup.GameStart"/>
+        <check_any>
+          <event_cue_signalled cue="md.Setup.GameStart"/>
+          <event_game_loaded/>
+        </check_any>
       </conditions>
       <actions>
         <debug_text text="'[GalaxyTrader MK3] Trading AI system initializing...'" chance="100"/>
@@ -47,6 +50,28 @@
       </actions>
     </cue>
     
+    <!-- ✅ One-Time Wake-Up for Ships Stuck in Old Wait States -->
+    <cue name="WakeUpShipsStuckInOldCode" instantiate="true">
+      <conditions>
+        <event_game_loaded/>
+      </conditions>
+      <delay exact="5s" comment="Wait for ships to register"/>
+      <actions>
+        <debug_text text="'[GT-WakeUp] ONE-TIME: Waking ships stuck in old wait states from previous save'" chance="100"/>
+        
+        <do_if value="global.$GT_Ships?">
+          <do_all exact="global.$GT_Ships.keys.count" counter="$idx">
+            <set_value name="$ship" exact="global.$GT_Ships.keys.{$idx}"/>
+            <do_if value="$ship.exists">
+              <debug_text text="'[GT-WakeUp] Sending GT_No_Trade_Found signal to ' + $ship.idcode + ' to wake from old wait state'" chance="100"/>
+              <!-- Signal the ship directly - it will trigger interrupt handlers in new wait states -->
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'" comment="Wake up ships stuck in old code"/>
+            </do_if>
+          </do_all>
+        </do_if>
+      </actions>
+    </cue>
+    
     <!-- ========================================
          AI SCRIPT SIGNAL HANDLERS
          These handle requests from aiscripts
@@ -58,8 +83,113 @@
         <event_object_signalled object="player.galaxy" param="'GT_Find_Trade'"/>
       </conditions>
       <actions>
+        <debug_text text="'[GT-MD] 📥 RECEIVED GT_Find_Trade signal at game time ' + player.age" chance="100"/>
         <set_value name="$requestData" exact="event.param2"/>
         <set_value name="$ship" exact="$requestData.$Ship"/>
+        <debug_text text="'[GT-MD] 📥 Signal is for ship: ' + $ship.idcode" chance="100"/>
+        
+        <!-- CRITICAL FIX: Trigger delayed processing to ensure AI enters wait state first -->
+        <!-- Without this, MD processes synchronously and sends response before AI wait is active -->
+        <debug_text text="'[GT-MD] ⏸️ Scheduling delayed processing (50ms) to ensure AI interrupt handler is active'" chance="100"/>
+        <signal_cue_instantly cue="ProcessDelayedTradeRequest" param="$requestData"/>
+      </actions>
+    </cue>
+    
+    <!-- AI Blacklist Validation Failure Handler -->
+    <cue name="HandleAITradeFailure" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Trade_Failed'"/>
+      </conditions>
+      <actions>
+        <set_value name="$failureData" exact="event.param2"/>
+        <set_value name="$ship" exact="$failureData.$Ship"/>
+        
+        <debug_text text="'[GT-MD] 🚫 RECEIVED GT_Trade_Failed from AI: ' + $ship.idcode + ' (Reason: ' + $failureData.$Reason + ')'" chance="100"/>
+        
+        <!-- Store failed trade to prevent re-selection -->
+        <do_if value="not global.$GT_FailedTrades?">
+          <set_value name="global.$GT_FailedTrades" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_FailedTrades.{$ship}?">
+          <set_value name="global.$GT_FailedTrades.{$ship}" exact="[]"/>
+        </do_if>
+        
+        <!-- ✅ NEW: Record failed sector for future filtering -->
+        <!-- AI now handles iteration through trade list internally, so no need to signal back -->
+        <do_if value="$failureData.$Partner?">
+          <!-- Extract sectors from failed partner -->
+          <set_value name="$buySector" exact="null"/>
+          <set_value name="$sellSector" exact="null"/>
+          
+          <!-- Determine which sector is the buy and which is sell based on IsBuying flag -->
+          <do_if value="$failureData.$IsBuying">
+            <set_value name="$buySector" exact="$failureData.$Partner.sector"/>
+            <!-- Try to get sell sector from pending trade list (get first trade as reference) -->
+            <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}?">
+              <set_value name="$tradeList" exact="global.$GT_PendingTrades.{$ship}"/>
+              <do_if value="typeof $tradeList == datatype.list and $tradeList.count gt 0">
+                <set_value name="$firstTrade" exact="$tradeList.{1}"/>
+                <do_if value="$firstTrade.$SellStation?">
+                  <set_value name="$sellSector" exact="@$firstTrade.$SellStation.sector"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$sellSector" exact="@$firstTrade.$SellOffer.owner.sector"/>
+                </do_else>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$sellSector" exact="$failureData.$Partner.sector"/>
+            <!-- Try to get buy sector from pending trade list -->
+            <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}?">
+              <set_value name="$tradeList" exact="global.$GT_PendingTrades.{$ship}"/>
+              <do_if value="typeof $tradeList == datatype.list and $tradeList.count gt 0">
+                <set_value name="$firstTrade" exact="$tradeList.{1}"/>
+                <do_if value="$firstTrade.$BuyStation?">
+                  <set_value name="$buySector" exact="@$firstTrade.$BuyStation.sector"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$buySector" exact="@$firstTrade.$BuyOffer.owner.sector"/>
+                </do_else>
+              </do_if>
+            </do_if>
+          </do_else>
+          
+          <!-- Store SECTOR PAIR for future filtering -->
+          <do_if value="$buySector? and $sellSector?">
+            <append_to_list name="global.$GT_FailedTrades.{$ship}" exact="table[
+              $BuySector = $buySector,
+              $SellSector = $sellSector,
+              $Reason = $failureData.$Reason,
+              $Timestamp = player.age
+            ]"/>
+            <debug_text text="'[GT-MD] ❌ Added failed sector pair to blacklist for ' + $ship.idcode + ': ' + 
+              @$buySector.knownname + ' → ' + @$sellSector.knownname + 
+              ' (will be filtered in next search)'" 
+              chance="100"/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-MD] ⚠️ WARNING: Could not store failed trade for ' + $ship.idcode + ' - sector data incomplete'" chance="100"/>
+          </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- ✅ REMOVED: SendTryNextTrade cue -->
+    <!-- No longer needed - AI now iterates through trade list internally -->
+    
+    
+    <!-- Delayed Trade Request Processing -->
+    <cue name="ProcessDelayedTradeRequest" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+        <check_value value="event.param.$Ship.exists"/>
+      </conditions>
+      <delay exact="50ms" comment="Allow AI to enter wait state before processing"/>
+      <actions>
+        <set_value name="$requestData" exact="event.param"/>
+        <set_value name="$ship" exact="$requestData.$Ship"/>
+        <debug_text text="'[GT-MD] ▶️ Processing trade request for ' + $ship.idcode + ' at game time ' + player.age" chance="100"/>
         
         <!-- Initialize search locks table if needed -->
         <do_if value="not global.$GT_SearchLocks?">

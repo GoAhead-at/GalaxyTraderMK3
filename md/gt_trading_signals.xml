@@ -33,7 +33,18 @@
               <debug_text text="'[GT-Fleet] ✅ Trade reservation released for ' + $ship.idcode" chance="100"/>
             </do_if>
             
-            <!-- 4. AI Script Notification (equipment check moved to pre-trade in AI script) -->
+            <!-- 4. Clear failed trades list (trade succeeded, start fresh) -->
+            <do_if value="global.$GT_FailedTrades? and global.$GT_FailedTrades.{$ship}?">
+              <remove_value name="global.$GT_FailedTrades.{$ship}"/>
+              <debug_text text="'[GT-Signals] 🧹 Cleared failed trades list for ' + $ship.idcode + ' (trade succeeded)'" chance="100"/>
+            </do_if>
+            
+            <!-- 4.5. Clear pending trade entry (no longer needed) -->
+            <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}?">
+              <remove_value name="global.$GT_PendingTrades.{$ship}"/>
+            </do_if>
+            
+            <!-- 5. AI Script Notification (equipment check moved to pre-trade in AI script) -->
             <signal_objects object="$ship" param="'GT_Trade_Completed'"/>
             <debug_text text="'[GT-AI] ✅ Trade completed signal sent to ' + $ship.idcode" chance="100"/>
           </do_while>
@@ -60,13 +71,108 @@
             <!-- 1. Log failure -->
             <debug_text text="'[GT-Failure] ' + $ship.idcode + ' trade failed: ' + $data.$reason + ' (' + @$data.$failureText + ')'" chance="100"/>
             
-            <!-- 2. Notify AI -->
-            <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="$data.$reason"/>
-            
-            <!-- 3. Release fleet reservation if exists -->
+            <!-- 2. Release fleet reservation if exists -->
             <do_if value="global.$GT_ActiveTradeReservations.{$ship}?">
               <remove_value name="global.$GT_ActiveTradeReservations.{$ship}"/>
             </do_if>
+            
+            <!-- 3. Categorize failure type and notify AI accordingly -->
+            <set_value name="$isPathingFailure" exact="false"/>
+            <set_value name="$pathingFailureReasons" exact="[
+              'ERR_NO_PATH_TO_DESTINATION',
+              'ERR_DESTINATION_BLACKLISTED', 
+              'ERR_SECTOR_BLACKLISTED',
+              'TRADEPARTNER_BLACKLISTED',
+              'ERR_CANNOT_DOCK'
+            ]"/>
+            
+            <do_if value="$pathingFailureReasons.indexof.{$data.$reason}">
+              <set_value name="$isPathingFailure" exact="true"/>
+            </do_if>
+            
+            <do_if value="$isPathingFailure">
+              <!-- PATHFINDING/BLACKLIST FAILURE: Trade route not accessible -->
+              <!-- This means the trade is theoretically good, but ship can't reach it -->
+              <!-- Solution: Try NEXT BEST TRADE from cache (skip this failed one) -->
+              
+              <!-- Track this failed trade so cache search skips it -->
+              <do_if value="not global.$GT_FailedTrades?">
+                <set_value name="global.$GT_FailedTrades" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_FailedTrades.{$ship}?">
+                <set_value name="global.$GT_FailedTrades.{$ship}" exact="[]"/>
+              </do_if>
+              
+              <!-- Get complete trade route from pending trades (stored before order creation) -->
+              <!-- CRITICAL: Only proceed if we have complete pending trade data - NO FALLBACK -->
+              <!-- Incomplete data (from partial failure signals) cannot be used for blacklisting -->
+              <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}?">
+                <!-- Use complete route from pending trades -->
+                <set_value name="$buyStation" exact="global.$GT_PendingTrades.{$ship}.$BuyStation"/>
+                <set_value name="$sellStation" exact="global.$GT_PendingTrades.{$ship}.$SellStation"/>
+                <set_value name="$ware" exact="global.$GT_PendingTrades.{$ship}.$Ware"/>
+                
+                <debug_text text="'[GT-Failure] ✅ RETRIEVED complete trade from pending:' +
+                  '\n  Buy: ' + @$buyStation.knownname +
+                  '\n  Sell: ' + @$sellStation.knownname +
+                  '\n  Ware: ' + @$ware.name"
+                  chance="100"/>
+                
+                <!-- Clean up pending trade entry -->
+                <remove_value name="global.$GT_PendingTrades.{$ship}"/>
+                
+                <!-- Extract sectors - only store sector PAIR (not individual stations) -->
+                <set_value name="$buySector" exact="@$buyStation.sector"/>
+                <set_value name="$sellSector" exact="@$sellStation.sector"/>
+                
+                <!-- Create failed trade record with complete sector information -->
+                <set_value name="$failedTradeRecord" exact="table[
+                  $BuySector = $buySector,
+                  $SellSector = $sellSector,
+                  $Reason = $data.$reason,
+                  $Timestamp = player.age
+                ]"/>
+                
+                <append_to_list name="global.$GT_FailedTrades.{$ship}" exact="$failedTradeRecord"/>
+                
+                <debug_text text="'[GT-Failure] 📝 BLOCKED sector pair for ' + $ship.idcode + ':' +
+                  '\n  Route: ' + @$buySector.knownname + ' → ' + @$sellSector.knownname +
+                  '\n  Reason: ' + $data.$reason +
+                  '\n  Total blocked routes for ship: ' + global.$GT_FailedTrades.{$ship}.count +
+                  '\n  ⚠ ALL station combinations in this sector pair will be filtered'"
+                  chance="100"/>
+              </do_if>
+              <do_else>
+                <!-- NO PENDING TRADE DATA: Cannot track failure -->
+                <!-- This indicates a serious issue: pending trade was cleared before failure occurred -->
+                <!-- OR pending trade was never created in the first place -->
+                <debug_text text="'[GT-Failure] ❌ CRITICAL: Cannot track failed trade for ' + $ship.idcode +
+                  '\n  Pending trade entry MISSING - this should never happen!' +
+                  '\n  Failure reason: ' + $data.$reason +
+                  '\n  Failure partner: ' + @$data.$partner.knownname +
+                  '\n  ⚠ Ship will continue without blacklisting this route'" chance="100"/>
+              </do_else>
+              
+              <do_if value="global.$GT_FailedTrades.{$ship}?">
+                <debug_text text="'[GT-Failure] 🚫 PATHFINDING FAILURE: ' + $ship.idcode + ' | Failed trades tracked: ' + global.$GT_FailedTrades.{$ship}.count" chance="100"/>
+              </do_if>
+              
+              <debug_text text="'[GT-Signals] 📡 Sending GT_Try_Next_Trade signal to ' + $ship.idcode" chance="100"/>
+              <signal_objects object="$ship" param="'GT_Try_Next_Trade'" param2="$data.$reason"/>
+              <debug_text text="'[GT-Signals] ✅ GT_Try_Next_Trade signal sent successfully to ' + $ship.idcode" chance="100"/>
+            </do_if>
+            <do_else>
+              <!-- OTHER FAILURE: Market conditions changed (destroyed, no stock, etc.) -->
+              <!-- Solution: Start NEW SEARCH to find current market opportunities -->
+              
+              <!-- Clean up pending trade entry -->
+              <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}?">
+                <remove_value name="global.$GT_PendingTrades.{$ship}"/>
+              </do_if>
+              
+              <debug_text text="'[GT-Failure] ❌ MARKET FAILURE: ' + $ship.idcode + ' - market conditions changed - will search for new trade'" chance="100"/>
+              <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="$data.$reason"/>
+            </do_else>
             
             <!-- 4. Cargo Safety: Handle destroyed sell station -->
             <do_if value="$data.$reason == 'ERR_TRADEPARTNER_DESTROYED' and not $data.$isBuying">
