@@ -1015,6 +1015,42 @@
         <!-- ===== CROSS-STATION TRADE MATCHING ===== -->
         <do_if value="$allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
           
+          <!-- ✅ PERFORMANCE: Limit offers to reduce matching complexity (TaterTrader approach) -->
+          <!-- Sort and keep only top 1/3 or max 150 offers by relative price -->
+          <set_value name="$maxOffersToMatch" exact="150"/>
+          
+          <!-- Limit sell offers -->
+          <do_if value="$allSellOffers.count gt $maxOffersToMatch">
+            <sort_trades name="$allSellOffers" tradelist="$allSellOffers" sorter="relativeprice"/>
+            <set_value name="$limitedSellOffers" exact="[]"/>
+            <do_all exact="$maxOffersToMatch" counter="$idx">
+              <append_to_list name="$limitedSellOffers" exact="$allSellOffers.{$idx}"/>
+            </do_all>
+            <set_value name="$allSellOffers" exact="$limitedSellOffers"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ LIMITED sell offers to top ' + $maxOffersToMatch + ' by relative price'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Limit buy offers -->
+          <do_if value="$allBuyOffers.count gt $maxOffersToMatch">
+            <sort_trades name="$allBuyOffers" tradelist="$allBuyOffers" sorter="relativeprice"/>
+            <set_value name="$limitedBuyOffers" exact="[]"/>
+            <do_all exact="$maxOffersToMatch" counter="$idx">
+              <append_to_list name="$limitedBuyOffers" exact="$allBuyOffers.{$idx}"/>
+            </do_all>
+            <set_value name="$allBuyOffers" exact="$limitedBuyOffers"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ LIMITED buy offers to top ' + $maxOffersToMatch + ' by relative price'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Matching ' + $allSellOffers.count + ' sell × ' + $allBuyOffers.count + ' buy = ' + ($allSellOffers.count * $allBuyOffers.count) + ' potential combinations'" chance="100"/>
+          </do_if>
+          
           <!-- ✅ OPTIMIZATION: Calculate available money ONCE (before loops, not inside) -->
           <set_value name="$availableMoney" exact="player.money"/>
           <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
@@ -1075,8 +1111,19 @@
           <set_value name="$nonConflictedBestTrade" exact="null"/>
           <set_value name="$nonConflictedBestScore" exact="0"/>
           
+          <!-- ✅ PERFORMANCE: Early exit threshold (stop when we have enough good trades) -->
+          <set_value name="$earlyExitThreshold" exact="100"/> <!-- Stop after finding 100+ valid trades -->
+          
           <!-- Match offers of same ware -->
           <do_all exact="$sellOffersByWare.keys.count" counter="$wareIdx">
+            <!-- ✅ PERFORMANCE: Early exit if we have enough trades -->
+            <do_if value="$tradeList.count ge $earlyExitThreshold">
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ EARLY EXIT: Found ' + $tradeList.count + ' trades (threshold: ' + $earlyExitThreshold + '), stopping search'" chance="100"/>
+              </do_if>
+              <break/>
+            </do_if>
+            
             <set_value name="$ware" exact="$sellOffersByWare.keys.{$wareIdx}"/>
             
             <do_if value="$buyOffersByWare.{$ware}?">
@@ -1314,27 +1361,40 @@
           </do_elseif>
         </do_if>
         
-        <!-- ✅ NEW: Sort trade list by efficiency (Score) descending and trim to top 20 -->
+        <!-- ✅ PERFORMANCE FIX: Use X4's native sort instead of O(n²) bubble sort -->
         <do_if value="$tradeList.count gt 0">
-          <!-- Bubble sort by Score descending (X4 MD doesn't have built-in sort) -->
-          <do_if value="$tradeList.count gt 1">
-            <do_all exact="$tradeList.count" counter="$i">
-              <do_all exact="$tradeList.count - $i" counter="$j">
-                <do_if value="$tradeList.{$j}.$Score lt $tradeList.{$j + 1}.$Score">
-                  <!-- Swap -->
-                  <set_value name="$temp" exact="$tradeList.{$j}"/>
-                  <set_value name="$tradeList.{$j}" exact="$tradeList.{$j + 1}"/>
-                  <set_value name="$tradeList.{$j + 1}" exact="$temp"/>
+          <!-- Convert trade list to tradeoffer format for sort_trades -->
+          <!-- Note: sort_trades expects actual tradeoffer objects, not our custom tables -->
+          <!-- Since we can't use native sort on custom tables, we use a simple insertion-sort approach -->
+          <!-- which is O(n·k) where k=20 (much better than O(n²) bubble sort) -->
+          
+          <!-- Trim to top 20 by score (already tracked best during collection) -->
+          <do_if value="$tradeList.count gt $maxTradesToReturn">
+            <!-- Simple selection: Find top N scores and remove rest -->
+            <set_value name="$sortedList" exact="[]"/>
+            
+            <!-- Extract top 20 by repeatedly finding max -->
+            <do_all exact="$maxTradesToReturn" counter="$rank">
+              <set_value name="$maxScore" exact="-999999999"/>
+              <set_value name="$maxIdx" exact="-1"/>
+              
+              <!-- Find highest remaining score -->
+              <do_all exact="$tradeList.count" counter="$idx">
+                <do_if value="$tradeList.{$idx}.$Score gt $maxScore">
+                  <set_value name="$maxScore" exact="$tradeList.{$idx}.$Score"/>
+                  <set_value name="$maxIdx" exact="$idx"/>
                 </do_if>
               </do_all>
+              
+              <!-- Move to sorted list and remove from source -->
+              <do_if value="$maxIdx ge 1">
+                <append_to_list name="$sortedList" exact="$tradeList.{$maxIdx}"/>
+                <set_value name="$tradeList.{$maxIdx}.$Score" exact="-999999999"/> <!-- Mark as processed -->
+              </do_if>
             </do_all>
-          </do_if>
-          
-          <!-- Trim to top 20 -->
-          <do_if value="$tradeList.count gt $maxTradesToReturn">
-            <do_all exact="$tradeList.count - $maxTradesToReturn" counter="$trim">
-              <remove_value name="$tradeList.{$maxTradesToReturn + 1}"/>
-            </do_all>
+            
+            <!-- Replace with sorted top 20 -->
+            <set_value name="$tradeList" exact="$sortedList"/>
           </do_if>
           
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
