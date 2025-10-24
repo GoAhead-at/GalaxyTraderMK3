@@ -574,257 +574,124 @@
       </actions>
     </cue>
 
-    <!-- Ship Pilot Change Monitor -->
-    <cue name="ShipPilotChangeMonitor" instantiate="true" checkinterval="15s">
+    <!-- Ship Pilot Change Monitor: REMOVED -->
+    <!-- Polling monitor has been removed. Order removal is now detected instantly via signal from AI script's <on_abort> handler. -->
+    <!-- This provides instant response (0ms latency) and zero CPU overhead. Professional code doesn't crash - we trust the signal system. -->
+
+    <!-- Orphaned Pilot Registry Cleanup - Catches edge cases where pilots are registered but ships no longer have GT orders -->
+    <cue name="OrphanedPilotCleanup" instantiate="true">
       <conditions>
-        <check_value value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0"/>
+        <event_cue_signalled/>
+        <check_value value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0"/>
       </conditions>
+      <delay exact="1s"/><!-- Small delay to let game stabilize after load -->
       <actions>
-        <!-- Check all registered GalaxyTrader ships for pilot changes -->
-        <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
-        <do_all exact="$shipKeys.count" counter="$i">
-          <set_value name="$ship" exact="$shipKeys.{$i}"/>
+        <debug_text text="'[GT-Core] Running orphaned pilot registry cleanup check...'" chance="100"/>
+        
+        <set_value name="$cleanedCount" exact="0"/>
+        <set_value name="$pilotKeys" exact="global.$GT_Pilots.keys.list"/>
+        
+        <do_all exact="$pilotKeys.count" counter="$i">
+          <set_value name="$pilot" exact="$pilotKeys.{$i}"/>
           
-          <!-- Skip if ship no longer exists -->
-          <do_if value="not $ship.exists or not $ship.isoperational">
+          <!-- Skip if pilot object no longer exists -->
+          <do_if value="not $pilot.exists">
             <continue/>
           </do_if>
           
-          <!-- Check if ship still has GalaxyTrader order -->
+          <!-- Get pilot's current ship -->
+          <set_value name="$currentShip" exact="@$pilot.ship"/>
+          <do_if value="not $currentShip or not $currentShip.exists">
+            <!-- Pilot not on any ship - skip -->
+            <continue/>
+          </do_if>
+          
+          <!-- Check if ship has active GT order -->
           <set_value name="$hasGTOrder" exact="false"/>
-          <do_if value="$ship.defaultorder?">
-            <do_if value="@$ship.defaultorder.id == 'GalaxyTraderMK3'">
+          
+          <!-- Direct GT order check -->
+          <do_if value="$currentShip.defaultorder?">
+            <do_if value="@$currentShip.defaultorder.id == 'GalaxyTraderMK3'">
               <set_value name="$hasGTOrder" exact="true"/>
             </do_if>
-            <do_elseif value="@$ship.defaultorder.id == 'Assist' and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
-              <set_value name="$hasGTOrder" exact="true"/>
+            
+            <!-- Subordinate check: If ship has Assist order, check commander -->
+            <do_elseif value="@$currentShip.defaultorder.id == 'Assist'">
+              <do_if value="$currentShip.commander and $currentShip.commander.exists and $currentShip.commander != $currentShip">
+                <do_if value="$currentShip.commander.defaultorder?">
+                  <do_if value="@$currentShip.commander.defaultorder.id == 'GalaxyTraderMK3'">
+                    <set_value name="$hasGTOrder" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
             </do_elseif>
           </do_if>
           
-          <!-- If ship no longer has GalaxyTrader order, handle appropriately -->
-          <do_if value="not $hasGTOrder">
-            <debug_text text="'[GalaxyTrader MK3] Ship ' + $ship.knownname + ' (' + $ship.idcode + ') no longer has GalaxyTrader order - checking for replacement vs removal'" chance="100"/>
-            
-            <!-- Get original name from registry -->
-            <set_value name="$originalName" exact="null"/>
-            <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
-              <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          <!-- If ship doesn't have GT order but pilot is registered (active OR paused), check if name needs restoration -->
+          <do_if value="not $hasGTOrder and global.$GT_Pilots.{$pilot}?">
+            <!-- Check if ship name is different from original (indicating it still has GT-style name) -->
+            <set_value name="$needsNameRestore" exact="false"/>
+            <do_if value="global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+              <!-- If current name differs from original, it needs restoration -->
+              <do_if value="$currentShip.knownname != $originalName">
+                <set_value name="$needsNameRestore" exact="true"/>
+              </do_if>
             </do_if>
             
-            <!-- SMART DETECTION: Check if this is likely an order replacement -->
-            <set_value name="$isOrderReplacement" exact="false"/>
-            
-            <!-- Heuristic 1: If ship has pilot with existing XP data, likely replacement -->
-            <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$XP? and global.$GT_Pilots.{$ship.pilot}.$XP gt 0">
-              <set_value name="$isOrderReplacement" exact="true"/>
-              <debug_text text="'[GalaxyTrader MK3] SMART DETECTION: Pilot has XP (' + global.$GT_Pilots.{$ship.pilot}.$XP + ') - likely order replacement'" chance="100"/>
+            <do_if value="$needsNameRestore">
+              <debug_text text="'[GT-Core] ORPHANED PILOT DETECTED: ' + $pilot.name + ' on ship ' + $currentShip.knownname + ' (original: ' + $originalName + ') - no GT order found!'" chance="100"/>
+              
+              <!-- Restore ship name -->
+              <set_object_name object="$currentShip" name="$originalName"/>
+              <debug_text text="'[GT-Core] Restored ship name from &quot;' + $currentShip.knownname + '&quot; to &quot;' + $originalName + '&quot;'" chance="100"/>
+              
+              <!-- Mark pilot as paused if not already (preserve XP) -->
+              <do_if value="not global.$GT_Pilots.{$pilot}.$Status? or global.$GT_Pilots.{$pilot}.$Status != 'paused'">
+                <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
+                <set_value name="global.$GT_Pilots.{$pilot}.$PausedTime" exact="player.age"/>
+                <set_value name="global.$GT_Pilots.{$pilot}.$PausedReason" exact="'Orphaned registration cleanup - ship no longer has GT order'"/>
+              </do_if>
+              
+              <set_value name="$cleanedCount" exact="$cleanedCount + 1"/>
             </do_if>
-            
-            <!-- Heuristic 2: If ship is still in same sector and operational, likely replacement -->
-            <do_elseif value="$ship.isoperational and not $ship.iscapitalship and $ship.pilot">
-              <set_value name="$isOrderReplacement" exact="true"/>
-              <debug_text text="'[GalaxyTrader MK3] SMART DETECTION: Ship operational with pilot in good state - likely order replacement'" chance="100"/>
-            </do_elseif>
-            
-            <!-- Send appropriate signal based on detection -->
-            <do_if value="$isOrderReplacement">
-              <debug_text text="'[GalaxyTrader MK3] ORDER REPLACEMENT DETECTED - preserving pilot XP data'" chance="100"/>
-              
-              <!-- Signal pause (preserve XP) -->
-              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Paused'" param2="table[
-                $Ship = $ship,
-                $Pilot = $ship.pilot,
-                $Reason = 'Order replacement detected - preserving XP data',
-                $PreserveData = true,
-                $OriginalName = $originalName
-              ]"/>
-            </do_if>
-            <do_else>
-              <debug_text text="'[GalaxyTrader MK3] ORDER REMOVAL DETECTED - performing full cleanup'" chance="100"/>
-              
-              <!-- Signal abort (full cleanup) -->
-              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                $Ship = $ship,
-                $Pilot = $ship.pilot,
-                $Reason = 'Order permanently removed by player',
-                $OriginalName = $originalName
-              ]"/>
-            </do_else>
-            
-            <continue/>
-          </do_if>
-          
-          <!-- Check for pilot changes -->
-          <set_value name="$currentPilot" exact="$ship.pilot"/>
-          <set_value name="$registeredPilotData" exact="null"/>
-          
-          <!-- Find which pilot this ship was registered with -->
-          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
-            <set_value name="$pilotKeys" exact="global.$GT_Pilots.keys.list"/>
-            <do_all exact="$pilotKeys.count" counter="$j">
-              <set_value name="$registeredPilot" exact="$pilotKeys.{$j}"/>
-              <do_if value="global.$GT_Pilots.{$registeredPilot}.$AssociatedShip? and global.$GT_Pilots.{$registeredPilot}.$AssociatedShip == $ship">
-                <set_value name="$registeredPilotData" exact="table[
-                  $Pilot = $registeredPilot,
-                  $Data = global.$GT_Pilots.{$registeredPilot}
-                ]"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          
-          <!-- Handle pilot change -->
-          <do_if value="$registeredPilotData and $currentPilot != $registeredPilotData.$Pilot">
-            <debug_text text="'[GalaxyTrader MK3] Pilot change detected on ship ' + $ship.knownname + ' (' + $ship.idcode + ')'" chance="100"/>
-            
-            <!-- Check if new pilot is a registered GalaxyTrader pilot -->
-            <do_if value="$currentPilot and global.$GT_Pilots.{$currentPilot}?">
-              <!-- New pilot is registered - update ship name with new pilot's XP/rank -->
-              <debug_text text="'[GalaxyTrader MK3] New pilot is registered GalaxyTrader: ' + $currentPilot.name + ' - updating ship name'" chance="100"/>
-              
-              <!-- Get new pilot's current XP and calculate skill level -->
-              <set_value name="$newPilotXP" exact="global.$GT_Pilots.{$currentPilot}.$XP"/>
-              <set_value name="$newSkillLevel" exact="1"/>
-              
-              <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds?">
-                <do_all exact="15" counter="$skillLevel">
-                  <do_if value="$newPilotXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevel}">
-                    <set_value name="$newSkillLevel" exact="$skillLevel"/>
-                  </do_if>
-                </do_all>
-              </do_if>
-              
-              <!-- Get original ship name and build new name -->
-              <do_if value="global.$GT_Pilots.{$currentPilot}.$OriginalShipName?">
-                <set_value name="$originalName" exact="global.$GT_Pilots.{$currentPilot}.$OriginalShipName"/>
-              </do_if>
-              <do_else>
-                <set_value name="$originalName" exact="$ship.knownname"/>
-              </do_else>
-              
-              <set_value name="$nameElements" exact="[]"/>
-              <set_value name="$prefixElements" exact="[]"/>
-              <set_value name="$suffixElements" exact="[]"/>
-              
-              <!-- Status (training/blocked/advance indicators) -->
-              <do_if value="global.$GT_GlobalSettings.$ShipNaming.$DisplayStatus">
-                <set_value name="$statusText" exact="''"/>
-                <!-- ADVANCE takes priority - pilot is eligible for advancement exam -->
-                <do_if value="global.$GT_Pilots.{$currentPilot}.$XPBlocked?">
-                  <set_value name="$statusText" exact="'ADVANCE'"/>
-                </do_if>
-                <!-- TRAINING only shown for non-advancement training -->
-                <do_elseif value="global.$GT_Pilots.{$currentPilot}.$TrainingInProgress? and not global.$GT_Pilots.{$currentPilot}.$XPBlocked?">
-                  <set_value name="$statusText" exact="'[TRAINING]'"/>
-                </do_elseif>
-                
-                <do_if value="$statusText != ''">
-                  <do_if value="global.$GT_GlobalSettings.$ShipNaming.$StatusPosition == 'prefix'">
-                    <append_to_list name="$prefixElements" exact="$statusText"/>
-                  </do_if>
-                  <do_else>
-                    <append_to_list name="$suffixElements" exact="$statusText"/>
-                  </do_else>
-                </do_if>
-              </do_if>
-              
-              <!-- Pilot Rank -->
-              <do_if value="global.$GT_GlobalSettings.$ShipNaming.$DisplayRank">
-                <set_value name="$rankTitle" exact="'Lehrling'"/>
-                <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
-                  <set_value name="$rankIndex" exact="($skillLevel / 3)i + 1"/>
-                  <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
-                    <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
-                  </do_if>
-                  <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
-                    <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
-                  </do_if>
-                </do_if>
-                
-                <do_if value="global.$GT_GlobalSettings.$ShipNaming.$RankPosition == 'prefix'">
-                  <append_to_list name="$prefixElements" exact="$rankTitle"/>
-                </do_if>
-                <do_else>
-                  <append_to_list name="$suffixElements" exact="$rankTitle"/>
-                </do_else>
-              </do_if>
-              
-              <!-- Level -->
-              <do_if value="global.$GT_GlobalSettings.$ShipNaming.$DisplayLevel">
-                <set_value name="$levelText" exact="'Lv.' + $skillLevel"/>
-                <do_if value="global.$GT_GlobalSettings.$ShipNaming.$LevelPosition == 'prefix'">
-                  <append_to_list name="$prefixElements" exact="$levelText"/>
-                </do_if>
-                <do_else>
-                  <append_to_list name="$suffixElements" exact="$levelText"/>
-                </do_else>
-              </do_if>
-              
-              <!-- XP -->
-              <do_if value="global.$GT_GlobalSettings.$ShipNaming.$DisplayXP">
-                <set_value name="$xpText" exact="'XP:' + $currentXP"/>
-                <do_if value="global.$GT_GlobalSettings.$ShipNaming.$XPPosition == 'prefix'">
-                  <append_to_list name="$prefixElements" exact="$xpText"/>
-                </do_if>
-                <do_else>
-                  <append_to_list name="$suffixElements" exact="$xpText"/>
-                </do_else>
-              </do_if>
-              
-              <!-- Build final name -->
-              <set_value name="$newName" exact="$originalName"/>
-              
-              <!-- Add prefix elements -->
-              <do_if value="$prefixElements.count gt 0">
-                <set_value name="$prefixString" exact="''"/>
-                <do_all exact="$prefixElements.count" counter="$j">
-                  <do_if value="$j gt 1">
-                    <set_value name="$prefixString" exact="$prefixString + ' '"/>
-                  </do_if>
-                  <set_value name="$prefixString" exact="$prefixString + $prefixElements.{$j}"/>
-                </do_all>
-                <set_value name="$newName" exact="$prefixString + ' ' + $newName"/>
-              </do_if>
-              
-              <!-- Add suffix elements -->
-              <do_if value="$suffixElements.count gt 0">
-                <set_value name="$suffixString" exact="''"/>
-                <do_all exact="$suffixElements.count" counter="$j">
-                  <do_if value="$j gt 1">
-                    <set_value name="$suffixString" exact="$suffixString + ' '"/>
-                  </do_if>
-                  <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
-                </do_all>
-                <set_value name="$newName" exact="$newName + ' (' + $suffixString + ')'"/>
-              </do_if>
-              
-              <!-- Apply the new name -->
-              <set_object_name object="$ship" name="$newName"/>
-              <set_value name="$updatedCount" exact="$updatedCount + 1"/>
-              
-              <debug_text text="'[GalaxyTrader MK3] Updated ship name: ' + $ship.idcode + ' -> ' + $newName" chance="100"/>
-            </do_if>
-            <do_else>
-              <!-- New pilot is not registered - restore original name -->
-              <debug_text text="'[GalaxyTrader MK3] New pilot is not registered GalaxyTrader - restoring original ship name'" chance="100"/>
-              
-              <!-- Get original name from the old pilot's data (being replaced) -->
-              <do_if value="$registeredPilotData.$Data.$OriginalShipName?">
-                <set_value name="$originalName" exact="$registeredPilotData.$Data.$OriginalShipName"/>
-              </do_if>
-              <do_else>
-                <set_value name="$originalName" exact="$ship.knownname"/>
-              </do_else>
-              <set_object_name object="$ship" name="$originalName"/>
-              
-              <!-- Clean up old pilot registry -->
-              <remove_value name="global.$GT_Pilots.{$registeredPilotData.$Pilot}"/>
-              <remove_value name="global.$GT_Ships.{$ship}"/>
-              
-              <debug_text text="'[GalaxyTrader MK3] Ship name restored to original: ' + $originalName + ' (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
-            </do_else>
           </do_if>
         </do_all>
+        
+        <do_if value="$cleanedCount gt 0">
+          <debug_text text="'[GT-Core] Orphaned pilot cleanup complete: ' + $cleanedCount + ' pilots cleaned up'" chance="100"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Core] Orphaned pilot cleanup complete: No orphaned pilots found'" chance="100"/>
+        </do_else>
+        
+        <!-- Schedule next cleanup in 5 minutes -->
+        <signal_cue_instantly cue="OrphanedPilotCleanupScheduler"/>
+      </actions>
+    </cue>
+    
+    <!-- Trigger orphaned cleanup on game load and start recurring schedule -->
+    <cue name="TriggerCleanupOnLoad" instantiate="true">
+      <conditions>
+        <event_game_loaded/>
+      </conditions>
+      <actions>
+        <debug_text text="'[GT-Core] Game loaded - triggering orphaned pilot cleanup...'" chance="100"/>
+        <signal_cue_instantly cue="OrphanedPilotCleanup"/>
+        <!-- Start the recurring cleanup schedule -->
+        <signal_cue_instantly cue="OrphanedPilotCleanupScheduler"/>
+      </actions>
+    </cue>
+    
+    <!-- Scheduler for recurring cleanup every 5 minutes -->
+    <cue name="OrphanedPilotCleanupScheduler" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="5min"/>
+      <actions>
+        <signal_cue_instantly cue="OrphanedPilotCleanup"/>
+        <reset_cue cue="OrphanedPilotCleanupScheduler"/>
       </actions>
     </cue>
 
@@ -1121,6 +988,62 @@
           <!-- Handle pilot assignment changes -->
           <set_value name="$oldPilot" exact="event.param.$oldPilot"/>
           
+          <debug_text text="'[GT-Core] Processing pilot change on ' + $ship.knownname + ' - Old: ' + @$oldPilot.name + ', New: ' + @$pilot.name" chance="100"/>
+          
+          <!-- Check if new pilot is a registered GT pilot -->
+          <do_if value="$pilot and global.$GT_Pilots.{$pilot}?">
+            <!-- New pilot is already registered - update ship name with their XP/rank -->
+            <debug_text text="'[GT-Core] New pilot ' + $pilot.name + ' is registered GT pilot - updating ship name'" chance="100"/>
+            
+            <!-- Register new pilot for this ship -->
+            <do_if value="md.GT_Ship_Management.Register_Pilot?">
+              <run_actions ref="md.GT_Ship_Management.Register_Pilot">
+                <param name="pilot" value="$pilot"/>
+                <param name="ship" value="$ship"/>
+              </run_actions>
+            </do_if>
+          </do_if>
+          <do_elseif value="$pilot">
+            <!-- New pilot is NOT registered - restore original ship name and clean up old pilot -->
+            <debug_text text="'[GT-Core] New pilot ' + $pilot.name + ' is NOT registered GT pilot - restoring original ship name'" chance="100"/>
+            
+            <!-- Get original name from old pilot's registry -->
+            <set_value name="$originalName" exact="null"/>
+            <do_if value="$oldPilot and global.$GT_Pilots.{$oldPilot}? and global.$GT_Pilots.{$oldPilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{$oldPilot}.$OriginalShipName"/>
+            </do_if>
+            <do_elseif value="$ship.knownname?">
+              <set_value name="$originalName" exact="$ship.knownname"/>
+            </do_elseif>
+            
+            <!-- Restore original ship name -->
+            <do_if value="$originalName">
+              <set_object_name object="$ship" name="$originalName"/>
+              <debug_text text="'[GT-Core] Ship name restored to: ' + $originalName" chance="100"/>
+            </do_if>
+            
+            <!-- Clean up old pilot if no other ships -->
+            <do_if value="$oldPilot and global.$GT_Pilots.{$oldPilot}?">
+              <set_value name="$oldPilotHasOtherShips" exact="false"/>
+              <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+                <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+                <do_all exact="$shipKeys.count" counter="$i">
+                  <set_value name="$otherShip" exact="$shipKeys.{$i}"/>
+                  <do_if value="@$otherShip.pilot == $oldPilot">
+                    <set_value name="$oldPilotHasOtherShips" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              
+              <do_if value="not $oldPilotHasOtherShips">
+                <remove_value name="global.$GT_Pilots.{$oldPilot}"/>
+                <debug_text text="'[GT-Core] Cleaned up old pilot registry: ' + $oldPilot.name" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_elseif>
+          
+          <!-- Apply performance modifications -->
           <do_if value="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment?">
             <run_actions ref="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment">
               <param name="ship" value="$ship"/>
