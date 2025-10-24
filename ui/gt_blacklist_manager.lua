@@ -86,7 +86,15 @@ local GT_Blacklist = {
 local function debugLog(message, level)
     if GT_Blacklist.CONFIG.DEBUG_MODE then
         local prefix = level == "ERROR" and "❌" or level == "WARN" and "⚠️" or "🛡️"
-        DebugError(string.format("[GT-Blacklist] %s %s", prefix, message))
+        local logText = string.format("[GT-Blacklist] %s %s", prefix, message)
+        
+        -- Only use DebugError for actual errors and warnings
+        if level == "ERROR" or level == "WARN" then
+            DebugError(logText)
+        else
+            -- For info/success messages, use standard print (appears in Scripts log, not as error)
+            print(logText)
+        end
     end
 end
 

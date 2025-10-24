@@ -826,10 +826,26 @@
         <resume label="main_loop"/>
       </do_if>
       <do_else>
-        <!-- Ship ready for new trade - send request to MD system -->
-        <do_if value="this.ship.cargo.free.all gt 0">
-          <!-- Look for buy opportunities -->
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Looking for trade opportunities...'" chance="$debugchance"/>
+        <!-- Ship ready for new trade - check cargo status -->
+        <!-- ✅ CARGO CHECK: Only trade if cargo is EMPTY -->
+        <set_value name="$hasCargo" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>
+        
+        <do_if value="$hasCargo">
+          <!-- Ship has cargo - sell it first using our trade search -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship has cargo - finding best buyer using trade search...'" chance="100"/>
+          
+          <signal_objects object="player.galaxy" param="'GT_Find_Sell'" param2="table[
+            $Ship = this.ship,
+            $HomeBase = this.$effectiveHome,
+            $MaxSell = $maxsell,
+            $RiskTolerance = $gt_risktolerance,
+            $DistancePenalty = $effectiveDistancePenalty,
+            $FleetCoordination = $effectiveFleetCoordination
+          ]"/>
+        </do_if>
+        <do_else>
+          <!-- Ship cargo is EMPTY - look for buy opportunities -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cargo empty - looking for trade opportunities...'" chance="$debugchance"/>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📤 SENDING GT_Find_Trade signal to MD at game time ' + player.age" chance="100"/>
           <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
@@ -845,19 +861,6 @@
             $FleetCoordination = $effectiveFleetCoordination
           ]"/>
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📤 GT_Find_Trade signal SENT, now at game time ' + player.age" chance="100"/>
-        </do_if>
-        <do_else>
-          <!-- Ship is full, look for sell opportunities -->
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cargo full, looking for sell opportunities...'" chance="$debugchance"/>
-          
-          <signal_objects object="player.galaxy" param="'GT_Find_Sell'" param2="table[
-            $Ship = this.ship,
-            $HomeBase = this.$effectiveHome,
-            $MaxSell = $maxsell,
-            $RiskTolerance = $gt_risktolerance,
-            $DistancePenalty = $effectiveDistancePenalty,
-            $FleetCoordination = $effectiveFleetCoordination
-          ]"/>
         </do_else>
       </do_else>
       
@@ -871,6 +874,8 @@
             <check_any>
               <event_object_signalled object="this.ship" param="'GT_Trade_Found'"/>
               <event_object_signalled object="this.ship" param="'GT_No_Trade_Found'"/>
+              <!-- ✅ SIMPLE: Destination threatened → abort and restart main loop -->
+              <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
             </check_any>
           </conditions>
           <actions>
@@ -885,6 +890,13 @@
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📥 INTERRUPT FIRED: GT_No_Trade_Found received at game time ' + player.age" chance="100"/>
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📨 RECEIVED GT_No_Trade_Found signal - starting retry logic'" chance="100"/>
               <resume label="no_trade_retry"/>
+            </do_elseif>
+            <do_elseif value="event.param == 'GT_Destination_Threatened'">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📥 INTERRUPT FIRED: Destination threatened - aborting current trade'" chance="100"/>
+              <!-- ✅ SIMPLE: Abort current trade, go back to main loop -->
+              <!-- Cargo check will detect cargo and send GT_Find_Sell automatically -->
+              <cancel_all_orders object="this.ship"/>
+              <resume label="main_loop"/>
             </do_elseif>
           </actions>
         </interrupt>
@@ -1271,6 +1283,217 @@
       
       <!-- Resume normal trading loop -->
       <resume label="main_loop"/>
+      
+      <!-- ========================================================================= -->
+      <!-- CARGO SAFETY HANDLERS (In-Parallel Monitoring)                           -->
+      <!-- These run in parallel with main trading loop via interrupt-based waits   -->
+      <!-- ========================================================================= -->
+      
+      <!-- ========================================================================= -->
+      <!-- CARGO SAFETY SYSTEM: Emergency Cargo Sale Handler                        -->
+      <!-- ========================================================================= -->
+      <label name="emergency_cargo_sale"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Emergency cargo sale handler activated'" chance="100"/>
+      <debug_text text="'[GT-AI]   - Global table exists: ' + global.$GT_EmergencySales?" chance="100"/>
+      <debug_text text="'[GT-AI]   - Ship entry exists: ' + global.$GT_EmergencySales.{this.ship}?" chance="100"/>
+      
+      <do_if value="global.$GT_EmergencySales? and global.$GT_EmergencySales.{this.ship}?">
+              <set_value name="$emergencySale" exact="global.$GT_EmergencySales.{this.ship}"/>
+              
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Executing emergency cargo sale'" chance="100"/>
+              <debug_text text="'[GT-AI]   - Ware: ' + @$emergencySale.$Ware.name + ' x' + @$emergencySale.$Amount" chance="100"/>
+              <debug_text text="'[GT-AI]   - Station: ' + @$emergencySale.$Station.knownname" chance="100"/>
+              
+              <!-- SAFE: Validate ship still exists (edge case: destroyed between MD signal and AI execution) -->
+              <do_if value="not @this.ship.exists or not @this.ship.isoperational">
+                <debug_text text="'[GT-AI] Ship no longer operational - aborting emergency sale'" chance="100"/>
+                <remove_value name="global.$GT_EmergencySales.{this.ship}"/>
+                <return/>
+              </do_if>
+              
+              <!-- VANILLA-FIRST: Use vanilla trade order system -->
+              <create_trade_order object="this.ship" 
+                                  tradeoffer="$emergencySale.$BuyOffer" 
+                                  amount="$emergencySale.$Amount" 
+                                  immediate="true"/>
+              
+              <!-- Create German logbook entry -->
+              <do_if value="$emergencySale.$LogbookData?">
+                <write_to_logbook category="general" 
+                                  title="$emergencySale.$LogbookData.$Title" 
+                                  text="$emergencySale.$LogbookData.$Text"
+                                  interaction="showonmap" 
+                                  object="$emergencySale.$Station"/>
+              </do_if>
+              
+              <!-- Clean up -->
+              <remove_value name="global.$GT_EmergencySales.{this.ship}"/>
+              
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Emergency sale order created'" chance="100"/>
+              
+              <!-- Check if more cargo remains (Bug Fix #2: No blocking wait - check immediately) -->
+              <!-- Trade order creation is instant, so we can check cargo status right away -->
+              <set_value name="$cargoRemaining" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>
+              <do_if value="$cargoRemaining">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': More cargo detected - re-triggering emergency dump for next ware'" chance="100"/>
+                <!-- Signal MD system via galaxy object (AI can't call MD cues directly) -->
+                <signal_objects object="player.galaxy" param="'GT_Recheck_Cargo'" param2="this.ship"/>
+              </do_if>
+        <do_else>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': All cargo cleared - ready for normal trading'" chance="100"/>
+        </do_else>
+      </do_if>
+      <do_else>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ERROR: No emergency sale data found!'" chance="100"/>
+      </do_else>
+      
+      <!-- After handling emergency sale, return to main loop -->
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Emergency cargo handler complete - returning to main loop'" chance="100"/>
+      <resume label="main_loop"/>
+      
+      <!-- ========================================================================= -->
+      <!-- CARGO SAFETY SYSTEM: Alternative Cargo Sale Handler                      -->
+      <!-- ========================================================================= -->
+      <label name="alternative_cargo_sale"/>
+      <wait exact="0s">
+        <interrupt>
+          <conditions>
+            <event_object_signalled object="this.ship" param="'GT_Alternative_Cargo_Sale'"/>
+          </conditions>
+          <actions>
+            <do_if value="global.$GT_AlternativeSales? and global.$GT_AlternativeSales.{this.ship}?">
+              <set_value name="$altSale" exact="global.$GT_AlternativeSales.{this.ship}"/>
+              
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Executing alternative cargo sale'" chance="100"/>
+              <debug_text text="'[GT-AI]   - Ware: ' + @$altSale.$Ware.name + ' x' + @$altSale.$Amount" chance="100"/>
+              <debug_text text="'[GT-AI]   - Station: ' + @$altSale.$Station.knownname" chance="100"/>
+              <debug_text text="'[GT-AI]   - Expected profit: ' + @$altSale.$Profit + ' Cr'" chance="100"/>
+              
+              <!-- SAFE: Validate ship still exists (edge case: destroyed between MD signal and AI execution) -->
+              <do_if value="not @this.ship.exists or not @this.ship.isoperational">
+                <debug_text text="'[GT-AI] Ship no longer operational - aborting alternative sale'" chance="100"/>
+                <remove_value name="global.$GT_AlternativeSales.{this.ship}"/>
+                <return/>
+              </do_if>
+              
+              <!-- VANILLA-FIRST: Use vanilla trade order system -->
+              <create_trade_order object="this.ship" 
+                                  tradeoffer="$altSale.$BuyOffer" 
+                                  amount="$altSale.$Amount" 
+                                  immediate="true"/>
+              
+              <!-- Create German logbook entry with reason and outcome -->
+              <do_if value="$altSale.$LogbookData?">
+                <write_to_logbook category="general" 
+                                  title="'Notverkauf erforderlich'" 
+                                  text="'Ich konnte meine ' + @$altSale.$Amount + ' Einheiten ' + @$altSale.$Ware.name + ' nicht am ursprünglichen Zielort ' + @$altSale.$OriginalStation + ' verkaufen, da diese Station ' + @$altSale.$LogbookData.$ReasonText + '. ' + @$altSale.$LogbookData.$OutcomeText + ' Die Ware wurde stattdessen an ' + @$altSale.$Station.knownname + ' verkauft.'"
+                                  interaction="showonmap" 
+                                  object="$altSale.$Station"/>
+              </do_if>
+              
+              <!-- Clean up -->
+              <remove_value name="global.$GT_AlternativeSales.{this.ship}"/>
+              
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Alternative sale order created'" chance="100"/>
+            </do_if>
+          </actions>
+        </interrupt>
+      </wait>
+      
+      <!-- ========================================================================= -->
+      <!-- THREAT RESPONSE: Mid-Flight Destination Threat Handler                   -->
+      <!-- ========================================================================= -->
+      <label name="threat_response"/>
+      <wait exact="0s">
+        <interrupt>
+          <conditions>
+            <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
+          </conditions>
+          <actions>
+            <set_value name="$threatData" exact="event.param2"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': DESTINATION THREATENED: ' + $threatData.$Sector.knownname + ' (Level ' + $threatData.$ThreatLevel + ') - Aborting!'" chance="100"/>
+            
+            <!-- Cancel all current orders -->
+            <cancel_all_orders object="this.ship"/>
+            
+            <!-- CRITICAL: Extract station name BEFORE cleanup (Bug Fix #1) -->
+            <set_value name="$originalStationName" exact="$threatData.$Sector.knownname"/> <!-- Fallback to sector name -->
+            
+            <!-- Try to get actual station name from pending trades BEFORE they're deleted -->
+            <do_if value="global.$GT_PendingTrades.{this.ship}? and @global.$GT_PendingTrades.{this.ship}.count gt 0">
+              <set_value name="$pendingTrade" exact="global.$GT_PendingTrades.{this.ship}.{1}"/>
+              <set_value name="$sellStation" exact="@$pendingTrade.$SellOffer.owner"/>
+              <do_if value="$sellStation?">
+                <set_value name="$originalStationName" exact="$sellStation.knownname"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Original sell station: ' + $originalStationName" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Now safe to clean up pending trade data (trade is aborted) -->
+            <do_if value="global.$GT_PendingTrades.{this.ship}?">
+              <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cleaned up pending trade data'" chance="100"/>
+            </do_if>
+            
+            <!-- Clean up active trade data if exists -->
+            <do_if value="global.$GT_TradingData? and global.$GT_TradingData.$ActiveTrades? and global.$GT_TradingData.$ActiveTrades.{this.ship}?">
+              <remove_value name="global.$GT_TradingData.$ActiveTrades.{this.ship}"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cleaned up active trade data'" chance="100"/>
+            </do_if>
+            
+            <!-- Determine cargo status -->
+            <set_value name="$hasCargo" exact="this.ship.cargo.{tag.container}.count gt 0"/>
+            
+            <!-- Case 1: Ship has cargo - find alternative sell station -->
+            <do_if value="$hasCargo">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship has cargo - finding alternative buyer'" chance="100"/>
+              
+              <!-- Get cargo details -->
+              <set_value name="$cargoWare" exact="null"/>
+              <set_value name="$cargoAmount" exact="0"/>
+              <set_value name="$buyPrice" exact="0"/>
+              
+              <set_value name="$cargoList" exact="@this.ship.cargo.list"/>
+              <do_if value="$cargoList? and $cargoList.count gt 0">
+                <set_value name="$cargoWare" exact="$cargoList.{1}"/>
+                <set_value name="$cargoAmount" exact="@this.ship.cargo.{$cargoWare}.count"/>
+                
+                <!-- Try to get original buy price from active trade data (if still exists somehow) -->
+                <do_if value="global.$GT_TradingData? and global.$GT_TradingData.$ActiveTrades? and global.$GT_TradingData.$ActiveTrades.{this.ship}?">
+                  <set_value name="$buyPrice" exact="@global.$GT_TradingData.$ActiveTrades.{this.ship}.$Trade.$BuyOffer.unitprice"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Signal Cargo Safety System to find alternative buyer -->
+              <signal_objects object="player.galaxy" param="'GT_Find_Alternative_Sell'" param2="table[
+                $Ship = this.ship,
+                $Ware = $cargoWare,
+                $Amount = $cargoAmount,
+                $BuyPrice = $buyPrice,
+                $OriginalStationName = $originalStationName,
+                $Reason = 'threat_detected'
+              ]"/>
+            </do_if>
+            
+            <!-- Case 2: Ship is empty - find new trade (will respect blacklist) -->
+            <do_else>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Empty cargo - will find new trade (blacklist active)'" chance="100"/>
+              
+              <!-- Reset trade search timer to trigger immediate search -->
+              <set_value name="this.$lastTradeSearch" exact="0"/>
+            </do_else>
+            
+            <!-- Create German alert logbook entry -->
+            <write_to_logbook category="alerts" 
+                              title="'Bedrohungsalarm: Handel abgebrochen'" 
+                              text="this.ship.knownname + ' hat den Handel zu ' + $threatData.$Sector.knownname + ' abgebrochen aufgrund von ' + $threatData.$ThreatType + ' (Bedrohungsstufe ' + $threatData.$ThreatLevel + ')'" 
+                              object="this.ship"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Threat response complete - resuming normal operation'" chance="100"/>
+          </actions>
+        </interrupt>
+      </wait>
       
     </actions>
   </attention>
