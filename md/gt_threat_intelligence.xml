@@ -3,6 +3,7 @@
   
   <!-- DYNAMIC THREAT INTELLIGENCE SYSTEM -->
   <!-- Real-time hostile activity detection and fleet-wide reporting for GalaxyTrader MK3 -->
+  <!-- Level Requirements: 6+ for threat detection, 12+ for mid-trade route threat analysis -->
   
   <cues>
     
@@ -161,6 +162,7 @@
     <!-- ========================================================================= -->
     <!-- NOTIFY SHIPS OF THREAT                                                    -->
     <!-- Event-driven threat notification for mid-flight response                 -->
+    <!-- Level 12+ Requirement: Only experienced pilots can analyze route threats -->
     <!-- ========================================================================= -->
     
     <cue name="NotifyShipsOfThreat" instantiate="true">
@@ -191,34 +193,83 @@
             
             <!-- Validate ship exists and is operational -->
             <do_if value="@$ship.exists and @$ship.isoperational">
+              <!-- Check pilot level - only Level 12+ can analyze route threats mid-trade -->
+              <set_value name="$pilot" exact="@$ship.pilot"/>
+              <set_value name="$pilotLevel" exact="0"/>
+              <do_if value="$pilot? and global.$GT_Pilots.{$pilot}?">
+                <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{$pilot}.$Level"/>
+              </do_if>
+              
+              <!-- Only Level 12+ pilots have tactical awareness for mid-trade route analysis -->
+              <do_if value="$pilotLevel ge 12">
               <set_value name="$shipHasDestination" exact="false"/>
               <set_value name="$destinationSector" exact="null"/>
               
-              <!-- Check if ship has pending trades with destination in threatened sector -->
+              <!-- Check if ship has pending trades with threatened sector in travel path -->
               <do_if value="global.$GT_PendingTrades.{$ship}?">
                 <set_value name="$tradeList" exact="global.$GT_PendingTrades.{$ship}"/>
                 <do_if value="$tradeList? and $tradeList.count gt 0">
                   <set_value name="$trade" exact="$tradeList.{1}"/>
                   
-                  <!-- Check buy station sector -->
+                  <!-- Get buy and sell stations -->
                   <set_value name="$buyStation" exact="@$trade.$BuyOffer.owner"/>
-                  <do_if value="$buyStation? and @$buyStation.sector == $threatenedSector">
-                    <set_value name="$shipHasDestination" exact="true"/>
-                    <set_value name="$destinationSector" exact="$threatenedSector"/>
+                  <set_value name="$sellStation" exact="@$trade.$SellOffer.owner"/>
+                  
+                  <!-- Build list of all sectors in the complete trade route -->
+                  <set_value name="$sectorsInRoute" exact="[]"/>
+                  
+                  <!-- Add ship's current sector -->
+                  <do_if value="$ship.sector?">
+                    <append_to_list name="$sectorsInRoute" exact="$ship.sector"/>
                   </do_if>
                   
-                  <!-- Check sell station sector if not already found -->
-                  <do_if value="not $shipHasDestination">
-                    <set_value name="$sellStation" exact="@$trade.$SellOffer.owner"/>
-                    <do_if value="$sellStation? and @$sellStation.sector == $threatenedSector">
-                      <set_value name="$shipHasDestination" exact="true"/>
-                      <set_value name="$destinationSector" exact="$threatenedSector"/>
+                  <!-- Add buy station sector and path from ship to buy station -->
+                  <do_if value="$buyStation? and $buyStation.sector?">
+                    <append_to_list name="$sectorsInRoute" exact="$buyStation.sector"/>
+                    
+                    <!-- Get path from ship's current sector to buy station -->
+                    <do_if value="$ship.sector? and $ship.sector != $buyStation.sector">
+                      <set_value name="$pathToBuy" exact="@$ship.sector.gatedistance.{$buyStation.sector}.path"/>
+                      <do_if value="$pathToBuy? and @$pathToBuy.count gt 0">
+                        <do_all exact="$pathToBuy.count" counter="$pathIdx">
+                          <set_value name="$pathSector" exact="$pathToBuy.{$pathIdx}"/>
+                          <do_if value="$pathSector?">
+                            <append_to_list name="$sectorsInRoute" exact="$pathSector"/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
                     </do_if>
                   </do_if>
+                  
+                  <!-- Add sell station sector and path from buy to sell -->
+                  <do_if value="$sellStation? and $sellStation.sector?">
+                    <append_to_list name="$sectorsInRoute" exact="$sellStation.sector"/>
+                    
+                    <do_if value="$buyStation? and $buyStation.sector? and $buyStation.sector != $sellStation.sector">
+                      <set_value name="$pathToSell" exact="@$buyStation.sector.gatedistance.{$sellStation.sector}.path"/>
+                      <do_if value="$pathToSell? and @$pathToSell.count gt 0">
+                        <do_all exact="$pathToSell.count" counter="$pathIdx">
+                          <set_value name="$pathSector" exact="$pathToSell.{$pathIdx}"/>
+                          <do_if value="$pathSector?">
+                            <append_to_list name="$sectorsInRoute" exact="$pathSector"/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Check if threatened sector is anywhere in the complete route -->
+                  <do_all exact="$sectorsInRoute.count" counter="$sectorIdx">
+                    <do_if value="$sectorsInRoute.{$sectorIdx} == $threatenedSector">
+                      <set_value name="$shipHasDestination" exact="true"/>
+                      <set_value name="$destinationSector" exact="$threatenedSector"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
                 </do_if>
               </do_if>
               
-              <!-- If ship has destination in threatened sector, signal it -->
+              <!-- If ship has threatened sector in travel path, signal it -->
               <do_if value="$shipHasDestination">
                 <signal_objects object="$ship" param="'GT_Destination_Threatened'" param2="table[
                   $Sector = $threatenedSector,
@@ -229,8 +280,13 @@
                 
                 <set_value name="$shipsNotified" operation="add"/>
                 
-                <debug_text text="'[GT-Threat]   Signaled ' + $ship.idcode + ': Destination threatened!'" chance="100"/>
+                <debug_text text="'[GT-Threat]   Signaled ' + $ship.idcode + ' (Pilot Lv.' + $pilotLevel + '): Threatened sector in travel path - aborting trade!'" chance="100"/>
               </do_if>
+              </do_if>
+              <do_else>
+                <!-- Lower level pilots lack tactical awareness for mid-trade route analysis -->
+                <debug_text text="'[GT-Threat]   ' + $ship.idcode + ' (Pilot Lv.' + $pilotLevel + ') has threatened sector in route but lacks experience for mid-trade threat analysis (requires Lv.12+)'" chance="100"/>
+              </do_else>
             </do_if>
           </do_all>
           
