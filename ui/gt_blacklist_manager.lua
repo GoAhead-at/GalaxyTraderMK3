@@ -66,7 +66,7 @@ local GT_Blacklist = {
     CONFIG = {
         DEBUG_MODE = true,
         BLACKLIST_NAME_PREFIX = "GT_ThreatAvoid_",
-        THREAT_LEVEL_THRESHOLD = 3,  -- Blacklist sectors with threat >= 3
+        THREAT_LEVEL_THRESHOLD = 3,  -- Default: Blacklist sectors with threat >= 3 (overridden by MD settings)
         UPDATE_INTERVAL = 5.0,        -- Check for updates every 5 seconds
     },
     
@@ -412,22 +412,29 @@ local function onInitialize(_, event_data)
         return false
     end
     
-    -- Parse init data: "relation|existing_id"
+    -- Parse init data: "relation|existing_id|threshold"
     -- relation is "enemy" (enabled) or "" (disabled)
+    -- existing_id is the blacklist ID (0 = create new)
+    -- threshold is the threat level threshold (1-5)
     debugLog(string.format("🔍 Received event_data from MD: '%s' (type: %s, length: %d)", 
              tostring(event_data), type(event_data), event_data and #event_data or 0))
     
-    local relation_value, existing_id = "", 0
+    local relation_value, existing_id, threshold = "", 0, 3
     if event_data and event_data ~= "" then
         local parts = {}
         for part in string.gmatch(event_data, "[^|]+") do
             table.insert(parts, part)
         end
-        debugLog(string.format("🔍 Parsed parts: [1]='%s', [2]='%s'", 
-                 tostring(parts[1] or "nil"), tostring(parts[2] or "nil")))
+        debugLog(string.format("🔍 Parsed parts: [1]='%s', [2]='%s', [3]='%s'", 
+                 tostring(parts[1] or "nil"), tostring(parts[2] or "nil"), tostring(parts[3] or "nil")))
         relation_value = parts[1] or ""
         existing_id = tonumber(parts[2]) or 0
+        threshold = tonumber(parts[3]) or 3
     end
+    
+    -- Apply threshold from MD settings
+    GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD = threshold
+    debugLog(string.format("📊 Blacklist threshold set to: %d", threshold))
     
     GT_Blacklist.relation_value = relation_value
     
