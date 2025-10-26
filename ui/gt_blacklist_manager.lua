@@ -80,6 +80,38 @@ local GT_Blacklist = {
 }
 
 -- =============================================================================
+-- STRING UTILITY FUNCTIONS (for ship name processing)
+-- =============================================================================
+
+-- Strip GT formatting from ship names
+-- Removes: prefixes like "ADVANCE", "[TRAINING]", "AVANÇAR" (any ALL-CAPS word or bracketed text)
+-- Removes: suffixes like "(Comerciante Lv.10 XP:3150)"
+local function stripGTFormatting(shipName)
+    if not shipName or shipName == "" then
+        return ""
+    end
+    
+    local cleanName = shipName
+    
+    -- Step 1: Remove bracketed prefix like "[TRAINING]", "[AUSBILDUNG]", etc.
+    cleanName = cleanName:gsub("^%[.-%]%s+", "")
+    
+    -- Step 2: Remove ALL-CAPS word prefix (like "ADVANCE ", "AVANÇAR ", "FORTSCHRITT ", etc.)
+    cleanName = cleanName:gsub("^[%u%d]+%s+", "")
+    
+    -- Step 3: Remove parenthetical suffix like "(Comerciante Lv.10 XP:3150)"
+    local parenPos = cleanName:find("%s%(")
+    if parenPos then
+        cleanName = cleanName:sub(1, parenPos - 1)
+    end
+    
+    -- Trim any trailing/leading whitespace
+    cleanName = cleanName:match("^%s*(.-)%s*$")
+    
+    return cleanName
+end
+
+-- =============================================================================
 -- UTILITY FUNCTIONS
 -- =============================================================================
 

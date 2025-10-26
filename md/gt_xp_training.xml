@@ -691,23 +691,55 @@
           <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
         </do_else>
         
-        <!-- Get the original ship name -->
-        <!-- NOTE: OriginalShipName should be the ship's clean name without GT prefixes (ADVANCE/[TRAINING]/rank) -->
-        <!--       If it gets stored with prefixes (e.g., from manual rename or save corruption), -->
-        <!--       the duplicate-prevention logic below (line 719-723) will prevent "ADVANCE ADVANCE" -->
-        <do_if value="global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-          <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+        <!-- CRITICAL FIX: Always build from CURRENT ship name, not stored original! -->
+        <!-- Why: Stored original becomes stale after language switches, pilot changes, etc. -->
+        <!-- Solution: Strip GT formatting from current name using Lua -->
+        
+        <!-- Ensure global table exists -->
+        <do_if value="not global.$GT_StrippedNames?">
+          <set_value name="global.$GT_StrippedNames" exact="table[]"/>
+        </do_if>
+        
+        <!-- Request Lua to strip the name -->
+        <!-- Pass ship ID code along with name: "SHIPID|ShipName" -->
+        <set_value name="$luaParam" exact="$ship.idcode + '|' + $ship.knownname"/>
+        <raise_lua_event name="'GT_StringUtils.StripShipName'" param="$luaParam"/>
+        
+        <!-- Signal to check response after delay -->
+        <signal_cue_instantly cue="CheckLuaResponse" param="table[$ship = $ship, $pilot = $pilot, $skillLevel = $skillLevel, $currentXP = $currentXP, $currentLevel = $currentLevel, $rankTitle = $rankTitle, $nameType = $nameType]"/>
+      </actions>
+    </cue>
+    
+    <!-- Check Lua response after brief delay -->
+    <cue name="CheckLuaResponse" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="5ms"/>
+      <actions>
+        <!-- Extract parameters -->
+        <set_value name="$ship" exact="event.param.$ship"/>
+        <set_value name="$pilot" exact="event.param.$pilot"/>
+        <set_value name="$skillLevel" exact="event.param.$skillLevel"/>
+        <set_value name="$currentXP" exact="event.param.$currentXP"/>
+        <set_value name="$currentLevel" exact="event.param.$currentLevel"/>
+        <set_value name="$rankTitle" exact="event.param.$rankTitle"/>
+        <set_value name="$nameType" exact="event.param.$nameType"/>
+        
+        <!-- Check for Lua response using ship OBJECT as key (not string!) -->
+        <do_if value="global.$GT_StrippedNames.{$ship}?">
+          <set_value name="$cleanedCurrentName" exact="global.$GT_StrippedNames.{$ship}"/>
+          <remove_value name="global.$GT_StrippedNames.{$ship}"/>
+          <debug_text text="'[GT-XP] ✅ Lua stripped name: ' + $ship.knownname + ' -> ' + $cleanedCurrentName" chance="100"/>
         </do_if>
         <do_else>
-          <!-- Fallback: Use current ship name, but CLEAN IT FIRST to strip any GT formatting -->
-          <run_actions ref="md.GT_Ship_Management.Strip_GT_Name_Formatting" result="$cleanedName">
-            <param name="shipName" value="$ship.knownname"/>
-          </run_actions>
-          <set_value name="global.$GT_Pilots.{$pilot}.$OriginalShipName" exact="$cleanedName"/>
-          <set_value name="$originalName" exact="$cleanedName"/>
-          <debug_text text="'[GT-XP] WARNING: Missing OriginalShipName for pilot ' + $pilot.name + ', cleaned current name: ' + $cleanedName + ' (from: ' + $ship.knownname + ')'" chance="100"/>
+          <!-- Fallback: Use current name as-is if Lua module not loaded -->
+          <set_value name="$cleanedCurrentName" exact="$ship.knownname"/>
+          <debug_text text="'[GT-XP] ⚠️ WARNING: Lua module not loaded, using current name as-is: ' + $cleanedCurrentName" chance="100"/>
         </do_else>
-
+        
+        <!-- Use cleaned current name as the base for building new name -->
+        <set_value name="$originalName" exact="$cleanedCurrentName"/>
         
         <!-- Build ship name using configurable naming system -->
         <set_value name="$nameElements" exact="[]"/>
@@ -721,17 +753,38 @@
         <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayStatus">
           <set_value name="$statusText" exact="''"/>
           <do_if value="$nameType == 'blocked'">
-            <set_value name="$statusText" exact="'ADVANCE'"/>
+            <set_value name="$statusText" exact="readtext.{77000}.{7001}"/>  <!-- Translated: ADVANCE / FORTSCHRITT / AVANCER / etc. -->
           </do_if>
           <do_elseif value="$nameType == 'training'">
-            <set_value name="$statusText" exact="'[TRAINING]'"/>
+            <set_value name="$statusText" exact="readtext.{77000}.{7002}"/>  <!-- Translated: [TRAINING] / [TRAINING] / [FORMATION] / etc. -->
           </do_elseif>
           
           <do_if value="$statusText != ''">
-            <!-- ✅ FIX: Check if status prefix already exists in original name to prevent duplication -->
+            <!-- ✅ LANGUAGE-INDEPENDENT: Pattern-based duplicate detection -->
+            <!-- CRITICAL: Check CURRENT ship name for prefix, not stored original! -->
+            <!-- (Stored original might be from different ship if pilot switched ships) -->
             <set_value name="$statusAlreadyExists" exact="false"/>
-            <do_if value="$originalName.indexof.{$statusText}? and $originalName.indexof.{$statusText} == 0">
+            <set_value name="$currentShipName" exact="$ship.knownname"/>
+            
+            <!-- Check for bracketed prefix like [ANYTHING] in CURRENT name -->
+            <do_if value="$currentShipName? and $currentShipName != '' and $currentShipName.indexof.{'['}? and $currentShipName.indexof.{'['} == 0">
               <set_value name="$statusAlreadyExists" exact="true"/>
+              <debug_text text="'[GT-XP] Skipping status prefix - current name already has bracketed prefix: ' + $currentShipName" chance="100"/>
+            </do_if>
+            
+            <!-- Check for ALL-CAPS first word (in any language) in CURRENT name -->
+            <!-- CRITICAL: Must check if indexof.{' '}? exists BEFORE using it! -->
+            <do_if value="$currentShipName? and $currentShipName != '' and not $statusAlreadyExists and $currentShipName.indexof.{' '}?">
+              <set_value name="$firstSpace" exact="$currentShipName.indexof.{' '}"/>
+              <do_if value="$firstSpace gt 2 and $firstSpace lt 20">
+                <!-- Use pattern check: compare position of text after first space in current vs uppercase -->
+                <set_value name="$afterFirstSpace" exact="$currentShipName.substring.{$firstSpace + 1}"/>
+                <set_value name="$currentShipNameUpper" exact="$currentShipName.toupper"/>
+                <do_if value="$afterFirstSpace? and $currentShipNameUpper.indexof.{$afterFirstSpace}? and $currentShipName.indexof.{$afterFirstSpace}? and $currentShipNameUpper.indexof.{$afterFirstSpace} == $currentShipName.indexof.{$afterFirstSpace}">
+                  <set_value name="$statusAlreadyExists" exact="true"/>
+                  <debug_text text="'[GT-XP] Skipping status prefix - current name already has ALL-CAPS prefix: ' + $currentShipName" chance="100"/>
+                </do_if>
+              </do_if>
             </do_if>
             
             <do_if value="not $statusAlreadyExists">
@@ -819,16 +872,27 @@
           <set_value name="$newShipName" exact="$prefixString + ' ' + $newShipName"/>
         </do_if>
         
-        <!-- Add suffix elements -->
+        <!-- Add suffix elements (only if not already present in CURRENT ship name) -->
         <do_if value="$suffixElements.count gt 0">
-          <set_value name="$suffixString" exact="''"/>
-          <do_all exact="$suffixElements.count" counter="$j">
-            <do_if value="$j gt 1">
-              <set_value name="$suffixString" exact="$suffixString + ' '"/>
-            </do_if>
-            <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
-          </do_all>
-          <set_value name="$newShipName" exact="$newShipName + ' (' + $suffixString + ')'"/>
+          <!-- CRITICAL: Check CURRENT ship name for suffix, not new name being built! -->
+          <!-- (After language switch, current name has suffix but new name doesn't yet) -->
+          <set_value name="$alreadyHasSuffix" exact="false"/>
+          <set_value name="$currentShipName" exact="$ship.knownname"/>
+          <do_if value="$currentShipName? and $currentShipName != '' and $currentShipName.indexof.{' ('}?">
+            <set_value name="$alreadyHasSuffix" exact="true"/>
+            <debug_text text="'[GT-XP] Skipping suffix - current name already has parenthetical: ' + $currentShipName" chance="100"/>
+          </do_if>
+          
+          <do_if value="not $alreadyHasSuffix">
+            <set_value name="$suffixString" exact="''"/>
+            <do_all exact="$suffixElements.count" counter="$j">
+              <do_if value="$j gt 1">
+                <set_value name="$suffixString" exact="$suffixString + ' '"/>
+              </do_if>
+              <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
+            </do_all>
+            <set_value name="$newShipName" exact="$newShipName + ' (' + $suffixString + ')'"/>
+          </do_if>
         </do_if>
         
         <!-- Update ship name -->
