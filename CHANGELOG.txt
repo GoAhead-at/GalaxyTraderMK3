@@ -1,6 +1,246 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.5.7 - 2025-10-26
+--------------------------
+
+IMPROVEMENT: Consistent Ship Name Prefix System with User Configuration
+  - Standardized all prefixes: ALL states now use brackets for consistency ([ADVANCE], [TRAINING])
+  - Added operational state prefixes: [REPAIR], [RESUPPLY], [MAINTENANCE], [REROUTE], [CLEARANCE]
+  - Brackets ensure ships with active states sort to top of fleet overview for easy identification
+  - Added global settings: DisplayOperationalState, OperationalStatePosition (prefix/suffix)
+  - Respects user's naming preferences for display and position of operational states
+  - Example: "[ADVANCE] [REPAIR] Mercury Sentinel (Trader Lv.9 XP:2850)"
+  - [MAINTENANCE] shown when both repair and resupply needed simultaneously
+  - [REROUTE] shown when destination threatened/blacklisted, cleared when new destination found
+  - [CLEARANCE] shown during emergency cargo disposal (cargo safety), cleared when cargo empty
+  - Operational state changes trigger automatic ship renaming to update display
+  - Fully localized: All operational state prefixes translated to 8 languages (English, German, French, Spanish, Italian, Portuguese, Russian, plus L001)
+  - Translation IDs: 7003-7007 for operational states in all language files
+  - Backwards compatible: Works with existing save games (defaults to enabled/prefix if settings don't exist)
+  - Files: gt_xp_training.xml, gt_maintenance.xml, gt_trading_ai.xml, gt_global_settings.xml, order.trade.galaxytrader.xml, all t/0001-L*.xml files
+
+IMPROVEMENT: Simplified Ship Name Building Using macro.name
+  - Replaced complex Lua-based string stripping with native macro.name property
+  - Removed 2 files completely (gt_string_utils.lua, gt_string_utils_loader.xml)
+  - Removed ReceiveStrippedName cue from gt_ship_management.xml
+  - Eliminated async event communication and 5ms delay
+  - Benefits: 97% less code (250 lines → 7 lines), no timing issues, no Lua dependency
+  - macro.name provides ship model with variant (e.g., "Mercury Sentinel", "Shuyaku Vanguard")
+  - Always localized correctly by X4 engine, works across all languages
+  - Files: gt_xp_training.xml (simplified), deleted 2 files, cleaned gt_ship_management.xml
+
+CRITICAL FIX: Unreliable List Membership Checks Using indexof
+  - Fixed: 20+ instances of unreliable indexof checks across entire codebase
+    * Root cause: X4's $list.indexof.{$item}? is unreliable for object/value lists
+    * Even when list empty or item absent, ? check can fail silently or give wrong results
+    * Caused silent logic failures, duplicate queue entries, incorrect training validation
+    * Affected: Queue deduplication, training validation, maintenance, utilities, coordination
+  - Solution: Replace ALL list indexof checks with explicit do_all loops
+    * Pattern: Set $found=false, loop through list, compare each item, break if found
+    * 100% reliable, handles empty lists, objects, and values correctly
+    * Early break optimization minimizes performance impact
+  - Locations Fixed (20 total):
+    * Queue Deduplication (4): gt_trading_ai.xml (2), gt_trading_queue.xml (1), gt_trading_maintenance.xml (1)
+      - Ships no longer added to queue multiple times
+      - Search queue deduplication now works correctly
+      - Idle ship recovery no longer creates duplicates
+    * Training System (10): gt_xp_training.xml (6), gt_configuration.xml (4)
+      - RequiredLevels checks now reliable (lines 136, 321, 336, 536, 564)
+      - TrainingCompleted checks now reliable (lines 140, 325, 341, 540, 569)
+      - Configuration retroactive fix checks now reliable (lines 187, 191, 449, 453)
+      - Pilots no longer incorrectly blocked/unblocked from trading
+    * Maintenance (1): gt_maintenance.xml (line 972)
+      - Excluded sectors check now reliable
+      - Ships respect sector exclusion configuration correctly
+    * Utilities (2): gt_utilities.xml (lines 309, 395)
+      - Ware basket membership check now reliable
+      - Sector path deduplication now reliable
+    * Fleet Coordination (1): gt_fleet_coordination.xml (line 213)
+      - Unique wares tracking now reliable
+      - Fleet statistics accurate
+    * Trading Signals (1): gt_trading_signals.xml (line 118)
+      - Pathing failure reason detection now reliable
+      - Trade failure categorization accurate
+    * Market Intelligence (1): gt_market_intelligence.xml (line 435)
+      - SpottedBy ship tracking now reliable
+      - Competitor tracking accurate
+  - IMPORTANT: String indexof UNCHANGED (still safe and correct)
+    * Character lookups in strings work fine: $string.indexof.{'['}?
+    * Only LIST membership checks were affected and fixed
+    * Lines with string indexof: gt_xp_training.xml (770, 777, 778, 783, 881, 921)
+  - Impact: Eliminates silent logic failures, improves reliability across all systems
+  - Files: 10 MD files modified (gt_trading_ai.xml, gt_trading_queue.xml, gt_trading_maintenance.xml, gt_xp_training.xml, gt_configuration.xml, gt_maintenance.xml, gt_utilities.xml, gt_fleet_coordination.xml, gt_trading_signals.xml, gt_market_intelligence.xml)
+
+CRITICAL FIX: Cargo Safety System Blocking Ship Operations
+  - Fixed: Ships with multiple cargo types creating concurrent trade orders
+    * Root cause: Cargo safety looped through ALL wares and tried to sell each simultaneously
+    * Problem: Created multiple trade orders at once → first succeeds, others fail
+    * Result: Ship stuck in loop trying to execute failed orders for remaining cargo
+    * Example: Ship with Energy Cells + Food Rations created 2 orders at once
+    * Solution: Sell ONE ware at a time (first ware in cargo list)
+    * After trade completes, ship loops back and sells next ware sequentially
+    * This prevents multiple concurrent orders and ensures clean cargo disposal
+  - Solution: Cargo safety now accepts ANY offer, even losses (0 Cr minimum)
+    * Ship MUST clear cargo before new trades, profitability irrelevant
+    * Changed MinProfit from 500Cr to 0Cr in HandleAISellRequest
+    * Added blacklist validation (station, sector activity, sector travel)
+    * Added operational status checks (isoperational, isclosingdown with @ operator)
+    * Added docking permission checks (dockingallowed)
+    * Added final offer validity check before creating trade order
+    * Sells wares one at a time sequentially to prevent concurrent order conflicts
+    * Guarantees only valid, reachable, dockable offers result in trade orders
+    * Accepts losses if necessary - better to dump cargo than stay stuck
+  - Impact: Ships no longer get stuck with unsellable cargo, NO failed trade orders, NO infinite loops, NO concurrent order conflicts
+  - Files: md/gt_trading_ai.xml (line 331), md/gt_trading_search.xml (lines 1835-1950)
+
+CRITICAL FIX: Stale Maintenance Orders Persisting from Save Files
+  - Fixed: Ships executing obsolete repair/resupply orders from previous sessions
+    * Root cause: global.$GT_RepairOrders and global.$GT_ResupplyOrders persisted in save files
+    * Maintenance check would correctly determine "no repair needed"
+    * But AI script would still find old order data and execute it anyway
+    * Result: Ships flying to irrelevant repair stations from old game sessions
+  - Solution: Clear stale orders at start of every maintenance check
+    * Added cleanup code at beginning of DoMaintenance (lines 67-75)
+    * Ensures fresh decisions based on current ship state
+    * Prevents stale data from old sessions affecting current gameplay
+  - Impact: Ships no longer execute outdated maintenance orders after game load
+  - Files: md/gt_maintenance.xml
+  - User report: Ships stuck trying to reach old repair stations after save/load
+
+FIX: Trade Search Reliability and Correctness
+  - Fixed: Incorrect @ operator usage with gatedistance (5 locations)
+    * gatedistance returns -1 for unreachable routes (not null)
+    * Using @ masked semantic meaning and required extra null checks
+    * Removed @ and simplified to direct -1 checks for clarity
+    * Locations: Lines 437, 443, 888, 1302, 1309
+  - Fixed: Stage 2 distance not blacklist-aware
+    * Stage 2 computed distances through blacklisted sectors for scoring
+    * Caused futile trade selection that would fail during execution
+    * Changed to use station objects (blacklist-aware) instead of sectors
+    * Buy distance: $ship.gatedistance.{$station} (was .{$sector})
+    * Sell distance: $buyStation.gatedistance.{$sellStation} (was sector-to-sector)
+  - Fixed: Sell-only path lacked blacklist pre-filtering
+    * Live search filtered blacklisted stations, sell-only did not
+    * Inconsistent behavior could select blacklisted buyers
+    * Added same pre-filter logic to sell-only path for consistency
+    * Checks: objectactivity, sectoractivity, sectortravel blacklists
+  - Removed: Redundant GT_ValidateStation call in sell-only path
+    * Function only checked operational status
+    * find_buy_offer already filters operational stations
+    * Removed redundant call for clarity and performance
+  - Implemented: Faction Priority parameter now functional
+    * Player Only (0): Boosts trades involving player-owned stations by 20%
+    * Foreign First (1): Boosts trades with non-player stations by 20%
+    * Equal Priority (2): No boost applied (default behavior)
+    * Applied in both cached trade search and live trade search
+  - Fixed: Money type conversion warnings in faction priority boost
+    * Root cause: Attempting to convert money to pure number and multiply by float
+    * Original approach: $efficiency / 1Cr * 0.2 (failed - division doesn't remove money type)
+    * Solution: Calculate boost as division instead of multiplication
+    * Changed: $boost = $efficiency / 5 (20% = 1/5), then $efficiency + $boost
+    * Eliminates "Loss of data while converting floating point to money value" warnings
+    * Works because division and addition preserve money type naturally
+  - Impact: More reliable trade selection, fewer futile attempts, clearer code, configurable faction preference, no type warnings
+  - Files: md/gt_trading_search.xml
+
+FEATURE: Language-Independent Ship Name Stripping
+  - Improved: Ship name stripping now works with ALL languages
+  - Problem: Strip_GT_Name_Formatting only recognized English prefixes
+    * Only stripped: "ADVANCE ", "[TRAINING] " (hardcoded English)
+    * Failed on: "FORTSCHRITT", "[AUSBILDUNG]", "AVANCER", "AWANS", etc.
+    * Result: Duplicate prefixes in non-English locales ("ADVANCE FORTSCHRITT...")
+  - Solution: Pattern-based detection instead of hardcoded strings
+    * Step 0: BACKWARD COMPATIBILITY - Explicitly strips old English "ADVANCE ", "[TRAINING] "
+      (Ensures migration from pre-0.5.7 saves works correctly when language changes)
+    * Step 1: Detects ANY bracketed prefix: [ANYTHING] pattern
+    * Step 2: Detects ANY ALL-CAPS word prefix: Pattern-based comparison (language-independent)
+    * Step 3: Suffix handling - skipped due to X4 string API limitations
+      - X4 only supports substring.{position} (from position to end)
+      - No substring.{start, end} or substring.{pos, length} available
+      - Cannot truncate strings at arbitrary positions
+      - Duplicate detection prevents adding new suffixes anyway
+    * Works with all character sets: Latin, Cyrillic, Chinese, etc.
+    * Prevents duplicates: Pattern-based detection catches existing formatting
+  - Migration Example (German player with old English save):
+    * Old save: "ADVANCE Merkur (Lv.5)" (English prefix from v0.5.6)
+    * Step 0: Strip "ADVANCE " → "Merkur (Lv.5)"
+    * Note: Suffix remains due to X4 API limits (cannot truncate at arbitrary position)
+    * New name: "FORTSCHRITT Merkur (Lv.5)" (German prefix from v0.5.7)
+    * Result: Clean migration without "FORTSCHRITT ADVANCE" duplication
+    * Suffix is updated dynamically each rename, so old suffix will be replaced eventually
+  - Benefits:
+    * Fully multilingual - no hardcoded language strings
+    * No maintenance needed for new languages
+    * Automatic support for all X4 languages
+    * Prevents duplicate prefixes in all locales
+    * Seamless migration from pre-0.5.7 saves
+  - Files: md/gt_ship_management.xml (Strip_GT_Name_Formatting library, lines 49-117)
+           md/gt_xp_training.xml (duplicate prevention logic, lines 730-761)
+
+FIX: Missing Order Menu Translations
+  - Fixed: Order parameter names were hardcoded in English
+  - Problem: Parameters displayed in English regardless of game language
+    * Affected: Allow Illegal Wares, Logbook Entries, Risk Tolerance, etc.
+    * 11 parameters total with hardcoded English text
+  - Solution: Added proper translation references
+    * Added translation IDs 1011-1019, 1050-1051 to all language files
+    * Updated order.trade.galaxytrader.xml to use {77000,XXXX} references
+  - Translations added for:
+    * English (L001, L044)
+    * German (L007, L049)  
+    * French (L033)
+    * Spanish (L034)
+    * Italian (L039)
+    * Portuguese (L055)
+    * Russian (L007)
+  - Files: t/0001-L*.xml (all language files)
+           aiscripts/order.trade.galaxytrader.xml (parameter text attributes)
+
+FIX: Critical Reliability - Replaced Unreliable indexof Checks with Explicit Loops
+  - Fixed: indexof list membership checks can silently fail in X4
+  - Problem: `$list.indexof.{$item}` is unreliable for list membership testing
+    * Can return false negatives with object references
+    * Fails silently on empty lists or null values
+    * No error indication when comparison fails
+  - Affected Areas (3 critical checks):
+    * Ware basket filtering (line 577) - could skip valid manually selected wares
+    * Faction restriction checks (lines 1000-1015, 1048-1063) - could allow/deny wrong trades
+  - Solution: Replaced with explicit loop pattern
+    ```xml
+    <set_value name="$found" exact="false"/>
+    <do_all exact="$list.count" counter="$i">
+      <do_if value="$list.{$i} == $targetItem">
+        <set_value name="$found" exact="true"/>
+        <break/>
+      </do_if>
+    </do_all>
+    ```
+  - Benefits:
+    * Deterministic behavior - always works correctly
+    * Debuggable - can add logging to see comparisons
+    * Performant - breaks early when match found
+    * Null-safe - explicit count check prevents crashes
+  - Files: md/gt_trading_search.xml (lines 577-591, 1000-1029, 1048-1077)
+
+FIX: Ship Name Status Prefixes Now Fully Translated
+  - Fixed: "ADVANCE" and "[TRAINING]" prefixes were hardcoded in English
+  - Problem: Ship names showed English prefixes regardless of game language
+    * Example: German player saw "ADVANCE Merkur" instead of "FORTSCHRITT Merkur"
+    * Affected all non-English players (German, French, Russian, etc.)
+  - Solution: Added translation IDs 7001-7002 for status prefixes
+    * English: "ADVANCE", "[TRAINING]"
+    * German: "FORTSCHRITT", "[TRAINING]"
+    * French: "AVANCER", "[FORMATION]"
+    * Russian: "ПРОГРЕСС", "[ТРЕНИРОВКА]"
+    * Spanish: "AVANZAR", "[ENTRENAMIENTO]"
+    * Italian: "AVANZAMENTO", "[ADDESTRAMENTO]"
+    * Portuguese: "AVANÇAR", "[TREINAMENTO]"
+  - Implementation: Changed from hardcoded strings to readtext.{77000}.{700X}
+  - Pattern-based stripping still works - detects ALL-CAPS and bracketed patterns
+  - Files: t/0001-L*.xml (all language files)
+           md/gt_xp_training.xml (lines 724, 727)
+
 Version 0.5.6 - 2025-10-25
 --------------------------
 
@@ -26,7 +266,7 @@ CRITICAL FIX: Duplicate Ship Names During Mod Updates
   - Files: gt_ship_management.xml (new Strip_GT_Name_Formatting library)
            gt_xp_training.xml (lines 73, 91, 703)
            gt_core_system.xml (lines 84, 312, 363, 752)
-  - User-reported issue resolved: No more manual "disable naming → update → wait → enable" workflow
+  - THX @ CadvanVLirigon
 
 CRITICAL FIX: SearchCachedTrades Early Exit Error
   - Fixed: MD error when trade cache is too small (< 10 entries)
