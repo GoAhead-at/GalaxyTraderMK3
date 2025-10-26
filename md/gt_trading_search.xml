@@ -77,6 +77,7 @@
           $MaxDistance = $maxDistance,
           $MinROI = $minROI,
           $MinAbsoluteProfit = $minAbsoluteProfit,
+          $FactionPriority = $factionPriority,
           $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
           $SkillLevel = $skillLevel,
           $AllowIllegal = $params.$AllowIllegal
@@ -269,6 +270,7 @@
         <set_value name="$ship" exact="$params.$Ship"/>
         <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
         <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
+        <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
         <set_value name="$distancePenaltyMultiplier" exact="$params.$DistancePenaltyMultiplier"/>
         <set_value name="$skillLevel" exact="$params.$SkillLevel"/>
         <set_value name="$allowIllegal" exact="@$params.$AllowIllegal"/> <!-- Default to false if not provided -->
@@ -434,19 +436,13 @@
             -->
             
             <!-- STAGE 1: Range check from home base (no blacklist) -->
-            <set_value name="$rangeCheckBuy" exact="@$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
-            <do_if value="not $rangeCheckBuy? or typeof $rangeCheckBuy != datatype.integer">
-              <set_value name="$rangeCheckBuy" exact="-1"/>
-            </do_if>
+            <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
             
             <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
               <set_value name="$rangeCheckSell" exact="0"/>
             </do_if>
             <do_else>
-              <set_value name="$rangeCheckSell" exact="@$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
-              <do_if value="not $rangeCheckSell? or typeof $rangeCheckSell != datatype.integer">
-                <set_value name="$rangeCheckSell" exact="-1"/>
-              </do_if>
+              <set_value name="$rangeCheckSell" exact="$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
             </do_else>
             
             <set_value name="$totalRangeDistance" exact="$rangeCheckBuy + $rangeCheckSell"/>
@@ -456,16 +452,17 @@
               <continue/>
             </do_if>
             
-            <!-- STAGE 2: Reachability check from CURRENT position with blacklist (pre-validate path) -->
-            <!-- STAGE 2: Basic reachability check from current position (NO blacklist - AI will validate) -->
-            <set_value name="$buyDistance" exact="$ship.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
+            <!-- STAGE 2: Blacklist-aware reachability check from current position -->
+            <!-- Uses station objects (not sectors) for blacklist-aware pathfinding -->
+            <set_value name="$buyDistance" exact="$ship.gatedistance.{$cacheEntry.$BuyOffer.owner}"/>
             
             <!-- Sell distance: BuyOffer station to SellOffer station -->
             <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
               <set_value name="$sellDistance" exact="0"/>
             </do_if>
             <do_else>
-              <set_value name="$sellDistance" exact="$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
+              <!-- Use buy station as reference to respect its blacklist -->
+              <set_value name="$sellDistance" exact="$cacheEntry.$BuyOffer.owner.gatedistance.{$cacheEntry.$SellOffer.owner}"/>
             </do_else>
             
             <!-- If trade route is in disconnected sectors, skip this trade -->
@@ -611,6 +608,21 @@
             <!-- Calculate current score with distance penalty (use blacklist-aware distance) -->
             <set_value name="$adjustedDistance" exact="$currentDistance * $distancePenaltyMultiplier"/>
             <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($cacheEntry.$Profit / $adjustedDistance) else $cacheEntry.$Profit"/>
+            
+            <!-- Apply faction priority boost -->
+            <do_if value="$factionPriority == 0">
+              <!-- Player Only: Boost player-owned stations by 20% -->
+              <do_if value="$cacheEntry.$BuyOffer.owner.owner == faction.player or $cacheEntry.$SellOffer.owner.owner == faction.player">
+                <set_value name="$efficiency" exact="$efficiency + ($efficiency * 0.2f)"/>
+              </do_if>
+            </do_if>
+            <do_elseif value="$factionPriority == 1">
+              <!-- Foreign First: Boost non-player stations by 20% -->
+              <do_if value="$cacheEntry.$BuyOffer.owner.owner != faction.player and $cacheEntry.$SellOffer.owner.owner != faction.player">
+                <set_value name="$efficiency" exact="$efficiency + ($efficiency * 0.2f)"/>
+              </do_if>
+            </do_elseif>
+            <!-- Equal Priority (2): No boost applied -->
             
             <!-- ✅ DEBUG: Log each entry being considered -->
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
@@ -891,10 +903,7 @@
         <!-- Collect offers from all stations -->
         <do_all exact="$stations.count" counter="$i">
           <set_value name="$station" exact="$stations.{$i}"/>
-          <set_value name="$stationDistance" exact="@$homeSector.gatedistance.{$station.sector}"/>
-          <do_if value="not $stationDistance?">
-            <set_value name="$stationDistance" exact="-1"/>
-          </do_if>
+          <set_value name="$stationDistance" exact="$homeSector.gatedistance.{$station.sector}"/>
           
           <do_if value="$stationDistance lt 0">
             <set_value name="$stationsSkipped" operation="add"/>
@@ -910,14 +919,7 @@
             <break/>
           </do_if>
           
-          <!-- Validate station (threat avoidance now handled by vanilla pathfinding) -->
-          <run_actions ref="md.GT_Utilities.GT_ValidateStation" result="$stationValid">
-            <param name="station" value="$station"/>
-            <param name="ship" value="$ship"/>
-          </run_actions>
-          
-          <do_if value="$stationValid">
-            <set_value name="$stationsEvaluated" operation="add"/>
+          <set_value name="$stationsEvaluated" operation="add"/>
             
             <!-- ✅ EFFICIENT WARE FILTERING: Query X4 engine for specific wares instead of post-filtering in MD -->
             <do_if value="$wareBasket? and $wareBasket.count gt 0">
@@ -981,6 +983,49 @@
             
             <set_value name="$stationOffers" exact="$buyOffers.count + $sellOffers.count"/>
             <set_value name="$offersFound" exact="$offersFound + $stationOffers"/>
+            
+            <!-- ===== PRE-FILTER BLACKLIST (SELL-ONLY PATH) ===== -->
+            <!-- Remove blacklisted buyers before scoring -->
+            <do_if value="$buyOffers.count gt 0">
+              <!-- Determine ship's blacklistgroup -->
+              <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+              <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+                <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+              </do_if>
+              
+              <set_value name="$buyOffersBlacklisted" exact="0"/>
+              <set_value name="$safeBuyOffers" exact="[]"/>
+              
+              <do_all exact="$buyOffers.count" counter="$k">
+                <set_value name="$offer" exact="$buyOffers.{$k}"/>
+                
+                <!-- Check if station or sector is blacklisted -->
+                <set_value name="$isBlacklisted" exact="false"/>
+                <do_if value="$blacklistgroup?">
+                  <set_value name="$stationBlacklisted" exact="@$offer.owner.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+                  <set_value name="$sectorActivityBlacklisted" exact="@$offer.owner.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+                  <set_value name="$sectorTravelBlacklisted" exact="@$offer.owner.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+                  <set_value name="$isBlacklisted" exact="$stationBlacklisted or $sectorActivityBlacklisted or $sectorTravelBlacklisted"/>
+                </do_if>
+                
+                <do_if value="not $isBlacklisted">
+                  <append_to_list name="$safeBuyOffers" exact="$offer"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$buyOffersBlacklisted" exact="$buyOffersBlacklisted + 1"/>
+                </do_else>
+              </do_all>
+              
+              <set_value name="$buyOffers" exact="$safeBuyOffers"/>
+              
+              <!-- Debug logging -->
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+                <do_if value="$buyOffersBlacklisted gt 0">
+                  <debug_text text="'[GT-Search] 🛡️ SELL-ONLY: Pre-filtered ' + $buyOffersBlacklisted + ' blacklisted buyers'" chance="100"/>
+                  <debug_text text="'[GT-Search] ✅ SELL-ONLY: ' + $buyOffers.count + ' safe buyers remaining'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
             
             <!-- Filter offers -->
             <set_value name="$filteredIllegalCount" exact="0"/>
@@ -1110,7 +1155,6 @@
             </do_all>
             
             <set_value name="$totalFilteredIllegal" exact="$totalFilteredIllegal + $filteredIllegalCount"/>
-          </do_if>
         </do_all>
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1308,22 +1352,14 @@
             <set_value name="$sellStation" exact="$allSellOffers.{$i}.owner"/>
             <do_if value="not $stationDistanceCache.{$sellStation}?">
               <!-- Calculate basic distance (vanilla will route around blacklist) -->
-              <set_value name="$stationDistanceCache.{$sellStation}" exact="@$homeSector.gatedistance.{$sellStation.sector}"/>
-              <!-- Convert null to -1 for disconnected sectors -->
-              <do_if value="not $stationDistanceCache.{$sellStation}? or typeof $stationDistanceCache.{$sellStation} != datatype.integer">
-                <set_value name="$stationDistanceCache.{$sellStation}" exact="-1"/>
-              </do_if>
+              <set_value name="$stationDistanceCache.{$sellStation}" exact="$homeSector.gatedistance.{$sellStation.sector}"/>
             </do_if>
           </do_all>
           <do_all exact="$allBuyOffers.count" counter="$i">
             <set_value name="$buyStation" exact="$allBuyOffers.{$i}.owner"/>
             <do_if value="not $stationDistanceCache.{$buyStation}?">
               <!-- Calculate basic distance (vanilla will route around blacklist) -->
-              <set_value name="$stationDistanceCache.{$buyStation}" exact="@$homeSector.gatedistance.{$buyStation.sector}"/>
-              <!-- Convert null to -1 for disconnected sectors -->
-              <do_if value="not $stationDistanceCache.{$buyStation}? or typeof $stationDistanceCache.{$buyStation} != datatype.integer">
-                <set_value name="$stationDistanceCache.{$buyStation}" exact="-1"/>
-              </do_if>
+              <set_value name="$stationDistanceCache.{$buyStation}" exact="$homeSector.gatedistance.{$buyStation.sector}"/>
             </do_if>
           </do_all>
           
@@ -1512,6 +1548,21 @@
                         <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
                         <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
                         <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($profit / $adjustedDistance) else $profit"/>
+                        
+                        <!-- Apply faction priority boost -->
+                        <do_if value="$factionPriority == 0">
+                          <!-- Player Only: Boost player-owned stations by 20% -->
+                          <do_if value="$sellOffer.owner.owner == faction.player or $buyOffer.owner.owner == faction.player">
+                            <set_value name="$efficiency" exact="$efficiency + ($efficiency * 0.2f)"/>
+                          </do_if>
+                        </do_if>
+                        <do_elseif value="$factionPriority == 1">
+                          <!-- Foreign First: Boost non-player stations by 20% -->
+                          <do_if value="$sellOffer.owner.owner != faction.player and $buyOffer.owner.owner != faction.player">
+                            <set_value name="$efficiency" exact="$efficiency + ($efficiency * 0.2f)"/>
+                          </do_if>
+                        </do_elseif>
+                        <!-- Equal Priority (2): No boost applied -->
                         
                         <!-- ✅ CRITICAL: Check if this sector pair previously failed for THIS ship -->
                         <set_value name="$isFailedSectorPair" exact="false"/>
