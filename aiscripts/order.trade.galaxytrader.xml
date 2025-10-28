@@ -610,6 +610,9 @@
         <set_value name="$repairData" exact="global.$GT_RepairOrders.{this.ship}"/>
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔧 Creating Repair order at ' + $repairData.$Station.knownname" chance="100"/>
         
+        <!-- Set flag to indicate maintenance transition for on_abort handler -->
+        <set_value name="this.$maintenance_transition" exact="true"/>
+        
         <create_order object="this.ship" id="'Repair'" immediate="false">
           <param name="destination" value="$repairData.$Station"/>
           <param name="hullpercent" value="100"/>
@@ -623,7 +626,14 @@
       <!-- Create Resupply order if data prepared -->
       <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{this.ship}?">
         <set_value name="$resupplyData" exact="global.$GT_ResupplyOrders.{this.ship}"/>
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🛡️ Creating Resupply build order at ' + $resupplyData.$Station.knownname" chance="100"/>
+        <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🛡️ CREATING RESUPPLY BUILD ORDER'" chance="100"/>
+        <debug_text text="'[GT-AI]    Target Station: ' + $resupplyData.$Station.knownname" chance="100"/>
+        <debug_text text="'[GT-AI]    Station Owner: ' + @$resupplyData.$Station.owner.knownname" chance="100"/>
+        <debug_text text="'[GT-AI]    Station Sector: ' + @$resupplyData.$Station.sector.knownname" chance="100"/>
+        <debug_text text="'[GT-AI]    Station exists: ' + $resupplyData.$Station.exists" chance="100"/>
+        <debug_text text="'[GT-AI]    Station operational: ' + @$resupplyData.$Station.isoperational" chance="100"/>
+        <debug_text text="'[GT-AI]    Distance from ship: ' + this.ship.gatedistance.{$resupplyData.$Station} + ' jumps'" chance="100"/>
         
         <!-- Use vanilla's pattern: add_build_to_modify_ship with shopping list -->
         <!-- This is what actually creates the order with specific items to buy -->
@@ -631,6 +641,9 @@
         
         <do_if value="$resupplyData.$AmmoTable or $resupplyData.$UnitTable">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📋 Shopping list - Ammo types: ' + @$resupplyData.$AmmoTable.keys.count + ', Unit types: ' + @$resupplyData.$UnitTable.keys.count" chance="100"/>
+          
+          <!-- Set flag to indicate maintenance transition for on_abort handler -->
+          <set_value name="this.$maintenance_transition" exact="true"/>
           
           <!-- Use vanilla's add_build_to_modify_ship action -->
           <add_build_to_modify_ship 
@@ -644,9 +657,13 @@
           
           <do_if value="$buildSuccessful">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Build order created successfully - waiting for completion'" chance="100"/>
+            <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
             <!-- Order will complete and trigger our diff patch's on_abort handler -->
           </do_if>
           <do_else>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ❌ FAILED to create build order!'" chance="100"/>
+            <debug_text text="'[GT-AI]    This usually means the station cannot build the requested items'" chance="100"/>
+            <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ Build order creation failed - station cannot fulfill order'" chance="100"/>
             
             <!-- Clean up resupply data -->
@@ -692,12 +709,18 @@
             </conditions>
             <actions>
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Maintenance complete signal received, proceeding to trade search'" chance="100"/>
+              
+              <!-- Clear maintenance transition flag -->
+              <remove_value name="this.$maintenance_transition"/>
             </actions>
           </interrupt>
         </wait>
         
         <!-- Timeout fallback -->
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏱️ Maintenance timeout after 600s, proceeding anyway'" chance="100"/>
+        
+        <!-- Clear maintenance transition flag on timeout as well -->
+        <remove_value name="this.$maintenance_transition"/>
       </do_if>
       <do_else>
         <!-- No maintenance needed -->
@@ -1460,14 +1483,20 @@
       <set_value name="$isTrainingTransition" exact="true"/>
     </do_if>
     
-    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Order terminating (actively trading: ' + $isActivelyTrading + ', training transition: ' + $isTrainingTransition + ')'" chance="100"/>
+    <!-- Check if a maintenance order was recently created (repair/resupply) -->
+    <set_value name="$isMaintenanceTransition" exact="false"/>
+    <do_if value="this.$maintenance_transition?">
+      <set_value name="$isMaintenanceTransition" exact="true"/>
+    </do_if>
+    
+    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Order terminating (actively trading: ' + $isActivelyTrading + ', training transition: ' + $isTrainingTransition + ', maintenance transition: ' + $isMaintenanceTransition + ')'" chance="100"/>
     
     <!-- Check if subordinate cleanup already sent signal (to avoid duplicate) -->
     <do_if value="this.$subordinate_cleanup_sent?">
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Subordinate cleanup signal already sent - skipping duplicate'" chance="100"/>
     </do_if>
-    <!-- Only send cleanup signal if NOT actively trading AND NOT transitioning to training -->
-    <do_elseif value="not $isActivelyTrading and not $isTrainingTransition">
+    <!-- Only send cleanup signal if NOT actively trading AND NOT transitioning to training/maintenance -->
+    <do_elseif value="not $isActivelyTrading and not $isTrainingTransition and not $isMaintenanceTransition">
       <!-- SMART DETECTION: Check if order was permanently removed or temporarily replaced -->
       <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
       <set_value name="$isPermanentRemoval" exact="false"/>
@@ -1514,10 +1543,11 @@
         <signal_objects object="player.galaxy" param="'GT_Ship_Order_Paused'" param2="$pauseData"/>
       </do_else>
       
-      <!-- Clear training flags -->
+      <!-- Clear training and maintenance flags -->
       <remove_value name="this.$training_in_progress"/>
       <remove_value name="this.$training_order_created"/>
       <remove_value name="this.$training_transition"/>
+      <remove_value name="this.$maintenance_transition"/>
     </do_elseif>
     <do_else>
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship still actively trading/training or subordinate cleanup already sent - NOT sending signals'" chance="100"/>

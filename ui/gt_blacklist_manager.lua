@@ -64,7 +64,7 @@ ffi.cdef[[
 local GT_Blacklist = {
     -- Configuration
     CONFIG = {
-        DEBUG_MODE = true,
+        DEBUG_MODE = false,  -- Set to true to enable debug logging
         BLACKLIST_NAME_PREFIX = "GT_ThreatAvoid_",
         THREAT_LEVEL_THRESHOLD = 3,  -- Default: Blacklist sectors with threat >= 3 (overridden by MD settings)
         UPDATE_INTERVAL = 5.0,        -- Check for updates every 5 seconds
