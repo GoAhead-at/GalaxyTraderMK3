@@ -194,7 +194,15 @@
               '\n  📦 Amount zero/negative: ' + $tradesRejectedAmount +
               '\n  🛡️ Blacklisted (safety net): ' + $tradesRejectedBlacklist +
               '\n  ━━━━━━━━━━━━━━━━━━━━━━━━' +
-              '\n  TOTAL REJECTED: ' + ($tradesRejectedDocking + $tradesRejectedProfit + $tradesRejectedDistance + $tradesRejectedAmount + $tradesRejectedBlacklist)" 
+              '\n  TOTAL REJECTED: ' + ($tradesRejectedDocking + $tradesRejectedProfit + $tradesRejectedDistance + $tradesRejectedAmount + $tradesRejectedBlacklist) +
+              (if $bestRejectedTrade? then 
+                '\n\n🏆 BEST REJECTED TRADE (still unprofitable):' +
+                '\n  Ware: ' + @$bestRejectedTrade.$ware.name +
+                '\n  Buy from: ' + @$bestRejectedTrade.$buyFrom.knownname + ' @ ' + $bestRejectedTrade.$buyPrice + ' Cr/unit' +
+                '\n  Sell to: ' + @$bestRejectedTrade.$sellTo.knownname + ' @ ' + $bestRejectedTrade.$sellPrice + ' Cr/unit' +
+                '\n  Best profit found: ' + $bestRejectedTrade.$profit + ' Cr (needed: ' + $minAbsoluteProfit + ' Cr)' +
+                '\n  Best ROI found: ' + $bestRejectedTrade.$roi + '% (needed: ' + $minROI + '%)'
+               else '')" 
               chance="100"/>
           </do_if>
           
@@ -676,7 +684,10 @@
                 <!-- Calculate fresh prices and profit -->
                 <set_value name="$freshBuyPrice" exact="$freshBuyOffer.unitprice"/>
                 <set_value name="$freshSellPrice" exact="$freshSellOffer.unitprice"/>
-                <set_value name="$freshMaxAmount" exact="[$freshBuyOffer.amount, $freshSellOffer.amount, $ship.cargo.free.all].min"/>
+                
+                <!-- Calculate max cargo capacity for this ware (same fix as live search) -->
+                <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $freshBuyOffer.ware.volume)i"/>
+                <set_value name="$freshMaxAmount" exact="[$freshBuyOffer.amount, $freshSellOffer.amount, $maxCargoCapacity].min"/>
                 
                 <!-- Skip if no tradeable amount -->
                 <do_if value="$freshMaxAmount gt 0">
@@ -1308,41 +1319,8 @@
         <!-- ===== CROSS-STATION TRADE MATCHING ===== -->
         <do_if value="$allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
           
-          <!-- ✅ PERFORMANCE: Limit offers to reduce matching complexity (TaterTrader approach) -->
-          <!-- Sort and keep only top 1/3 or max 250 offers by relative price -->
-          <!-- NOTE: Now working with safe (non-blacklisted) offers only! -->
-          <set_value name="$maxOffersToMatch" exact="250"/>
-          
-          <!-- Limit sell offers -->
-          <do_if value="$allSellOffers.count gt $maxOffersToMatch">
-            <sort_trades name="$allSellOffers" tradelist="$allSellOffers" sorter="relativeprice"/>
-            <set_value name="$limitedSellOffers" exact="[]"/>
-            <do_all exact="$maxOffersToMatch" counter="$idx">
-              <append_to_list name="$limitedSellOffers" exact="$allSellOffers.{$idx}"/>
-            </do_all>
-            <set_value name="$allSellOffers" exact="$limitedSellOffers"/>
-            
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ LIMITED sell offers to top ' + $maxOffersToMatch + ' by relative price'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <!-- Limit buy offers -->
-          <do_if value="$allBuyOffers.count gt $maxOffersToMatch">
-            <sort_trades name="$allBuyOffers" tradelist="$allBuyOffers" sorter="relativeprice"/>
-            <set_value name="$limitedBuyOffers" exact="[]"/>
-            <do_all exact="$maxOffersToMatch" counter="$idx">
-              <append_to_list name="$limitedBuyOffers" exact="$allBuyOffers.{$idx}"/>
-            </do_all>
-            <set_value name="$allBuyOffers" exact="$limitedBuyOffers"/>
-            
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ LIMITED buy offers to top ' + $maxOffersToMatch + ' by relative price'" chance="100"/>
-            </do_if>
-          </do_if>
-          
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Matching ' + $allSellOffers.count + ' sell × ' + $allBuyOffers.count + ' buy = ' + ($allSellOffers.count * $allBuyOffers.count) + ' potential combinations'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Total offers before indexing: ' + $allSellOffers.count + ' sell, ' + $allBuyOffers.count + ' buy'" chance="100"/>
           </do_if>
           
           <!-- ✅ OPTIMIZATION: Calculate available money ONCE (before loops, not inside) -->
@@ -1416,6 +1394,33 @@
               <set_value name="$sellOffersForWare" exact="$sellOffersByWare.{$ware}"/>
               <set_value name="$buyOffersForWare" exact="$buyOffersByWare.{$ware}"/>
               
+              <!-- ✅ PER-WARE LIMITING: Keep top 100 offers per ware (independent per ware) -->
+              <set_value name="$maxOffersPerWare" exact="100"/>
+              
+              <!-- Limit sell offers for this specific ware -->
+              <do_if value="$sellOffersForWare.count gt $maxOffersPerWare">
+                <!-- Sort by relativeprice to get best offers for this ware -->
+                <sort_trades name="$sellOffersForWare" tradelist="$sellOffersForWare" sorter="relativeprice"/>
+                <!-- Keep top N offers (relativeprice sorted, take from start for now) -->
+                <set_value name="$limitedSellOffers" exact="[]"/>
+                <do_all exact="$maxOffersPerWare" counter="$idx">
+                  <append_to_list name="$limitedSellOffers" exact="$sellOffersForWare.{$idx}"/>
+                </do_all>
+                <set_value name="$sellOffersForWare" exact="$limitedSellOffers"/>
+              </do_if>
+              
+              <!-- Limit buy offers for this specific ware -->
+              <do_if value="$buyOffersForWare.count gt $maxOffersPerWare">
+                <!-- Sort by relativeprice to get best offers for this ware -->
+                <sort_trades name="$buyOffersForWare" tradelist="$buyOffersForWare" sorter="relativeprice"/>
+                <!-- Keep top N offers -->
+                <set_value name="$limitedBuyOffers" exact="[]"/>
+                <do_all exact="$maxOffersPerWare" counter="$idx">
+                  <append_to_list name="$limitedBuyOffers" exact="$buyOffersForWare.{$idx}"/>
+                </do_all>
+                <set_value name="$buyOffersForWare" exact="$limitedBuyOffers"/>
+              </do_if>
+              
                 <do_all exact="$sellOffersForWare.count" counter="$i">
                   <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
                   
@@ -1445,7 +1450,10 @@
                       <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
                     </do_if>
                     
-                    <set_value name="$maxAmount" exact="[$sellOffer.amount, $buyOffer.amount, $ship.cargo.{$sellOffer.ware}.max, $maxAffordable].min"/>
+                    <!-- Calculate max cargo capacity for this ware (vanilla formula: free cargo / ware volume) -->
+                    <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $sellOffer.ware.volume)i"/>
+                    
+                    <set_value name="$maxAmount" exact="[$sellOffer.amount, $buyOffer.amount, $maxCargoCapacity, $maxAffordable].min"/>
                     
                     <do_if value="$maxAmount le 0">
                       <!-- Track rejection reason -->
@@ -1472,6 +1480,39 @@
                       <do_if value="$roi lt $roiThreshold or $profit lt $profitThreshold">
                         <!-- Track rejection reason -->
                         <set_value name="$tradesRejectedProfit" operation="add"/>
+                        
+                        <!-- DEBUG: Track best rejected trade to see if we're even close -->
+                        <do_if value="not $bestRejectedProfit? or $profit gt $bestRejectedProfit">
+                          <set_value name="$bestRejectedProfit" exact="$profit"/>
+                          <set_value name="$bestRejectedTrade" exact="table[
+                            $ware = $sellOffer.ware,
+                            $buyFrom = $sellOffer.owner,
+                            $sellTo = $buyOffer.owner,
+                            $buyPrice = $buyPrice,
+                            $sellPrice = $sellPrice,
+                            $profit = $profit,
+                            $roi = $roi
+                          ]"/>
+                        </do_if>
+                        
+                        <!-- DEBUG: Log first 5 rejected trades to diagnose issue -->
+                        <do_if value="$tradesRejectedProfit le 5 and global.$GT_Config.$Debug.$Enabled">
+                          <debug_text text="'[GT-Search-DEBUG] Trade #' + $tradesRejectedProfit + ' REJECTED for insufficient profit:' + 
+                            '\n  Ware: ' + @$sellOffer.ware.name +
+                            '\n  Buy from: ' + @$sellOffer.owner.knownname + ' @ ' + $buyPrice + ' Cr/unit (' + $sellOffer.amount + ' available)' +
+                            '\n  Sell to: ' + @$buyOffer.owner.knownname + ' @ ' + $sellPrice + ' Cr/unit (' + $buyOffer.amount + ' wanted)' +
+                            '\n  Ship cargo: ' + $ship.cargo.free.all + ' free, ware volume: ' + $sellOffer.ware.volume +
+                            '\n  Max cargo capacity: ' + $maxCargoCapacity + ' units' +
+                            '\n  Max affordable: ' + $maxAffordable + ' units' +
+                            '\n  Max amount: ' + $maxAmount + ' units (min of: sell=' + $sellOffer.amount + ', buy=' + $buyOffer.amount + ', cargo=' + $maxCargoCapacity + ', afford=' + $maxAffordable + ')' +
+                            '\n  Investment: ' + $investment + ' Cr' +
+                            '\n  Revenue: ' + $revenue + ' Cr' +
+                            '\n  PROFIT: ' + $profit + ' Cr (threshold: ' + $profitThreshold + ' Cr)' +
+                            '\n  ROI: ' + $roi + '% (threshold: ' + $roiThreshold + '%)' +
+                            '\n  → Rejected: ' + (if $profit lt $profitThreshold then 'profit too low' else 'ROI too low')" 
+                            chance="100"/>
+                        </do_if>
+                        
                         <continue/>
                       </do_if>
                       
