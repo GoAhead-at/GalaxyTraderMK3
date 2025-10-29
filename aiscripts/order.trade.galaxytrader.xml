@@ -1065,6 +1065,8 @@
         <set_value name="$sellStation" exact="null"/>
         <set_value name="$tradesChecked" exact="0"/>
         <set_value name="$tradesBlacklisted" exact="0"/>
+        <set_value name="$tradesRejectedDocking" exact="0"/>
+        <set_value name="$tradesRejectedPath" exact="0"/>
         
         <!-- Iterate through trade list -->
         <do_all exact="$tradeList.count" counter="$tradeIdx">
@@ -1088,13 +1090,69 @@
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 Validating trade ' + $tradeIdx + '/' + $tradeList.count + ': ' + @$currentTrade.$BuyOffer.ware.name + ' (' + @$buyStation.knownname + ' → ' + @$sellStation.knownname + ')'" chance="100"/>
         
+        <!-- CRITICAL: Check docking permissions FIRST (most common failure, cheapest check) -->
+        <set_value name="$canDockAtBuyStation" exact="$buyStation.dockingallowed.{this.assignedcontrolled}"/>
+        <set_value name="$canDockAtSellStation" exact="$sellStation.dockingallowed.{this.assignedcontrolled}"/>
+        
+        <do_if value="not $canDockAtBuyStation or not $canDockAtSellStation">
+          <!-- DOCKING NOT ALLOWED - Skip to next trade -->
+          <set_value name="$tradesRejectedDocking" operation="add"/>
+          <set_value name="$deniedStation" exact="if not $canDockAtBuyStation then $buyStation else $sellStation"/>
+          <set_value name="$deniedType" exact="if not $canDockAtBuyStation then 'BUY' else 'SELL'"/>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ Trade ' + $tradeIdx + '/' + $tradeList.count + ' DOCKING DENIED:' + 
+            '\n  Station: ' + @$deniedStation.knownname + 
+            '\n  Sector: ' + @$deniedStation.sector.knownname + 
+            '\n  Type: ' + $deniedType + 
+            '\n  Reason: Docking not allowed (reputation, war, or permissions)' +
+            '\n  → Trying next trade in list...'" 
+            chance="100"/>
+          
+          <!-- Continue to next trade in list -->
+          <continue/>
+        </do_if>
+        
         <!-- Determine ship's blacklistgroup (same logic as vanilla's lib.define.blacklistgroup) -->
         <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
         <do_if value="(@this.assignedcontrolled.primarypurpose == purpose.fight) or (@this.assignedcontrolled.primarypurpose == purpose.auxiliary)">
           <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
         </do_if>
         
-        <!-- Check if buy station OR its sector is blacklisted (matches vanilla's order.trade.perform) -->
+        <!-- CRITICAL: Check path reachability BEFORE blacklist (faster to fail on unreachable) -->
+        <!-- Check if buy station is reachable using BLACKLIST-AWARE gatedistance -->
+        <!-- CRITICAL: Must use blacklist parameters so gatedistance respects blocked paths! -->
+        <!-- Correct syntax: $ship.gatedistance.{$targetSector}.{$blacklistgroup}.{$ship} (NO blacklisttype!) -->
+        <set_value name="$buySector" exact="$buyStation.sector"/>
+        <set_value name="$sellSector" exact="$sellStation.sector"/>
+        <set_value name="$buyDistance" exact="this.assignedcontrolled.gatedistance.{$buySector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+        <set_value name="$sellDistance" exact="this.assignedcontrolled.gatedistance.{$sellSector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+        
+        <!-- DEBUG: Always log distance check to diagnose issues -->
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 PATH check (blacklist-aware):' + 
+          '\n  BUY: ' + @$buyStation.knownname + ' (Sector: ' + @$buyStation.sector.knownname + ', Distance: ' + $buyDistance + ')' +
+          '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance: ' + $sellDistance + ')' +
+          '\n  Blacklist group: ' + $blacklistgroup +
+          '\n  Result: ' + (if $buyDistance lt 0 or $sellDistance lt 0 then 'BLOCKED' else 'OK')" 
+          chance="100"/>
+        
+        <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+          <!-- PATH BLOCKED - Skip to next trade -->
+          <set_value name="$tradesRejectedPath" operation="add"/>
+          <set_value name="$unreachableStation" exact="if $buyDistance lt 0 then $buyStation else $sellStation"/>
+          <set_value name="$unreachableType" exact="if $buyDistance lt 0 then 'BUY' else 'SELL'"/>
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🚫 Trade ' + $tradeIdx + '/' + $tradeList.count + ' PATH BLOCKED:' + 
+            '\n  Station: ' + @$unreachableStation.knownname + 
+            '\n  Type: ' + $unreachableType + 
+            '\n  Reason: No path exists (disconnected sectors, war, or gates destroyed)' +
+            '\n  → Trying next trade in list...'" 
+            chance="100"/>
+          
+          <!-- Continue to next trade in list -->
+          <continue/>
+        </do_if>
+        
+        <!-- Check if buy station OR its sector is blacklisted (matches vanilla's order.trade.perform line 156) -->
         <set_value name="$buyBlacklisted" exact="false"/>
         <do_if value="$blacklistgroup?">
           <!-- Check station itself (objectactivity) -->
@@ -1102,6 +1160,7 @@
           <!-- Check sector (sectoractivity AND sectortravel - same as vanilla) -->
           <set_value name="$buySectorActivityBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           <set_value name="$buySectorTravelBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          
           <set_value name="$buyBlacklisted" exact="$buyStationBlacklisted or $buySectorActivityBlacklisted or $buySectorTravelBlacklisted"/>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 BUY blacklist check:' + 
@@ -1114,7 +1173,7 @@
             chance="100"/>
         </do_if>
         
-        <!-- Check if sell station OR its sector is blacklisted (matches vanilla's order.trade.perform) -->
+        <!-- Check if sell station OR its sector is blacklisted (matches vanilla's order.trade.perform line 156) -->
         <set_value name="$sellBlacklisted" exact="false"/>
         <do_if value="$blacklistgroup?">
           <!-- Check station itself (objectactivity) -->
@@ -1122,6 +1181,7 @@
           <!-- Check sector (sectoractivity AND sectortravel - same as vanilla) -->
           <set_value name="$sellSectorActivityBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           <set_value name="$sellSectorTravelBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          
           <set_value name="$sellBlacklisted" exact="$sellStationBlacklisted or $sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted"/>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 SELL blacklist check:' + 
@@ -1142,7 +1202,7 @@
             <set_value name="$tradeType" exact="if $buyBlacklisted then 'BUY' else 'SELL'"/>
             
             <!-- Determine what was blacklisted (station or sector) -->
-            <set_value name="$blacklistReason" exact="'Unknown'"/>
+            <set_value name="$blacklistReason" exact="'Sector (sectortravel)'"/>  <!-- Default to most common case -->
             <do_if value="$buyBlacklisted">
               <do_if value="$buyStationBlacklisted">
                 <set_value name="$blacklistReason" exact="'Station (objectactivity)'"/>
@@ -1150,9 +1210,6 @@
               <do_elseif value="$buySectorActivityBlacklisted">
                 <set_value name="$blacklistReason" exact="'Sector (sectoractivity)'"/>
               </do_elseif>
-              <do_else>
-                <set_value name="$blacklistReason" exact="'Sector (sectortravel)'"/>
-              </do_else>
             </do_if>
             <do_else>
               <do_if value="$sellStationBlacklisted">
@@ -1161,9 +1218,6 @@
               <do_elseif value="$sellSectorActivityBlacklisted">
                 <set_value name="$blacklistReason" exact="'Sector (sectoractivity)'"/>
               </do_elseif>
-              <do_else>
-                <set_value name="$blacklistReason" exact="'Sector (sectortravel)'"/>
-              </do_else>
             </do_else>
             
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ Trade ' + $tradeIdx + '/' + $tradeList.count + ' BLACKLISTED:' + 
@@ -1199,7 +1253,7 @@
         
         <!-- After loop: Check if we found a valid trade -->
         <do_if value="$validTradeFound">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Blacklist validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesRejectedPath + ' unreachable, ' + $tradesRejectedDocking + ' docking denied, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
           
           <!-- ✅ CRITICAL FIX: Update pending trade entry with ACTUAL trade being executed -->
           <!-- Failure handler expects table with $BuyStation, $SellStation, $Ware -->

@@ -55,6 +55,72 @@
           </do_if>
         </do_if>
         
+        <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+        <!-- OPTIMIZATION 4: Final blacklist validation (catches mid-search updates) -->
+        <!-- This check runs ONCE per trade execution (vs. 1.3M times during search) -->
+        <!-- If blacklisted, restart search - pre-filtering will catch updated blacklist -->
+        <!-- Impact: 12 property lookups once per execution (minimal overhead) -->
+        <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+        <do_if value="$canExecute">
+          <!-- Determine ship's blacklistgroup (same logic as vanilla) -->
+          <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+          <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+            <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+          </do_if>
+          
+          <!-- CRITICAL: Check path reachability FIRST (faster to fail on unreachable) -->
+          <!-- Extract stations from trade structure (handle both formats) -->
+          <set_value name="$buyStation" exact="if $trade.$BuyStation? then $trade.$BuyStation else $trade.$BuyOffer.owner"/>
+          <set_value name="$sellStation" exact="if $trade.$SellStation? then $trade.$SellStation else $trade.$SellOffer.owner"/>
+          
+          <!-- Use BLACKLIST-AWARE gatedistance so it respects blocked paths from threat system -->
+          <!-- Correct syntax: $ship.gatedistance.{$targetSector}.{$blacklistgroup}.{$ship} (NO blacklisttype!) -->
+          <set_value name="$buySector" exact="$buyStation.sector"/>
+          <set_value name="$sellSector" exact="$sellStation.sector"/>
+          <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+          <set_value name="$sellDistance" exact="$ship.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+          
+          <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+            <debug_text text="'[GT-Execution] 🚫 PATH BLOCKED: Trade became unreachable - restarting' +
+              '\n  Ware: ' + @$trade.$BuyOffer.ware.name +
+              '\n  BUY: ' + @$buyStation.knownname + ' (Sector: ' + @$buyStation.sector.knownname + ', Distance: ' + $buyDistance + ')' +
+              '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance: ' + $sellDistance + ')' +
+              '\n  Reason: No path exists (disconnected sectors, war, or gates destroyed)' +
+              '\n  → Trade execution aborted, ship will search again with updated connectivity'" 
+              chance="100"/>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <set_value name="$canExecute" exact="false"/>
+          </do_if>
+          
+          <do_if value="$canExecute">
+            <!-- Check buy/sell station blacklists (matches vanilla order.trade.perform) -->
+            <!-- Vanilla line 156: checks objectactivity, sectoractivity, sectortravel -->
+            <set_value name="$buyStationBlacklisted" exact="@$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$buySectorActivityBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$buySectorTravelBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+            
+            <set_value name="$sellStationBlacklisted" exact="@$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$sellSectorActivityBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$sellSectorTravelBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+            
+            <set_value name="$isBlacklisted" exact="$buyStationBlacklisted or $buySectorActivityBlacklisted or $buySectorTravelBlacklisted or $sellStationBlacklisted or $sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted"/>
+            
+            <do_if value="$isBlacklisted">
+              <debug_text text="'[GT-Execution] ⚠️ BLACKLIST DETECTED: Trade became unsafe mid-search - restarting' +
+                '\n  Ware: ' + @$trade.$BuyOffer.ware.name +
+                '\n  BUY: ' + @$buyStation.knownname + ' (Sector: ' + @$buyStation.sector.knownname + ')' +
+                '\n    Station: ' + $buyStationBlacklisted + ', SectorActivity: ' + $buySectorActivityBlacklisted + ', SectorTravel: ' + $buySectorTravelBlacklisted +
+                '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ')' +
+                '\n    Station: ' + $sellStationBlacklisted + ', SectorActivity: ' + $sellSectorActivityBlacklisted + ', SectorTravel: ' + $sellSectorTravelBlacklisted +
+                '\n  → Trade execution aborted, ship will search again (updated blacklist will be applied)'" 
+                chance="100"/>
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+              <set_value name="$canExecute" exact="false"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+        
         <!-- Only proceed if all checks passed -->
         <do_if value="$canExecute">
           <!-- CRITICAL FIX: Verify sufficient funds -->
