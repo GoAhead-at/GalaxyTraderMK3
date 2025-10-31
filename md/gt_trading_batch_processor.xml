@@ -1,0 +1,601 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Trading_Batch_Processor" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+    <!-- BATCHED TRADE MATCHING PROCESSOR -->
+    <!-- Pattern inspired by TaterTrader's tick-based cooperative multitasking -->
+    <!-- Adapted for MD scripts: processes trades in batches with delays between -->
+    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+    
+    <cue name="ProcessTradeMatchingBatch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="5ms"/> <!-- Cooperative multitasking: yield control between batches -->
+      <actions>
+        <!-- Retrieve ship object from signal (used as table key) -->
+        <set_value name="$ship" exact="event.param"/>
+        
+        <!-- ✅ CRITICAL: Ensure global.$GT_BatchDataList is a TABLE (not list) -->
+        <!-- Previous versions may have initialized this as a list, which breaks object key access -->
+        <do_if value="not global.$GT_BatchDataList?">
+          <set_value name="global.$GT_BatchDataList" exact="table[]"/>
+        </do_if>
+        
+        <!-- Retrieve state from GLOBAL TABLE using ship object as key (persists after SearchLiveTrades ends) -->
+        <set_value name="$state" exact="@global.$GT_BatchDataList.{$ship}"/>
+        
+        <!-- Validate state exists -->
+        <do_if value="not $state?">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Batch] ⚠️ Batch state not found for ship ' + $ship.idcode + ' (global.$GT_BatchDataList exists: ' + global.$GT_BatchDataList? + ')'" chance="100"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Extract all state variables -->
+        <set_value name="$batchId" exact="$state.$batchId"/>
+        <set_value name="$waitingCue" exact="$state.$waitingCue"/>
+        <!-- Note: $ship already set from event.param above -->
+        <!-- ✅ UNIVERSAL CACHE: No blacklistgroup - blacklist filtering happens at retrieval -->
+        <set_value name="$wareKeysList" exact="$state.$wareKeysList"/>
+        <set_value name="$sellOffersList" exact="$state.$sellOffersList"/>
+        <set_value name="$buyOffersList" exact="$state.$buyOffersList"/>
+        
+        <!-- DEBUG: Verify lists were received correctly -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <set_value name="$keysCount" exact="0"/>
+          <set_value name="$sellCount" exact="0"/>
+          <set_value name="$buyCount" exact="0"/>
+          <do_if value="$wareKeysList?">
+            <set_value name="$keysCount" exact="$wareKeysList.count"/>
+          </do_if>
+          <do_if value="$sellOffersList?">
+            <set_value name="$sellCount" exact="$sellOffersList.count"/>
+          </do_if>
+          <do_if value="$buyOffersList?">
+            <set_value name="$buyCount" exact="$buyOffersList.count"/>
+          </do_if>
+          <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Received state: keys=' + $keysCount + ', sellEntries=' + $sellCount + ', buyEntries=' + $buyCount" chance="100"/>
+          <do_if value="not $wareKeysList?">
+            <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') WARNING wareKeysList is NULL!'" chance="100"/>
+          </do_if>
+          <do_if value="$wareKeysList? and $wareKeysList.count == 0">
+            <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') WARNING wareKeysList is EMPTY count=0!'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <set_value name="$stationDistanceCache" exact="$state.$stationDistanceCache"/>
+        <set_value name="$tradeList" exact="$state.$tradeList"/>
+        <set_value name="$crossStationBestScore" exact="$state.$crossStationBestScore"/>
+        <set_value name="$crossStationBestTrade" exact="$state.$crossStationBestTrade"/>
+        <set_value name="$nonConflictedBestScore" exact="$state.$nonConflictedBestScore"/>
+        <set_value name="$nonConflictedBestTrade" exact="$state.$nonConflictedBestTrade"/>
+        <set_value name="$reservedRoutes" exact="$state.$reservedRoutes"/>
+        <set_value name="$failedTrades" exact="$state.$failedTrades"/>
+        <!-- ✅ UNIVERSAL CACHE: No escape sectors or current sector blacklist - removed for universal processing -->
+        <set_value name="$currentWareIndex" exact="$state.$currentWareIndex"/>
+        <!-- CRITICAL: Always initialize $tradesPerWare as empty table first -->
+        <!-- Then check if state has existing VALID data (not null) before using it -->
+        <set_value name="$tradesPerWare" exact="table[]"/>
+        <!-- Try to load existing data from state if available -->
+        <set_value name="$existingTradesPerWare" exact="@$state.$tradesPerWare"/>
+        <!-- CRITICAL: Only use state value if it's actually a valid table (not null) -->
+        <!-- X4 MD: null? = true, so we can't use ? to detect null -->
+        <!-- Solution: Check if .keys.count exists - valid tables have this, null doesn't -->
+        <set_value name="$existingKeys" exact="@$existingTradesPerWare.keys"/>
+        <set_value name="$existingCount" exact="@$existingKeys.count"/>
+        <!-- Only use state table if ALL three checks pass: exists, has keys, keys has count -->
+        <do_if value="$existingTradesPerWare? and $existingKeys? and $existingCount?">
+          <!-- Valid table exists in state - use it (guaranteed not null!) -->
+          <set_value name="$tradesPerWare" exact="$existingTradesPerWare"/>
+        </do_if>
+        <!-- Otherwise keep our initialized empty table -->
+        <set_value name="$maxTradesPerWare" exact="$state.$maxTradesPerWare"/>
+        <set_value name="$batchSize" exact="$state.$batchSize"/>
+        <set_value name="$earlyExitThreshold" exact="$state.$earlyExitThreshold"/>
+        <set_value name="$maxDistance" exact="$state.$maxDistance"/>
+        <set_value name="$distancePenaltyMultiplier" exact="$state.$distancePenaltyMultiplier"/>
+        <set_value name="$factionPriority" exact="$state.$factionPriority"/>
+        <set_value name="$minROI" exact="$state.$minROI"/>
+        <set_value name="$minAbsoluteProfit" exact="$state.$minAbsoluteProfit"/>
+        <set_value name="$gt_AdvancedAnalytics" exact="$state.$gt_AdvancedAnalytics"/>
+        <set_value name="$availableMoney" exact="$state.$availableMoney"/>
+        <set_value name="$tradesRejectedProfit" exact="$state.$tradesRejectedProfit"/>
+        <set_value name="$tradesRejectedDocking" exact="$state.$tradesRejectedDocking"/>
+        <set_value name="$tradesRejectedAmount" exact="$state.$tradesRejectedAmount"/>
+        <set_value name="$tradesRejectedDistance" exact="$state.$tradesRejectedDistance"/>
+        <!-- ✅ UNIVERSAL CACHE: No tradesRejectedBlacklist - blacklist filtering happens at retrieval -->
+        <set_value name="$bestRejectedProfit" exact="$state.$bestRejectedProfit"/>
+        <set_value name="$bestRejectedTrade" exact="$state.$bestRejectedTrade"/>
+        
+        <!-- ✅ UNIVERSAL CACHE: No sector blacklist cache building - removed for universal processing -->
+        <!-- Blacklist filtering happens per-ship during cache retrieval, not during cache building -->
+        
+        <!-- Calculate batch boundaries using wareKeysList (list, not table) -->
+        <set_value name="$wareCount" exact="0"/>
+        <do_if value="$wareKeysList?">
+          <set_value name="$wareCount" exact="$wareKeysList.count"/>
+        </do_if>
+        
+        <!-- CRITICAL: Lists are 1-based, so batchStart should be 1-based too -->
+        <!-- $currentWareIndex is 0-based (starts at 0), convert to 1-based for list access -->
+        <set_value name="$batchStart1Based" exact="$currentWareIndex + 1"/>
+        <set_value name="$batchEnd1Based" exact="[$currentWareIndex + $batchSize + 1, $wareCount + 1].min"/>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Processing batch: list indices ' + $batchStart1Based + '-' + ($batchEnd1Based - 1) + ' of ' + $wareCount" chance="100"/>
+        </do_if>
+        
+        <!-- Process this batch of wares -->
+        <!-- NOTE: Lists in X4 are 1-based! $batchOffset starts at 1 -->
+        <!-- batchStart1Based is already 1-based, so we just add offset-1 -->
+        <do_if value="$batchStart1Based le $wareCount">
+          <do_all exact="$batchEnd1Based - $batchStart1Based" counter="$batchOffset">
+            <!-- $batchOffset starts at 1, batchStart1Based is 1-based -->
+            <!-- For first item: batchStart1Based=1, batchOffset=1 → wareIdx=1+1-1=1 ✓ -->
+            <set_value name="$wareIdx" exact="$batchStart1Based + $batchOffset - 1"/>
+            
+            <!-- ✅ PERFORMANCE: Early exit if we have enough trades -->
+            <do_if value="$tradeList.count ge $earlyExitThreshold">
+              <break/>
+            </do_if>
+            
+            <!-- Get ware from list -->
+            <set_value name="$ware" exact="$wareKeysList.{$wareIdx}"/>
+            
+            <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+            <!-- WARE QUOTA CHECK: Skip this ware if we've already collected enough trades for it -->
+            <!-- This ensures diversity by preventing one ware from monopolizing all trade slots -->
+            <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+            <set_value name="$tradesForThisWare" exact="0"/>
+            <!-- CRITICAL: Check if table is valid before accessing (prevents null errors) -->
+            <set_value name="$tradesPerWareKeys" exact="@$tradesPerWare.keys"/>
+            <do_if value="$tradesPerWareKeys? and $tradesPerWare.{$ware}?">
+              <set_value name="$tradesForThisWare" exact="$tradesPerWare.{$ware}"/>
+            </do_if>
+            
+            <!-- Skip to next ware if quota reached -->
+            <do_if value="$tradesForThisWare ge $maxTradesPerWare">
+              <continue/>
+            </do_if>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $wareIdx lt 2">
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Processing ware #' + $wareIdx + ': ' + (if $ware? then @$ware.name else 'NULL') + ' (quota: ' + $tradesForThisWare + '/' + $maxTradesPerWare + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- Find sell offers for this ware in list -->
+            <set_value name="$sellOffersForWare" exact="[]"/>
+            <do_all exact="$sellOffersList.count" counter="$i">
+              <set_value name="$entry" exact="$sellOffersList.{$i}"/>
+              <do_if value="$entry.$ware == $ware">
+                <set_value name="$sellOffersForWare" exact="$entry.$offers"/>
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <!-- Find buy offers for this ware in list -->
+            <set_value name="$buyOffersForWare" exact="[]"/>
+            <do_all exact="$buyOffersList.count" counter="$i">
+              <set_value name="$entry" exact="$buyOffersList.{$i}"/>
+              <do_if value="$entry.$ware == $ware">
+                <set_value name="$buyOffersForWare" exact="$entry.$offers"/>
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $wareIdx lt 2">
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + (if $ware? then @$ware.name else 'NULL')" chance="100"/>
+            </do_if>
+            
+            <!-- Process this ware if both sell and buy offers exist -->
+            <do_if value="$sellOffersForWare.count gt 0 and $buyOffersForWare.count gt 0">
+              
+              <do_all exact="$sellOffersForWare.count" counter="$i">
+                <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
+                
+                <!-- Validate sell offer is valid before processing -->
+                <!-- Use @ operator to safely check properties (prevents crashes on invalid trade objects) -->
+                <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
+                <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
+                <do_if value="not $sellOffer? or not $sellOfferOwner? or not $sellOfferPrice?">
+                  <continue/>
+                </do_if>
+                
+                <do_all exact="$buyOffersForWare.count" counter="$j">
+                  <set_value name="$buyOffer" exact="$buyOffersForWare.{$j}"/>
+                  
+                  <!-- Validate buy offer is valid before processing -->
+                  <!-- Use @ operator to safely check properties (prevents crashes on invalid trade objects) -->
+                  <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
+                  <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
+                  <do_if value="not $buyOffer? or not $buyOfferOwner? or not $buyOfferPrice?">
+                    <continue/>
+                  </do_if>
+                  
+                  <!-- Different stations only -->
+                  <do_if value="$sellOfferOwner != $buyOfferOwner">
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- OPTIMIZATION 3: Early profit rejection (skip impossible trades instantly) -->
+                    <!-- Use already-extracted safe values -->
+                    <set_value name="$buyPrice" exact="$sellOfferPrice"/>
+                    <set_value name="$sellPrice" exact="$buyOfferPrice"/>
+                    
+                    <do_if value="$sellPrice le $buyPrice">
+                      <set_value name="$tradesRejectedProfit" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- CRITICAL: Check if ship can dock at BOTH stations -->
+                    <!-- Use safe extracted values -->
+                    <set_value name="$canDockAtBuyStation" exact="@$sellOfferOwner.dockingallowed.{$ship}"/>
+                    <set_value name="$canDockAtSellStation" exact="@$buyOfferOwner.dockingallowed.{$ship}"/>
+                    
+                    <do_if value="not $canDockAtBuyStation or not $canDockAtSellStation">
+                      <set_value name="$tradesRejectedDocking" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Calculate max affordable -->
+                    <set_value name="$maxAffordable" exact="99999"/>
+                    <do_if value="$buyPrice gt 0">
+                      <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
+                    </do_if>
+                    
+                    <!-- Calculate max cargo capacity -->
+                    <!-- Use @ operator for safe property access -->
+                    <set_value name="$sellOfferWare" exact="@$sellOffer.ware"/>
+                    <set_value name="$sellOfferAmount" exact="@$sellOffer.amount"/>
+                    <set_value name="$buyOfferAmount" exact="@$buyOffer.amount"/>
+                    <do_if value="not $sellOfferWare? or not $sellOfferAmount? or not $buyOfferAmount?">
+                      <continue/>
+                    </do_if>
+                    <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $sellOfferWare.volume)i"/>
+                    <set_value name="$maxAmount" exact="[$sellOfferAmount, $buyOfferAmount, $maxCargoCapacity, $maxAffordable].min"/>
+                    
+                    <do_if value="$maxAmount le 0">
+                      <set_value name="$tradesRejectedAmount" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Calculate profit and ROI -->
+                    <set_value name="$investment" exact="$buyPrice * $maxAmount"/>
+                    <set_value name="$revenue" exact="$sellPrice * $maxAmount"/>
+                    <set_value name="$profit" exact="$revenue - $investment"/>
+                    <set_value name="$roi" exact="if $investment gt 0 then (($profit * 100) / $investment) else 100"/>
+                    
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- CACHE FIRST: Cache ALL profitable trades BEFORE any filtering -->
+                    <!-- This ensures cache contains all trades that ANY ship might accept -->
+                    <!-- Blacklist filtering happens when READING from cache (SearchCachedTrades) -->
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- Cache trade if enabled and meets global cache threshold -->
+                    <!-- ✅ CRITICAL: Cache respects global CacheProfitThreshold setting -->
+                    <!-- Universal cache: no ship-specific filters, but must meet global minimum -->
+                    <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
+                      <!-- Get cache threshold from global settings (default 20%) -->
+                      <set_value name="$cacheThreshold" exact="20"/>
+                      <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+                        <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+                      </do_if>
+                      
+                      <!-- Only cache trades that meet global cache profit threshold -->
+                      <do_if value="$profit gt 0 and $roi ge $cacheThreshold">
+                        <!-- Validate required data exists before caching -->
+                        <!-- Debug: Log why trades aren't cached -->
+                        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and not ($sellOfferWare? and $sellOfferOwner? and $buyOfferOwner?)">
+                          <debug_text text="'[GT-Cache-DEBUG] ⚠ Trade NOT cached (validation failed): ROI=' + ($roi/1) + '%, Profit=' + ($profit/100) + ' Cr, sellOfferWare=' + ($sellOfferWare? and 'OK' or 'NULL') + ', sellOfferOwner=' + ($sellOfferOwner? and 'OK' or 'NULL') + ', buyOfferOwner=' + ($buyOfferOwner? and 'OK' or 'NULL')" chance="20"/>
+                        </do_if>
+                        <do_if value="$sellOfferWare? and $sellOfferOwner? and $buyOfferOwner?">
+                          <!-- Ensure cache list exists -->
+                          <do_if value="not global.$GT_TradeCache?">
+                            <set_value name="global.$GT_TradeCache" exact="[]"/>
+                          </do_if>
+                          
+                          <!-- Extract sectors for route distance (needed for cache entry) -->
+                          <set_value name="$buySector" exact="@$sellOfferOwner.sector"/>
+                          <set_value name="$sellSector" exact="@$buyOfferOwner.sector"/>
+                          <set_value name="$routeDistance" exact="0"/>
+                          <do_if value="$buySector? and $sellSector?">
+                            <do_if value="$buySector == $sellSector">
+                              <set_value name="$routeDistance" exact="0"/>
+                            </do_if>
+                            <do_else>
+                              <!-- ✅ UNIVERSAL CACHE: Use range-only distance (NO blacklist params) -->
+                              <set_value name="$routeDistance" exact="$buySector.gatedistance.{$sellSector}"/>
+                              <do_if value="$routeDistance lt 0">
+                                <!-- No path available - distance invalid -->
+                                <set_value name="$routeDistance" exact="-1"/>
+                              </do_if>
+                            </do_else>
+                          </do_if>
+                          
+                          <!-- Append trade entry as flat table to list -->
+                          <!-- ✅ CRITICAL: Store route distance (buy station → sell station) for position-independent validation -->
+                          <append_to_list name="global.$GT_TradeCache" exact="table[
+                            $WareId = $sellOfferWare.id,
+                            $WareName = $sellOfferWare.name,
+                            $SellStationId = $buyOfferOwner.idcode,
+                            $BuyStationId = $sellOfferOwner.idcode,
+                            $BuyOffer = $sellOffer,
+                            $SellOffer = $buyOffer,
+                            $Amount = $maxAmount,
+                            $Profit = $profit,
+                            $ROI = $roi,
+                            $BuyPrice = $buyPrice,
+                            $SellPrice = $sellPrice,
+                            $Distance = $routeDistance,
+                            $Timestamp = player.age
+                          ]"/>
+                          
+                          <!-- Debug logging for cache population -->
+                          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                            <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
+                            <debug_text text="'[GT-Cache] ✅ Trade cached: ' + $sellOfferWare.name + ', ROI=' + ($roi/1) + '%, Profit=' + ($profit/100) + ' Cr, Distance=' + $routeDistance + ' jumps (cache now: ' + $cacheCount + ' entries)'" chance="100"/>
+                          </do_if>
+                        </do_if>
+                      </do_if>
+                    </do_if>
+                    
+                    <!-- Check thresholds -->
+                    <set_value name="$roiThreshold" exact="$minROI"/>
+                    <set_value name="$profitThreshold" exact="$minAbsoluteProfit"/>
+                    <do_if value="$gt_AdvancedAnalytics">
+                      <set_value name="$roiThreshold" exact="$roiThreshold * 0.95"/>
+                      <set_value name="$profitThreshold" exact="($profitThreshold * 0.95)i"/>
+                    </do_if>
+                    
+                    <do_if value="$roi lt $roiThreshold or $profit lt $profitThreshold">
+                      <set_value name="$tradesRejectedProfit" operation="add"/>
+                      
+                      <!-- Track best rejected trade -->
+                      <do_if value="not $bestRejectedProfit? or $profit gt $bestRejectedProfit">
+                        <set_value name="$bestRejectedProfit" exact="$profit"/>
+                        <set_value name="$bestRejectedTrade" exact="table[
+                          $ware = $sellOfferWare,
+                          $buyFrom = $sellOfferOwner,
+                          $sellTo = $buyOfferOwner,
+                          $buyPrice = $buyPrice,
+                          $sellPrice = $sellPrice,
+                          $profit = $profit,
+                          $roi = $roi
+                        ]"/>
+                      </do_if>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Use cached distances -->
+                    <set_value name="$buyDistance" exact="@$stationDistanceCache.{$sellOfferOwner}"/>
+                    <do_if value="not $buyDistance? or typeof $buyDistance != datatype.integer">
+                      <set_value name="$buyDistance" exact="-1"/>
+                    </do_if>
+                    
+                    <set_value name="$sellDistance" exact="@$stationDistanceCache.{$buyOfferOwner}"/>
+                    <do_if value="not $sellDistance? or typeof $sellDistance != datatype.integer">
+                      <set_value name="$sellDistance" exact="-1"/>
+                    </do_if>
+                    
+                    <!-- Filter unreachable trades -->
+                    <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+                      <set_value name="$tradesRejectedDistance" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Check distance constraints -->
+                    <do_if value="$buyDistance gt $maxDistance or $sellDistance gt $maxDistance">
+                      <set_value name="$tradesRejectedDistance" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- OPTIMIZATION: Use cached sector blacklist status (fast table lookup) -->
+                    <!-- Extract sectors for distance calculation and caching -->
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- Use safe extracted station values -->
+                    <set_value name="$buySector" exact="@$sellOfferOwner.sector"/>
+                    <set_value name="$sellSector" exact="@$buyOfferOwner.sector"/>
+                    <do_if value="not $buySector? or not $sellSector?">
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- Calculate route distance (buy station → sell station) for cache validation -->
+                    <!-- This is position-independent and will detect if blacklists block the route -->
+                    <set_value name="$routeDistance" exact="0"/>
+                    <do_if value="$buySector == $sellSector">
+                      <!-- Same sector: route distance is 0 -->
+                      <set_value name="$routeDistance" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <!-- ✅ UNIVERSAL CACHE: Use range-only distance (NO blacklist params) -->
+                      <set_value name="$buyStationSector" exact="$buySector"/>
+                      <set_value name="$sellStationSector" exact="$sellSector"/>
+                      <set_value name="$routeDistance" exact="$buyStationSector.gatedistance.{$sellStationSector}"/>
+                    </do_else>
+                    
+                    <!-- Calculate efficiency (uses total distance for scoring, but route distance for cache) -->
+                    <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
+                    <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
+                    <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($profit / $adjustedDistance) else $profit"/>
+                    
+                    <!-- ✅ UNIVERSAL CACHE: No escape route priority - removed for universal processing -->
+                    
+                    <!-- Apply faction priority boost -->
+                    <set_value name="$sellOfferOwnerOwner" exact="@$sellOfferOwner.owner"/>
+                    <set_value name="$buyOfferOwnerOwner" exact="@$buyOfferOwner.owner"/>
+                    <do_if value="$factionPriority == 0">
+                      <do_if value="$sellOfferOwnerOwner == faction.player or $buyOfferOwnerOwner == faction.player">
+                        <set_value name="$boost" exact="$efficiency / 5"/>
+                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
+                      </do_if>
+                    </do_if>
+                    <do_elseif value="$factionPriority == 1">
+                      <do_if value="$sellOfferOwnerOwner != faction.player and $buyOfferOwnerOwner != faction.player">
+                        <set_value name="$boost" exact="$efficiency / 5"/>
+                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
+                      </do_if>
+                    </do_elseif>
+                    
+                    <!-- ✅ UNIVERSAL CACHE: No blacklist filtering - removed for universal processing -->
+                    <!-- Blacklist filtering happens per-ship during cache retrieval -->
+                    
+                    <!-- Check if this sector pair previously failed -->
+                    <set_value name="$isFailedSectorPair" exact="false"/>
+                    <do_if value="$failedTrades.count gt 0">
+                      <do_all exact="$failedTrades.count" counter="$failIdx">
+                        <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+                        
+                        <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                          <do_if value="$buySector == $failedTrade.$BuySector and 
+                                        $sellSector == $failedTrade.$SellSector">
+                            <set_value name="$isFailedSectorPair" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_if>
+                      </do_all>
+                    </do_if>
+                    
+                    <!-- ✅ UNIVERSAL CACHE: Collect ALL valid trades (no blacklist filtering) -->
+                    <!-- Respect ware quota to ensure diversity -->
+                    <do_if value="not $isFailedSectorPair and $tradesForThisWare lt $maxTradesPerWare">
+                      <set_value name="$trade" exact="table[
+                        $BuyOffer = $sellOffer,
+                        $SellOffer = $buyOffer,
+                        $BuyStation = $sellOfferOwner,
+                        $SellStation = $buyOfferOwner,
+                        $Amount = $maxAmount,
+                        $Profit = $profit,
+                        $ROI = $roi,
+                        $Score = $efficiency,
+                        $BuyPrice = $buyPrice,
+                        $SellPrice = $sellPrice,
+                        $Distance = $routeDistance,
+                        $Risk = 0
+                      ]"/>
+                      
+                      <append_to_list name="$tradeList" exact="$trade"/>
+                      
+                      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                      <!-- WARE QUOTA: Increment counter for this ware -->
+                      <!-- Ensures we don't collect too many trades for a single ware -->
+                      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                      <set_value name="$tradesForThisWare" operation="add"/>
+                      <!-- CRITICAL: X4 MD Problem - ? operator checks existence (not null), so null? = true -->
+                      <!-- The safest solution: Use try/catch pattern by checking if we can access .keys.count -->
+                      <!-- If $tradesPerWare is null, @$tradesPerWare.keys = null, and @null.count = null -->
+                      <!-- null? = true (exists but is null), so we check for .count property existence -->
+                      <set_value name="$keysCheck" exact="@$tradesPerWare.keys"/>
+                      <set_value name="$countCheck" exact="@$keysCheck.count"/>
+                      <!-- CRITICAL: null? = true in X4 MD, so we must check if countCheck is a NUMBER -->
+                      <!-- Valid tables: keys.count = integer (0 or higher) -->
+                      <!-- Null tables: keys = null, so keys.count = null (not a number) -->
+                      <!-- We check if countCheck exists AND is >= 0 (proves it's a number, not null) -->
+          <do_if value="not $countCheck? or $countCheck lt 0">
+            <!-- Table is invalid (null or negative) - must reinitialize -->
+            <set_value name="$tradesPerWare" exact="table[]"/>
+          </do_if>
+                      <!-- Now guaranteed safe to set property -->
+                      <set_value name="$tradesPerWare.{$ware}" exact="$tradesForThisWare"/>
+                      
+                      <!-- Track overall best -->
+                      <do_if value="$efficiency gt $crossStationBestScore">
+                        <set_value name="$crossStationBestScore" exact="$efficiency"/>
+                        <set_value name="$crossStationBestTrade" exact="$trade"/>
+                      </do_if>
+                      
+                      <!-- Check for route conflicts -->
+                      <set_value name="$routeConflicted" exact="false"/>
+                      <do_if value="$reservedRoutes.count gt 0">
+                        <set_value name="$tradeCacheKey" exact="$sellOfferOwner.idcode + '_' + $buyOfferOwner.idcode + '_' + $sellOfferWare"/>
+                        <set_value name="$routeConflicted" exact="$reservedRoutes.indexof.{$tradeCacheKey}?"/>
+                      </do_if>
+                      
+                      <!-- Track best non-conflicted -->
+                      <do_if value="not $routeConflicted and not $isFailedSectorPair and $efficiency gt $nonConflictedBestScore">
+                        <set_value name="$nonConflictedBestScore" exact="$efficiency"/>
+                        <set_value name="$nonConflictedBestTrade" exact="$trade"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_all>
+            </do_if>
+          </do_all>
+          
+          <!-- Update state with new progress -->
+          <!-- Convert 1-based batchEnd back to 0-based for storage -->
+          <set_value name="$state.$currentWareIndex" exact="$batchEnd1Based - 1"/>
+          <set_value name="$state.$tradeList" exact="$tradeList"/>
+          <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
+          <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
+          <set_value name="$state.$nonConflictedBestScore" exact="$nonConflictedBestScore"/>
+          <set_value name="$state.$nonConflictedBestTrade" exact="$nonConflictedBestTrade"/>
+          <set_value name="$state.$tradesRejectedProfit" exact="$tradesRejectedProfit"/>
+          <set_value name="$state.$tradesRejectedDocking" exact="$tradesRejectedDocking"/>
+          <set_value name="$state.$tradesRejectedAmount" exact="$tradesRejectedAmount"/>
+          <set_value name="$state.$tradesRejectedDistance" exact="$tradesRejectedDistance"/>
+          <!-- ✅ UNIVERSAL CACHE: No tradesRejectedBlacklist or sectorBlacklistCache - removed for universal processing -->
+          <!-- CRITICAL: Only save $tradesPerWare to state if it's a valid table (not null) -->
+          <set_value name="$verifyTableForSave" exact="@$tradesPerWare.keys"/>
+          <do_if value="$verifyTableForSave?">
+            <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
+          </do_if>
+          <do_else>
+            <!-- Was null - save empty table instead -->
+            <set_value name="$state.$tradesPerWare" exact="table[]"/>
+          </do_else>
+          <set_value name="$state.$bestRejectedProfit" exact="$bestRejectedProfit"/>
+          <set_value name="$state.$bestRejectedTrade" exact="$bestRejectedTrade"/>
+          
+          <!-- Update global state using ship object as key -->
+          <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
+          
+          <!-- Check if more batches needed -->
+          <!-- batchEnd1Based is 1-based, wareCount is count (max valid index) -->
+          <do_if value="$batchEnd1Based le $wareCount and $tradeList.count lt $earlyExitThreshold">
+            <!-- Signal next batch with same ship - must signal cue template, not instance -->
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+          </do_if>
+          <do_else>
+            <!-- All batches complete - signal completion -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Complete. Total: ' + $tradeList.count + ' trades'" chance="100"/>
+            </do_if>
+            
+            <!-- Pack results -->
+            <set_value name="$results" exact="table[
+              $ship = $ship,
+              $tradeList = $tradeList,
+              $crossStationBestTrade = $crossStationBestTrade,
+              $crossStationBestScore = $crossStationBestScore,
+              $nonConflictedBestTrade = $nonConflictedBestTrade,
+              $nonConflictedBestScore = $nonConflictedBestScore,
+              $tradesRejectedProfit = $tradesRejectedProfit,
+              $tradesRejectedDocking = $tradesRejectedDocking,
+              $tradesRejectedAmount = $tradesRejectedAmount,
+              $tradesRejectedDistance = $tradesRejectedDistance,
+              $bestRejectedProfit = $bestRejectedProfit,
+              $bestRejectedTrade = $bestRejectedTrade
+            ]"/>
+            
+            <!-- Store results in global TABLE for SearchLiveTrades_Resume to retrieve -->
+            <do_if value="not global.$GT_BatchResultsList?">
+              <set_value name="global.$GT_BatchResultsList" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_BatchResultsList.{$ship}" exact="$results"/>
+            
+            <!-- NOTE: Don't clean up batch data yet - resume cue needs ship reference -->
+            <!-- Cleanup happens in resume cue after extracting ship -->
+            
+            <!-- Signal SearchLiveTrades_Resume cue to continue processing (pass ship object) -->
+            <signal_cue_instantly cue="md.GT_Trading_Search.SearchLiveTrades_Resume" param="$ship"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Signalled waiting cue to resume'" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>
