@@ -141,7 +141,14 @@
               <set_value name="$savedTradeList" exact="$savedTradeListTemp"/>
             </do_if>
           </do_if>
-          <set_value name="$savedTradeListCount" exact="$savedTradeList.count"/>
+          <!-- ✅ SAFETY: Ensure $savedTradeList is valid before accessing .count -->
+          <set_value name="$savedTradeListCount" exact="0"/>
+          <do_if value="$savedTradeList?">
+            <set_value name="$savedTradeListCountTemp" exact="@$savedTradeList.count"/>
+            <do_if value="$savedTradeListCountTemp?">
+              <set_value name="$savedTradeListCount" exact="$savedTradeListCountTemp"/>
+            </do_if>
+          </do_if>
           <set_value name="$savedBestTrade" exact="@global.$GT_SearchResult.$BestTrade"/>
           <set_value name="$savedBestScore" exact="@global.$GT_SearchResult.$BestScore"/>
           
@@ -361,14 +368,28 @@
         <set_value name="$previousLiveSearchReturnedZeroTrades" exact="false"/>
         <do_if value="$isLiveSearchContinuation and $liveTradeList.count == 0">
           <!-- Previous live search returned 0 trades -->
-          <!-- ✅ CRITICAL FIX: Clear continuation state when 0 trades detected -->
-          <!-- This handles cases where blacklist was removed but old 0-trade results are cached -->
-          <!-- Instead of applying cooldown, clear stale continuation and allow fresh search -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Previous live search returned 0 trades - clearing continuation state to allow fresh search (blacklist may have been removed)'" chance="100"/>
+          <!-- ✅ CRITICAL FIX: Apply cooldown to prevent infinite loop when ship is stuck -->
+          <!-- If ship is in blacklisted sector and all trades filtered, cooldown prevents immediate re-search -->
+          <!-- ✅ ESCAPE EXCEPTION: Don't apply cooldown if ship needs to escape -->
+          
+          <!-- Check if ship is in blacklisted sector (needs escape) -->
+          <set_value name="$needsEscape" exact="false"/>
+          <set_value name="$currentSector" exact="$ship.sector"/>
+          <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+          <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+            <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+          </do_if>
+          <do_if value="$blacklistgroup? and $currentSector?">
+            <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$needsEscape" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
           </do_if>
           
-          <!-- Clear continuation state to force fresh search -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Previous live search returned 0 trades - ' + if $needsEscape then 'ESCAPE NEEDED, skipping cooldown' else 'applying cooldown to prevent loop (ship may be stuck in blacklisted sector)'" chance="100"/>
+          </do_if>
+          
+          <!-- Clear continuation state -->
           <set_value name="$isLiveSearchContinuation" exact="false"/>
           <set_value name="$liveTradeList" exact="[]"/>
           <set_value name="$liveBestTrade" exact="null"/>
@@ -388,9 +409,31 @@
           <remove_value name="global.$GT_SearchResult.$FilteredByPathBlocked"/>
           <remove_value name="global.$GT_SearchResult.$TotalTradesEvaluated"/>
           
-          <!-- ✅ CRITICAL: Also clear cache miss cooldown to allow immediate fresh search -->
-          <!-- When blacklist is removed, we want to search immediately, not wait for cooldown -->
-          <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+          <!-- ✅ CRITICAL: Apply cooldown for zero-trade live searches (prevents infinite loop) -->
+          <!-- ✅ ESCAPE EXCEPTION: Only apply cooldown if ship doesn't need to escape -->
+          <do_if value="not $needsEscape">
+            <!-- Use same cooldown system as cache misses, but mark it as zero-trade cooldown -->
+            <do_if value="not global.$GT_CacheMissCooldowns?">
+              <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+              $LastLiveSearch = player.age,
+              $CooldownDuration = 60s
+            ]"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⏸️ Applied 60s cooldown after zero-trade live search - ship may be stuck, will retry later'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Ship needs to escape - clear any existing cooldown so it can search again immediately -->
+            <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+              <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+            </do_if>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🚨 ESCAPE NEEDED: Zero trades found but ship in blacklisted sector - clearing cooldown to allow immediate escape search'" chance="100"/>
+            </do_if>
+          </do_else>
         </do_if>
         
         <do_if value="not $isLiveSearchContinuation">
@@ -405,23 +448,51 @@
         <do_if value="$shouldDoLiveSearch">
           <!-- ✅ COOLDOWN MECHANISM: Prevent cache miss → live search loops -->
           <!-- If cache miss triggered live search recently, enforce cooldown before allowing another -->
+          <!-- ✅ ESCAPE EXCEPTION: Bypass cooldown if ship is in blacklisted sector and needs to escape -->
           <set_value name="$canDoLiveSearch" exact="true"/>
           <set_value name="$cooldownRemaining" exact="0"/>
-          <!-- Check cooldown for cache miss triggers -->
+          
+          <!-- ✅ ESCAPE LOGIC: Check if ship is in blacklisted sector (needs escape, bypass cooldown) -->
+          <set_value name="$needsEscape" exact="false"/>
+          <set_value name="$currentSector" exact="$ship.sector"/>
+          <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+          <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+            <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+          </do_if>
+          <do_if value="$blacklistgroup? and $currentSector?">
+            <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$needsEscape" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
+          </do_if>
+          
+          <!-- Check cooldown for cache miss triggers (only if not escaping) -->
           <set_value name="$hasCooldown" exact="false"/>
-          <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
-            <set_value name="$hasCooldown" exact="true"/>
-            <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
-            <set_value name="$timeSinceLastSearch" exact="player.age - $cooldownData.$LastLiveSearch"/>
-            <set_value name="$cooldownRemaining" exact="$cooldownData.$CooldownDuration - $timeSinceLastSearch"/>
-            <do_if value="$cooldownRemaining gt 0">
-              <!-- Still in cooldown - skip live search -->
-              <set_value name="$canDoLiveSearch" exact="false"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss → live search cooldown active (' + ($cooldownRemaining / 1) + 's remaining of ' + ($cooldownData.$CooldownDuration / 1) + 's) - skipping live search to prevent loop'" chance="100"/>
+          <do_if value="not $needsEscape">
+            <!-- Only check cooldown if ship doesn't need to escape -->
+            <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+              <set_value name="$hasCooldown" exact="true"/>
+              <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
+              <set_value name="$timeSinceLastSearch" exact="player.age - $cooldownData.$LastLiveSearch"/>
+              <set_value name="$cooldownRemaining" exact="$cooldownData.$CooldownDuration - $timeSinceLastSearch"/>
+              <do_if value="$cooldownRemaining gt 0">
+                <!-- Still in cooldown - skip live search -->
+                <set_value name="$canDoLiveSearch" exact="false"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss → live search cooldown active (' + ($cooldownRemaining / 1) + 's remaining of ' + ($cooldownData.$CooldownDuration / 1) + 's) - skipping live search to prevent loop'" chance="100"/>
+                </do_if>
               </do_if>
             </do_if>
           </do_if>
+          <do_else>
+            <!-- Ship needs to escape - bypass cooldown and clear it -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🚨 ESCAPE NEEDED: Ship in blacklisted sector - bypassing cooldown to search for escape route'" chance="100"/>
+            </do_if>
+            <!-- Clear cooldown so ship can search immediately for escape -->
+            <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+              <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+            </do_if>
+          </do_else>
           
           <do_if value="$canDoLiveSearch">
             <!-- DEBUG: No cached trade, performing live search -->
@@ -600,6 +671,38 @@
           <!-- Single item or empty: no sort needed -->
         </do_if>
         
+        <!-- ✅ CRITICAL FIX: If tradeList exists but bestTrade is null, select best from list -->
+        <!-- This can happen during continuation if BestTrade wasn't stored in global -->
+        <!-- ✅ FIX: Check both existence AND null (MD ? operator only checks existence, not null) -->
+        <set_value name="$bestTradeIsValid" exact="false"/>
+        <do_if value="$bestTrade?">
+          <set_value name="$testScore" exact="@$bestTrade.$Score"/>
+          <do_if value="$testScore?">
+            <set_value name="$bestTradeIsValid" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <do_if value="not $bestTradeIsValid">
+          <do_if value="$tradeList? and $tradeList.count? and $tradeList.count gt 0">
+            <!-- Select first trade from sorted list (highest score after sorting) -->
+            <set_value name="$firstTrade" exact="@$tradeList.{0}"/>
+            <set_value name="$firstTradeValid" exact="false"/>
+            <do_if value="$firstTrade?">
+              <set_value name="$testScore" exact="@$firstTrade.$Score"/>
+              <do_if value="$testScore?">
+                <set_value name="$firstTradeValid" exact="true"/>
+              </do_if>
+            </do_if>
+            <do_if value="$firstTradeValid">
+              <set_value name="$bestTrade" exact="$firstTrade"/>
+              <set_value name="$bestScore" exact="$firstTrade.$Score"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ bestTrade was null but tradeList has ' + $tradeList.count + ' trades - selected first trade as bestTrade'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        
         <!-- Execute best trade if found -->
         <!-- DEBUG: Log bestTrade status for continuation debugging -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -608,13 +711,83 @@
           <do_if value="$tradeList?">
             <set_value name="$tradeListCount" exact="$tradeList.count"/>
           </do_if>
-          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Trade execution check: bestTrade=' + $bestTradeExists + ', tradeList.count=' + $tradeListCount + ', isContinuation=' + $isLiveSearchContinuation" chance="100"/>
+          <set_value name="$bestTradeCheck" exact="'null'"/>
+          <do_if value="$bestTrade?">
+            <set_value name="$bestTradeCheck" exact="'exists'"/>
+            <do_if value="$bestTrade.$BuyOffer?">
+              <set_value name="$bestTradeCheck" exact="'valid'"/>
+            </do_if>
+          </do_if>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Trade execution check: bestTrade=' + $bestTradeCheck + ', tradeList.count=' + $tradeListCount + ', isContinuation=' + $isLiveSearchContinuation" chance="100"/>
         </do_if>
         
-        <do_if value="$bestTrade">
+        <!-- ✅ DEBUG: Validate bestTrade before execution -->
+        <!-- ✅ FIX: More robust validation - check that properties actually exist and are not null -->
+        <set_value name="$bestTradeIsValidForExecution" exact="false"/>
+        <do_if value="$bestTrade?">
+          <set_value name="$testBuyOffer" exact="@$bestTrade.$BuyOffer"/>
+          <set_value name="$testSellOffer" exact="@$bestTrade.$SellOffer"/>
+          <set_value name="$testScore" exact="@$bestTrade.$Score"/>
+          <!-- ✅ CRITICAL FIX: Check if BuyOffer/SellOffer exist AND are not null, AND Score exists AND is > 0 -->
+          <!-- In MD, null? returns true (variable exists), so we need to check Score > 0 to ensure it's a real trade -->
+          <do_if value="$testBuyOffer? and $testSellOffer? and $testScore? and $testScore gt 0">
+            <!-- Double-check: Try accessing a property from BuyOffer to ensure it's not null -->
+            <set_value name="$testWare" exact="@$testBuyOffer.ware"/>
+            <do_if value="$testWare?">
+              <set_value name="$bestTradeIsValidForExecution" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <do_if value="$bestTradeIsValidForExecution">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ bestTrade is VALID - proceeding with execution'" chance="100"/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ❌ bestTrade is INVALID (null or missing properties) - cannot execute'" chance="100"/>
+            <!-- ✅ FIX: If bestTrade is invalid but tradeList has trades, select first valid trade from list -->
+            <do_if value="$tradeList? and $tradeList.count? and $tradeList.count gt 0">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Attempting to select valid trade from tradeList (' + $tradeList.count + ' trades available)'" chance="100"/>
+              <do_all exact="$tradeList.count" counter="$i">
+                <set_value name="$candidateTrade" exact="$tradeList.{$i}"/>
+                <set_value name="$candidateBuyOffer" exact="@$candidateTrade.$BuyOffer"/>
+                <set_value name="$candidateSellOffer" exact="@$candidateTrade.$SellOffer"/>
+                <set_value name="$candidateScore" exact="@$candidateTrade.$Score"/>
+                <do_if value="$candidateBuyOffer? and $candidateSellOffer? and $candidateScore? and $candidateScore gt 0">
+                  <set_value name="$candidateWare" exact="@$candidateBuyOffer.ware"/>
+                  <do_if value="$candidateWare?">
+                    <set_value name="$bestTrade" exact="$candidateTrade"/>
+                    <set_value name="$bestScore" exact="$candidateScore"/>
+                    <set_value name="$bestTradeIsValidForExecution" exact="true"/>
+                    <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ Selected valid trade from tradeList[' + $i + '] (Score: ' + $candidateScore + ')'" chance="100"/>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <do_if value="$bestTradeIsValidForExecution">
+          <!-- ✅ DEBUG: Log that we're entering the bestTrade execution block -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ ENTERING bestTrade execution block'" chance="100"/>
+          </do_if>
+          
           <!-- DEBUG: Trade execution with full details -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $bestTrade.$BuyOffer.ware.name + ' (x' + $bestTrade.$Amount + ')' + '\n  📍 BUY from: ' + $bestTrade.$BuyOffer.owner.knownname + ' @ ' + ($bestTrade.$BuyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $bestTrade.$SellOffer.owner.knownname + ' @ ' + ($bestTrade.$SellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $bestTrade.$Distance + ' jumps' + '\n  💰 Profit: ' + ($bestTrade.$Profit / 100) + ' Cr' + '\n  📈 ROI: ' + @$bestTrade.$ROI + '%' + '\n  📊 Score: ' + $bestTrade.$Score + '\n  ⚠ Risk: ' + $bestTrade.$Risk" chance="100"/>
+            <set_value name="$wareName" exact="@$bestTrade.$BuyOffer.ware.name"/>
+            <set_value name="$buyStationName" exact="@$bestTrade.$BuyOffer.owner.knownname"/>
+            <set_value name="$sellStationName" exact="@$bestTrade.$SellOffer.owner.knownname"/>
+            <set_value name="$amount" exact="@$bestTrade.$Amount"/>
+            <set_value name="$buyPrice" exact="@$bestTrade.$BuyPrice"/>
+            <set_value name="$sellPrice" exact="@$bestTrade.$SellPrice"/>
+            <set_value name="$distance" exact="@$bestTrade.$Distance"/>
+            <set_value name="$profit" exact="@$bestTrade.$Profit"/>
+            <set_value name="$roi" exact="@$bestTrade.$ROI"/>
+            <set_value name="$score" exact="@$bestTrade.$Score"/>
+            <set_value name="$risk" exact="@$bestTrade.$Risk"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 📊 BEST TRADE SELECTED:' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr' + '\n  📈 ROI: ' + $roi + '%' + '\n  📊 Score: ' + $score + '\n  ⚠ Risk: ' + $risk" chance="100"/>
           </do_if>
           
           <!-- ✅ OPTIMIZED: Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
@@ -623,12 +796,18 @@
               <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
             </do_if>
             
-            <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
-              $BuyStation = $bestTrade.$BuyOffer.owner,
-              $SellStation = $bestTrade.$SellOffer.owner,
-              $Ware = $bestTrade.$BuyOffer.ware,
-              $Timestamp = player.age
-            ]"/>
+            <!-- ✅ FIX: Use safe operators to access bestTrade properties -->
+            <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
+            <set_value name="$fleetSellStation" exact="@$bestTrade.$SellOffer.owner"/>
+            <set_value name="$fleetWare" exact="@$bestTrade.$BuyOffer.ware"/>
+            <do_if value="$fleetBuyStation? and $fleetSellStation? and $fleetWare?">
+              <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
+                $BuyStation = $fleetBuyStation,
+                $SellStation = $fleetSellStation,
+                $Ware = $fleetWare,
+                $Timestamp = player.age
+              ]"/>
+            </do_if>
           </do_if>
           
           <!-- Execute trade -->
@@ -1153,7 +1332,67 @@
             <!-- STAGE 2: Basic reachability check from current position -->
             <!-- Use BLACKLIST-AWARE gatedistance so blocked paths return -1 -->
             <set_value name="$buySector" exact="$cacheEntry.$BuyOffer.owner.sector"/>
-            <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{blacklistgroup.civilian}.{$ship}"/>
+            
+            <!-- ✅ FIX: Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
+            <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+            <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+              <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+            </do_if>
+            
+            <set_value name="$currentSector" exact="$ship.sector"/>
+            
+            <!-- ✅ FIX: Block intra-sector trades in blacklisted sectors (force escape) -->
+            <!-- If ship is in blacklisted sector and both buy/sell are same sector, block trade -->
+            <set_value name="$skipIntraSectorTrade" exact="false"/>
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <do_if value="$buySector == $currentSector and $cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
+                <!-- Intra-sector trade in blacklisted sector - BLOCK to force escape -->
+                <set_value name="$skipIntraSectorTrade" exact="true"/>
+                <!-- Track as filtered (intra-sector in blacklisted sector) -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <do_if value="$ware?">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$outOfRange" exact="$wareStats.$outOfRange + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
+            <do_if value="$skipIntraSectorTrade">
+              <continue/> <!-- Skip to next cache entry -->
+            </do_if>
+            
+            <!-- ✅ ESCAPE LOGIC: Block buying in blacklisted sector (force escape) -->
+            <!-- Ship in blacklisted sector must NOT buy in that sector -->
+            <set_value name="$buySectorActivityBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+            <set_value name="$buySectorTravelBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+            <do_if value="$buySectorActivityBlacklisted or $buySectorTravelBlacklisted">
+              <!-- Block buying in blacklisted sector (even if ship is already there) -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <do_if value="$ware?">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$outOfRange" exact="$wareStats.$outOfRange + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/> <!-- Skip to next cache entry -->
+            </do_if>
+            
+            <!-- ✅ ESCAPE LOGIC: Use non-blacklist-aware gatedistance for escape trades -->
+            <!-- If ship is in blacklisted sector and buying from different sector, use non-blacklist-aware pathfinding -->
+            <set_value name="$currentSectorIsBlacklistedForEscape" exact="false"/>
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <set_value name="$currentSectorIsBlacklistedForEscape" exact="true"/>
+            </do_if>
+            <do_if value="$currentSectorIsBlacklistedForEscape and $buySector != $currentSector">
+              <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
+              <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}"/>
+            </do_if>
+            <do_else>
+              <!-- Normal case: Use blacklist-aware gatedistance -->
+              <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+            </do_else>
             
             <!-- Sell distance: BuyOffer station to SellOffer station -->
             <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
@@ -1161,7 +1400,7 @@
             </do_if>
             <do_else>
               <set_value name="$sellSector" exact="$cacheEntry.$SellOffer.owner.sector"/>
-              <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{blacklistgroup.civilian}.{$ship}"/>
+              <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
             </do_else>
             
             <!-- If trade route is unreachable (disconnected sectors), skip this trade -->
@@ -2591,25 +2830,73 @@
             <set_value name="$sellSector" exact="@$trade.$SellStation.sector"/>
             <set_value name="$currentSector" exact="$ship.sector"/>
             
-            <!-- Buy sector: Check if ship needs to travel there -->
-            <do_if value="$buySector != $currentSector">
-              <set_value name="$buySectorActivityBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$buySectorTravelBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$isBlacklisted" exact="$buySectorActivityBlacklisted or $buySectorTravelBlacklisted"/>
-              <do_if value="$isBlacklisted">
+            <!-- ✅ FIX: Block intra-sector trades in blacklisted sectors (force escape) -->
+            <!-- If ship is in blacklisted sector and both buy/sell are same sector, block trade -->
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <do_if value="$buySector == $currentSector and $sellSector == $currentSector">
+                <!-- Intra-sector trade in blacklisted sector - BLOCK to force escape -->
+                <set_value name="$isBlacklisted" exact="true"/>
                 <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
                 <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
               </do_if>
             </do_if>
             
-            <!-- Sell sector: Always check (ship must leave if blacklisted) -->
+            <!-- ✅ CRITICAL: Check if buy STATION is blacklisted (objectactivity) -->
+            <!-- Always check station blacklist, regardless of ship position -->
+            <do_if value="not $isBlacklisted">
+              <set_value name="$buyStation" exact="@$trade.$BuyStation"/>
+              <set_value name="$buyStationBlacklisted" exact="@$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+              <do_if value="$buyStationBlacklisted">
+                <set_value name="$isBlacklisted" exact="true"/>
+                <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
+                <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+            
+            <!-- ✅ CRITICAL: Check if sell STATION is blacklisted (objectactivity) -->
+            <!-- Always check station blacklist, regardless of ship position -->
+            <do_if value="not $isBlacklisted">
+              <set_value name="$sellStation" exact="@$trade.$SellStation"/>
+              <set_value name="$sellStationBlacklisted" exact="@$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+              <do_if value="$sellStationBlacklisted">
+                <set_value name="$isBlacklisted" exact="true"/>
+                <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
+                <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+            
+            <!-- ✅ CRITICAL: Check if buy SECTOR is blacklisted -->
+            <!-- ESCAPE LOGIC: Ship in blacklisted sector must NOT buy in that sector (force escape) -->
+            <!-- Ship must take trades that exit the blacklisted sector -->
+            <do_if value="not $isBlacklisted">
+              <set_value name="$buySectorActivityBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+              <set_value name="$buySectorTravelBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+              <do_if value="$buySectorActivityBlacklisted or $buySectorTravelBlacklisted">
+                <!-- ✅ ESCAPE LOGIC: Block buying in blacklisted sector (even if ship is already there) -->
+                <!-- Ship must escape by buying from a different (non-blacklisted) sector -->
+                <!-- Block if ship needs to travel TO blacklisted sector OR if ship is already in blacklisted sector -->
+                <set_value name="$isBlacklisted" exact="true"/>
+                <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
+                <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+            
+            <!-- ✅ CRITICAL: Check if sell SECTOR is blacklisted -->
+            <!-- ESCAPE LOGIC: Block selling to blacklisted sector (unless ship is already there, in which case it must escape via buy) -->
+            <!-- Since buy sector is already blocked if blacklisted, sell sector check prevents entering blacklisted sectors -->
             <do_if value="not $isBlacklisted">
               <set_value name="$sellSectorActivityBlacklisted" exact="@$sellSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
               <set_value name="$sellSectorTravelBlacklisted" exact="@$sellSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$isBlacklisted" exact="$sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted"/>
-              <do_if value="$isBlacklisted">
-                <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
-                <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
+              <do_if value="$sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted">
+                <!-- ✅ ESCAPE LOGIC: Block selling to blacklisted sector (prevent entering) -->
+                <!-- Ship is already forced to buy from non-blacklisted sector, so this prevents entering via sell -->
+                <do_if value="$sellSector != $currentSector">
+                  <!-- Ship needs to travel TO a blacklisted sector - BLOCK -->
+                  <set_value name="$isBlacklisted" exact="true"/>
+                  <set_value name="$filteredByBlacklist" exact="$filteredByBlacklist + 1"/>
+                  <set_value name="$wareStats.$filteredByBlacklist" exact="$wareStats.$filteredByBlacklist + 1"/>
+                </do_if>
+                <!-- If sellSector == currentSector: This shouldn't happen since buy is blocked, but allow it for safety -->
               </do_if>
             </do_if>
             
@@ -2617,11 +2904,76 @@
             <!-- NOTE: Caching disabled due to X4 MD table key limitations with object references -->
             <!-- Direct calculation is fast enough for now -->
             <do_if value="not $isBlacklisted">
-              <!-- Calculate distances directly (no caching due to table key limitations) -->
-              <set_value name="$buyPathDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$sellPathDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+              <!-- ✅ FIX: Handle same-sector cases first (ship already there = 0 distance) -->
+              <!-- If ship is in blacklisted sector, allow trades where ship stays in same sector OR escapes -->
+              <set_value name="$buyPathDistance" exact="-1"/>
+              <set_value name="$sellPathDistance" exact="-1"/>
               
-              <!-- Use cached/distances -->
+              <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
+              <!-- Check if current sector is blacklisted for escape logic -->
+              <set_value name="$currentSectorIsBlacklistedForEscape" exact="false"/>
+              <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+                <set_value name="$currentSectorIsBlacklistedForEscape" exact="true"/>
+              </do_if>
+              
+              <!-- Buy path: If ship is already in buy sector, distance is 0 (no travel needed) -->
+              <do_if value="$buySector == $currentSector">
+                <set_value name="$buyPathDistance" exact="0"/>
+              </do_if>
+              <do_elseif value="$currentSectorIsBlacklistedForEscape">
+                <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
+                <set_value name="$buyPathDistance" exact="$ship.gatedistance.{$buySector}"/>
+              </do_elseif>
+              <do_else>
+                <!-- Normal case: Ship needs to travel TO buy sector - use blacklist-aware pathfinding -->
+                <set_value name="$buyPathDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+              </do_else>
+              
+              <!-- Sell path calculation -->
+              <!-- ✅ CRITICAL: If ship is in blacklisted sector and buy is same sector, use ship position (not buy sector) -->
+              <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
+              <set_value name="$currentSectorIsBlacklisted" exact="false"/>
+              <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+                <set_value name="$currentSectorIsBlacklisted" exact="true"/>
+              </do_if>
+              
+              <do_if value="$sellSector == $buySector">
+                <!-- Buy and sell in same sector -->
+                <set_value name="$sellPathDistance" exact="0"/>
+              </do_if>
+              <do_elseif value="$buySector == $currentSector">
+                <!-- Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
+                <!-- This handles escape case: ship in blacklisted sector, staying there to buy, then selling in safe sector -->
+                <!-- ✅ ESCAPE LOGIC: If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
+                <!-- This allows escape even if all paths go through blacklisted sectors -->
+                <do_if value="$currentSectorIsBlacklisted">
+                  <!-- Escape case: Use non-blacklist-aware distance to check if ANY path exists -->
+                  <set_value name="$sellPathDistance" exact="$ship.gatedistance.{$sellSector}"/>
+                </do_if>
+                <do_else>
+                  <!-- Normal case: Use blacklist-aware distance -->
+                  <set_value name="$sellPathDistance" exact="$ship.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+                </do_else>
+              </do_elseif>
+              <do_else>
+                <!-- Normal case: Need to travel from buy to sell sector -->
+                <set_value name="$sellPathDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+              </do_else>
+              
+              <!-- Block if paths are unreachable (but allow same-sector trades for escape) -->
+              <!-- ✅ DEBUG: Log path distances for troubleshooting escape trades -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and ($buyPathDistance lt 0 or $sellPathDistance lt 0)">
+                <set_value name="$buySectorName" exact="@$buySector.knownname"/>
+                <set_value name="$sellSectorName" exact="@$sellSector.knownname"/>
+                <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                <set_value name="$wareName" exact="@$ware.name"/>
+                <debug_text text="'[GT-Resume] ' + $ship.idcode + ': Path blocked for ' + $wareName + ':' +
+                  '\n  Current sector: ' + $currentSectorName + ' (blacklisted: ' + $currentSectorIsBlacklisted + ')' +
+                  '\n  Buy sector: ' + $buySectorName + ' (distance: ' + $buyPathDistance + ', same as current: ' + ($buySector == $currentSector) + ')' +
+                  '\n  Sell sector: ' + $sellSectorName + ' (distance: ' + $sellPathDistance + ', same as buy: ' + ($sellSector == $buySector) + ')'"
+                  chance="100"/>
+              </do_if>
+              
               <do_if value="$buyPathDistance lt 0 or $sellPathDistance lt 0">
                 <set_value name="$isBlacklisted" exact="true"/>
                 <set_value name="$filteredByPathBlocked" exact="$filteredByPathBlocked + 1"/>
@@ -3196,10 +3548,18 @@
             </match_buyer>
           </find_buy_offer>
           
+          <!-- ✅ FIX: Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
+          <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+          <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
+            <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+          </do_if>
+          
           <!-- Find best price -->
           <do_all exact="$buyOffers.count" counter="$j">
             <set_value name="$offer" exact="$buyOffers.{$j}"/>
             <set_value name="$station" exact="$offer.owner"/>
+            <set_value name="$currentSector" exact="$ship.sector"/>
+            <set_value name="$stationSector" exact="$station.sector"/>
             
             <!-- ✅ NOTE: tradepartner="$ship" in find_buy_offer already filters by faction relations -->
             <!-- No explicit check needed - C++ engine handles it -->
@@ -3207,27 +3567,43 @@
             <!-- ✅ VALIDATION: Check blacklists before considering offer -->
             <set_value name="$isBlacklisted" exact="false"/>
             
+            <!-- ✅ FIX: Block intra-sector sales in blacklisted sectors (force escape) -->
+            <!-- If ship is in blacklisted sector and trying to sell to station in same sector, block -->
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <do_if value="$stationSector == $currentSector">
+                <!-- Intra-sector sale in blacklisted sector - BLOCK to force escape -->
+                <set_value name="$isBlacklisted" exact="true"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (intra-sector sale in blacklisted sector - must escape)'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
             <!-- Check station blacklist (object activity) -->
-            <do_if value="@$station.isblacklisted.{blacklisttype.objectactivity}.{blacklistgroup.civilian}.{$ship}">
+            <do_if value="not $isBlacklisted and @$station.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}">
               <set_value name="$isBlacklisted" exact="true"/>
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
                 <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (station blacklisted)'" chance="100"/>
               </do_if>
             </do_if>
             
-            <!-- Check sector blacklist (sector activity) -->
-            <do_if value="not $isBlacklisted and @$station.sector.isblacklisted.{blacklisttype.sectoractivity}.{blacklistgroup.civilian}.{$ship}">
-              <set_value name="$isBlacklisted" exact="true"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (sector activity blacklisted)'" chance="100"/>
+            <!-- Check sector blacklist (sector activity) - only if station is in different sector -->
+            <do_if value="not $isBlacklisted and $stationSector != $currentSector">
+              <do_if value="@$stationSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}">
+                <set_value name="$isBlacklisted" exact="true"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (sector activity blacklisted)'" chance="100"/>
+                </do_if>
               </do_if>
             </do_if>
             
-            <!-- Check sector blacklist (travel) -->
-            <do_if value="not $isBlacklisted and @$station.sector.isblacklisted.{blacklisttype.sectortravel}.{blacklistgroup.civilian}.{$ship}">
-              <set_value name="$isBlacklisted" exact="true"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (sector travel blacklisted)'" chance="100"/>
+            <!-- Check sector blacklist (travel) - only if station is in different sector -->
+            <do_if value="not $isBlacklisted and $stationSector != $currentSector">
+              <do_if value="@$stationSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+                <set_value name="$isBlacklisted" exact="true"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Rejected ' + @$station.knownname + ' (sector travel blacklisted)'" chance="100"/>
+                </do_if>
               </do_if>
             </do_if>
             
@@ -3235,7 +3611,7 @@
             <!-- Uses blacklist-aware gatedistance - returns -1 if path blocked by blacklisted sector -->
             <!-- Vanilla pattern: order.dock.xml:503 -->
             <do_if value="not $isBlacklisted">
-              <set_value name="$pathDistance" exact="$ship.gatedistance.{$station.sector}.{blacklistgroup.civilian}.{$ship}"/>
+              <set_value name="$pathDistance" exact="$ship.gatedistance.{$stationSector}.{$blacklistgroup}.{$ship}"/>
               
               <do_if value="$pathDistance lt 0">
                 <!-- Path goes through blacklisted sector or no path exists -->

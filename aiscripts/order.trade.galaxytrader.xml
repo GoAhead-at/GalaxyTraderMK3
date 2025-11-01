@@ -1125,11 +1125,61 @@
         <!-- Correct syntax: $ship.gatedistance.{$targetSector}.{$blacklistgroup}.{$ship} (NO blacklisttype!) -->
         <set_value name="$buySector" exact="$buyStation.sector"/>
         <set_value name="$sellSector" exact="$sellStation.sector"/>
-        <set_value name="$buyDistance" exact="this.assignedcontrolled.gatedistance.{$buySector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
-        <set_value name="$sellDistance" exact="this.assignedcontrolled.gatedistance.{$sellSector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+        <set_value name="$currentSector" exact="this.ship.sector"/>
+        
+        <!-- ✅ ESCAPE LOGIC: Check if ship is in a blacklisted sector (needed for escape path calculation) -->
+        <set_value name="$currentSectorIsBlacklisted" exact="false"/>
+        <do_if value="$blacklistgroup?">
+          <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorIsBlacklisted" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
+        </do_if>
+        
+        <!-- ✅ ESCAPE LOGIC: Calculate path distances with escape support -->
+        <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
+        <!-- Buy path: If ship is already in buy sector, distance is 0 (no travel needed) -->
+        <set_value name="$buyDistance" exact="-1"/>
+        <do_if value="$buySector == $currentSector">
+          <!-- Ship already in buy sector - no travel needed -->
+          <set_value name="$buyDistance" exact="0"/>
+        </do_if>
+        <do_elseif value="$currentSectorIsBlacklisted">
+          <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
+          <set_value name="$buyDistance" exact="this.assignedcontrolled.gatedistance.{$buySector}"/>
+        </do_elseif>
+        <do_else>
+          <!-- Normal case: Ship needs to travel TO buy sector - use blacklist-aware pathfinding -->
+          <set_value name="$buyDistance" exact="this.assignedcontrolled.gatedistance.{$buySector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+        </do_else>
+        
+        <!-- Sell path: Calculate based on buy location -->
+        <set_value name="$sellDistance" exact="-1"/>
+        <do_if value="$sellSector == $buySector">
+          <!-- Buy and sell in same sector -->
+          <set_value name="$sellDistance" exact="0"/>
+        </do_if>
+        <do_elseif value="$buySector == $currentSector">
+          <!-- ✅ ESCAPE CASE: Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
+          <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
+          <!-- ✅ ESCAPE LOGIC: If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
+          <!-- This allows escape even if all paths go through blacklisted sectors -->
+          <do_if value="$currentSectorIsBlacklisted">
+            <!-- Escape case: Use non-blacklist-aware distance to check if ANY path exists -->
+            <set_value name="$sellDistance" exact="this.assignedcontrolled.gatedistance.{$sellSector}"/>
+          </do_if>
+          <do_else>
+            <!-- Normal case: Use blacklist-aware distance -->
+            <set_value name="$sellDistance" exact="this.assignedcontrolled.gatedistance.{$sellSector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          </do_else>
+        </do_elseif>
+        <do_else>
+          <!-- Normal case: Need to travel from buy to sell sector -->
+          <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+        </do_else>
         
         <!-- DEBUG: Always log distance check to diagnose issues -->
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 PATH check (blacklist-aware):' + 
+          '\n  Current sector: ' + @$currentSector.knownname +
           '\n  BUY: ' + @$buyStation.knownname + ' (Sector: ' + @$buyStation.sector.knownname + ', Distance: ' + $buyDistance + ')' +
           '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance: ' + $sellDistance + ')' +
           '\n  Blacklist group: ' + $blacklistgroup +
@@ -1223,7 +1273,16 @@
           <continue/>
         </do_if>
         
-        <!-- Check if buy station OR its sector is blacklisted (matches vanilla's order.trade.perform line 156) -->
+        <!-- ✅ ESCAPE LOGIC: Check if ship is in a blacklisted sector -->
+        <set_value name="$currentSectorIsBlacklisted" exact="false"/>
+        <do_if value="$blacklistgroup?">
+          <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorIsBlacklisted" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
+        </do_if>
+        
+        <!-- ✅ ESCAPE LOGIC: Check if buy station OR its sector is blacklisted -->
+        <!-- CRITICAL: Always check target sector blacklist - escape only affects PATH, not destination -->
         <set_value name="$buyBlacklisted" exact="false"/>
         <do_if value="$blacklistgroup?">
           <!-- Check station itself (objectactivity) -->
@@ -1232,19 +1291,32 @@
           <set_value name="$buySectorActivityBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           <set_value name="$buySectorTravelBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           
-          <set_value name="$buyBlacklisted" exact="$buyStationBlacklisted or $buySectorActivityBlacklisted or $buySectorTravelBlacklisted"/>
+          <!-- ✅ ESCAPE LOGIC: Block buying in blacklisted sector (force escape) -->
+          <!-- Ship in blacklisted sector must NOT buy in that sector -->
+          <!-- Ship must escape by buying from a different (non-blacklisted) sector -->
+          <do_if value="$buySectorActivityBlacklisted or $buySectorTravelBlacklisted">
+            <!-- Block buying in blacklisted sector (even if ship is already there) -->
+            <set_value name="$buyBlacklisted" exact="true"/>
+          </do_if>
+          <do_else>
+            <!-- Target sector is not blacklisted - only check station -->
+            <set_value name="$buyBlacklisted" exact="$buyStationBlacklisted"/>
+          </do_else>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 BUY blacklist check:' + 
+            '\n  Current sector: ' + @$currentSector.knownname + ' (blacklisted: ' + $currentSectorIsBlacklisted + ')' +
             '\n  Station: ' + @$buyStation.knownname + 
             '\n  Sector: ' + @$buyStation.sector.knownname + 
             '\n  Station (objectactivity): ' + $buyStationBlacklisted + 
             '\n  Sector (sectoractivity): ' + $buySectorActivityBlacklisted + 
             '\n  Sector (sectortravel): ' + $buySectorTravelBlacklisted + 
+            '\n  Ship in buy sector: ' + ($buySector == $currentSector) +
             '\n  Final result: ' + $buyBlacklisted" 
             chance="100"/>
         </do_if>
         
-        <!-- Check if sell station OR its sector is blacklisted (matches vanilla's order.trade.perform line 156) -->
+        <!-- ✅ ESCAPE LOGIC: Check if sell station OR its sector is blacklisted -->
+        <!-- CRITICAL: Always check target sector blacklist - escape only affects PATH, not destination -->
         <set_value name="$sellBlacklisted" exact="false"/>
         <do_if value="$blacklistgroup?">
           <!-- Check station itself (objectactivity) -->
@@ -1253,15 +1325,48 @@
           <set_value name="$sellSectorActivityBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           <set_value name="$sellSectorTravelBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
           
-          <set_value name="$sellBlacklisted" exact="$sellStationBlacklisted or $sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted"/>
+          <!-- ✅ ALWAYS check if target sector is blacklisted -->
+          <!-- Escape exception: Allow sell sector if ship is already IN it (escape FROM) -->
+          <!-- But still block if ship needs to travel TO a blacklisted sector -->
+          <do_if value="$sellSectorActivityBlacklisted or $sellSectorTravelBlacklisted">
+            <do_if value="$sellSector == $currentSector">
+              <!-- Ship is already in sell sector - allow escape FROM blacklisted sector -->
+              <!-- Only block if station itself is blacklisted -->
+              <set_value name="$sellBlacklisted" exact="$sellStationBlacklisted"/>
+            </do_if>
+            <do_else>
+              <!-- Ship needs to travel TO a blacklisted sector - BLOCK -->
+              <set_value name="$sellBlacklisted" exact="true"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <!-- Target sector is not blacklisted - only check station -->
+            <set_value name="$sellBlacklisted" exact="$sellStationBlacklisted"/>
+          </do_else>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔍 SELL blacklist check:' + 
+            '\n  Current sector: ' + @$currentSector.knownname + ' (blacklisted: ' + $currentSectorIsBlacklisted + ')' +
             '\n  Station: ' + @$sellStation.knownname + 
             '\n  Sector: ' + @$sellStation.sector.knownname + 
             '\n  Station (objectactivity): ' + $sellStationBlacklisted + 
             '\n  Sector (sectoractivity): ' + $sellSectorActivityBlacklisted + 
             '\n  Sector (sectortravel): ' + $sellSectorTravelBlacklisted + 
+            '\n  Ship in sell sector: ' + ($sellSector == $currentSector) +
             '\n  Final result: ' + $sellBlacklisted" 
+            chance="100"/>
+        </do_if>
+        
+        <!-- ✅ ESCAPE LOGIC: Block intra-sector trades in blacklisted sectors -->
+        <!-- If ship is in blacklisted sector and both buy/sell are in same sector, block to force escape -->
+        <set_value name="$isIntraSectorTradeInBlacklisted" exact="false"/>
+        <do_if value="$currentSectorIsBlacklisted and $buySector == $currentSector and $sellSector == $currentSector">
+          <set_value name="$isIntraSectorTradeInBlacklisted" exact="true"/>
+          <set_value name="$buyBlacklisted" exact="true"/>  <!-- Block by marking as blacklisted -->
+          
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🚫 Intra-sector trade BLOCKED (escape required):' + 
+            '\n  Current sector: ' + @$currentSector.knownname + ' (BLACKLISTED)' +
+            '\n  Buy/Sell: Both in ' + @$currentSector.knownname +
+            '\n  Reason: Ship must escape from blacklisted sector'"
             chance="100"/>
         </do_if>
         
@@ -1344,13 +1449,80 @@
             chance="100"/>
           
           <!-- Create X4 native TradePerform orders with blacklist routing -->
-          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$pendingTrade.$Amount" immediate="false" internal="true"/>
-          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$pendingTrade.$Amount" immediate="false" internal="true"/>
+          <!-- ✅ MATCH TATERTRADER: Removed internal="true" - let vanilla handle internalorder via patch -->
+          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$pendingTrade.$Amount" immediate="false"/>
+          <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$pendingTrade.$Amount" immediate="false"/>
           
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📋 Trade orders created:' +
             '\n  BUY: ' + @$buyStation.knownname + ' → ' + @$pendingTrade.$Ware.name + ' (x' + $pendingTrade.$Amount + ')' +
             '\n  SELL: ' + @$sellStation.knownname"
             chance="100"/>
+          
+          <!-- ✅ ESCAPE ROUTE: Send logbook message when ship is escaping from blacklisted sector -->
+          <set_value name="$isEscapeTrade" exact="false"/>
+          <do_if value="$currentSectorIsBlacklisted">
+            <!-- Check if trade leads to a different sector (escape route) -->
+            <set_value name="$isEscapeTrade" exact="($buySector != $currentSector) or ($sellSector != $currentSector)"/>
+          </do_if>
+          
+          <do_if value="$isEscapeTrade">
+            <!-- Build escape route message -->
+            <!-- ✅ FIX: Extract values safely with null checks -->
+            <set_value name="$escapeWare" exact="null"/>
+            <set_value name="$escapeAmount" exact="0"/>
+            <set_value name="$escapeProfit" exact="0"/>
+            
+            <!-- Extract ware from BuyOffer (more reliable than $Ware property) -->
+            <do_if value="$pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.ware?">
+              <set_value name="$escapeWare" exact="$pendingTrade.$BuyOffer.ware.name"/>
+            </do_if>
+            <do_elseif value="$pendingTrade.$Ware?">
+              <set_value name="$escapeWare" exact="$pendingTrade.$Ware.name"/>
+            </do_elseif>
+            
+            <!-- Extract amount -->
+            <do_if value="$pendingTrade.$Amount?">
+              <set_value name="$escapeAmount" exact="$pendingTrade.$Amount"/>
+            </do_if>
+            
+            <!-- Extract profit -->
+            <do_if value="$pendingTrade.$Profit?">
+              <set_value name="$escapeProfit" exact="$pendingTrade.$Profit"/>
+            </do_if>
+            
+            <!-- Build message with safe string concatenation -->
+            <set_value name="$escapeMessage" exact="'Ship is escaping from blacklisted sector: ' + @$currentSector.knownname"/>
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n\nTrade Route:'"/>
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n  Buy: ' + @$buyStation.knownname + ' (Sector: ' + @$buySector.knownname + ')'"/>
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n  Sell: ' + @$sellStation.knownname + ' (Sector: ' + @$sellSector.knownname + ')'"/>
+            
+            <!-- Add ware info (with null check) -->
+            <set_value name="$wareInfo" exact="'Unknown Ware'"/>
+            <do_if value="$escapeWare?">
+              <set_value name="$wareInfo" exact="$escapeWare"/>
+            </do_if>
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n  Ware: ' + $wareInfo + ' (x' + $escapeAmount + ')'"/>
+            
+            <!-- Add profit info -->
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n  Expected Profit: ' + ($escapeProfit / 100) + ' Cr'"/>
+            <set_value name="$escapeMessage" exact="$escapeMessage + '\n\nThe ship will escape the blacklisted sector after completing this trade.'"/>
+            
+            <!-- DEBUG: Log the message being written -->
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📝 ESCAPE ROUTE LOGBOOK DEBUG:' + '\n  Ware: ' + $wareInfo + '\n  Amount: ' + $escapeAmount + '\n  Profit: ' + ($escapeProfit / 100) + ' Cr' + '\n  Message length: ' + $escapeMessage.length" chance="100"/>
+            
+            <!-- DEBUG: Log the full message text that will be written to logbook -->
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📝 ESCAPE ROUTE LOGBOOK MESSAGE:' + '\n' + $escapeMessage" chance="100"/>
+            
+            <!-- Write to ship logbook -->
+            <write_to_logbook 
+              category="general" 
+              title="'Escape Route: ' + this.ship.knownname" 
+              interaction="showonmap" 
+              object="this.ship" 
+              text="$escapeMessage"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📝 Escape route logbook entry created'" chance="100"/>
+          </do_if>
           
           <!-- Log to ship logbook if enabled (moved from MD execution to after validation) -->
           <set_value name="$logbookEnabled" exact="false"/>
