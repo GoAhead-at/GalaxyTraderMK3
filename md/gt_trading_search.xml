@@ -148,9 +148,10 @@
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🔍 Continuation check: waitingFlag=' + $savedWaitingForBatch + ', liveShip=' + $savedShipId + ', currentShip=' + $ship.idcode + ', tradeListCount=' + $savedTradeListCount" chance="100"/>
           </do_if>
           
-          <!-- Check if live search just completed (WaitingForBatch = false, TradeList exists, Ship matches) -->
-          <do_if value="not $savedWaitingForBatch and $savedTradeListCount gt 0 and $savedShip == $ship">
-            <!-- Live search just completed for this ship - use those results -->
+          <!-- Check if live search just completed (WaitingForBatch = false, TradeList exists or is empty, Ship matches) -->
+          <!-- ✅ FIX: Accept continuation even with 0 trades (all blacklisted) to prevent infinite loops -->
+          <do_if value="not $savedWaitingForBatch and $savedShip == $ship">
+            <!-- Live search just completed for this ship - use those results (even if 0 trades) -->
             <set_value name="$isLiveSearchContinuation" exact="true"/>
             <set_value name="$liveTradeList" exact="$savedTradeList"/>
             <set_value name="$liveBestTrade" exact="$savedBestTrade"/>
@@ -240,20 +241,51 @@
           </do_all>
         </do_if>
         
-        <!-- ===== PHASE 2: LIVE TRADE SEARCH (if no good cached trade OR insufficient diversity) ===== -->
+        <!-- ===== PHASE 2: LIVE TRADE SEARCH (only if no cached trades found) ===== -->
         <!-- Skip live search entirely if we're already using live search results from continuation -->
+        <!-- ✅ REMOVED: Low diversity check - use cached trades even if diversity is low -->
         <!-- Trigger live search if: 
              1. NOT continuing from live search, AND
-             2. (No cached trades found, OR Cache found trades but diversity is too low (≤2 wares and ≤5 trades))
-             This ensures we get diverse wares even if cache has limited options -->
+             2. No cached trades found, AND
+             3. Previous live search did NOT return 0 trades (to prevent infinite loops when all trades are blacklisted) -->
         <set_value name="$shouldDoLiveSearch" exact="false"/>
-        <do_if value="not $isLiveSearchContinuation">
-          <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
-          <do_if value="$foundCachedTrade and $cacheWareCount le 2 and $tradeList.count le 5">
-            <set_value name="$shouldDoLiveSearch" exact="true"/>
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache found trades but diversity too low (' + $cacheWareCount + ' wares, ' + $tradeList.count + ' trades) - performing live search for more diverse options'" chance="100"/>
+        <set_value name="$previousLiveSearchReturnedZeroTrades" exact="false"/>
+        <do_if value="$isLiveSearchContinuation and $liveTradeList.count eq 0">
+          <!-- Previous live search returned 0 trades (likely all blacklisted) -->
+          <set_value name="$previousLiveSearchReturnedZeroTrades" exact="true"/>
+          
+          <!-- ✅ FIX: Apply cooldown when live search returns 0 trades to prevent infinite loops -->
+          <do_if value="not global.$GT_CacheMissCooldowns?">
+            <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
+          </do_if>
+          <set_value name="$hasCooldown" exact="false"/>
+          <do_if value="global.$GT_CacheMissCooldowns.{$ship}?">
+            <set_value name="$hasCooldown" exact="true"/>
+            <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
+            <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
+            <do_if value="$newCooldown gt 60s">
+              <set_value name="$newCooldown" exact="60s"/>
             </do_if>
+          </do_if>
+          <do_else>
+            <!-- First time live search returned 0 trades - start at 10 seconds -->
+            <set_value name="$newCooldown" exact="10s"/>
+          </do_else>
+          <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+            $LastLiveSearch = player.age,
+            $CooldownDuration = $newCooldown
+          ]"/>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Previous live search returned 0 trades (all blacklisted) - applying cooldown (' + ($newCooldown / 1) + 's) and skipping live search to prevent infinite loop'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <do_if value="not $isLiveSearchContinuation or not $previousLiveSearchReturnedZeroTrades">
+          <set_value name="$shouldDoLiveSearch" exact="false"/>
+          <do_if value="not $isLiveSearchContinuation">
+            <!-- ✅ REMOVED: Low diversity check - only trigger live search on cache miss -->
+            <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
           </do_if>
         </do_if>
         
@@ -262,20 +294,18 @@
           <!-- If cache miss triggered live search recently, enforce cooldown before allowing another -->
           <set_value name="$canDoLiveSearch" exact="true"/>
           <set_value name="$cooldownRemaining" exact="0"/>
-          <do_if value="not $foundCachedTrade">
-            <!-- Check cooldown for cache miss → live search -->
-            <set_value name="$hasCooldown" exact="false"/>
-            <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
-              <set_value name="$hasCooldown" exact="true"/>
-              <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
-              <set_value name="$timeSinceLastSearch" exact="player.age - $cooldownData.$LastLiveSearch"/>
-              <set_value name="$cooldownRemaining" exact="$cooldownData.$CooldownDuration - $timeSinceLastSearch"/>
-              <do_if value="$cooldownRemaining gt 0">
-                <!-- Still in cooldown - skip live search -->
-                <set_value name="$canDoLiveSearch" exact="false"/>
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss → live search cooldown active (' + ($cooldownRemaining / 1) + 's remaining of ' + ($cooldownData.$CooldownDuration / 1) + 's) - skipping live search to prevent loop'" chance="100"/>
-                </do_if>
+          <!-- Check cooldown for cache miss triggers -->
+          <set_value name="$hasCooldown" exact="false"/>
+          <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+            <set_value name="$hasCooldown" exact="true"/>
+            <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
+            <set_value name="$timeSinceLastSearch" exact="player.age - $cooldownData.$LastLiveSearch"/>
+            <set_value name="$cooldownRemaining" exact="$cooldownData.$CooldownDuration - $timeSinceLastSearch"/>
+            <do_if value="$cooldownRemaining gt 0">
+              <!-- Still in cooldown - skip live search -->
+              <set_value name="$canDoLiveSearch" exact="false"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss → live search cooldown active (' + ($cooldownRemaining / 1) + 's remaining of ' + ($cooldownData.$CooldownDuration / 1) + 's) - skipping live search to prevent loop'" chance="100"/>
               </do_if>
             </do_if>
           </do_if>
@@ -290,30 +320,28 @@
             <do_if value="not global.$GT_CacheMissCooldowns?">
               <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
             </do_if>
-            <do_if value="not $foundCachedTrade">
-              <!-- Update cooldown after cache miss → live search -->
-              <do_if value="not $hasCooldown">
-                <!-- First cache miss for this ship - start at 10 seconds -->
-                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                  $LastLiveSearch = player.age,
-                  $CooldownDuration = 10s
-                ]"/>
-              </do_if>
-              <do_else>
-                <!-- Increase cooldown (double, max 60s) - cooldownData exists since hasCooldown is true -->
-                <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
-                <do_if value="$newCooldown gt 60s">
-                  <set_value name="$newCooldown" exact="60s"/>
-                </do_if>
-                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                  $LastLiveSearch = player.age,
-                  $CooldownDuration = $newCooldown
-                ]"/>
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
-                </do_if>
-              </do_else>
+            <!-- ✅ FIX: Update cooldown for cache miss triggers -->
+            <do_if value="not $hasCooldown">
+              <!-- First live search trigger for this ship - start at 10 seconds -->
+              <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+                $LastLiveSearch = player.age,
+                $CooldownDuration = 10s
+              ]"/>
             </do_if>
+            <do_else>
+              <!-- Increase cooldown (double, max 60s) - cooldownData exists since hasCooldown is true -->
+              <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
+              <do_if value="$newCooldown gt 60s">
+                <set_value name="$newCooldown" exact="60s"/>
+              </do_if>
+              <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+                $LastLiveSearch = player.age,
+                $CooldownDuration = $newCooldown
+              ]"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss → live search cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
+              </do_if>
+            </do_else>
             
             <!-- Perform live search -->
             <signal_cue_instantly cue="SearchLiveTrades" param="table[
@@ -2661,9 +2689,11 @@
         </do_else>
         
         <!-- 8. Return results (including rejection statistics for diagnostics) -->
+        <!-- Store trade count before storing in global (for accurate logging) -->
+        <set_value name="$finalTradeCount" exact="$diverseList.count"/>
         <set_value name="$waitingFlag" exact="false"/>
         <set_value name="global.$GT_SearchResult" exact="table[
-          $Found = ($diverseList.count gt 0),
+          $Found = ($finalTradeCount gt 0),
           $BestTrade = $bestTrade,
           $BestScore = $bestScore,
           $TradeList = $diverseList,
@@ -2688,7 +2718,7 @@
         <do_if value="$originalParams?">
           <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$originalParams"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $diverseList.count + ' trades)'" chance="100"/>
+            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades)'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
