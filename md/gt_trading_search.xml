@@ -129,11 +129,19 @@
             <set_value name="$savedWaitingForBatch" exact="global.$GT_SearchResult.$WaitingForBatch"/>
           </do_if>
           <set_value name="$savedShip" exact="@global.$GT_SearchResult.$Ship"/>
-          <set_value name="$savedTradeList" exact="@global.$GT_SearchResult.$TradeList"/>
-          <set_value name="$savedTradeListCount" exact="0"/>
-          <do_if value="$savedTradeList?">
-            <set_value name="$savedTradeListCount" exact="$savedTradeList.count"/>
+          <!-- ✅ CRITICAL: Initialize to empty list first, then extract if global exists and is not null -->
+          <!-- The ? operator checks existence, not null - so initialize to safe default first -->
+          <set_value name="$savedTradeList" exact="[]"/>
+          <set_value name="$savedTradeListTemp" exact="@global.$GT_SearchResult.$TradeList"/>
+          <do_if value="$savedTradeListTemp?">
+            <!-- Global value exists - check if it's actually a list (has .count property) -->
+            <set_value name="$tempCount" exact="@$savedTradeListTemp.count"/>
+            <do_if value="$tempCount?">
+              <!-- Valid list with count - use it -->
+              <set_value name="$savedTradeList" exact="$savedTradeListTemp"/>
+            </do_if>
           </do_if>
+          <set_value name="$savedTradeListCount" exact="$savedTradeList.count"/>
           <set_value name="$savedBestTrade" exact="@global.$GT_SearchResult.$BestTrade"/>
           <set_value name="$savedBestScore" exact="@global.$GT_SearchResult.$BestScore"/>
           
@@ -352,43 +360,43 @@
         <set_value name="$shouldDoLiveSearch" exact="false"/>
         <set_value name="$previousLiveSearchReturnedZeroTrades" exact="false"/>
         <do_if value="$isLiveSearchContinuation and $liveTradeList.count == 0">
-          <!-- Previous live search returned 0 trades (likely all blacklisted) -->
-          <set_value name="$previousLiveSearchReturnedZeroTrades" exact="true"/>
-          
-          <!-- ✅ FIX: Apply cooldown when live search returns 0 trades to prevent infinite loops -->
-          <do_if value="not global.$GT_CacheMissCooldowns?">
-            <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
-          </do_if>
-          <set_value name="$hasCooldown" exact="false"/>
-          <do_if value="global.$GT_CacheMissCooldowns.{$ship}?">
-            <set_value name="$hasCooldown" exact="true"/>
-            <set_value name="$cooldownData" exact="global.$GT_CacheMissCooldowns.{$ship}"/>
-            <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
-            <do_if value="$newCooldown gt 60s">
-              <set_value name="$newCooldown" exact="60s"/>
-            </do_if>
-          </do_if>
-          <do_else>
-            <!-- First time live search returned 0 trades - start at 10 seconds -->
-            <set_value name="$newCooldown" exact="10s"/>
-          </do_else>
-          <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-            $LastLiveSearch = player.age,
-            $CooldownDuration = $newCooldown
-          ]"/>
-          
+          <!-- Previous live search returned 0 trades -->
+          <!-- ✅ CRITICAL FIX: Clear continuation state when 0 trades detected -->
+          <!-- This handles cases where blacklist was removed but old 0-trade results are cached -->
+          <!-- Instead of applying cooldown, clear stale continuation and allow fresh search -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Previous live search returned 0 trades (all blacklisted) - applying cooldown (' + ($newCooldown / 1) + 's) and skipping live search to prevent infinite loop'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Previous live search returned 0 trades - clearing continuation state to allow fresh search (blacklist may have been removed)'" chance="100"/>
           </do_if>
+          
+          <!-- Clear continuation state to force fresh search -->
+          <set_value name="$isLiveSearchContinuation" exact="false"/>
+          <set_value name="$liveTradeList" exact="[]"/>
+          <set_value name="$liveBestTrade" exact="null"/>
+          <set_value name="$liveBestScore" exact="0"/>
+          
+          <!-- ✅ CRITICAL: Initialize tradeList to empty list to prevent null errors -->
+          <set_value name="$tradeList" exact="[]"/>
+          <set_value name="$bestTrade" exact="null"/>
+          <set_value name="$bestScore" exact="0"/>
+          
+          <!-- Clear old search result state to prevent re-use -->
+          <remove_value name="global.$GT_SearchResult.$WaitingForBatch"/>
+          <remove_value name="global.$GT_SearchResult.$TradeList"/>
+          <remove_value name="global.$GT_SearchResult.$BestTrade"/>
+          <remove_value name="global.$GT_SearchResult.$BestScore"/>
+          <remove_value name="global.$GT_SearchResult.$FilteredByBlacklist"/>
+          <remove_value name="global.$GT_SearchResult.$FilteredByPathBlocked"/>
+          <remove_value name="global.$GT_SearchResult.$TotalTradesEvaluated"/>
         </do_if>
         
-        <do_if value="not $isLiveSearchContinuation or not $previousLiveSearchReturnedZeroTrades">
-          <set_value name="$shouldDoLiveSearch" exact="false"/>
-          <do_if value="not $isLiveSearchContinuation">
-            <!-- ✅ REMOVED: Low diversity check - only trigger live search on cache miss -->
-            <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
-          </do_if>
+        <do_if value="not $isLiveSearchContinuation">
+          <!-- ✅ REMOVED: Low diversity check - only trigger live search on cache miss -->
+          <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
         </do_if>
+        <do_else>
+          <!-- Using continuation results - don't trigger new live search -->
+          <set_value name="$shouldDoLiveSearch" exact="false"/>
+        </do_else>
         
         <do_if value="$shouldDoLiveSearch">
           <!-- ✅ COOLDOWN MECHANISM: Prevent cache miss → live search loops -->
@@ -505,7 +513,11 @@
             <do_if value="global.$GT_SearchResult.$OffersFound?">
               <set_value name="$offersFound" exact="global.$GT_SearchResult.$OffersFound"/>
             </do_if>
-            <set_value name="$tradeList" exact="@global.$GT_SearchResult.$TradeList"/>
+            <!-- ✅ CRITICAL: Initialize to empty list first, then extract from global if it exists -->
+            <set_value name="$tradeList" exact="[]"/>
+            <do_if value="global.$GT_SearchResult.$TradeList?">
+              <set_value name="$tradeList" exact="global.$GT_SearchResult.$TradeList"/>
+            </do_if>
             <!-- Update rejection statistics from live search (if available) -->
             <do_if value="global.$GT_SearchResult.$TradesRejectedDocking?">
               <set_value name="$tradesRejectedDocking" exact="global.$GT_SearchResult.$TradesRejectedDocking"/>
