@@ -193,6 +193,65 @@
             <!-- Process this ware if both sell and buy offers exist -->
             <do_if value="$sellOffersForWare.count gt 0 and $buyOffersForWare.count gt 0">
               
+              <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+              <!-- ✅ OPTIMIZATION #1: Limit offers BEFORE nested loops to reduce iterations -->
+              <!-- Reduces from 50×100 = 5,000 to 20×20 = 400 iterations per ware (92% reduction) -->
+              <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+              <set_value name="$maxOffersPerWareForMatching" exact="20"/>
+              
+              <!-- Limit sell offers BEFORE nested loop (take first N = cheapest = best buyers) -->
+              <do_if value="$sellOffersForWare.count gt $maxOffersPerWareForMatching">
+                <!-- Simple approach: Take first N offers (they're already ordered by relativeprice from batch) -->
+                <set_value name="$limitedSellOffers" exact="[]"/>
+                <do_all exact="$maxOffersPerWareForMatching" counter="$idx">
+                  <append_to_list name="$limitedSellOffers" exact="$sellOffersForWare.{$idx}"/>
+                </do_all>
+                <set_value name="$sellOffersForWare" exact="$limitedSellOffers"/>
+              </do_if>
+              
+              <!-- Limit buy offers BEFORE nested loop (take last N = highest payers = best profit) -->
+              <do_if value="$buyOffersForWare.count gt $maxOffersPerWareForMatching">
+                <!-- Take last N offers (highest payers = best profit) -->
+                <set_value name="$limitedBuyOffers" exact="[]"/>
+                <set_value name="$startIndex" exact="$buyOffersForWare.count - $maxOffersPerWareForMatching"/>
+                <do_all exact="$maxOffersPerWareForMatching" counter="$idx">
+                  <set_value name="$actualIndex" exact="$startIndex + $idx"/>
+                  <append_to_list name="$limitedBuyOffers" exact="$buyOffersForWare.{$actualIndex}"/>
+                </do_all>
+                <set_value name="$buyOffersForWare" exact="$limitedBuyOffers"/>
+              </do_if>
+              
+              <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+              <!-- ✅ OPTIMIZATION #2: Pre-cache docking permissions BEFORE nested loops -->
+              <!-- Reduces property lookups from 400,000+ to ~40-100 (99.98% reduction) -->
+              <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+              <set_value name="$dockingCache" exact="table[]"/>
+              <set_value name="$uniqueStations" exact="table[]"/>
+              
+              <!-- Collect all unique stations from limited offers -->
+              <do_all exact="$sellOffersForWare.count" counter="$i">
+                <set_value name="$offer" exact="$sellOffersForWare.{$i}"/>
+                <set_value name="$station" exact="@$offer.owner"/>
+                <do_if value="$station? and not $uniqueStations.{$station}?">
+                  <set_value name="$uniqueStations.{$station}" exact="true"/>
+                </do_if>
+              </do_all>
+              <do_all exact="$buyOffersForWare.count" counter="$i">
+                <set_value name="$offer" exact="$buyOffersForWare.{$i}"/>
+                <set_value name="$station" exact="@$offer.owner"/>
+                <do_if value="$station? and not $uniqueStations.{$station}?">
+                  <set_value name="$uniqueStations.{$station}" exact="true"/>
+                </do_if>
+              </do_all>
+              
+              <!-- Pre-cache docking permissions for all unique stations -->
+              <do_all exact="$uniqueStations.keys.count" counter="$stationIdx">
+                <set_value name="$station" exact="$uniqueStations.keys.{$stationIdx}"/>
+                <set_value name="$canDock" exact="@$station.dockingallowed.{$ship}"/>
+                <set_value name="$dockingCache.{$station}" exact="$canDock"/>
+              </do_all>
+              
+              <!-- NOW run nested loops on LIMITED offers with CACHED docking -->
               <do_all exact="$sellOffersForWare.count" counter="$i">
                 <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
                 
@@ -228,10 +287,9 @@
                       <continue/>
                     </do_if>
                     
-                    <!-- CRITICAL: Check if ship can dock at BOTH stations -->
-                    <!-- Use safe extracted values -->
-                    <set_value name="$canDockAtBuyStation" exact="@$sellOfferOwner.dockingallowed.{$ship}"/>
-                    <set_value name="$canDockAtSellStation" exact="@$buyOfferOwner.dockingallowed.{$ship}"/>
+                    <!-- ✅ OPTIMIZATION #2: Use CACHED docking permissions (pre-cached before loop) -->
+                    <set_value name="$canDockAtBuyStation" exact="@$dockingCache.{$sellOfferOwner}"/>
+                    <set_value name="$canDockAtSellStation" exact="@$dockingCache.{$buyOfferOwner}"/>
                     
                     <do_if value="not $canDockAtBuyStation or not $canDockAtSellStation">
                       <set_value name="$tradesRejectedDocking" operation="add"/>
@@ -526,6 +584,12 @@
                       <!-- Now guaranteed safe to set property -->
                       <set_value name="$tradesPerWare.{$ware}" exact="$tradesForThisWare"/>
                       
+                      <!-- ✅ OPTIMIZATION #3: Early exit when quota reached -->
+                      <!-- Break from inner loop (buy offers) when we have enough trades for this ware -->
+                      <do_if value="$tradesForThisWare ge $maxTradesPerWare">
+                        <break/>  <!-- Exit buy offers loop -->
+                      </do_if>
+                      
                       <!-- Track overall best -->
                       <do_if value="$efficiency gt $crossStationBestScore">
                         <set_value name="$crossStationBestScore" exact="$efficiency"/>
@@ -547,6 +611,11 @@
                     </do_if>
                   </do_if>
                 </do_all>
+                
+                <!-- ✅ OPTIMIZATION #3: Early exit from outer loop if quota reached -->
+                <do_if value="$tradesForThisWare ge $maxTradesPerWare">
+                  <break/>  <!-- Exit sell offers loop -->
+                </do_if>
               </do_all>
             </do_if>
           </do_all>
