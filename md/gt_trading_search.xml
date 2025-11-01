@@ -2684,33 +2684,81 @@
           <debug_text text="$wareDebug" chance="100"/>
         </do_if>
         
-        <!-- ✅ EARLY EXIT: Sort trades by distance (shortest first) per ware, break when exceeding maxDistance -->
-        <!-- This matches the old implementation pattern: pre-sort by distance, break early when limit reached -->
+        <!-- ✅ FIX: Determine home sector FIRST (same logic as SearchLiveTrades) -->
+        <!-- Ships must only trade with stations within maxDistance from HOME SECTOR, not ship position -->
+        <set_value name="$homeBase" exact="null"/>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$HomeBase?">
+          <set_value name="$homeBase" exact="global.$GT_AIParameters.{$ship}.$HomeBase"/>
+        </do_if>
+        
+        <!-- Fallback chain -->
+        <do_if value="not $homeBase? or not $homeBase.exists">
+          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+          <do_if value="not $homeBase? or not $homeBase.exists">
+            <set_value name="$homeBase" exact="$ship.sector"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Extract sector -->
+        <set_value name="$homeSector" exact="null"/>
+        <do_if value="$homeBase.isclass.station">
+          <set_value name="$homeSector" exact="$homeBase.sector"/>
+        </do_if>
+        <do_elseif value="$homeBase.isclass.sector">
+          <set_value name="$homeSector" exact="$homeBase"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="$homeSector" exact="$ship.sector"/>
+        </do_else>
+        
+        <!-- Validate -->
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <set_value name="$homeSector" exact="$ship.sector"/>
+        </do_if>
+        
+        <!-- ✅ EARLY EXIT: Sort trades by distance from HOME SECTOR (shortest first) per ware, break when exceeding maxDistance -->
+        <!-- This matches the requirement: stations must not be farther from home sector than maxDistance -->
         <set_value name="$diverseList" exact="[]"/>
-        <set_value name="$currentSector" exact="$ship.sector"/>
         <do_all exact="$tradesByWare.keys.count" counter="$wareIdx">
           <set_value name="$ware" exact="$tradesByWare.keys.{$wareIdx}"/>
           <set_value name="$wareTrades" exact="$tradesByWare.{$ware}"/>
           
-          <!-- ✅ STEP 1: Sort this ware's trades by distance (ship to buy station) for early exit -->
-          <!-- Calculate distance for each trade and create distance-sorted list -->
+          <!-- ✅ STEP 1: Sort this ware's trades by distance from HOME SECTOR (max of buy/sell distances) -->
+          <!-- Calculate distance for each trade from home sector to both stations -->
           <set_value name="$tradesWithDistance" exact="[]"/>
           <do_all exact="$wareTrades.count" counter="$i">
             <set_value name="$trade" exact="$wareTrades.{$i}"/>
             <set_value name="$buySector" exact="@$trade.$BuyStation.sector"/>
-            <set_value name="$tradeDistance" exact="-1"/>
-            <do_if value="$buySector == $currentSector">
-              <set_value name="$tradeDistance" exact="0"/>
+            <set_value name="$sellSector" exact="@$trade.$SellStation.sector"/>
+            
+            <!-- ✅ FIX: Calculate distance from HOME SECTOR to stations (not from ship position) -->
+            <set_value name="$buyDistance" exact="-1"/>
+            <set_value name="$sellDistance" exact="-1"/>
+            
+            <do_if value="$buySector == $homeSector">
+              <set_value name="$buyDistance" exact="0"/>
             </do_if>
             <do_else>
-              <!-- Calculate blacklist-aware distance from ship to buy station -->
-              <set_value name="$tradeDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+              <!-- Range-only distance from home sector to buy station (universal validation) -->
+              <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
             </do_else>
-            <!-- Only include trades with valid distance (>= 0 means reachable) -->
-            <do_if value="$tradeDistance ge 0">
+            
+            <do_if value="$sellSector == $homeSector">
+              <set_value name="$sellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <!-- Range-only distance from home sector to sell station (universal validation) -->
+              <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+            </do_else>
+            
+            <!-- Use max distance (farthest station from home) for sorting -->
+            <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
+            
+            <!-- Only include trades where BOTH stations are within maxDistance from home AND paths exist -->
+            <do_if value="$buyDistance ge 0 and $sellDistance ge 0 and $maxStationDistance le $maxDistance">
               <append_to_list name="$tradesWithDistance" exact="table[
                 $Trade = $trade,
-                $Distance = $tradeDistance
+                $Distance = $maxStationDistance
               ]"/>
             </do_if>
           </do_all>
@@ -2898,16 +2946,105 @@
         </do_if>
         
         <!-- 6. Select best trade (for backward compatibility) -->
+        <!-- ✅ CRITICAL FIX: Re-validate distance from home sector AND verify trade exists in final diverseList -->
+        <!-- Prevents using stale trades that were filtered out by blacklist/path checks -->
         <set_value name="$bestTrade" exact="null"/>
         <set_value name="$bestScore" exact="0"/>
+        
+        <!-- Validate nonConflictedBestTrade: Both stations must be within maxDistance from home sector AND exist in diverseList -->
+        <set_value name="$validatedNonConflictedTrade" exact="null"/>
         <do_if value="$nonConflictedBestTrade? and $nonConflictedBestScore gt 0">
-          <!-- Prefer non-conflicted from filtered list (only if Score > 0) -->
-          <set_value name="$bestTrade" exact="$nonConflictedBestTrade"/>
+          <set_value name="$tradeBuySector" exact="@$nonConflictedBestTrade.$BuyStation.sector"/>
+          <set_value name="$tradeSellSector" exact="@$nonConflictedBestTrade.$SellStation.sector"/>
+          <set_value name="$tradeBuyDistance" exact="-1"/>
+          <set_value name="$tradeSellDistance" exact="-1"/>
+          
+          <do_if value="$tradeBuySector == $homeSector">
+            <set_value name="$tradeBuyDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$tradeBuyDistance" exact="$homeSector.gatedistance.{$tradeBuySector}"/>
+          </do_else>
+          
+          <do_if value="$tradeSellSector == $homeSector">
+            <set_value name="$tradeSellDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$tradeSellDistance" exact="$homeSector.gatedistance.{$tradeSellSector}"/>
+          </do_else>
+          
+          <!-- ✅ CRITICAL: Check if trade exists in final diverseList (wasn't filtered out) -->
+          <set_value name="$tradeExistsInDiverseList" exact="false"/>
+          <do_if value="$tradeBuyDistance ge 0 and $tradeSellDistance ge 0 and $tradeBuyDistance le $maxDistance and $tradeSellDistance le $maxDistance">
+            <!-- Verify trade wasn't filtered out - check if it exists in diverseList by comparing stations and ware -->
+            <do_all exact="$diverseList.count" counter="$i">
+              <set_value name="$diverseTrade" exact="$diverseList.{$i}"/>
+              <do_if value="$diverseTrade.$BuyStation == $nonConflictedBestTrade.$BuyStation and 
+                             $diverseTrade.$SellStation == $nonConflictedBestTrade.$SellStation and
+                             $diverseTrade.$BuyOffer.ware == $nonConflictedBestTrade.$BuyOffer.ware">
+                <set_value name="$tradeExistsInDiverseList" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <!-- Only use if both distance valid AND trade exists in final filtered list -->
+            <do_if value="$tradeExistsInDiverseList">
+              <set_value name="$validatedNonConflictedTrade" exact="$nonConflictedBestTrade"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Validate crossStationBestTrade: Both stations must be within maxDistance from home sector AND exist in diverseList -->
+        <set_value name="$validatedCrossStationTrade" exact="null"/>
+        <do_if value="$crossStationBestTrade? and $crossStationBestScore gt 0">
+          <set_value name="$tradeBuySector" exact="@$crossStationBestTrade.$BuyStation.sector"/>
+          <set_value name="$tradeSellSector" exact="@$crossStationBestTrade.$SellStation.sector"/>
+          <set_value name="$tradeBuyDistance" exact="-1"/>
+          <set_value name="$tradeSellDistance" exact="-1"/>
+          
+          <do_if value="$tradeBuySector == $homeSector">
+            <set_value name="$tradeBuyDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$tradeBuyDistance" exact="$homeSector.gatedistance.{$tradeBuySector}"/>
+          </do_else>
+          
+          <do_if value="$tradeSellSector == $homeSector">
+            <set_value name="$tradeSellDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$tradeSellDistance" exact="$homeSector.gatedistance.{$tradeSellSector}"/>
+          </do_else>
+          
+          <!-- ✅ CRITICAL: Check if trade exists in final diverseList (wasn't filtered out) -->
+          <set_value name="$tradeExistsInDiverseList" exact="false"/>
+          <do_if value="$tradeBuyDistance ge 0 and $tradeSellDistance ge 0 and $tradeBuyDistance le $maxDistance and $tradeSellDistance le $maxDistance">
+            <!-- Verify trade wasn't filtered out - check if it exists in diverseList by comparing stations and ware -->
+            <do_all exact="$diverseList.count" counter="$i">
+              <set_value name="$diverseTrade" exact="$diverseList.{$i}"/>
+              <do_if value="$diverseTrade.$BuyStation == $crossStationBestTrade.$BuyStation and 
+                             $diverseTrade.$SellStation == $crossStationBestTrade.$SellStation and
+                             $diverseTrade.$BuyOffer.ware == $crossStationBestTrade.$BuyOffer.ware">
+                <set_value name="$tradeExistsInDiverseList" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <!-- Only use if both distance valid AND trade exists in final filtered list -->
+            <do_if value="$tradeExistsInDiverseList">
+              <set_value name="$validatedCrossStationTrade" exact="$crossStationBestTrade"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <do_if value="$validatedNonConflictedTrade? and $nonConflictedBestScore gt 0">
+          <!-- Prefer non-conflicted from filtered list (only if Score > 0, validated, AND exists in diverseList) -->
+          <set_value name="$bestTrade" exact="$validatedNonConflictedTrade"/>
           <set_value name="$bestScore" exact="$nonConflictedBestScore"/>
         </do_if>
-        <do_elseif value="$crossStationBestTrade? and $crossStationBestScore gt 0">
-          <!-- Use cross-station trade (only if Score > 0) -->
-          <set_value name="$bestTrade" exact="$crossStationBestTrade"/>
+        <do_elseif value="$validatedCrossStationTrade? and $crossStationBestScore gt 0">
+          <!-- Use cross-station trade (only if Score > 0, validated, AND exists in diverseList) -->
+          <set_value name="$bestTrade" exact="$validatedCrossStationTrade"/>
           <set_value name="$bestScore" exact="$crossStationBestScore"/>
         </do_elseif>
         <do_else>
