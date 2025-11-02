@@ -112,10 +112,9 @@
         <!-- ═══════════════════════════════════════════════════════════════════════════ -->
         <do_if value="$canExecute">
           <!-- Determine ship's blacklistgroup (same logic as vanilla) -->
-          <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
-          <do_if value="(@$ship.primarypurpose == purpose.fight) or (@$ship.primarypurpose == purpose.auxiliary)">
-            <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
-          </do_if>
+          <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <!-- CRITICAL: Check path reachability FIRST (faster to fail on unreachable) -->
           <!-- Extract stations from trade structure (handle both formats) -->
@@ -143,58 +142,44 @@
           
           <!-- ✅ ESCAPE LOGIC: Calculate path distances with escape support -->
           <!-- Check if current sector is blacklisted for escape logic -->
-          <set_value name="$currentSectorIsBlacklistedForEscape" exact="false"/>
-          <do_if value="$blacklistgroup?">
-            <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
-            <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
-            <set_value name="$currentSectorIsBlacklistedForEscape" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
-          </do_if>
+          <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklistedForEscape">
+            <param name="sector" value="$currentSector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+          </run_actions>
           
           <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
-          <!-- Buy path: If ship is already in buy sector, distance is 0 (no travel needed) -->
-          <set_value name="$buyDistance" exact="-1"/>
-          <do_if value="$buySector == $currentSector">
-            <!-- Ship already in buy sector - no travel needed -->
-            <set_value name="$buyDistance" exact="0"/>
-          </do_if>
-          <do_elseif value="$currentSectorIsBlacklistedForEscape">
-            <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
-            <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}"/>
-          </do_elseif>
-          <do_else>
-            <!-- Normal case: Ship needs to travel TO buy sector - use blacklist-aware pathfinding -->
-            <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
-          </do_else>
+          <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$buyDistance">
+            <param name="ship" value="$ship"/>
+            <param name="fromSector" value="$currentSector"/>
+            <param name="toSector" value="$buySector"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+            <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+          </run_actions>
           
           <!-- Sell path: Calculate based on buy location -->
-          <set_value name="$sellDistance" exact="-1"/>
           <do_if value="$sellSector == $buySector">
             <!-- Buy and sell in same sector -->
             <set_value name="$sellDistance" exact="0"/>
           </do_if>
           <do_elseif value="$buySector == $currentSector">
             <!-- ✅ ESCAPE CASE: Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
-            <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
-            <!-- ✅ ESCAPE LOGIC: If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
-            <!-- This allows escape even if all paths go through blacklisted sectors -->
-            <set_value name="$currentSectorIsBlacklisted" exact="false"/>
-            <do_if value="$blacklistgroup?">
-              <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
-              <set_value name="$currentSectorIsBlacklisted" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
-            </do_if>
-            <do_if value="$currentSectorIsBlacklisted">
-              <!-- Escape case: Use non-blacklist-aware distance to check if ANY path exists -->
-              <set_value name="$sellDistance" exact="$ship.gatedistance.{$sellSector}"/>
-            </do_if>
-            <do_else>
-              <!-- Normal case: Use blacklist-aware distance -->
-              <set_value name="$sellDistance" exact="$ship.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
-            </do_else>
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$sellDistance">
+              <param name="ship" value="$ship"/>
+              <param name="fromSector" value="$currentSector"/>
+              <param name="toSector" value="$sellSector"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+            </run_actions>
           </do_elseif>
           <do_else>
             <!-- Normal case: Need to travel from buy to sell sector -->
-            <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+            <do_if value="$buySector == $sellSector">
+              <set_value name="$sellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+            </do_else>
           </do_else>
           
           <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
@@ -218,11 +203,19 @@
           <do_if value="$canExecute">
             <!-- Check buy/sell station blacklists (matches vanilla order.trade.perform) -->
             <!-- Vanilla line 156: checks objectactivity, sectoractivity, sectortravel -->
-            <set_value name="$buyStationBlacklisted" exact="@$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsStationBlacklisted" result="$buyStationBlacklisted">
+              <param name="station" value="$buyStation"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
             <set_value name="$buySectorActivityBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
             <set_value name="$buySectorTravelBlacklisted" exact="@$buyStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
             
-            <set_value name="$sellStationBlacklisted" exact="@$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship}"/>
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsStationBlacklisted" result="$sellStationBlacklisted">
+              <param name="station" value="$sellStation"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
             <set_value name="$sellSectorActivityBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
             <set_value name="$sellSectorTravelBlacklisted" exact="@$sellStation.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
             
@@ -426,9 +419,9 @@
             </do_if>
             
             <!-- CRITICAL: Signal AI that trade is ready for validation -->
-            <!-- <debug_text text="'[GT-Execution] 📤 SENDING GT_Trade_Found signal to ' + $ship.idcode + ' at game time ' + player.age" chance="100"/> -->
+            <debug_text text="'[GT-Execution] 📤 SENDING GT_Trade_Found signal to ' + $ship.idcode + ' at game time ' + player.age" chance="100"/>
             <signal_objects object="$ship" param="'GT_Trade_Found'"/>
-            <!-- <debug_text text="'[GT-Execution] ✅ GT_Trade_Found signal SENT to ' + $ship.idcode + ' at game time ' + player.age" chance="100"/> -->
+            <debug_text text="'[GT-Execution] ✅ GT_Trade_Found signal SENT to ' + $ship.idcode + ' at game time ' + player.age" chance="100"/>
           </do_if>
         </do_if>
         <!-- ✅ Close $tradeValid block -->
