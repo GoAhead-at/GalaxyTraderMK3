@@ -83,8 +83,11 @@
         <set_value name="$gt_AdvancedAnalytics" exact="$skillLevel ge 15"/>
 
         <!-- Level-based ROI and Absolute Profit thresholds (0.5x @Lv1 → 2.0x @Lv15) -->
-        <set_value name="$roiMultiplier" exact="0.5 + (($skillLevel - 1) * (1.5 / 14))"/>
-        <set_value name="$profitMultiplier" exact="0.5 + (($skillLevel - 1) * (1.5 / 14))"/>
+        <!-- Get skill-based multipliers (using library function) -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_GetSkillMultiplier" result="$roiMultiplier">
+          <param name="skillLevel" value="$skillLevel"/>
+        </run_actions>
+        <set_value name="$profitMultiplier" exact="$roiMultiplier"/>
         <set_value name="$minROI" exact="$minROI * $roiMultiplier"/>
         <set_value name="$minAbsoluteProfit" exact="($minAbsoluteProfit * $profitMultiplier)i"/>
         
@@ -232,6 +235,21 @@
           <set_value name="$tradeList" exact="$cacheTradeList"/>
         </do_else>
         
+        <!-- ✅ FIX: Validate bestTrade IMMEDIATELY after setting from cache/live sources -->
+        <!-- Use strict validation to catch invalid trades before execution validation -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$bestTradeValidFromSource">
+          <param name="trade" value="$bestTrade"/>
+          <param name="minScore" value="0"/>
+        </run_actions>
+        <do_if value="not $bestTradeValidFromSource">
+          <!-- bestTrade from source is invalid - clear it so fallback can fix it -->
+          <set_value name="$bestTrade" exact="null"/>
+          <set_value name="$bestScore" exact="0"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ bestTrade from source (cache/live) is INVALID - cleared for fallback fix'" chance="100"/>
+          </do_if>
+        </do_if>
+        
         <!-- Initialize rejection statistics (for both cached and live searches) -->
         <set_value name="$tradesRejectedDocking" exact="0"/>
         <set_value name="$tradesRejectedBlacklist" exact="0"/>
@@ -311,11 +329,10 @@
             <set_value name="$totalEvaluated" exact="$totalRejected"/>
           </do_elseif>
           
-          <!-- Extract sector name safely -->
-          <set_value name="$sectorNameForStorage" exact="@$ship.sector.knownname"/>
-          <do_if value="not $sectorNameForStorage?">
-            <set_value name="$sectorNameForStorage" exact="'Unknown Sector'"/>
-          </do_if>
+          <!-- Extract sector name safely (using library function) -->
+          <run_actions ref="md.GT_Utilities.GT_GetSectorNameSafe" result="$sectorNameForStorage">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <!-- Store per-ship to prevent overwrites by other ships' searches -->
           <do_if value="not global.$GT_SearchResult.$LastRejectionStats?">
@@ -584,6 +601,21 @@
           <do_if value="not $isLiveSearchContinuation">
             <set_value name="$bestTrade" exact="@global.$GT_SearchResult.$BestTrade"/>
             <set_value name="$bestScore" exact="@global.$GT_SearchResult.$BestScore"/>
+            
+            <!-- ✅ FIX: Validate bestTrade IMMEDIATELY after extracting from global -->
+            <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$bestTradeValidFromGlobal">
+              <param name="trade" value="$bestTrade"/>
+              <param name="minScore" value="0"/>
+            </run_actions>
+            <do_if value="not $bestTradeValidFromGlobal">
+              <!-- bestTrade from global is invalid - clear it so fallback can fix it -->
+              <set_value name="$bestTrade" exact="null"/>
+              <set_value name="$bestScore" exact="0"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ bestTrade from global.$GT_SearchResult is INVALID - cleared for fallback fix'" chance="100"/>
+              </do_if>
+            </do_if>
+            
             <do_if value="global.$GT_SearchResult.$StationsEvaluated?">
               <set_value name="$stationsEvaluated" exact="global.$GT_SearchResult.$StationsEvaluated"/>
             </do_if>
@@ -675,33 +707,32 @@
         
         <!-- ✅ CRITICAL FIX: If tradeList exists but bestTrade is null, select best from list -->
         <!-- This can happen during continuation if BestTrade wasn't stored in global -->
-        <!-- ✅ FIX: Check both existence AND null (MD ? operator only checks existence, not null) -->
+        <!-- ✅ FIX: Use strict validation (library function) instead of weak Score-only check -->
         <set_value name="$bestTradeIsValid" exact="false"/>
-        <do_if value="$bestTrade?">
-          <set_value name="$testScore" exact="@$bestTrade.$Score"/>
-          <do_if value="$testScore?">
-            <set_value name="$bestTradeIsValid" exact="true"/>
-          </do_if>
-        </do_if>
+        <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$bestTradeIsValid">
+          <param name="trade" value="$bestTrade"/>
+          <param name="minScore" value="0"/>
+        </run_actions>
         
         <do_if value="not $bestTradeIsValid">
+          <!-- ✅ FIX: Use library function for consistent validation -->
           <do_if value="$tradeList? and $tradeList.count? and $tradeList.count gt 0">
-            <!-- Select first trade from sorted list (highest score after sorting) -->
-            <set_value name="$firstTrade" exact="@$tradeList.{0}"/>
-            <set_value name="$firstTradeValid" exact="false"/>
-            <do_if value="$firstTrade?">
-              <set_value name="$testScore" exact="@$firstTrade.$Score"/>
-              <do_if value="$testScore?">
-                <set_value name="$firstTradeValid" exact="true"/>
+            <do_all exact="$tradeList.count" counter="$i">
+              <set_value name="$firstTrade" exact="@$tradeList.{$i}"/>
+              <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$firstTradeValid">
+                <param name="trade" value="$firstTrade"/>
+                <param name="minScore" value="0"/>
+              </run_actions>
+              <do_if value="$firstTradeValid">
+                <set_value name="$testScore" exact="@$firstTrade.$Score"/>
+                <set_value name="$bestTrade" exact="$firstTrade"/>
+                <set_value name="$bestScore" exact="$testScore"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ bestTrade was null but tradeList has ' + $tradeList.count + ' trades - selected valid trade[' + $i + '] as bestTrade'" chance="100"/>
+                </do_if>
+                <break/>
               </do_if>
-            </do_if>
-            <do_if value="$firstTradeValid">
-              <set_value name="$bestTrade" exact="$firstTrade"/>
-              <set_value name="$bestScore" exact="$firstTrade.$Score"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ bestTrade was null but tradeList has ' + $tradeList.count + ' trades - selected first trade as bestTrade'" chance="100"/>
-              </do_if>
-            </do_if>
+            </do_all>
           </do_if>
         </do_if>
         
@@ -752,20 +783,24 @@
               <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚠️ Attempting to select valid trade from tradeList (' + $tradeList.count + ' trades available)'" chance="100"/>
               <do_all exact="$tradeList.count" counter="$i">
                 <set_value name="$candidateTrade" exact="$tradeList.{$i}"/>
-                <set_value name="$candidateBuyOffer" exact="@$candidateTrade.$BuyOffer"/>
-                <set_value name="$candidateSellOffer" exact="@$candidateTrade.$SellOffer"/>
-                <set_value name="$candidateScore" exact="@$candidateTrade.$Score"/>
-                <do_if value="$candidateBuyOffer? and $candidateSellOffer? and $candidateScore? and $candidateScore gt 0">
-                  <set_value name="$candidateWare" exact="@$candidateBuyOffer.ware"/>
-                  <do_if value="$candidateWare?">
-                    <set_value name="$bestTrade" exact="$candidateTrade"/>
-                    <set_value name="$bestScore" exact="$candidateScore"/>
-                    <set_value name="$bestTradeIsValidForExecution" exact="true"/>
-                    <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ Selected valid trade from tradeList[' + $i + '] (Score: ' + $candidateScore + ')'" chance="100"/>
-                    <break/>
-                  </do_if>
+                <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$candidateValid">
+                  <param name="trade" value="$candidateTrade"/>
+                  <param name="minScore" value="0"/>
+                </run_actions>
+                <do_if value="$candidateValid">
+                  <set_value name="$candidateScore" exact="@$candidateTrade.$Score"/>
+                  <set_value name="$bestTrade" exact="$candidateTrade"/>
+                  <set_value name="$bestScore" exact="$candidateScore"/>
+                  <set_value name="$bestTradeIsValidForExecution" exact="true"/>
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ✅ Selected valid trade from tradeList[' + $i + '] (Score: ' + $candidateScore + ')'" chance="100"/>
+                  <break/>
                 </do_if>
               </do_all>
+            </do_if>
+            <!-- ✅ FIX: If still invalid after all fallbacks, signal no trade found -->
+            <do_if value="not $bestTradeIsValidForExecution">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ❌ No valid trades found in tradeList (' + (if $tradeList? and $tradeList.count? then $tradeList.count else 0) + ' entries) - all trades invalid'" chance="100"/>
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             </do_if>
           </do_else>
         </do_if>
@@ -974,11 +1009,10 @@
             '\n  TotalTradesFromResume: ' + $totalTradesFromResume" 
             chance="100"/>
           
-          <!-- Extract sector name safely -->
-          <set_value name="$sectorNameForStorage" exact="@$ship.sector.knownname"/>
-          <do_if value="not $sectorNameForStorage?">
-            <set_value name="$sectorNameForStorage" exact="'Unknown Sector'"/>
-          </do_if>
+          <!-- Extract sector name safely (using library function) -->
+          <run_actions ref="md.GT_Utilities.GT_GetSectorNameSafe" result="$sectorNameForStorage">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <!-- Store per-ship to prevent overwrites by other ships' searches -->
           <do_if value="not global.$GT_SearchResult.$LastRejectionStats?">
@@ -1075,44 +1109,10 @@
         <set_value name="$bestScore" exact="0"/>
         <set_value name="$foundCachedTrade" exact="false"/>
         
-        <!-- ===== DETERMINE HOME SECTOR (same logic as live search) ===== -->
-        <set_value name="$homeBase" exact="null"/>
-        <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$HomeBase?">
-          <set_value name="$homeBase" exact="global.$GT_AIParameters.{$ship}.$HomeBase"/>
-        </do_if>
-        
-        <!-- Fallback chain -->
-        <do_if value="not $homeBase? or not $homeBase.exists">
-          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
-          <do_if value="not $homeBase? or not $homeBase.exists">
-            <set_value name="$homeBase" exact="$ship.sector"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Extract sector -->
-        <do_if value="$homeBase.isclass.station">
-          <set_value name="$homeSector" exact="$homeBase.sector"/>
-        </do_if>
-        <do_elseif value="$homeBase.isclass.sector">
-          <set_value name="$homeSector" exact="$homeBase"/>
-        </do_elseif>
-        <do_else>
-          <set_value name="$homeSector" exact="$ship.sector"/>
-        </do_else>
-        
-        <!-- Validate -->
-        <do_if value="not $homeSector? or not $homeSector.exists">
-          <set_value name="$homeSector" exact="$ship.sector"/>
-        </do_if>
-        
-        <!-- DEBUG: Log home sector determination -->
-        <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
-          <debug_text text="'[GT-Cache-DEBUG] (' + $ship.idcode + ') Home sector resolution:' + 
-            '\n  HomeBase: ' + @$homeBase.knownname + 
-            '\n  HomeSector: ' + @$homeSector.knownname + 
-            '\n  Ship current sector: ' + @$ship.sector.knownname" 
-            chance="100"/>
-        </do_if>
+        <!-- ===== DETERMINE HOME SECTOR (using library function) ===== -->
+        <run_actions ref="md.GT_Utilities.GT_GetHomeSector" result="$homeSector">
+          <param name="ship" value="$ship"/>
+        </run_actions>
         
         <!-- Cache age check removed - not needed, individual entries have $Timestamp -->
         <set_value name="$cacheAge" exact="0s"/>
@@ -1124,9 +1124,23 @@
         </do_if>
         
         <!-- ✅ CACHE REPLENISHMENT: Force live search if cache too small -->
+        <!-- ✅ DIAGNOSTIC: Check if cache is disabled first -->
+        <do_if value="not global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? or not global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
+            <debug_text text="'[GT-Cache-DIAG] ⚠ Cache is DISABLED (global.$GT_GlobalSettings.$Fleet.$EnableTradeCache = false) - cannot use cache'" chance="100"/>
+          </do_if>
+        </do_if>
         <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.count lt 10">
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
             <debug_text text="'[GT-Cache] ⚠ Cache too small (' + global.$GT_TradeCache.count + ' entries) - forcing live search to replenish'" chance="100"/>
+            <!-- ✅ DIAGNOSTIC: If cache is enabled but empty, log threshold info -->
+            <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache and global.$GT_TradeCache.count == 0">
+              <set_value name="$cacheThreshold" exact="20"/>
+              <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+                <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+              </do_if>
+              <debug_text text="'[GT-Cache-DIAG] Cache is empty but enabled - threshold is ' + ($cacheThreshold/1) + '% ROI (check batch processor logs for why trades are rejected)'" chance="100"/>
+            </do_if>
           </do_if>
           
           <!-- Return empty result via global variable to trigger live search -->
@@ -1313,17 +1327,18 @@
               2. Reachability check: Can ship reach it from current position? (basic connectivity)
             -->
             
-            <!-- STAGE 1: Range check from home base (no blacklist) -->
+            <!-- STAGE 1: Range check from home base (no blacklist) - using library function -->
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculateTradeRouteDistance" result="$totalRangeDistance">
+              <param name="homeSector" value="$homeSector"/>
+              <param name="buyStation" value="$cacheEntry.$BuyOffer.owner"/>
+              <param name="sellStation" value="$cacheEntry.$SellOffer.owner"/>
+            </run_actions>
+            <!-- Extract individual distances for validation (backwards compatible) -->
             <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
-            
-            <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
-              <set_value name="$rangeCheckSell" exact="0"/>
-            </do_if>
-            <do_else>
+            <set_value name="$rangeCheckSell" exact="0"/>
+            <do_if value="$cacheEntry.$BuyOffer.owner.sector != $cacheEntry.$SellOffer.owner.sector">
               <set_value name="$rangeCheckSell" exact="$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
-            </do_else>
-            
-            <set_value name="$totalRangeDistance" exact="$rangeCheckBuy + $rangeCheckSell"/>
+            </do_if>
             
             <!-- Skip if outside operational range -->
             <do_if value="$rangeCheckBuy lt 0 or $rangeCheckSell lt 0 or $totalRangeDistance gt $maxDistance">
@@ -1708,8 +1723,11 @@
                   
                   <!-- ✅ CORRECT LOGIC: Calculate fresh ROI and check relative percentage drop -->
                   <do_if value="$freshProfit gt 0">
-                    <!-- Calculate fresh ROI as percentage -->
-                    <set_value name="$freshROI" exact="(($freshSellPrice - $freshBuyPrice) * 100) / $freshBuyPrice"/>
+                    <!-- Calculate fresh ROI as percentage (using library function) -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateROIFromPrices" result="$freshROI">
+                      <param name="buyPrice" value="$freshBuyPrice"/>
+                      <param name="sellPrice" value="$freshSellPrice"/>
+                    </run_actions>
                     
                     <!-- Get cache threshold from global settings (default 20%) -->
                     <set_value name="$cacheThreshold" exact="20"/>
@@ -1784,9 +1802,16 @@
                       </do_if>
                       
                       <!-- Also track best trade for backward compatibility -->
+                      <!-- ✅ FIX: Validate trade before setting bestTrade for consistency -->
                       <do_if value="$efficiency gt $bestScore">
-                        <set_value name="$bestScore" exact="$efficiency"/>
-                        <set_value name="$bestTrade" exact="$trade"/>
+                        <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$isValid">
+                          <param name="trade" value="$trade"/>
+                          <param name="minScore" value="0"/>
+                        </run_actions>
+                        <do_if value="$isValid">
+                          <set_value name="$bestScore" exact="$efficiency"/>
+                          <set_value name="$bestTrade" exact="$trade"/>
+                        </do_if>
                       </do_if>
                       
                       <set_value name="$foundCachedTrade" exact="true"/>
@@ -2048,12 +2073,18 @@
             <!-- Single item or empty: no sort needed -->
             
             <!-- Update bestTrade and bestScore from diverse list for backward compatibility -->
+            <!-- ✅ FIX: Use library function for consistent validation -->
             <set_value name="$bestTrade" exact="null"/>
             <set_value name="$bestScore" exact="0"/>
             <do_all exact="$tradeList.count" counter="$i">
               <set_value name="$trade" exact="$tradeList.{$i}"/>
-              <do_if value="$trade.$Score gt $bestScore">
-                <set_value name="$bestScore" exact="$trade.$Score"/>
+              <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$isValid">
+                <param name="trade" value="$trade"/>
+                <param name="minScore" value="$bestScore"/>
+              </run_actions>
+              <do_if value="$isValid">
+                <set_value name="$testScore" exact="@$trade.$Score"/>
+                <set_value name="$bestScore" exact="$testScore"/>
                 <set_value name="$bestTrade" exact="$trade"/>
               </do_if>
             </do_all>
@@ -2252,10 +2283,16 @@
             wares="$wareBasket" 
             multiple="true">
             <match_seller tradesknownto="$ship.owner">
+              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_seller>
-            <relativeprice max="0.5"/>  <!-- Only reasonably priced offers -->
+            <relativeprice max="0.0"/>  <!-- Only offers at average price or below (was 0.5 - too lenient) -->
+            <amount min="100"/>  <!-- Only offers with at least 100 items -->
+            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_sell_offer>
         </do_if>
         <do_else>
@@ -2266,10 +2303,16 @@
             result="$allSellOffers" 
             multiple="true">
             <match_seller tradesknownto="$ship.owner">
+              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_seller>
-            <relativeprice max="0.5"/>
+            <relativeprice max="0.0"/>  <!-- Only offers at average price or below (was 0.5 - too lenient) -->
+            <amount min="100"/>  <!-- Only offers with at least 100 items -->
+            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_sell_offer>
         </do_else>
         
@@ -2283,9 +2326,16 @@
             wares="$wareBasket" 
             multiple="true">
             <match_buyer tradesknownto="$ship.owner">
+              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_buyer>
+            <relativeprice min="0.0"/>  <!-- Only buy offers paying at least average price (was 1.0 = 100% above avg - too strict!) -->
+            <amount min="100"/>  <!-- Only offers with at least 100 items -->
+            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_buy_offer>
         </do_if>
         <do_else>
@@ -2295,9 +2345,16 @@
             result="$allBuyOffers" 
             multiple="true">
             <match_buyer tradesknownto="$ship.owner">
+              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_buyer>
+            <relativeprice min="0.0"/>  <!-- Only buy offers paying at least average price (was 1.0 = 100% above avg - too strict!) -->
+            <amount min="100"/>  <!-- Only offers with at least 100 items -->
+            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_buy_offer>
         </do_else>
         
@@ -2314,11 +2371,93 @@
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
           <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ NATIVE ACTIONS: Collected ' + $allSellOffers.count + ' sell + ' + $allBuyOffers.count + ' buy offers (instant C++ query)'" chance="100"/>
+          <!-- ✅ DIAGNOSTIC: If native query returns 0 offers, test with minimal filters to find blocker -->
+          <do_if value="$offersFound == 0">
+            <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') ⚠️ Native query returned 0 offers with filters: dockable=true, enemy=false, amount≥100, totalvolume≥100, sellPrice≤average, buyPrice≥average'" chance="100"/>
+            <!-- Test query with ONLY tradesknownto (no other filters) to see if offers exist -->
+            <set_value name="$testSellOffers" exact="[]"/>
+            <set_value name="$testBuyOffers" exact="[]"/>
+            <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$testSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner"/>
+              <!-- NO other filters - just test if offers exist -->
+            </find_sell_offer>
+            <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$testBuyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner"/>
+              <!-- NO other filters - just test if offers exist -->
+            </find_buy_offer>
+            <set_value name="$testOffersFound" exact="$testSellOffers.count + $testBuyOffers.count"/>
+            <do_if value="$testOffersFound gt 0">
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') ✅ Found ' + $testOffersFound + ' offers with MINIMAL filters (tradesknownto only) - testing individual filters...'" chance="100"/>
+              
+              <!-- Test 1: tradesknownto + dock (no enemy, no relativeprice) -->
+              <set_value name="$test1Sell" exact="[]"/>
+              <set_value name="$test1Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test1Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                </match_seller>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test1Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                </match_buyer>
+              </find_buy_offer>
+              <set_value name="$test1Found" exact="$test1Sell.count + $test1Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 1 (tradesknownto+dock): ' + $test1Found + ' offers'" chance="100"/>
+              
+              <!-- Test 2: tradesknownto + dock + enemy (no relativeprice) -->
+              <set_value name="$test2Sell" exact="[]"/>
+              <set_value name="$test2Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test2Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test2Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+              </find_buy_offer>
+              <set_value name="$test2Found" exact="$test2Sell.count + $test2Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 2 (+enemy filter): ' + $test2Found + ' offers'" chance="100"/>
+              
+              <!-- Test 3: tradesknownto + dock + enemy + relativeprice -->
+              <set_value name="$test3Sell" exact="[]"/>
+              <set_value name="$test3Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test3Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <relativeprice max="0.0"/>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test3Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <relativeprice min="0.0"/>
+              </find_buy_offer>
+              <set_value name="$test3Found" exact="$test3Sell.count + $test3Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 3 (+relativeprice): ' + $test3Found + ' offers (BLOCKING FILTER IDENTIFIED!)'" chance="100"/>
+              
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') ❌ Even MINIMAL query (tradesknownto only) returns 0 offers - ship may not know about any stations'" chance="100"/>
+            </do_else>
+          </do_if>
         </do_if>
         
         <!-- ✅ UNIVERSAL CACHE: Native actions filtered by:
              - known stations (tradesknownto)
-             - price (relativeprice max=0.5)
+             - docking relation (match_relation_to dock) - only dockable stations
+             - faction relations (match_relation_to enemy not) - exclude enemy factions
+             - sell price (relativeprice max=0.0) - average price or below (was 0.5 - too lenient)
+             - buy price (relativeprice min=0.0) - at least average selling price (was 1.0 - too strict!)
+             - amount (min=100) - minimum 100 items
+             - total volume (min=100) - minimum total trade volume
              ❌ NO blacklist filtering (ship-specific, applied at retrieval)
              ❌ NO illegal ware filtering (ship-specific, applied at retrieval)
              ✅ Distance range filtering only (universal validation)
@@ -3513,10 +3652,16 @@
         </do_elseif>
         <do_else>
           <!-- Fallback: Find best from diverse list -->
+          <!-- ✅ FIX: Use library function for consistent validation -->
           <do_all exact="$diverseList.count" counter="$i">
             <set_value name="$trade" exact="$diverseList.{$i}"/>
-            <do_if value="$trade.$Score gt $bestScore">
-              <set_value name="$bestScore" exact="$trade.$Score"/>
+            <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$isValid">
+              <param name="trade" value="$trade"/>
+              <param name="minScore" value="$bestScore"/>
+            </run_actions>
+            <do_if value="$isValid">
+              <set_value name="$testScore" exact="@$trade.$Score"/>
+              <set_value name="$bestScore" exact="$testScore"/>
               <set_value name="$bestTrade" exact="$trade"/>
             </do_if>
           </do_all>
