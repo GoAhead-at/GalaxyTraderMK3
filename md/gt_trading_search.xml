@@ -556,16 +556,22 @@
             <set_value name="$searchMethod" exact="'live'"/>
           </do_if>
           <do_else>
-            <!-- Cooldown active - skip live search, return empty results -->
+            <!-- Cooldown active - skip live search -->
             <!-- CRITICAL: Don't clear results if we're using live search continuation (results already set above) -->
+            <!-- CRITICAL: Preserve cache tradeList even if bestTrade was invalid (fallback can find valid trade from list) -->
             <do_if value="not $isLiveSearchContinuation">
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping live search due to cooldown - returning empty results'" chance="100"/>
+                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping live search due to cooldown - preserving cache results (bestTrade may be null, tradeList.count=' + (if $tradeList? and $tradeList.count? then $tradeList.count else 0) + ')'" chance="100"/>
               </do_if>
               <set_value name="$searchMethod" exact="'cache'"/>
-              <set_value name="$bestTrade" exact="null"/>
-              <set_value name="$bestScore" exact="0"/>
-              <set_value name="$tradeList" exact="[]"/>
+              <!-- Only clear bestTrade if it was invalid (already cleared above), but preserve tradeList from cache -->
+              <!-- bestTrade will be selected from tradeList by fallback logic if needed -->
+              <do_if value="not $bestTrade? or not $bestTrade.$BuyOffer?">
+                <set_value name="$bestTrade" exact="null"/>
+                <set_value name="$bestScore" exact="0"/>
+              </do_if>
+              <!-- Preserve tradeList from cache - don't overwrite with empty list! -->
+              <!-- Fallback logic will try to find valid trade from tradeList -->
             </do_if>
           </do_else>
           
@@ -2784,7 +2790,105 @@
         <set_value name="$intraSectorTradesFiltered" exact="0"/>
         <set_value name="$intraSectorTradesValid" exact="0"/>
         
-        <do_all exact="$tradeList.count" counter="$i">
+        <!-- ✅ OPTIMIZATION #11: Parallel Filtering with Cooperative Multitasking -->
+        <!-- Process trades in batches to prevent blocking the game engine -->
+        <!-- This prevents frame stutter when filtering large trade lists (100+ trades) -->
+        <!-- Store filtering state in global table (persists across cue instances) -->
+        <do_if value="not global.$GT_FilterState?">
+          <set_value name="global.$GT_FilterState" exact="table[]"/>
+        </do_if>
+        
+        <!-- Initialize filter state for this ship -->
+        <!-- Include batch processor results variables (from SearchLiveTrades_Resume) -->
+        <set_value name="$filterState" exact="table[
+          $ship = $ship,
+          $tradeList = $tradeList,
+          $wareBasket = $wareBasket,
+          $allowIllegal = $allowIllegal,
+          $blacklistgroup = $blacklistgroup,
+          $currentSector = $currentSector,
+          $gatedistanceCache = $gatedistanceCache,
+          $filteredTradeList = $filteredTradeList,
+          $filteredByWareBasket = $filteredByWareBasket,
+          $filteredByIllegal = $filteredByIllegal,
+          $filteredByBlacklist = $filteredByBlacklist,
+          $filteredByPathBlocked = $filteredByPathBlocked,
+          $tradesByWareStats = $tradesByWareStats,
+          $intraSectorTradesTotal = $intraSectorTradesTotal,
+          $intraSectorTradesFiltered = $intraSectorTradesFiltered,
+          $intraSectorTradesValid = $intraSectorTradesValid,
+          $filterIndex = 0,
+          $filterBatchSize = 15,
+          $maxDistance = $maxDistance,
+          $crossStationBestTrade = $crossStationBestTrade,
+          $crossStationBestScore = $crossStationBestScore,
+          $nonConflictedBestTrade = $nonConflictedBestTrade,
+          $nonConflictedBestScore = $nonConflictedBestScore,
+          $tradesRejectedProfit = $tradesRejectedProfit,
+          $tradesRejectedDocking = $tradesRejectedDocking,
+          $tradesRejectedAmount = $tradesRejectedAmount,
+          $tradesRejectedDistance = $tradesRejectedDistance,
+          $bestRejectedTrade = $bestRejectedTrade
+        ]"/>
+        <set_value name="global.$GT_FilterState.{$ship}" exact="$filterState"/>
+        
+        <!-- Signal batch filtering cue to start processing -->
+        <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Batch" param="$ship"/>
+        
+        <!-- Wait for batch filtering to complete (resume cue will signal back) -->
+        <!-- Note: We'll resume in FilterTradeList_Resume cue -->
+        <!-- Cancel this cue - resume cue will continue processing -->
+        <cancel_cue cue="this"/>
+      </actions>
+    </cue>
+    
+    <!-- ✅ OPTIMIZATION #11: Batch Trade Filtering with Cooperative Multitasking -->
+    <cue name="FilterTradeList_Batch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="1ms"/>  <!-- Cooperative multitasking: yield control between batches -->
+      <actions>
+        <set_value name="$ship" exact="event.param"/>
+        
+        <!-- Retrieve state from global table -->
+        <set_value name="$filterState" exact="@global.$GT_FilterState.{$ship}"/>
+        <do_if value="not $filterState?">
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Extract state variables -->
+        <set_value name="$tradeList" exact="$filterState.$tradeList"/>
+        <set_value name="$wareBasket" exact="$filterState.$wareBasket"/>
+        <set_value name="$allowIllegal" exact="$filterState.$allowIllegal"/>
+        <set_value name="$blacklistgroup" exact="$filterState.$blacklistgroup"/>
+        <set_value name="$currentSector" exact="$filterState.$currentSector"/>
+        <set_value name="$gatedistanceCache" exact="$filterState.$gatedistanceCache"/>
+        <set_value name="$filterIndex" exact="$filterState.$filterIndex"/>
+        <set_value name="$filterBatchSize" exact="$filterState.$filterBatchSize"/>
+        
+        <!-- Get mutable lists/stats from state (or initialize if first batch) -->
+        <set_value name="$filteredTradeList" exact="@$filterState.$filteredTradeList"/>
+        <do_if value="not $filteredTradeList?">
+          <set_value name="$filteredTradeList" exact="[]"/>
+        </do_if>
+        <set_value name="$filteredByWareBasket" exact="@$filterState.$filteredByWareBasket"/>
+        <set_value name="$filteredByIllegal" exact="@$filterState.$filteredByIllegal"/>
+        <set_value name="$filteredByBlacklist" exact="@$filterState.$filteredByBlacklist"/>
+        <set_value name="$filteredByPathBlocked" exact="@$filterState.$filteredByPathBlocked"/>
+        <set_value name="$tradesByWareStats" exact="@$filterState.$tradesByWareStats"/>
+        <do_if value="not $tradesByWareStats?">
+          <set_value name="$tradesByWareStats" exact="table[]"/>
+        </do_if>
+        <set_value name="$intraSectorTradesTotal" exact="@$filterState.$intraSectorTradesTotal"/>
+        <set_value name="$intraSectorTradesFiltered" exact="@$filterState.$intraSectorTradesFiltered"/>
+        <set_value name="$intraSectorTradesValid" exact="@$filterState.$intraSectorTradesValid"/>
+        
+        <!-- Process one batch of trades -->
+        <set_value name="$filterTotalTrades" exact="$tradeList.count"/>
+        <set_value name="$batchEnd" exact="[$filterIndex + $filterBatchSize, $filterTotalTrades].min"/>
+        <do_all exact="$batchEnd - $filterIndex" counter="$batchOffset">
+          <set_value name="$i" exact="$filterIndex + $batchOffset"/>
           <set_value name="$trade" exact="$tradeList.{$i}"/>
           <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
           
@@ -2795,11 +2899,11 @@
           <set_value name="$wareStats" exact="$tradesByWareStats.{$ware}"/>
           <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
           
-          <!-- ✅ Extract sectors early for intra-sector trade detection -->
+          <!-- Extract sectors early for intra-sector trade detection -->
           <set_value name="$buySector" exact="@$trade.$BuyStation.sector"/>
           <set_value name="$sellSector" exact="@$trade.$SellStation.sector"/>
           
-          <!-- Track if this is a TRUE intra-sector trade (both buy AND sell in current sector) -->
+          <!-- Track if this is a TRUE intra-sector trade -->
           <run_actions ref="md.GT_Trade_Utilities.GT_IsIntraSectorTrade" result="$isIntraSectorTrade">
             <param name="buySector" value="$buySector"/>
             <param name="sellSector" value="$sellSector"/>
@@ -2809,7 +2913,7 @@
             <set_value name="$intraSectorTradesTotal" exact="$intraSectorTradesTotal + 1"/>
           </do_if>
           
-          <!-- Filter trade for ship (ware basket, illegal, blacklist, path availability) -->
+          <!-- Filter trade for ship -->
           <run_actions ref="md.GT_Trade_Utilities.GT_FilterTradeForShip" result="$filterResult">
             <param name="trade" value="$trade"/>
             <param name="ship" value="$ship"/>
@@ -2828,7 +2932,6 @@
           <set_value name="$isAllowed" exact="$filterResult.$IsAllowed"/>
           <set_value name="$filterReason" exact="$filterResult.$FilterReason"/>
           <do_if value="not $isAllowed">
-            <!-- Update global filter counters -->
             <do_if value="$filterReason == 'ware_basket'">
               <set_value name="$filteredByWareBasket" exact="$filteredByWareBasket + 1"/>
             </do_if>
@@ -2841,7 +2944,6 @@
             <do_elseif value="$filterReason == 'path_blocked'">
               <set_value name="$filteredByPathBlocked" exact="$filteredByPathBlocked + 1"/>
             </do_elseif>
-            <!-- Track if intra-sector trade was filtered -->
             <do_if value="$isIntraSectorTrade">
               <set_value name="$intraSectorTradesFiltered" exact="$intraSectorTradesFiltered + 1"/>
             </do_if>
@@ -2851,13 +2953,11 @@
           <do_if value="$isAllowed">
             <append_to_list name="$filteredTradeList" exact="$trade"/>
             <set_value name="$wareStats.$valid" exact="$wareStats.$valid + 1"/>
-            <!-- Track if intra-sector trade is valid -->
             <do_if value="$isIntraSectorTrade">
               <set_value name="$intraSectorTradesValid" exact="$intraSectorTradesValid + 1"/>
             </do_if>
           </do_if>
           <do_else>
-            <!-- Track if intra-sector trade was filtered (for any reason) -->
             <do_if value="$isIntraSectorTrade">
               <set_value name="$intraSectorTradesFiltered" exact="$intraSectorTradesFiltered + 1"/>
             </do_if>
@@ -2866,6 +2966,93 @@
           <!-- Update ware stats -->
           <set_value name="$tradesByWareStats.{$ware}" exact="$wareStats"/>
         </do_all>
+        
+        <!-- Update state for next batch or completion -->
+        <set_value name="$filterIndex" exact="$batchEnd"/>
+        <set_value name="$filterState.$filterIndex" exact="$filterIndex"/>
+        <set_value name="$filterState.$filteredTradeList" exact="$filteredTradeList"/>
+        <set_value name="$filterState.$filteredByWareBasket" exact="$filteredByWareBasket"/>
+        <set_value name="$filterState.$filteredByIllegal" exact="$filteredByIllegal"/>
+        <set_value name="$filterState.$filteredByBlacklist" exact="$filteredByBlacklist"/>
+        <set_value name="$filterState.$filteredByPathBlocked" exact="$filteredByPathBlocked"/>
+        <set_value name="$filterState.$tradesByWareStats" exact="$tradesByWareStats"/>
+        <set_value name="$filterState.$intraSectorTradesTotal" exact="$intraSectorTradesTotal"/>
+        <set_value name="$filterState.$intraSectorTradesFiltered" exact="$intraSectorTradesFiltered"/>
+        <set_value name="$filterState.$intraSectorTradesValid" exact="$intraSectorTradesValid"/>
+        <set_value name="global.$GT_FilterState.{$ship}" exact="$filterState"/>
+        
+        <!-- Check if more batches needed -->
+        <do_if value="$filterIndex lt $filterTotalTrades">
+          <!-- Signal next batch -->
+          <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Batch" param="$ship"/>
+        </do_if>
+        <do_else>
+          <!-- All batches complete - signal resume cue to continue processing -->
+          <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Resume cue: Continue processing after batch filtering completes -->
+    <cue name="FilterTradeList_Resume" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param"/>
+        
+        <!-- Retrieve filtered results from global state -->
+        <set_value name="$filterState" exact="@global.$GT_FilterState.{$ship}"/>
+        <do_if value="not $filterState?">
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Extract all filtered results and statistics -->
+        <set_value name="$filteredTradeList" exact="$filterState.$filteredTradeList"/>
+        <set_value name="$filteredByWareBasket" exact="$filterState.$filteredByWareBasket"/>
+        <set_value name="$filteredByIllegal" exact="$filterState.$filteredByIllegal"/>
+        <set_value name="$filteredByBlacklist" exact="$filterState.$filteredByBlacklist"/>
+        <set_value name="$filteredByPathBlocked" exact="$filterState.$filteredByPathBlocked"/>
+        <set_value name="$tradesByWareStats" exact="$filterState.$tradesByWareStats"/>
+        <set_value name="$intraSectorTradesTotal" exact="$filterState.$intraSectorTradesTotal"/>
+        <set_value name="$intraSectorTradesFiltered" exact="$filterState.$intraSectorTradesFiltered"/>
+        <set_value name="$intraSectorTradesValid" exact="$filterState.$intraSectorTradesValid"/>
+        <set_value name="$tradeList" exact="$filterState.$tradeList"/>
+        <set_value name="$maxDistance" exact="$filterState.$maxDistance"/>
+        
+        <!-- Extract batch processor result variables -->
+        <set_value name="$crossStationBestTrade" exact="@$filterState.$crossStationBestTrade"/>
+        <set_value name="$crossStationBestScore" exact="@$filterState.$crossStationBestScore"/>
+        <set_value name="$nonConflictedBestTrade" exact="@$filterState.$nonConflictedBestTrade"/>
+        <set_value name="$nonConflictedBestScore" exact="@$filterState.$nonConflictedBestScore"/>
+        <set_value name="$tradesRejectedProfit" exact="@$filterState.$tradesRejectedProfit"/>
+        <set_value name="$tradesRejectedDocking" exact="@$filterState.$tradesRejectedDocking"/>
+        <set_value name="$tradesRejectedAmount" exact="@$filterState.$tradesRejectedAmount"/>
+        <set_value name="$tradesRejectedDistance" exact="@$filterState.$tradesRejectedDistance"/>
+        <set_value name="$bestRejectedTrade" exact="@$filterState.$bestRejectedTrade"/>
+        
+        <!-- Initialize to safe defaults if not set -->
+        <do_if value="not $tradesRejectedProfit?">
+          <set_value name="$tradesRejectedProfit" exact="0"/>
+        </do_if>
+        <do_if value="not $tradesRejectedDocking?">
+          <set_value name="$tradesRejectedDocking" exact="0"/>
+        </do_if>
+        <do_if value="not $tradesRejectedAmount?">
+          <set_value name="$tradesRejectedAmount" exact="0"/>
+        </do_if>
+        <do_if value="not $tradesRejectedDistance?">
+          <set_value name="$tradesRejectedDistance" exact="0"/>
+        </do_if>
+        <do_if value="not $crossStationBestScore?">
+          <set_value name="$crossStationBestScore" exact="0"/>
+        </do_if>
+        <do_if value="not $nonConflictedBestScore?">
+          <set_value name="$nonConflictedBestScore" exact="0"/>
+        </do_if>
+        
+        <!-- Clean up filter state -->
+        <remove_value name="global.$GT_FilterState.{$ship}"/>
         
         <!-- DEBUG: Log filtering statistics -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
