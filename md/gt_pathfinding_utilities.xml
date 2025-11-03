@@ -118,5 +118,144 @@
       </actions>
     </library>
     
+    <!-- Calculate Trade Path Distances (with escape logic) -->
+    <library name="GT_CalculateTradePathDistances" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship for pathfinding"/>
+        <param name="currentSector" comment="Ship's current sector"/>
+        <param name="buySector" comment="Buy station sector"/>
+        <param name="sellSector" comment="Sell station sector"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group"/>
+      </params>
+      <actions>
+        <!-- ✅ FIX: Handle same-sector cases first (ship already there = 0 distance) -->
+        <!-- If ship is in blacklisted sector, allow trades where ship stays in same sector OR escapes -->
+        <set_value name="$buyPathDistance" exact="-1"/>
+        <set_value name="$sellPathDistance" exact="-1"/>
+        
+        <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
+        <!-- Check if current sector is blacklisted for escape logic -->
+        <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklistedForEscape">
+          <param name="sector" value="$currentSector"/>
+          <param name="ship" value="$ship"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+        </run_actions>
+        
+        <!-- Buy path calculation -->
+        <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$buyPathDistance">
+          <param name="ship" value="$ship"/>
+          <param name="fromSector" value="$currentSector"/>
+          <param name="toSector" value="$buySector"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+          <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+        </run_actions>
+        
+        <!-- Sell path calculation -->
+        <!-- ✅ CRITICAL: If ship is in blacklisted sector and buy is same sector, use ship position (not buy sector) -->
+        <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
+        <do_if value="$sellSector == $buySector">
+          <!-- Buy and sell in same sector -->
+          <set_value name="$sellPathDistance" exact="0"/>
+        </do_if>
+        <do_elseif value="$sellSector == $currentSector">
+          <!-- ✅ ISOLATION FIX: Sell sector is current sector (intra-sector trade) - distance is 0 -->
+          <set_value name="$sellPathDistance" exact="0"/>
+        </do_elseif>
+        <do_elseif value="$buySector == $currentSector">
+          <!-- Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
+          <!-- This handles escape case: ship in blacklisted sector, staying there to buy, then selling in safe sector -->
+          <!-- ✅ ESCAPE LOGIC: If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
+          <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$sellPathDistance">
+            <param name="ship" value="$ship"/>
+            <param name="fromSector" value="$currentSector"/>
+            <param name="toSector" value="$sellSector"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+            <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+          </run_actions>
+        </do_elseif>
+        <do_else>
+          <!-- Normal case: Need to travel from buy to sell sector -->
+          <!-- Note: GT_CalculatePathDistance uses ship.gatedistance, but here we need buySector.gatedistance -->
+          <!-- For sector-to-sector distance, calculate manually -->
+          <do_if value="$buySector == $sellSector">
+            <set_value name="$sellPathDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellPathDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+          </do_else>
+        </do_else>
+        
+        <!-- Check if paths are reachable -->
+        <set_value name="$isReachable" exact="($buyPathDistance ge 0 and $sellPathDistance ge 0)"/>
+        
+        <!-- Check if intra-sector trade -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_IsIntraSectorTrade" result="$isIntraSectorTrade">
+          <param name="buySector" value="$buySector"/>
+          <param name="sellSector" value="$sellSector"/>
+          <param name="currentSector" value="$currentSector"/>
+        </run_actions>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$BuyPathDistance" exact="$buyPathDistance"/>
+        <set_value name="$result.$SellPathDistance" exact="$sellPathDistance"/>
+        <set_value name="$result.$IsReachable" exact="$isReachable"/>
+        <set_value name="$result.$IsIntraSectorTrade" exact="$isIntraSectorTrade"/>
+        <set_value name="$result.$CurrentSectorIsBlacklisted" exact="$currentSectorIsBlacklistedForEscape"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Build Station Distance Cache from Offers -->
+    <library name="GT_BuildStationDistanceCache" purpose="run_actions">
+      <params>
+        <param name="sellOffers" comment="List of sell offers"/>
+        <param name="buyOffers" comment="List of buy offers"/>
+        <param name="homeSector" comment="Home/base sector for distance calculation"/>
+      </params>
+      <actions>
+        <!-- Extract unique stations from offers -->
+        <set_value name="$sellStations" exact="[]"/>
+        <set_value name="$buyStations" exact="[]"/>
+        <set_value name="$sellStationsSeen" exact="table[]"/>
+        <set_value name="$buyStationsSeen" exact="table[]"/>
+        <do_all exact="$sellOffers.count" counter="$i">
+          <set_value name="$station" exact="$sellOffers.{$i}.owner"/>
+          <do_if value="not $sellStationsSeen.{$station}?">
+            <set_value name="$sellStationsSeen.{$station}" exact="true"/>
+            <append_to_list name="$sellStations" exact="$station"/>
+          </do_if>
+        </do_all>
+        <do_all exact="$buyOffers.count" counter="$i">
+          <set_value name="$station" exact="$buyOffers.{$i}.owner"/>
+          <do_if value="not $buyStationsSeen.{$station}?">
+            <set_value name="$buyStationsSeen.{$station}" exact="true"/>
+            <append_to_list name="$buyStations" exact="$station"/>
+          </do_if>
+        </do_all>
+        <!-- Calculate distance cache for sell stations -->
+        <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculateStationDistanceCache" result="$sellDistanceCache">
+          <param name="stations" value="$sellStations"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        <!-- Calculate distance cache for buy stations -->
+        <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculateStationDistanceCache" result="$buyDistanceCache">
+          <param name="stations" value="$buyStations"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        <!-- Merge caches -->
+        <set_value name="$stationDistanceCache" exact="table[]"/>
+        <do_all exact="$sellStations.count" counter="$i">
+          <set_value name="$station" exact="$sellStations.{$i}"/>
+          <set_value name="$stationDistanceCache.{$station}" exact="$sellDistanceCache.{$station}"/>
+        </do_all>
+        <do_all exact="$buyStations.count" counter="$i">
+          <set_value name="$station" exact="$buyStations.{$i}"/>
+          <set_value name="$stationDistanceCache.{$station}" exact="$buyDistanceCache.{$station}"/>
+        </do_all>
+        <return value="$stationDistanceCache"/>
+      </actions>
+    </library>
+    
   </cues>
 </mdscript>

@@ -234,5 +234,252 @@
       </actions>
     </library>
     
+    <!-- Sort Trades By Score (highest first) -->
+    <library name="GT_SortTradesByScore" purpose="run_actions">
+      <params>
+        <param name="tradeList" comment="List of trades to sort"/>
+      </params>
+      <actions>
+        <!-- ✅ OPTIMIZATION #5: Optimize sort for small lists (≤10 items: O(n) vs O(n²)) -->
+        <do_if value="$tradeList? and $tradeList.count gt 1">
+          <do_if value="$tradeList.count gt 10">
+            <!-- Large list: Full selection sort (necessary for proper ordering) -->
+            <set_value name="$sortedTradeList" exact="[]"/>
+            <set_value name="$remainingTrades" exact="$tradeList"/>
+            <do_all exact="$tradeList.count" counter="$sortIdx">
+              <set_value name="$maxScore" exact="-999999999"/>
+              <set_value name="$maxIdx" exact="-1"/>
+              <do_all exact="$remainingTrades.count" counter="$i">
+                <set_value name="$trade" exact="$remainingTrades.{$i}"/>
+                <set_value name="$tradeScore" exact="$trade.$Score"/>
+                <do_if value="$tradeScore gt $maxScore">
+                  <set_value name="$maxScore" exact="$tradeScore"/>
+                  <set_value name="$maxIdx" exact="$i"/>
+                </do_if>
+              </do_all>
+              <do_if value="$maxIdx ge 0">
+                <append_to_list name="$sortedTradeList" exact="$remainingTrades.{$maxIdx}"/>
+                <remove_value name="$remainingTrades.{$maxIdx}"/>
+              </do_if>
+            </do_all>
+            <set_value name="$tradeList" exact="$sortedTradeList"/>
+          </do_if>
+          <do_elseif value="$tradeList.count gt 1">
+            <!-- Small list (2-10): Single pass bubble-like sort (O(n²) but n is small) -->
+            <set_value name="$sortedTradeList" exact="$tradeList"/>
+            <!-- Single pass: swap adjacent elements if wrong order (n-1 comparisons) -->
+            <do_all exact="$tradeList.count - 1" counter="$pass">
+              <set_value name="$swapped" exact="false"/>
+              <do_all exact="$tradeList.count - 1 - $pass" counter="$i">
+                <set_value name="$currentScore" exact="$sortedTradeList.{$i}.$Score"/>
+                <set_value name="$nextScore" exact="$sortedTradeList.{$i + 1}.$Score"/>
+                <do_if value="$currentScore lt $nextScore">
+                  <!-- Swap -->
+                  <set_value name="$temp" exact="$sortedTradeList.{$i}"/>
+                  <set_value name="$sortedTradeList.{$i}" exact="$sortedTradeList.{$i + 1}"/>
+                  <set_value name="$sortedTradeList.{$i + 1}" exact="$temp"/>
+                  <set_value name="$swapped" exact="true"/>
+                </do_if>
+              </do_all>
+              <!-- Early exit if no swaps (already sorted) -->
+              <do_if value="not $swapped">
+                <break/>
+              </do_if>
+            </do_all>
+            <set_value name="$tradeList" exact="$sortedTradeList"/>
+          </do_elseif>
+          <!-- Single item or empty: no sort needed -->
+        </do_if>
+        <return value="$tradeList"/>
+      </actions>
+    </library>
+    
+    <!-- Filter Trade For Ship (ware basket, illegal, blacklist, path availability) -->
+    <library name="GT_FilterTradeForShip" purpose="run_actions">
+      <params>
+        <param name="trade" comment="Trade to filter"/>
+        <param name="ship" comment="Ship that would execute the trade"/>
+        <param name="ware" comment="Ware being traded"/>
+        <param name="wareBasket" comment="Allowed ware basket (empty = all wares allowed)"/>
+        <param name="allowIllegal" default="false" comment="Whether to allow illegal wares"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group"/>
+        <param name="currentSector" comment="Ship's current sector"/>
+        <param name="buySector" comment="Buy station sector"/>
+        <param name="sellSector" comment="Sell station sector"/>
+        <param name="filterStats" default="null" comment="Optional filter statistics table to update"/>
+        <param name="isIntraSectorTrade" default="false" comment="Whether this is an intra-sector trade"/>
+      </params>
+      <actions>
+        <!-- Initialize result -->
+        <set_value name="$isAllowed" exact="true"/>
+        <set_value name="$filterReason" exact="''"/>
+        
+        <!-- Ware basket check -->
+        <set_value name="$wareAllowed" exact="true"/>
+        <do_if value="$wareBasket.count gt 0">
+          <run_actions ref="md.GT_Utilities.GT_IsWareInBasket" result="$wareAllowed">
+            <param name="ware" value="$ware"/>
+            <param name="basket" value="$wareBasket"/>
+          </run_actions>
+          <do_if value="not $wareAllowed">
+            <set_value name="$isAllowed" exact="false"/>
+            <set_value name="$filterReason" exact="'ware_basket'"/>
+            <do_if value="$filterStats?">
+              <set_value name="$filterStats.$filteredByWareBasket" exact="$filterStats.$filteredByWareBasket + 1"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Illegal ware check -->
+        <do_if value="$wareAllowed and not $allowIllegal and @$ware.illegal">
+          <set_value name="$wareAllowed" exact="false"/>
+          <set_value name="$isAllowed" exact="false"/>
+          <set_value name="$filterReason" exact="'illegal'"/>
+          <do_if value="$filterStats?">
+            <set_value name="$filterStats.$filteredByIllegal" exact="$filterStats.$filteredByIllegal + 1"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Blacklist check -->
+        <set_value name="$isBlacklisted" exact="false"/>
+        <do_if value="$wareAllowed">
+          <!-- ✅ FIX: Block intra-sector trades in blacklisted sectors (force escape) -->
+          <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklisted">
+            <param name="sector" value="$currentSector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+          </run_actions>
+          <do_if value="$currentSectorIsBlacklisted">
+            <do_if value="$buySector == $currentSector and $sellSector == $currentSector">
+              <!-- Intra-sector trade in blacklisted sector - BLOCK to force escape -->
+              <set_value name="$isBlacklisted" exact="true"/>
+              <set_value name="$isAllowed" exact="false"/>
+              <set_value name="$filterReason" exact="'blacklist_intra'"/>
+              <do_if value="$filterStats?">
+                <set_value name="$filterStats.$filteredByBlacklist" exact="$filterStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Check buy station blacklist -->
+          <do_if value="not $isBlacklisted">
+            <set_value name="$buyStation" exact="@$trade.$BuyStation"/>
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsStationBlacklisted" result="$buyStationBlacklisted">
+              <param name="station" value="$buyStation"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <do_if value="$buyStationBlacklisted">
+              <set_value name="$isBlacklisted" exact="true"/>
+              <set_value name="$isAllowed" exact="false"/>
+              <set_value name="$filterReason" exact="'blacklist_buy_station'"/>
+              <do_if value="$filterStats?">
+                <set_value name="$filterStats.$filteredByBlacklist" exact="$filterStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Check sell station blacklist -->
+          <do_if value="not $isBlacklisted">
+            <set_value name="$sellStation" exact="@$trade.$SellStation"/>
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsStationBlacklisted" result="$sellStationBlacklisted">
+              <param name="station" value="$sellStation"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <do_if value="$sellStationBlacklisted">
+              <set_value name="$isBlacklisted" exact="true"/>
+              <set_value name="$isAllowed" exact="false"/>
+              <set_value name="$filterReason" exact="'blacklist_sell_station'"/>
+              <do_if value="$filterStats?">
+                <set_value name="$filterStats.$filteredByBlacklist" exact="$filterStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Check buy sector blacklist -->
+          <do_if value="not $isBlacklisted">
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$buySectorBlacklisted">
+              <param name="sector" value="$buySector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <do_if value="$buySectorBlacklisted">
+              <set_value name="$isBlacklisted" exact="true"/>
+              <set_value name="$isAllowed" exact="false"/>
+              <set_value name="$filterReason" exact="'blacklist_buy_sector'"/>
+              <do_if value="$filterStats?">
+                <set_value name="$filterStats.$filteredByBlacklist" exact="$filterStats.$filteredByBlacklist + 1"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Check sell sector blacklist -->
+          <do_if value="not $isBlacklisted">
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$sellSectorBlacklisted">
+              <param name="sector" value="$sellSector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <do_if value="$sellSectorBlacklisted">
+              <do_if value="$sellSector != $currentSector">
+                <!-- Ship needs to travel TO a blacklisted sector - BLOCK -->
+                <set_value name="$isBlacklisted" exact="true"/>
+                <set_value name="$isAllowed" exact="false"/>
+                <set_value name="$filterReason" exact="'blacklist_sell_sector'"/>
+                <do_if value="$filterStats?">
+                  <set_value name="$filterStats.$filteredByBlacklist" exact="$filterStats.$filteredByBlacklist + 1"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Path availability check -->
+          <do_if value="not $isBlacklisted">
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculateTradePathDistances" result="$pathResult">
+              <param name="ship" value="$ship"/>
+              <param name="currentSector" value="$currentSector"/>
+              <param name="buySector" value="$buySector"/>
+              <param name="sellSector" value="$sellSector"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            
+            <!-- Debug logging (if enabled) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <do_if value="$pathResult.$IsIntraSectorTrade or not $pathResult.$IsReachable">
+                <set_value name="$buySectorName" exact="@$buySector.knownname"/>
+                <set_value name="$sellSectorName" exact="@$sellSector.knownname"/>
+                <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                <set_value name="$wareName" exact="@$ware.name"/>
+                <set_value name="$tradeType" exact="if $pathResult.$IsIntraSectorTrade then 'INTRA-SECTOR' else 'CROSS-SECTOR'"/>
+                <debug_text text="'[GT-Resume] ' + $ship.idcode + ': ' + $tradeType + ' trade (' + $wareName + '):' +
+                  '\n  Current sector: ' + $currentSectorName + ' (blacklisted: ' + $pathResult.$CurrentSectorIsBlacklisted + ')' +
+                  '\n  Buy sector: ' + $buySectorName + ' (distance: ' + $pathResult.$BuyPathDistance + ', same as current: ' + ($buySector == $currentSector) + ')' +
+                  '\n  Sell sector: ' + $sellSectorName + ' (distance: ' + $pathResult.$SellPathDistance + ', same as buy: ' + ($sellSector == $buySector) + ', same as current: ' + ($sellSector == $currentSector) + ')' +
+                  (if not $pathResult.$IsReachable then ' [PATH BLOCKED]' else '')"
+                  chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Block if paths are unreachable -->
+            <do_if value="not $pathResult.$IsReachable">
+              <set_value name="$isBlacklisted" exact="true"/>
+              <set_value name="$isAllowed" exact="false"/>
+              <set_value name="$filterReason" exact="'path_blocked'"/>
+              <do_if value="$filterStats?">
+                <set_value name="$filterStats.$filteredByPathBlocked" exact="$filterStats.$filteredByPathBlocked + 1"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Return result -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$IsAllowed" exact="$isAllowed"/>
+        <set_value name="$result.$FilterReason" exact="$filterReason"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
   </cues>
 </mdscript>
