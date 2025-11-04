@@ -2236,13 +2236,46 @@
           <param name="ship" value="$ship"/>
         </run_actions>
         
+        <!-- ✅ ISOLATION CHECK: For isolated ships, collect offers from current sector ONLY -->
+        <!-- Check isolation status before collecting offers to optimize collection -->
+        <set_value name="$currentSector" exact="$ship.sector"/>
+        <set_value name="$shipIsIsolated" exact="false"/>
+        <set_value name="$searchSpace" exact="player.galaxy"/>
+        <!-- Price range defaults: normal trading -->
+        <!-- ✅ DIVERSITY FOR SCORING: Include both best and worse offers for diverse trade selection -->
+        <!-- Scoring system evaluates multiple wares and combines offers, so we need a wide range -->
+        <!-- Includes very cheap offers (best) AND moderately expensive ones (worse) for diversity -->
+        <set_value name="$sellPriceMax" exact="0.5"/>  <!-- Sell offers: includes prices from very cheap to 50% above average (diverse range) -->
+        <set_value name="$buyPriceMin" exact="-0.5"/>  <!-- Buy offers: includes prices from 50% below average to very good (diverse range) -->
+        <do_if value="$currentSector?">
+          <!-- Quick isolation check: Check if all connected sectors are blacklisted -->
+          <run_actions ref="md.GT_Blacklist_Utilities.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
+            <param name="sector" value="$currentSector"/>
+            <param name="ship" value="$ship"/>
+            <param name="returnDetails" value="false"/>
+          </run_actions>
+          <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
+          <set_value name="$shipIsIsolated" exact="if $isolatedValue? and ($isolatedValue == true or $isolatedValue == 1) then true else false"/>
+          <do_if value="$shipIsIsolated">
+            <!-- Ship is isolated - search only in current sector with expanded price range -->
+            <set_value name="$searchSpace" exact="$currentSector"/>
+            <!-- ✅ ISOLATION PRICE RELAXATION: Accept worse prices to find more trades in single sector -->
+            <set_value name="$sellPriceMax" exact="0.5"/>   <!-- Accept prices up to 50% above average (more expensive, but more options) -->
+            <set_value name="$buyPriceMin" exact="-0.5"/>   <!-- Accept prices down to 50% below average (cheaper buyers, but more options) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔒 ISOLATED: Collecting offers from current sector only: ' + (if $sectorName? then $sectorName else 'NULL') + ' (price range expanded: sell max=' + $sellPriceMax + ', buy min=' + $buyPriceMin + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
         <!-- ✅ NATIVE C++ ACTION: Find all sell offers (ship buys FROM these stations) -->
         <!-- This single call replaces ~2000 station iterations! -->
         <do_if value="$wareBasket.count gt 0">
           <!-- Manual ware selection: query specific wares -->
           <find_sell_offer 
             tradepartner="$ship" 
-            space="player.galaxy" 
+            space="$searchSpace" 
             result="$allSellOffers" 
             wares="$wareBasket" 
             multiple="true">
@@ -2254,7 +2287,7 @@
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_seller>
-            <relativeprice max="0.0"/>  <!-- Only offers at average price or below (was 0.5 - too lenient) -->
+            <relativeprice max="$sellPriceMax"/>  <!-- Normal: 0.0 (at average or below), Isolated: 0.5 (expanded range) -->
             <amount min="100"/>  <!-- Only offers with at least 100 items -->
             <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_sell_offer>
@@ -2263,7 +2296,7 @@
           <!-- Auto wares: query all compatible wares -->
           <find_sell_offer 
             tradepartner="$ship" 
-            space="player.galaxy" 
+            space="$searchSpace" 
             result="$allSellOffers" 
             multiple="true">
             <match_seller tradesknownto="$ship.owner">
@@ -2274,7 +2307,7 @@
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_seller>
-            <relativeprice max="0.0"/>  <!-- Only offers at average price or below (was 0.5 - too lenient) -->
+            <relativeprice max="$sellPriceMax"/>  <!-- Normal: 0.0 (at average or below), Isolated: 0.5 (expanded range) -->
             <amount min="100"/>  <!-- Only offers with at least 100 items -->
             <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_sell_offer>
@@ -2285,7 +2318,7 @@
         <do_if value="$wareBasket.count gt 0">
           <find_buy_offer 
             tradepartner="$ship" 
-            space="player.galaxy" 
+            space="$searchSpace" 
             result="$allBuyOffers" 
             wares="$wareBasket" 
             multiple="true">
@@ -2297,7 +2330,7 @@
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_buyer>
-            <relativeprice min="0.0"/>  <!-- Only buy offers paying at least average price (was 1.0 = 100% above avg - too strict!) -->
+            <relativeprice min="$buyPriceMin"/>  <!-- Normal: 0.0 (at average or above), Isolated: -0.5 (expanded range) -->
             <amount min="100"/>  <!-- Only offers with at least 100 items -->
             <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_buy_offer>
@@ -2305,7 +2338,7 @@
         <do_else>
           <find_buy_offer 
             tradepartner="$ship" 
-            space="player.galaxy" 
+            space="$searchSpace" 
             result="$allBuyOffers" 
             multiple="true">
             <match_buyer tradesknownto="$ship.owner">
@@ -2316,7 +2349,7 @@
               <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
               <!-- Blacklist filtering happens per-ship during cache retrieval -->
             </match_buyer>
-            <relativeprice min="0.0"/>  <!-- Only buy offers paying at least average price (was 1.0 = 100% above avg - too strict!) -->
+            <relativeprice min="$buyPriceMin"/>  <!-- Normal: 0.0 (at average or above), Isolated: -0.5 (expanded range) -->
             <amount min="100"/>  <!-- Only offers with at least 100 items -->
             <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
           </find_buy_offer>

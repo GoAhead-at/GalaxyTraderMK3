@@ -46,21 +46,24 @@
         <set_value name="$distanceRatio" exact="$distance / $distanceBase"/>
         <set_value name="$nonLinearFactor" exact="1.0 + ($distanceRatio * $distanceRatio)"/>
         <set_value name="$adjustedDistance" exact="$distance * $distancePenaltyMultiplier * $nonLinearFactor"/>
-        <!-- ✅ FIX: Convert float result to integer to avoid "Loss of data while converting floating point" error -->
-        <!-- Use scaled integer math: multiply profit by 10000, convert adjustedDistance to integer (multiply by 10000), then do integer division -->
-        <!-- This gives us integer result with precision (efficiency scaled by 10000 for integer math) -->
-        <set_value name="$efficiency" exact="$profit"/>
+        <!-- ✅ FIX: Convert money to number before division to avoid "Loss of data while converting floating point" error -->
+        <!-- Convert profit (money in cents) to numeric value using f suffix to force float conversion -->
+        <!-- Pattern from order.trade.perform.xml:243: (money / 1Cr)f forces float conversion -->
+        <set_value name="$efficiency" exact="0.0"/>
         <do_if value="$adjustedDistance gt 0">
-          <!-- Scale to integers: profit is already in cents (×100), multiply by 100 more to get ×10000 scale -->
-          <!-- This ensures we have integer precision for the division -->
-          <set_value name="$scaledProfit" exact="$profit * 100"/>
-          <!-- Convert adjustedDistance to integer by multiplying by 10000 and storing in integer variable -->
-          <!-- X4 will truncate float to int when assigning to integer variable -->
-          <set_value name="$scaledDistanceInt" exact="($adjustedDistance * 10000)"/>
-          <!-- Integer division: integer / integer = integer result (efficiency scaled by 10000) -->
+          <!-- Convert profit from money (cents) to number by dividing by 1ct, then scale by 100 -->
+          <!-- Use f suffix to force float conversion (pattern from order.trade.perform.xml:243) -->
+          <set_value name="$profitNum" exact="(($profit / 1ct) * 100)f"/>
+          <!-- Scale adjustedDistance by 10000 for precision -->
+          <set_value name="$scaledDistance" exact="$adjustedDistance * 10000.0"/>
+          <!-- Division: number / number = number (efficiency scaled by 10000) -->
           <!-- Note: Efficiency is now scaled by 10000, but all comparisons/scoring work correctly with scaled values -->
-          <set_value name="$efficiency" exact="$scaledProfit / $scaledDistanceInt"/>
+          <set_value name="$efficiency" exact="$profitNum / $scaledDistance"/>
         </do_if>
+        <do_else>
+          <!-- If distance is 0, efficiency equals profit (converted to number) -->
+          <set_value name="$efficiency" exact="($profit / 1ct)f"/>
+        </do_else>
         
         <!-- Apply faction priority boost -->
         <do_if value="$factionPriority == 0 and ($buyStationOwner == faction.player or $sellStationOwner == faction.player)">
@@ -157,12 +160,19 @@
         <param name="ware" comment="Ware to calculate capacity for"/>
         <param name="buyOfferAmount" comment="Buy offer amount"/>
         <param name="sellOfferAmount" comment="Sell offer amount"/>
+        <param name="availableMoney" default="999999Cr" comment="Available money"/>
+        <param name="buyPrice" default="0" comment="Buy price per unit"/>
       </params>
       <actions>
         <!-- Calculate max cargo capacity for this ware -->
         <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $ware.volume)i"/>
-        <!-- Return minimum of offer amounts and cargo capacity -->
-        <return value="[$buyOfferAmount, $sellOfferAmount, $maxCargoCapacity].min"/>
+        <!-- Calculate max affordable based on available money -->
+        <set_value name="$maxAffordable" exact="99999"/>
+        <do_if value="$buyPrice gt 0">
+          <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
+        </do_if>
+        <!-- Return minimum of offer amounts, cargo capacity, and money limit -->
+        <return value="[$buyOfferAmount, $sellOfferAmount, $maxCargoCapacity, $maxAffordable].min"/>
       </actions>
     </library>
     
@@ -470,8 +480,23 @@
             </run_actions>
             
             <!-- Debug logging (if enabled) -->
+            <!-- ✅ FIX: Only log intra-sector trades for isolated ships (they're common for non-isolated ships) -->
+            <!-- Always log unreachable paths as they indicate problems -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <do_if value="$pathResult.$IsIntraSectorTrade or not $pathResult.$IsReachable">
+              <set_value name="$shouldLogIntraSector" exact="false"/>
+              <do_if value="$pathResult.$IsIntraSectorTrade">
+                <!-- Check if ship is isolated - only log intra-sector trades for isolated ships -->
+                <do_if value="$currentSector?">
+                  <run_actions ref="md.GT_Blacklist_Utilities.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
+                    <param name="sector" value="$currentSector"/>
+                    <param name="ship" value="$ship"/>
+                    <param name="returnDetails" value="false"/>
+                  </run_actions>
+                  <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
+                  <set_value name="$shouldLogIntraSector" exact="if $isolatedValue? and ($isolatedValue == true or $isolatedValue == 1) then true else false"/>
+                </do_if>
+              </do_if>
+              <do_if value="$shouldLogIntraSector or not $pathResult.$IsReachable">
                 <set_value name="$buySectorName" exact="@$buySector.knownname"/>
                 <set_value name="$sellSectorName" exact="@$sellSector.knownname"/>
                 <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
@@ -502,6 +527,374 @@
         <set_value name="$result" exact="table[]"/>
         <set_value name="$result.$IsAllowed" exact="$isAllowed"/>
         <set_value name="$result.$FilterReason" exact="$filterReason"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Build Docking Cache -->
+    <library name="GT_BuildDockingCache" purpose="run_actions">
+      <params>
+        <param name="sellOffers" comment="List of sell offers"/>
+        <param name="buyOffers" comment="List of buy offers"/>
+        <param name="ship" comment="Ship to check docking for"/>
+      </params>
+      <actions>
+        <set_value name="$dockingCache" exact="table[]"/>
+        <set_value name="$uniqueStations" exact="table[]"/>
+        
+        <!-- Collect all unique stations from sell offers -->
+        <do_all exact="$sellOffers.count" counter="$i">
+          <set_value name="$offer" exact="$sellOffers.{$i}"/>
+          <set_value name="$station" exact="@$offer.owner"/>
+          <!-- Validate station is valid before using as table key -->
+          <set_value name="$stationValid" exact="false"/>
+          <do_if value="$station? and not ($station == null)">
+            <set_value name="$stationId" exact="@$station.idcode"/>
+            <do_if value="$stationId?">
+              <set_value name="$stationValid" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_if value="$stationValid and $station? and not ($station == null)">
+            <do_if value="not $uniqueStations.{$station}?">
+              <set_value name="$uniqueStations.{$station}" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <!-- Collect all unique stations from buy offers -->
+        <do_all exact="$buyOffers.count" counter="$i">
+          <set_value name="$offer" exact="$buyOffers.{$i}"/>
+          <set_value name="$station" exact="@$offer.owner"/>
+          <!-- Validate station is valid before using as table key -->
+          <set_value name="$stationValid" exact="false"/>
+          <do_if value="$station? and not ($station == null)">
+            <set_value name="$stationId" exact="@$station.idcode"/>
+            <do_if value="$stationId?">
+              <set_value name="$stationValid" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_if value="$stationValid and $station? and not ($station == null)">
+            <do_if value="not $uniqueStations.{$station}?">
+              <set_value name="$uniqueStations.{$station}" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <!-- Pre-cache docking permissions for all unique stations -->
+        <do_all exact="$uniqueStations.keys.count" counter="$stationIdx">
+          <set_value name="$station" exact="$uniqueStations.keys.{$stationIdx}"/>
+          <set_value name="$canDock" exact="@$station.dockingallowed.{$ship}"/>
+          <set_value name="$dockingCache.{$station}" exact="$canDock"/>
+        </do_all>
+        
+        <return value="$dockingCache"/>
+      </actions>
+    </library>
+    
+    <!-- Separate Offers By Sector -->
+    <library name="GT_SeparateOffersBySector" purpose="run_actions">
+      <params>
+        <param name="sellOffers" comment="List of sell offers"/>
+        <param name="buyOffers" comment="List of buy offers"/>
+        <param name="currentSector" comment="Current sector to compare against"/>
+      </params>
+      <actions>
+        <set_value name="$intraSectorSellOffers" exact="[]"/>
+        <set_value name="$intraSectorBuyOffers" exact="[]"/>
+        <set_value name="$crossSectorSellOffers" exact="[]"/>
+        <set_value name="$crossSectorBuyOffers" exact="[]"/>
+        
+        <!-- ✅ FIX: Validate currentSector is set and not null -->
+        <do_if value="not $currentSector?">
+          <!-- If currentSector is null, all offers are cross-sector -->
+          <set_value name="$crossSectorSellOffers" exact="$sellOffers"/>
+          <set_value name="$crossSectorBuyOffers" exact="$buyOffers"/>
+        </do_if>
+        <do_else>
+          <!-- Separate sell offers -->
+          <do_all exact="$sellOffers.count" counter="$idx">
+            <set_value name="$offer" exact="$sellOffers.{$idx}"/>
+            <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+            <!-- ✅ FIX: Compare sectors directly - == should work for same component reference -->
+            <do_if value="$offerSector? and $offerSector == $currentSector">
+              <append_to_list name="$intraSectorSellOffers" exact="$offer"/>
+            </do_if>
+            <do_else>
+              <append_to_list name="$crossSectorSellOffers" exact="$offer"/>
+            </do_else>
+          </do_all>
+          
+          <!-- Separate buy offers -->
+          <do_all exact="$buyOffers.count" counter="$idx">
+            <set_value name="$offer" exact="$buyOffers.{$idx}"/>
+            <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+            <!-- ✅ FIX: Compare sectors directly - == should work for same component reference -->
+            <do_if value="$offerSector? and $offerSector == $currentSector">
+              <append_to_list name="$intraSectorBuyOffers" exact="$offer"/>
+            </do_if>
+            <do_else>
+              <append_to_list name="$crossSectorBuyOffers" exact="$offer"/>
+            </do_else>
+          </do_all>
+        </do_else>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$IntraSectorSell" exact="$intraSectorSellOffers"/>
+        <set_value name="$result.$IntraSectorBuy" exact="$intraSectorBuyOffers"/>
+        <set_value name="$result.$CrossSectorSell" exact="$crossSectorSellOffers"/>
+        <set_value name="$result.$CrossSectorBuy" exact="$crossSectorBuyOffers"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Calculate Trade Thresholds -->
+    <library name="GT_CalculateTradeThresholds" purpose="run_actions">
+      <params>
+        <param name="minROI" comment="Base minimum ROI"/>
+        <param name="minAbsoluteProfit" comment="Base minimum profit"/>
+        <param name="useAdvancedAnalytics" default="false" comment="Apply 95% multiplier"/>
+        <param name="isIntraSector" default="false" comment="Is intra-sector trade"/>
+        <param name="isIsolated" default="false" comment="Is ship isolated"/>
+      </params>
+      <actions>
+        <set_value name="$roiThreshold" exact="$minROI"/>
+        <set_value name="$profitThreshold" exact="$minAbsoluteProfit"/>
+        
+        <!-- Apply advanced analytics adjustment -->
+        <do_if value="$useAdvancedAnalytics">
+          <set_value name="$roiThreshold" exact="$roiThreshold * 0.95"/>
+          <set_value name="$profitThreshold" exact="($profitThreshold * 0.95)i"/>
+        </do_if>
+        
+        <!-- Apply intra-sector/isolation adjustments -->
+        <do_if value="$isIntraSector">
+          <do_if value="$isIsolated">
+            <!-- Isolated intra-sector: 25% of threshold -->
+            <set_value name="$roiThreshold" exact="$roiThreshold * 0.25"/>
+            <set_value name="$profitThreshold" exact="($profitThreshold * 0.25)i"/>
+          </do_if>
+          <do_else>
+            <!-- Normal intra-sector: 50% of threshold -->
+            <set_value name="$roiThreshold" exact="$roiThreshold * 0.5"/>
+            <set_value name="$profitThreshold" exact="($profitThreshold * 0.5)i"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$ROIThreshold" exact="$roiThreshold"/>
+        <set_value name="$result.$ProfitThreshold" exact="$profitThreshold"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Create Trade Object -->
+    <library name="GT_CreateTradeObject" purpose="run_actions">
+      <params>
+        <param name="sellOffer" comment="Sell offer"/>
+        <param name="buyOffer" comment="Buy offer"/>
+        <param name="sellStation" comment="Sell station"/>
+        <param name="buyStation" comment="Buy station"/>
+        <param name="amount" comment="Trade amount"/>
+        <param name="profit" comment="Trade profit"/>
+        <param name="roi" comment="Trade ROI"/>
+        <param name="efficiency" comment="Trade efficiency score"/>
+        <param name="buyPrice" comment="Buy price"/>
+        <param name="sellPrice" comment="Sell price"/>
+        <param name="distance" default="0" comment="Route distance"/>
+        <param name="risk" default="0" comment="Trade risk"/>
+      </params>
+      <actions>
+        <set_value name="$trade" exact="table[
+          $BuyOffer = $sellOffer,
+          $SellOffer = $buyOffer,
+          $BuyStation = $sellStation,
+          $SellStation = $buyStation,
+          $Amount = $amount,
+          $Profit = $profit,
+          $ROI = $roi,
+          $Score = $efficiency,
+          $BuyPrice = $buyPrice,
+          $SellPrice = $sellPrice,
+          $Distance = $distance,
+          $Risk = $risk
+        ]"/>
+        <return value="$trade"/>
+      </actions>
+    </library>
+    
+    <!-- Add Intra-Sector Offers -->
+    <library name="GT_AddIntraSectorOffers" purpose="run_actions">
+      <params>
+        <param name="originalSellOffers" comment="Original sell offers before limiting"/>
+        <param name="originalBuyOffers" comment="Original buy offers before limiting"/>
+        <param name="limitedSellOffers" comment="Limited sell offers (will be modified)"/>
+        <param name="limitedBuyOffers" comment="Limited buy offers (will be modified)"/>
+        <param name="currentSector" comment="Current sector"/>
+        <param name="currentSectorIsBlacklisted" default="false" comment="Is current sector blacklisted"/>
+      </params>
+      <actions>
+        <set_value name="$addedSellCount" exact="0"/>
+        <set_value name="$addedBuyCount" exact="0"/>
+        
+        <!-- Only add intra-sector offers if current sector is not blacklisted -->
+        <do_if value="$currentSector? and not $currentSectorIsBlacklisted">
+          <!-- Scan original sell offers for intra-sector ones not in limited list -->
+          <do_all exact="$originalSellOffers.count" counter="$idx">
+            <set_value name="$offer" exact="$originalSellOffers.{$idx}"/>
+            <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+            <do_if value="$offerSector? and $offerSector == $currentSector">
+              <!-- Check if already in limited list -->
+              <set_value name="$alreadyIncluded" exact="false"/>
+              <do_all exact="$limitedSellOffers.count" counter="$checkIdx">
+                <do_if value="$limitedSellOffers.{$checkIdx} == $offer">
+                  <set_value name="$alreadyIncluded" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <!-- Add if not already included -->
+              <do_if value="not $alreadyIncluded">
+                <append_to_list name="$limitedSellOffers" exact="$offer"/>
+                <set_value name="$addedSellCount" operation="add"/>
+              </do_if>
+            </do_if>
+          </do_all>
+          
+          <!-- Scan original buy offers for intra-sector ones not in limited list -->
+          <do_all exact="$originalBuyOffers.count" counter="$idx">
+            <set_value name="$offer" exact="$originalBuyOffers.{$idx}"/>
+            <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+            <do_if value="$offerSector? and $offerSector == $currentSector">
+              <!-- Check if already in limited list -->
+              <set_value name="$alreadyIncluded" exact="false"/>
+              <do_all exact="$limitedBuyOffers.count" counter="$checkIdx">
+                <do_if value="$limitedBuyOffers.{$checkIdx} == $offer">
+                  <set_value name="$alreadyIncluded" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <!-- Add if not already included -->
+              <do_if value="not $alreadyIncluded">
+                <append_to_list name="$limitedBuyOffers" exact="$offer"/>
+                <set_value name="$addedBuyCount" operation="add"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$UpdatedSellOffers" exact="$limitedSellOffers"/>
+        <set_value name="$result.$UpdatedBuyOffers" exact="$limitedBuyOffers"/>
+        <set_value name="$result.$AddedSellCount" exact="$addedSellCount"/>
+        <set_value name="$result.$AddedBuyCount" exact="$addedBuyCount"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Validate Trade Offer Pair -->
+    <library name="GT_ValidateTradeOfferPair" purpose="run_actions">
+      <params>
+        <param name="sellOffer" comment="Sell offer to validate"/>
+        <param name="buyOffer" comment="Buy offer to validate"/>
+      </params>
+      <actions>
+        <!-- Validate sell offer -->
+        <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
+        <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
+        <do_if value="not $sellOffer? or not $sellOfferOwner? or not $sellOfferPrice?">
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Validate buy offer -->
+        <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
+        <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
+        <do_if value="not $buyOffer? or not $buyOfferOwner? or not $buyOfferPrice?">
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Different stations only -->
+        <do_if value="$sellOfferOwner == $buyOfferOwner">
+          <return value="false"/>
+        </do_if>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Check Failed Sector Pair -->
+    <library name="GT_CheckFailedSectorPair" purpose="run_actions">
+      <params>
+        <param name="buySector" comment="Buy station sector"/>
+        <param name="sellSector" comment="Sell station sector"/>
+        <param name="failedTrades" comment="List of failed trades to check against"/>
+      </params>
+      <actions>
+        <set_value name="$isFailed" exact="false"/>
+        <do_if value="$failedTrades.count gt 0">
+          <do_all exact="$failedTrades.count" counter="$failIdx">
+            <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+            <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+              <do_if value="$buySector == $failedTrade.$BuySector and $sellSector == $failedTrade.$SellSector">
+                <set_value name="$isFailed" exact="true"/>
+                <break/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$isFailed"/>
+      </actions>
+    </library>
+    
+    <!-- Check Route Conflict -->
+    <library name="GT_CheckRouteConflict" purpose="run_actions">
+      <params>
+        <param name="sellStation" comment="Sell station"/>
+        <param name="buyStation" comment="Buy station"/>
+        <param name="ware" comment="Ware being traded"/>
+        <param name="reservedRoutes" comment="List of reserved route keys"/>
+      </params>
+      <actions>
+        <set_value name="$isConflicted" exact="false"/>
+        <do_if value="$reservedRoutes.count gt 0">
+          <set_value name="$tradeCacheKey" exact="$sellStation.idcode + '_' + $buyStation.idcode + '_' + $ware"/>
+          <set_value name="$isConflicted" exact="$reservedRoutes.indexof.{$tradeCacheKey}?"/>
+        </do_if>
+        <return value="$isConflicted"/>
+      </actions>
+    </library>
+    
+    <!-- Update Trade Quota -->
+    <library name="GT_UpdateTradeQuota" purpose="run_actions">
+      <params>
+        <param name="tradesPerWare" comment="Table of trades per ware (may be null or invalid)"/>
+        <param name="ware" comment="Ware to update quota for"/>
+        <param name="increment" default="1" comment="Amount to increment"/>
+      </params>
+      <actions>
+        <!-- Ensure tradesPerWare is a valid table -->
+        <set_value name="$validTable" exact="$tradesPerWare"/>
+        <set_value name="$keysCheck" exact="@$validTable.keys"/>
+        <set_value name="$countCheck" exact="@$keysCheck.count"/>
+        <do_if value="not $countCheck? or $countCheck lt 0">
+          <set_value name="$validTable" exact="table[]"/>
+        </do_if>
+        
+        <!-- Get current count for this ware -->
+        <set_value name="$currentCount" exact="0"/>
+        <do_if value="$validTable.{$ware}?">
+          <set_value name="$currentCount" exact="$validTable.{$ware}"/>
+        </do_if>
+        
+        <!-- Update count -->
+        <set_value name="$newCount" exact="$currentCount + $increment"/>
+        <set_value name="$validTable.{$ware}" exact="$newCount"/>
+        
+        <!-- Return updated table and new count -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$UpdatedTable" exact="$validTable"/>
+        <set_value name="$result.$NewCount" exact="$newCount"/>
         <return value="$result"/>
       </actions>
     </library>

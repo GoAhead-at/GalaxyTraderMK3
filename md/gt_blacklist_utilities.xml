@@ -516,5 +516,119 @@
       </actions>
     </library>
     
+    <!-- Check And Handle Isolation -->
+    <!-- ✅ REFACTORED: Extracted from gt_trading_batch_processor.xml for reusability and maintainability -->
+    <!-- This function checks if a ship is isolated, manages state, handles logging, and writes logbook messages -->
+    <library name="GT_CheckAndHandleIsolation" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check isolation for"/>
+        <param name="state" comment="Batch state table (will be updated and returned)"/>
+      </params>
+      <actions>
+        <set_value name="$shipIsIsolated" exact="false"/>
+        <set_value name="$updatedState" exact="$state"/>
+        
+        <!-- Check if isolation has already been checked for this ship -->
+        <do_if value="not $updatedState.$shipIsIsolatedChecked?">
+          <!-- First time checking isolation for this ship -->
+          <set_value name="$currentSector" exact="$ship.sector"/>
+          <do_if value="$currentSector?">
+            <!-- Check if current sector is blacklisted (if yes, not isolated, it's just blacklisted) -->
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklisted">
+              <param name="sector" value="$currentSector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <do_if value="not $currentSectorIsBlacklisted">
+              <!-- Ship is in non-blacklisted sector - check if all routes are blocked -->
+              <run_actions ref="md.GT_Blacklist_Utilities.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
+                <param name="sector" value="$currentSector"/>
+                <param name="ship" value="$ship"/>
+                <param name="returnDetails" value="false"/>
+              </run_actions>
+              <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
+              <set_value name="$shipIsIsolated" exact="if $isolatedValue? and ($isolatedValue == true or $isolatedValue == 1) then true else false"/>
+              <set_value name="$updatedState.$shipIsIsolated" exact="if $shipIsIsolated then 1 else 0"/>
+              <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
+              
+              <!-- Log isolation status -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <set_value name="$connectedCount" exact="@$isolationCheck.$ConnectedSectorsCount"/>
+                <set_value name="$blacklistedCount" exact="@$isolationCheck.$BlacklistedSectorsCount"/>
+                <set_value name="$nonBlacklistedCount" exact="@$isolationCheck.$NonBlacklistedSectorsCount"/>
+                <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                <do_if value="$shipIsIsolated">
+                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🚨 ISOLATED: All ' + $connectedCount + ' connected sectors are blacklisted (ship in ' + $currentSectorName + ')'" chance="100"/>
+                </do_if>
+                <do_else>
+                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ✅ NOT ISOLATED: ' + $nonBlacklistedCount + ' of ' + $connectedCount + ' connected sectors are non-blacklisted (ship in ' + $currentSectorName + ')'" chance="100"/>
+                </do_else>
+              </do_if>
+              
+              <!-- Log isolation message if isolated -->
+              <do_if value="$shipIsIsolated">
+                <set_value name="$isolationAlreadyLogged" exact="false"/>
+                <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$IsolationLogged?">
+                  <set_value name="$isolationAlreadyLogged" exact="global.$GT_Ships.{$ship}.$IsolationLogged"/>
+                </do_if>
+                <do_if value="not $isolationAlreadyLogged">
+                  <do_if value="not global.$GT_Ships?">
+                    <set_value name="global.$GT_Ships" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_Ships.{$ship}?">
+                    <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+                  </do_if>
+                  <set_value name="global.$GT_Ships.{$ship}.$IsolationLogged" exact="true"/>
+                  <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                  <do_if value="not $currentSectorName?">
+                    <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
+                  </do_if>
+                  <set_value name="$shipName" exact="@$ship.knownname"/>
+                  <do_if value="not $shipName?">
+                    <set_value name="$shipName" exact="$ship.idcode"/>
+                  </do_if>
+                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🚨 ISOLATION DETECTED: Ship in ' + $currentSectorName + ' (non-blacklisted) but ALL routes to other sectors blocked by blacklist - prioritizing intra-sector trades'" chance="100"/>
+                  <set_value name="$logbookEnabled" exact="true"/>
+                  <do_if value="global.$GT_Ships.{$ship}.$LogbookEntries?">
+                    <set_value name="$logbookEnabled" exact="global.$GT_Ships.{$ship}.$LogbookEntries"/>
+                  </do_if>
+                  <do_if value="$logbookEnabled">
+                    <set_value name="$isolationMessage" exact="{77000,3211}.[$shipName, $currentSectorName]"/>
+                    <write_to_logbook
+                      category="general"
+                      title="'Isolated Trading: ' + $shipName"
+                      interaction="showonmap"
+                      object="$ship"
+                      text="$isolationMessage"/>
+                    <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 📝 ISOLATION LOGBOOK MESSAGE WRITTEN: Ship ' + $shipName + ' in sector ' + $currentSectorName + ' - forced to intra-sector trades only due to blacklisted hub sectors'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- Current sector is blacklisted - ship is not isolated, it's just in a blacklisted sector -->
+              <set_value name="$shipIsIsolated" exact="false"/>
+              <set_value name="$updatedState.$shipIsIsolated" exact="0"/>
+              <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
+            </do_else>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Isolation already checked - retrieve from state -->
+          <set_value name="$isolatedStateValue" exact="@$updatedState.$shipIsIsolated"/>
+          <set_value name="$shipIsIsolated" exact="if $isolatedStateValue? and ($isolatedStateValue == 1 or $isolatedStateValue == true) then true else false"/>
+        </do_else>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$IsIsolated" exact="$shipIsIsolated"/>
+        <set_value name="$result.$UpdatedState" exact="$updatedState"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
   </cues>
 </mdscript>

@@ -76,22 +76,11 @@
         <set_value name="$failedTrades" exact="$state.$failedTrades"/>
         <!-- ✅ UNIVERSAL CACHE: No escape sectors or current sector blacklist - removed for universal processing -->
         <set_value name="$currentWareIndex" exact="$state.$currentWareIndex"/>
-        <!-- CRITICAL: Always initialize $tradesPerWare as empty table first -->
-        <!-- Then check if state has existing VALID data (not null) before using it -->
-        <set_value name="$tradesPerWare" exact="table[]"/>
-        <!-- Try to load existing data from state if available -->
+        <!-- ✅ OPTIMIZATION: Use library function to validate table safely -->
         <set_value name="$existingTradesPerWare" exact="@$state.$tradesPerWare"/>
-        <!-- CRITICAL: Only use state value if it's actually a valid table (not null) -->
-        <!-- X4 MD: null? = true, so we can't use ? to detect null -->
-        <!-- Solution: Check if .keys.count exists - valid tables have this, null doesn't -->
-        <set_value name="$existingKeys" exact="@$existingTradesPerWare.keys"/>
-        <set_value name="$existingCount" exact="@$existingKeys.count"/>
-        <!-- Only use state table if ALL three checks pass: exists, has keys, keys has count -->
-        <do_if value="$existingTradesPerWare? and $existingKeys? and $existingCount?">
-          <!-- Valid table exists in state - use it (guaranteed not null!) -->
-          <set_value name="$tradesPerWare" exact="$existingTradesPerWare"/>
-        </do_if>
-        <!-- Otherwise keep our initialized empty table -->
+        <run_actions ref="md.GT_Utilities.GT_ValidateTableSafe" result="$tradesPerWare">
+          <param name="table" value="$existingTradesPerWare"/>
+        </run_actions>
         <set_value name="$maxTradesPerWare" exact="$state.$maxTradesPerWare"/>
         <set_value name="$batchSize" exact="$state.$batchSize"/>
         <set_value name="$earlyExitThreshold" exact="$state.$earlyExitThreshold"/>
@@ -112,6 +101,19 @@
         
         <!-- ✅ UNIVERSAL CACHE: No sector blacklist cache building - removed for universal processing -->
         <!-- Blacklist filtering happens per-ship during cache retrieval, not during cache building -->
+        
+        <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+        <!-- ✅ ISOLATION DETECTION: Check ONCE per ship BEFORE processing any wares -->
+        <!-- This ensures Phase 2 (cross-sector trades) is skipped immediately if isolated -->
+        <!-- ✅ REFACTORED: Uses GT_CheckAndHandleIsolation library for maintainability -->
+        <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+        <run_actions ref="md.GT_Blacklist_Utilities.GT_CheckAndHandleIsolation" result="$isolationResult">
+          <param name="ship" value="$ship"/>
+          <param name="state" value="$state"/>
+        </run_actions>
+        <set_value name="$shipIsIsolated" exact="$isolationResult.$IsIsolated"/>
+        <set_value name="$state" exact="$isolationResult.$UpdatedState"/>
+        <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
         
         <!-- Calculate batch boundaries using wareKeysList (list, not table) -->
         <set_value name="$wareCount" exact="0"/>
@@ -204,6 +206,54 @@
               <set_value name="$originalSellOffers" exact="$sellOffersForWare"/>
               <set_value name="$originalBuyOffers" exact="$buyOffersForWare"/>
               
+              <!-- ✅ ISOLATION FILTER: For isolated ships, filter offers to current sector ONLY -->
+              <!-- Isolated ships can't reach other sectors, so only look at offers in current sector -->
+              <set_value name="$currentSector" exact="$ship.sector"/>
+              <do_if value="$shipIsIsolated and $currentSector?">
+                <!-- Filter sell offers to current sector only -->
+                <set_value name="$filteredSellOffers" exact="[]"/>
+                <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                <do_all exact="$sellOffersForWare.count" counter="$idx">
+                  <set_value name="$offer" exact="$sellOffersForWare.{$idx}"/>
+                  <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+                  <do_if value="$offerSector?">
+                    <set_value name="$offerSectorName" exact="@$offerSector.knownname"/>
+                    <do_if value="$offerSector == $currentSector">
+                      <append_to_list name="$filteredSellOffers" exact="$offer"/>
+                    </do_if>
+                    <do_elseif value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $idx le 3">
+                      <!-- Debug first 3 offers to verify sector comparison -->
+                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔍 SELL OFFER #' + $idx + ': Offer sector=' + (if $offerSectorName? then $offerSectorName else 'NULL') + ', Current sector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', Match=' + ($offerSector == $currentSector)" chance="100"/>
+                    </do_elseif>
+                  </do_if>
+                </do_all>
+                <set_value name="$sellOffersForWare" exact="$filteredSellOffers"/>
+                
+                <!-- Filter buy offers to current sector only -->
+                <set_value name="$filteredBuyOffers" exact="[]"/>
+                <do_all exact="$buyOffersForWare.count" counter="$idx">
+                  <set_value name="$offer" exact="$buyOffersForWare.{$idx}"/>
+                  <set_value name="$offerSector" exact="@$offer.owner.sector"/>
+                  <do_if value="$offerSector?">
+                    <set_value name="$offerSectorName" exact="@$offerSector.knownname"/>
+                    <do_if value="$offerSector == $currentSector">
+                      <append_to_list name="$filteredBuyOffers" exact="$offer"/>
+                    </do_if>
+                    <do_elseif value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $idx le 3">
+                      <!-- Debug first 3 offers to verify sector comparison -->
+                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔍 BUY OFFER #' + $idx + ': Offer sector=' + (if $offerSectorName? then $offerSectorName else 'NULL') + ', Current sector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', Match=' + ($offerSector == $currentSector)" chance="100"/>
+                    </do_elseif>
+                  </do_if>
+                </do_all>
+                <set_value name="$buyOffersForWare" exact="$filteredBuyOffers"/>
+                
+                <!-- Debug log filtered counts -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔒 ISOLATED FILTER: ' + $wareName + ' in ' + (if $currentSectorName? then $currentSectorName else 'NULL') + ' - Filtered to ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy (current sector only)'" chance="100"/>
+                </do_if>
+              </do_if>
+              
               <!-- Limit sell offers BEFORE nested loop (take first N = cheapest = best buyers) -->
               <do_if value="$sellOffersForWare.count gt $maxOffersPerWareForMatching">
                 <!-- Simple approach: Take first N offers (they're already ordered by relativeprice from batch) -->
@@ -230,7 +280,10 @@
               <!-- Scenario: Ship in non-blacklisted sector, but all routes to other sectors blocked by blacklist -->
               <!-- Solution: Ensure intra-sector trades are always considered for matching -->
               <!-- ✅ EXCEPTION: Do NOT include intra-sector offers if ship is in blacklisted sector (escape priority) -->
-              <set_value name="$currentSector" exact="$ship.sector"/>
+              <!-- Note: $currentSector already set above for isolated filter -->
+              <do_if value="not $currentSector?">
+                <set_value name="$currentSector" exact="$ship.sector"/>
+              </do_if>
               <set_value name="$currentSectorIsBlacklisted" exact="false"/>
               <do_if value="$currentSector?">
                 <!-- Check if current sector is blacklisted (if yes, skip intra-sector offers to force escape) -->
@@ -243,421 +296,84 @@
                   <param name="blacklistgroup" value="$blacklistgroup"/>
                 </run_actions>
               </do_if>
-              <do_if value="$currentSector? and not $currentSectorIsBlacklisted">
-                <!-- Scan original sell offers for intra-sector ones not in limited list -->
-                <do_all exact="$originalSellOffers.count" counter="$idx">
-                  <set_value name="$offer" exact="$originalSellOffers.{$idx}"/>
-                  <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                  <do_if value="$offerSector? and $offerSector == $currentSector">
-                    <!-- Check if already in limited list -->
-                    <set_value name="$alreadyIncluded" exact="false"/>
-                    <do_all exact="$sellOffersForWare.count" counter="$checkIdx">
-                      <do_if value="$sellOffersForWare.{$checkIdx} == $offer">
-                        <set_value name="$alreadyIncluded" exact="true"/>
-                        <break/>
-                      </do_if>
-                    </do_all>
-                    <!-- Add if not already included -->
-                    <do_if value="not $alreadyIncluded">
-                      <append_to_list name="$sellOffersForWare" exact="$offer"/>
-                    </do_if>
-                  </do_if>
-                </do_all>
-                
-                <!-- Scan original buy offers for intra-sector ones not in limited list -->
-                <do_all exact="$originalBuyOffers.count" counter="$idx">
-                  <set_value name="$offer" exact="$originalBuyOffers.{$idx}"/>
-                  <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                  <do_if value="$offerSector? and $offerSector == $currentSector">
-                    <!-- Check if already in limited list -->
-                    <set_value name="$alreadyIncluded" exact="false"/>
-                    <do_all exact="$buyOffersForWare.count" counter="$checkIdx">
-                      <do_if value="$buyOffersForWare.{$checkIdx} == $offer">
-                        <set_value name="$alreadyIncluded" exact="true"/>
-                        <break/>
-                      </do_if>
-                    </do_all>
-                    <!-- Add if not already included -->
-                    <do_if value="not $alreadyIncluded">
-                      <append_to_list name="$buyOffersForWare" exact="$offer"/>
-                    </do_if>
-                  </do_if>
-                </do_all>
-                
-                <!-- DEBUG: Log if intra-sector offers were added -->
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and ($sellOffersForWare.count gt $maxOffersPerWareForMatching or $buyOffersForWare.count gt $maxOffersPerWareForMatching)">
-                  <set_value name="$addedSell" exact="$sellOffersForWare.count - $maxOffersPerWareForMatching"/>
-                  <set_value name="$addedBuy" exact="$buyOffersForWare.count - $maxOffersPerWareForMatching"/>
-                  <do_if value="$addedSell gt 0 or $addedBuy gt 0">
-                    <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ✅ Added intra-sector offers for ' + (if $ware? then @$ware.name else 'NULL') + ' in ' + @$currentSector.knownname + ': ' + $addedSell + ' sell, ' + $addedBuy + ' buy (beyond top ' + $maxOffersPerWareForMatching + ')'" chance="100"/>
-                  </do_if>
-                </do_if>
+              <!-- ✅ OPTIMIZATION: Use library function to add intra-sector offers -->
+              <run_actions ref="md.GT_Trade_Utilities.GT_AddIntraSectorOffers" result="$intraSectorResult">
+                <param name="originalSellOffers" value="$originalSellOffers"/>
+                <param name="originalBuyOffers" value="$originalBuyOffers"/>
+                <param name="limitedSellOffers" value="$sellOffersForWare"/>
+                <param name="limitedBuyOffers" value="$buyOffersForWare"/>
+                <param name="currentSector" value="$currentSector"/>
+                <param name="currentSectorIsBlacklisted" value="$currentSectorIsBlacklisted"/>
+              </run_actions>
+              <set_value name="$sellOffersForWare" exact="$intraSectorResult.$UpdatedSellOffers"/>
+              <set_value name="$buyOffersForWare" exact="$intraSectorResult.$UpdatedBuyOffers"/>
+              
+              <!-- DEBUG: Log if intra-sector offers were added -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and ($intraSectorResult.$AddedSellCount gt 0 or $intraSectorResult.$AddedBuyCount gt 0)">
+                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ✅ Added intra-sector offers for ' + (if $ware? then @$ware.name else 'NULL') + ' in ' + @$currentSector.knownname + ': ' + $intraSectorResult.$AddedSellCount + ' sell, ' + $intraSectorResult.$AddedBuyCount + ' buy (beyond top ' + $maxOffersPerWareForMatching + ')'" chance="100"/>
               </do_if>
               
               <!-- ═══════════════════════════════════════════════════════════════════════════ -->
               <!-- ✅ OPTIMIZATION #2: Pre-cache docking permissions BEFORE nested loops -->
               <!-- Reduces property lookups from 400,000+ to ~40-100 (99.98% reduction) -->
               <!-- ═══════════════════════════════════════════════════════════════════════════ -->
-              <set_value name="$dockingCache" exact="table[]"/>
-              <set_value name="$uniqueStations" exact="table[]"/>
-              
-              <!-- Collect all unique stations from limited offers -->
-              <do_all exact="$sellOffersForWare.count" counter="$i">
-                <set_value name="$offer" exact="$sellOffersForWare.{$i}"/>
-                <set_value name="$station" exact="@$offer.owner"/>
-                <!-- ✅ FIX: Validate station is valid before using as table key -->
-                <!-- The ? operator only checks existence, not null - so test property access instead -->
-                <set_value name="$stationValid" exact="false"/>
-                <do_if value="$station? and not ($station == null)">
-                  <set_value name="$stationId" exact="@$station.idcode"/>
-                  <do_if value="$stationId?">
-                    <set_value name="$stationValid" exact="true"/>
-                  </do_if>
-                </do_if>
-                <!-- Only check and add to table if station is valid and not null -->
-                <!-- ✅ CRITICAL: Triple-check station is not null before using as table key -->
-                <do_if value="$stationValid and $station? and not ($station == null)">
-                  <do_if value="not $uniqueStations.{$station}?">
-                    <set_value name="$uniqueStations.{$station}" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_all>
-              <do_all exact="$buyOffersForWare.count" counter="$i">
-                <set_value name="$offer" exact="$buyOffersForWare.{$i}"/>
-                <set_value name="$station" exact="@$offer.owner"/>
-                <!-- ✅ FIX: Validate station is valid before using as table key -->
-                <set_value name="$stationValid" exact="false"/>
-                <do_if value="$station? and not ($station == null)">
-                  <set_value name="$stationId" exact="@$station.idcode"/>
-                  <do_if value="$stationId?">
-                    <set_value name="$stationValid" exact="true"/>
-                  </do_if>
-                </do_if>
-                <!-- Only check and add to table if station is valid and not null -->
-                <!-- ✅ CRITICAL: Triple-check station is not null before using as table key -->
-                <do_if value="$stationValid and $station? and not ($station == null)">
-                  <do_if value="not $uniqueStations.{$station}?">
-                    <set_value name="$uniqueStations.{$station}" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_all>
-              
-              <!-- Pre-cache docking permissions for all unique stations -->
-              <do_all exact="$uniqueStations.keys.count" counter="$stationIdx">
-                <set_value name="$station" exact="$uniqueStations.keys.{$stationIdx}"/>
-                <set_value name="$canDock" exact="@$station.dockingallowed.{$ship}"/>
-                <set_value name="$dockingCache.{$station}" exact="$canDock"/>
-              </do_all>
-              
-              <!-- ✅ DETECT ISOLATION SCENARIO: Check if ship is isolated due to blacklisted hub sectors -->
-              <!-- Scenario: Ship in non-blacklisted sector, but all routes to other sectors blocked by blacklist -->
-              <!-- Solution: Mark ship as isolated and prioritize intra-sector trades more aggressively -->
-              <!-- ✅ OPTIMIZATION: Check isolation only once per ship (cache result in state) -->
-              <set_value name="$shipIsIsolated" exact="false"/>
-              <do_if value="not $state.$shipIsIsolatedChecked?">
-                <!-- First time checking isolation for this ship in this batch - perform check -->
-                <set_value name="$currentSector" exact="$ship.sector"/>
-                <do_if value="$currentSector?">
-                <!-- Check if current sector is blacklisted (if yes, not isolated, it's just blacklisted) -->
-                <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
-                  <param name="ship" value="$ship"/>
-                </run_actions>
-                <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklisted">
-                  <param name="sector" value="$currentSector"/>
-                  <param name="ship" value="$ship"/>
-                  <param name="blacklistgroup" value="$blacklistgroup"/>
-                </run_actions>
-                <do_if value="not $currentSectorIsBlacklisted">
-                  <!-- Ship is in non-blacklisted sector - check if all routes are blocked -->
-                  <!-- Sample a few unique sectors from offers to test reachability -->
-                  <set_value name="$testedSectors" exact="table[]"/>
-                  <set_value name="$unreachableCount" exact="0"/>
-                  <set_value name="$testCount" exact="0"/>
-                  <set_value name="$reachableViaGatesCount" exact="0"/>
-                  
-                  <!-- Sample up to 10 unique sectors from sell offers -->
-                  <do_all exact="$originalSellOffers.count" counter="$idx">
-                    <do_if value="$testCount lt 10">
-                      <set_value name="$offer" exact="$originalSellOffers.{$idx}"/>
-                      <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                      <!-- ✅ CRITICAL: Skip current sector - we only test OTHER sectors for isolation -->
-                      <do_if value="$offerSector? and $offerSector != $currentSector">
-                        <do_if value="not $testedSectors.{$offerSector}?">
-                          <set_value name="$testedSectors.{$offerSector}" exact="true"/>
-                          <!-- Test reachability with blacklist-aware pathfinding -->
-                          <set_value name="$testDistance" exact="$ship.gatedistance.{$offerSector}.{$blacklistgroup}.{$ship}"/>
-                          <!-- ✅ CRITICAL: Only count sectors that require gate jumps (distance > 0) for isolation check -->
-                          <!-- Distance 0 = same zone (can't leave via gates), Distance < 0 = unreachable -->
-                          <!-- Ship is isolated if ALL sectors requiring gate jumps (distance > 0) are unreachable -->
-                          <do_if value="$testDistance gt 0">
-                            <!-- This sector requires gate jumps - count it for isolation check -->
-                            <set_value name="$testCount" exact="$testCount + 1"/>
-                            <set_value name="$reachableViaGatesCount" exact="$reachableViaGatesCount + 1"/>
-                            <!-- Distance > 0 means reachable via gates - ship is NOT isolated -->
-                            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                              <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ✅ REACHABLE VIA GATES: ' + @$offerSector.knownname + ' (distance: ' + $testDistance + ') - Ship NOT isolated (can leave zone via gates)'" chance="100"/>
-                            </do_if>
-                          </do_if>
-                          <do_elseif value="$testDistance lt 0">
-                            <!-- Unreachable - but only count if it would require gates (but we can't know without checking first) -->
-                            <!-- Actually, if distance < 0, we can't reach it, so don't count it -->
-                            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                              <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ❌ UNREACHABLE: ' + @$offerSector.knownname + ' (distance: ' + $testDistance + ')'" chance="100"/>
-                            </do_if>
-                          </do_elseif>
-                          <do_else>
-                            <!-- Distance 0 = same zone (connected via accelerators, not gates) -->
-                            <!-- Check if this sector is blacklisted - if yes, ship still isolated (can't use it) -->
-                            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$sameZoneSectorBlacklisted">
-                              <param name="sector" value="$offerSector"/>
-                              <param name="ship" value="$ship"/>
-                              <param name="blacklistgroup" value="$blacklistgroup"/>
-                            </run_actions>
-                            <do_if value="$sameZoneSectorBlacklisted">
-                              <!-- Same zone but blacklisted - can't use it, doesn't prevent isolation -->
-                              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ⚠️ SAME ZONE (BLACKLISTED): ' + @$offerSector.knownname + ' (distance: 0) - Blacklisted, cannot use for trading (does not prevent isolation)'" chance="100"/>
-                              </do_if>
-                            </do_if>
-                            <do_else>
-                              <!-- Same zone and NOT blacklisted - ship can trade here, NOT isolated -->
-                              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ✅ SAME ZONE (REACHABLE): ' + @$offerSector.knownname + ' (distance: 0) - Ship NOT isolated (can trade in same zone)'" chance="100"/>
-                              </do_if>
-                              <!-- ✅ CRITICAL: If ANY non-blacklisted sector in same zone is available, ship is NOT isolated -->
-                              <set_value name="$shipIsIsolated" exact="false"/>
-                              <set_value name="$state.$shipIsIsolated" exact="false"/>
-                            </do_else>
-                          </do_else>
-                        </do_if>
-                      </do_if>
-                    </do_if>
-                  </do_all>
-                  
-                  <!-- ✅ FIX: Also sample from buy offers if we haven't found enough test sectors -->
-                  <do_if value="$testCount lt 10">
-                    <do_all exact="$originalBuyOffers.count" counter="$idx">
-                      <do_if value="$testCount lt 10">
-                        <set_value name="$offer" exact="$originalBuyOffers.{$idx}"/>
-                        <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                        <!-- ✅ CRITICAL: Skip current sector - we only test OTHER sectors for isolation -->
-                        <do_if value="$offerSector? and $offerSector != $currentSector">
-                          <do_if value="not $testedSectors.{$offerSector}?">
-                            <set_value name="$testedSectors.{$offerSector}" exact="true"/>
-                            <!-- Test reachability with blacklist-aware pathfinding -->
-                            <set_value name="$testDistance" exact="$ship.gatedistance.{$offerSector}.{$blacklistgroup}.{$ship}"/>
-                            <!-- ✅ CRITICAL: Only count sectors that require gate jumps (distance > 0) for isolation check -->
-                            <!-- Distance 0 = same zone (can't leave via gates), Distance < 0 = unreachable -->
-                            <!-- Ship is isolated if ALL sectors requiring gate jumps (distance > 0) are unreachable -->
-                            <do_if value="$testDistance gt 0">
-                              <!-- This sector requires gate jumps - count it for isolation check -->
-                              <set_value name="$testCount" exact="$testCount + 1"/>
-                              <set_value name="$reachableViaGatesCount" exact="$reachableViaGatesCount + 1"/>
-                              <!-- Distance > 0 means reachable via gates -->
-                              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ✅ REACHABLE VIA GATES: ' + @$offerSector.knownname + ' (distance: ' + $testDistance + ') - Ship NOT isolated (can leave zone via gates)'" chance="100"/>
-                              </do_if>
-                            </do_if>
-                            <do_elseif value="$testDistance lt 0">
-                              <!-- Unreachable - but only count if it would require gates (but we can't know without checking first) -->
-                              <!-- Actually, if distance < 0, we can't reach it, so don't count it -->
-                              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ❌ UNREACHABLE: ' + @$offerSector.knownname + ' (distance: ' + $testDistance + ')'" chance="100"/>
-                              </do_if>
-                            </do_elseif>
-                            <do_else>
-                              <!-- Distance 0 = same zone (connected via accelerators, not gates) -->
-                              <!-- Check if this sector is blacklisted - if yes, ship still isolated (can't use it) -->
-                              <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$sameZoneSectorBlacklisted">
-                                <param name="sector" value="$offerSector"/>
-                                <param name="ship" value="$ship"/>
-                                <param name="blacklistgroup" value="$blacklistgroup"/>
-                              </run_actions>
-                              <do_if value="$sameZoneSectorBlacklisted">
-                                <!-- Same zone but blacklisted - can't use it, doesn't prevent isolation -->
-                                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ⚠️ SAME ZONE (BLACKLISTED): ' + @$offerSector.knownname + ' (distance: 0) - Blacklisted, cannot use for trading (does not prevent isolation)'" chance="100"/>
-                                </do_if>
-                              </do_if>
-                              <do_else>
-                                <!-- Same zone and NOT blacklisted - ship can trade here, NOT isolated -->
-                                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ')   ✅ SAME ZONE (REACHABLE): ' + @$offerSector.knownname + ' (distance: 0) - Ship NOT isolated (can trade in same zone)'" chance="100"/>
-                                </do_if>
-                                <!-- ✅ CRITICAL: If ANY non-blacklisted sector in same zone is available, ship is NOT isolated -->
-                                <set_value name="$shipIsIsolated" exact="false"/>
-                                <set_value name="$state.$shipIsIsolated" exact="false"/>
-                              </do_else>
-                            </do_else>
-                          </do_if>
-                        </do_if>
-                      </do_if>
-                    </do_all>
-                  </do_if>
-                  
-                  <!-- ✅ DEBUG: Log isolation check results -->
-                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                    <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔍 ISOLATION CHECK: Tested ' + $testCount + ' sectors requiring gate jumps, ' + $reachableViaGatesCount + ' reachable (ship in ' + @$currentSector.knownname + ')'" chance="100"/>
-                  </do_if>
-                  
-                  <!-- ✅ STRICT: Ship is only isolated if NO sectors requiring gate jumps are reachable -->
-                  <!-- This ensures the ship truly cannot reach any other sector via gates and must trade intra-sector -->
-                  <!-- If $testCount > 0 but $reachableViaGatesCount == 0, all tested sectors requiring gates are unreachable = isolated -->
-                  <!-- If $testCount == 0, we didn't find any sectors requiring gates = might be isolated (no offers from other zones) -->
-                  <do_if value="$testCount == 0">
-                    <!-- No sectors requiring gate jumps found - ship might be isolated (only offers from same zone) -->
-                    <set_value name="$shipIsIsolated" exact="true"/>
-                    <set_value name="$state.$shipIsIsolated" exact="true"/>
-                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔍 NO SECTORS REQUIRING GATES: All offers are from same zone - ship ISOLATED (can\'t leave via gates)'" chance="100"/>
-                    </do_if>
-                  </do_if>
-                  <do_elseif value="$testCount gt 0 and $reachableViaGatesCount == 0">
-                    <!-- Tested sectors requiring gates, but ALL are unreachable = isolated -->
-                    <set_value name="$shipIsIsolated" exact="true"/>
-                    <set_value name="$state.$shipIsIsolated" exact="true"/>
-                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🚨 ISOLATED: All ' + $testCount + ' sectors requiring gate jumps are unreachable - ship ISOLATED'" chance="100"/>
-                    </do_if>
-                  </do_elseif>
-                  <do_else>
-                    <!-- At least one sector requiring gates is reachable = NOT isolated -->
-                    <set_value name="$shipIsIsolated" exact="false"/>
-                    <set_value name="$state.$shipIsIsolated" exact="false"/>
-                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ✅ NOT ISOLATED: ' + $reachableViaGatesCount + ' of ' + $testCount + ' sectors requiring gates are reachable'" chance="100"/>
-                    </do_if>
-                  </do_else>
-                  
-                  <!-- Only log isolation message if ship is actually isolated -->
-                  <do_if value="$shipIsIsolated">
-                    
-                    <!-- ✅ LOG ISOLATION MESSAGE: Only log once per ship (check persistent global flag) -->
-                    <!-- ✅ FIX: Use global.$GT_Ships instead of $state for persistence across searches -->
-                    <set_value name="$isolationAlreadyLogged" exact="false"/>
-                    <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$IsolationLogged?">
-                      <set_value name="$isolationAlreadyLogged" exact="global.$GT_Ships.{$ship}.$IsolationLogged"/>
-                    </do_if>
-                    
-                    <do_if value="not $isolationAlreadyLogged">
-                      <!-- Mark as logged in persistent global storage -->
-                      <do_if value="not global.$GT_Ships?">
-                        <set_value name="global.$GT_Ships" exact="table[]"/>
-                      </do_if>
-                      <do_if value="not global.$GT_Ships.{$ship}?">
-                        <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
-                      </do_if>
-                      <set_value name="global.$GT_Ships.{$ship}.$IsolationLogged" exact="true"/>
-                      
-                      <!-- Extract sector name safely -->
-                      <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
-                      <do_if value="not $currentSectorName?">
-                        <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
-                      </do_if>
-                      
-                      <!-- Extract ship name safely -->
-                      <set_value name="$shipName" exact="@$ship.knownname"/>
-                      <do_if value="not $shipName?">
-                        <set_value name="$shipName" exact="$ship.idcode"/>
-                      </do_if>
-                      
-                      <!-- DEBUG: Always log to debug log -->
-                      <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🚨 ISOLATION DETECTED: Ship in ' + $currentSectorName + ' (non-blacklisted) but ALL routes to other sectors blocked by blacklist - prioritizing intra-sector trades'" chance="100"/>
-                      
-                      <!-- Logbook message: Check if ship has logbook entries enabled -->
-                      <set_value name="$logbookEnabled" exact="true"/>
-                      <do_if value="global.$GT_Ships.{$ship}.$LogbookEntries?">
-                        <set_value name="$logbookEnabled" exact="global.$GT_Ships.{$ship}.$LogbookEntries"/>
-                      </do_if>
-                      
-                      <do_if value="$logbookEnabled">
-                        <!-- Build message using translation ID 3211 with 2 parameters: ship name, sector name -->
-                        <set_value name="$isolationMessage" exact="{77000,3211}.[$shipName, $currentSectorName]"/>
-                        
-                        <!-- Write to ship logbook -->
-                        <write_to_logbook
-                          category="general"
-                          title="'Isolated Trading: ' + $shipName"
-                          interaction="showonmap"
-                          object="$ship"
-                          text="$isolationMessage"/>
-                        
-                        <!-- DEBUG: Log the message that was written -->
-                        <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 📝 ISOLATION LOGBOOK MESSAGE WRITTEN: Ship ' + $shipName + ' in sector ' + $currentSectorName + ' - forced to intra-sector trades only due to blacklisted hub sectors'" chance="100"/>
-                      </do_if>
-                    </do_if>
-                  </do_if>
-                  <do_else>
-                    <set_value name="$state.$shipIsIsolated" exact="false"/>
-                  </do_else>
-                </do_if>
-              </do_if>
-              <do_else>
-                <!-- Use cached isolation status from previous ware -->
-                <set_value name="$shipIsIsolated" exact="$state.$shipIsIsolated"/>
-              </do_else>
-              </do_if>
-              
-              <!-- Mark that isolation has been checked for this ship -->
-              <set_value name="$state.$shipIsIsolatedChecked" exact="true"/>
+              <run_actions ref="md.GT_Trade_Utilities.GT_BuildDockingCache" result="$dockingCache">
+                <param name="sellOffers" value="$sellOffersForWare"/>
+                <param name="buyOffers" value="$buyOffersForWare"/>
+                <param name="ship" value="$ship"/>
+              </run_actions>
               
               <!-- ✅ OPTIMIZATION: Separate intra-sector offers for prioritized matching -->
               <!-- This ensures intra-sector offers match with each other to create true intra-sector trades -->
-              <set_value name="$intraSectorSellOffers" exact="[]"/>
-              <set_value name="$intraSectorBuyOffers" exact="[]"/>
-              <set_value name="$crossSectorSellOffers" exact="[]"/>
-              <set_value name="$crossSectorBuyOffers" exact="[]"/>
+              <run_actions ref="md.GT_Trade_Utilities.GT_SeparateOffersBySector" result="$separatedOffers">
+                <param name="sellOffers" value="$sellOffersForWare"/>
+                <param name="buyOffers" value="$buyOffersForWare"/>
+                <param name="currentSector" value="$currentSector"/>
+              </run_actions>
+              <set_value name="$intraSectorSellOffers" exact="$separatedOffers.$IntraSectorSell"/>
+              <set_value name="$intraSectorBuyOffers" exact="$separatedOffers.$IntraSectorBuy"/>
+              <set_value name="$crossSectorSellOffers" exact="$separatedOffers.$CrossSectorSell"/>
+              <set_value name="$crossSectorBuyOffers" exact="$separatedOffers.$CrossSectorBuy"/>
               
-              <!-- Separate sell offers -->
-              <do_all exact="$sellOffersForWare.count" counter="$idx">
-                <set_value name="$offer" exact="$sellOffersForWare.{$idx}"/>
-                <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                <do_if value="$offerSector? and $offerSector == $currentSector">
-                  <append_to_list name="$intraSectorSellOffers" exact="$offer"/>
-                </do_if>
-                <do_else>
-                  <append_to_list name="$crossSectorSellOffers" exact="$offer"/>
-                </do_else>
-              </do_all>
-              
-              <!-- Separate buy offers -->
-              <do_all exact="$buyOffersForWare.count" counter="$idx">
-                <set_value name="$offer" exact="$buyOffersForWare.{$idx}"/>
-                <set_value name="$offerSector" exact="@$offer.owner.sector"/>
-                <do_if value="$offerSector? and $offerSector == $currentSector">
-                  <append_to_list name="$intraSectorBuyOffers" exact="$offer"/>
-                </do_if>
-                <do_else>
-                  <append_to_list name="$crossSectorBuyOffers" exact="$offer"/>
-                </do_else>
-              </do_all>
+              <!-- ✅ DEBUG: Log separation results for isolated ships -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                <set_value name="$sectorName" exact="if $currentSector? then @$currentSector.knownname else 'NULL'"/>
+                <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') 🔍 SEPARATION for ' + $wareName + ' in ' + $sectorName + ': Total=' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy | Intra=' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy | Cross=' + $crossSectorSellOffers.count + ' sell, ' + $crossSectorBuyOffers.count + ' buy'" chance="100"/>
+              </do_if>
               
               <!-- NOW run nested loops: PRIORITIZE intra-sector matches first -->
               <!-- Phase 1: Match intra-sector sell offers with intra-sector buy offers (TRUE intra-sector trades) -->
+              <!-- ✅ DEBUG: Log Phase 1 availability -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                <set_value name="$sectorName" exact="if $currentSector? then @$currentSector.knownname else 'NULL'"/>
+                <set_value name="$isolationLabel" exact="if $shipIsIsolated then ' [ISOLATED]' else ''"/>
+                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') 🔍 Phase 1 (INTRA-SECTOR)' + $isolationLabel + ' for ' + $wareName + ' in ' + $sectorName + ': ' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy offers' + (if ($intraSectorSellOffers.count == 0 or $intraSectorBuyOffers.count == 0) then ' ⚠️ MISSING ONE TYPE!' else '')" chance="100"/>
+              </do_if>
               <do_if value="$intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
                 <do_all exact="$intraSectorSellOffers.count" counter="$i">
                   <set_value name="$sellOffer" exact="$intraSectorSellOffers.{$i}"/>
                 
-                <!-- Validate sell offer is valid before processing -->
-                <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
-                <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
-                <do_if value="not $sellOffer? or not $sellOfferOwner? or not $sellOfferPrice?">
-                  <continue/>
-                </do_if>
-                
-                  <do_all exact="$intraSectorBuyOffers.count" counter="$j">
-                    <set_value name="$buyOffer" exact="$intraSectorBuyOffers.{$j}"/>
+                <do_all exact="$intraSectorBuyOffers.count" counter="$j">
+                  <set_value name="$buyOffer" exact="$intraSectorBuyOffers.{$j}"/>
                   
-                  <!-- Validate buy offer is valid before processing -->
-                  <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
-                  <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
-                  <do_if value="not $buyOffer? or not $buyOfferOwner? or not $buyOfferPrice?">
+                  <!-- ✅ OPTIMIZATION: Use library function to validate offer pair -->
+                  <run_actions ref="md.GT_Trade_Utilities.GT_ValidateTradeOfferPair" result="$isValidPair">
+                    <param name="sellOffer" value="$sellOffer"/>
+                    <param name="buyOffer" value="$buyOffer"/>
+                  </run_actions>
+                  <do_if value="not $isValidPair">
                     <continue/>
                   </do_if>
                   
-                  <!-- Different stations only -->
-                  <do_if value="$sellOfferOwner != $buyOfferOwner">
-                    <!-- ✅ PROCESS INTRA-SECTOR TRADE: Full trade creation logic for true intra-sector matches -->
+                  <!-- Extract offer properties after validation -->
+                  <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
+                  <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
+                  <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
+                  <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
+                  
+                  <!-- ✅ PROCESS INTRA-SECTOR TRADE: Full trade creation logic for true intra-sector matches -->
                     <!-- ═══════════════════════════════════════════════════════════════════════════ -->
                     <!-- OPTIMIZATION 3: Early profit rejection (skip impossible trades instantly) -->
                     <set_value name="$buyPrice" exact="$sellOfferPrice"/>
@@ -665,6 +381,12 @@
                     
                     <do_if value="$sellPrice le $buyPrice">
                       <set_value name="$tradesRejectedProfit" operation="add"/>
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                        <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                        <set_value name="$buyStationName" exact="if $sellOfferOwner? then @$sellOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$sellStationName" exact="if $buyOfferOwner? then @$buyOfferOwner.knownname else 'NULL'"/>
+                        <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ❌ INTRA-SECTOR REJECTED (no profit): ' + $wareName + ' (Buy: ' + $buyStationName + ' @ ' + ($buyPrice/100) + ' Cr, Sell: ' + $sellStationName + ' @ ' + ($sellPrice/100) + ' Cr - sellPrice le buyPrice)'" chance="100"/>
+                      </do_if>
                       <continue/>
                     </do_if>
                     
@@ -674,58 +396,79 @@
                     
                     <do_if value="not $canDockAtBuyStation or not $canDockAtSellStation">
                       <set_value name="$tradesRejectedDocking" operation="add"/>
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                        <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                        <set_value name="$buyStationName" exact="if $sellOfferOwner? then @$sellOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$sellStationName" exact="if $buyOfferOwner? then @$buyOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$dockBuy" exact="if $canDockAtBuyStation then 'YES' else 'NO'"/>
+                        <set_value name="$dockSell" exact="if $canDockAtSellStation then 'YES' else 'NO'"/>
+                        <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ❌ INTRA-SECTOR REJECTED (docking): ' + $wareName + ' (Buy: ' + $buyStationName + ' dock=' + $dockBuy + ', Sell: ' + $sellStationName + ' dock=' + $dockSell + ')'" chance="100"/>
+                      </do_if>
                       <continue/>
                     </do_if>
                     
-                    <!-- Calculate max affordable -->
-                    <set_value name="$maxAffordable" exact="99999"/>
-                    <do_if value="$buyPrice gt 0">
-                      <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
-                    </do_if>
-                    
-                    <!-- Calculate max cargo capacity -->
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate max tradeable amount -->
                     <set_value name="$sellOfferWare" exact="@$sellOffer.ware"/>
                     <set_value name="$sellOfferAmount" exact="@$sellOffer.amount"/>
                     <set_value name="$buyOfferAmount" exact="@$buyOffer.amount"/>
                     <do_if value="not $sellOfferWare? or not $sellOfferAmount? or not $buyOfferAmount?">
                       <continue/>
                     </do_if>
-                    <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $sellOfferWare.volume)i"/>
-                    <set_value name="$maxAmount" exact="[$sellOfferAmount, $buyOfferAmount, $maxCargoCapacity, $maxAffordable].min"/>
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateMaxTradeableAmount" result="$maxAmount">
+                      <param name="ship" value="$ship"/>
+                      <param name="ware" value="$sellOfferWare"/>
+                      <param name="buyOfferAmount" value="$buyOfferAmount"/>
+                      <param name="sellOfferAmount" value="$sellOfferAmount"/>
+                      <param name="availableMoney" value="$availableMoney"/>
+                      <param name="buyPrice" value="$buyPrice"/>
+                    </run_actions>
                     
                     <do_if value="$maxAmount le 0">
                       <set_value name="$tradesRejectedAmount" operation="add"/>
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                        <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                        <set_value name="$buyStationName" exact="if $sellOfferOwner? then @$sellOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$sellStationName" exact="if $buyOfferOwner? then @$buyOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$offerAmount" exact="if $sellOfferAmount? then $sellOfferAmount else 0"/>
+                        <set_value name="$buyAmount" exact="if $buyOfferAmount? then $buyOfferAmount else 0"/>
+                        <set_value name="$cargoCap" exact="if $maxCargoCapacity? then $maxCargoCapacity else 0"/>
+                        <set_value name="$affordable" exact="if $maxAffordable? then $maxAffordable else 0"/>
+                        <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ❌ INTRA-SECTOR REJECTED (zero amount): ' + $wareName + ' (maxAmount=' + $maxAmount + ', offer=' + $offerAmount + ', buy=' + $buyAmount + ', cargo=' + $cargoCap + ', money=' + $affordable + ')'" chance="100"/>
+                      </do_if>
                       <continue/>
                     </do_if>
                     
-                    <!-- Calculate profit and ROI -->
-                    <set_value name="$investment" exact="$buyPrice * $maxAmount"/>
-                    <set_value name="$revenue" exact="$sellPrice * $maxAmount"/>
-                    <set_value name="$profit" exact="$revenue - $investment"/>
-                    <set_value name="$roi" exact="if $investment gt 0 then (($profit * 100) / $investment) else 100"/>
+                    <!-- ✅ OPTIMIZATION: Use library functions to calculate profit, ROI, and thresholds -->
+                    <run_actions ref="md.GT_Utilities.GT_CalculateProfit" result="$profit">
+                      <param name="buyPrice" value="$buyPrice"/>
+                      <param name="sellPrice" value="$sellPrice"/>
+                      <param name="amount" value="$maxAmount"/>
+                    </run_actions>
+                    <run_actions ref="md.GT_Utilities.GT_CalculateROI" result="$roi">
+                      <param name="investment" value="$buyPrice * $maxAmount"/>
+                      <param name="profit" value="$profit"/>
+                    </run_actions>
                     
-                    <!-- ✅ INTRA-SECTOR PRIORITY: Lower profit threshold for intra-sector trades -->
-                    <!-- This ensures ships in isolated sectors can still trade even with lower profits -->
-                    <set_value name="$roiThreshold" exact="$minROI"/>
-                    <set_value name="$profitThreshold" exact="$minAbsoluteProfit"/>
-                    <do_if value="$gt_AdvancedAnalytics">
-                      <set_value name="$roiThreshold" exact="$roiThreshold * 0.95"/>
-                      <set_value name="$profitThreshold" exact="($profitThreshold * 0.95)i"/>
-                    </do_if>
-                    <!-- ✅ FIX: For intra-sector trades, allow lower profit -->
-                    <!-- ✅ ISOLATION SCENARIO: If ship is isolated, allow even lower profit (25% of threshold) -->
-                    <!-- Normal intra-sector: 50% of threshold, Isolated: 25% of threshold -->
-                    <do_if value="$shipIsIsolated">
-                      <set_value name="$roiThreshold" exact="$roiThreshold * 0.25"/>
-                      <set_value name="$profitThreshold" exact="($profitThreshold * 0.25)i"/>
-                    </do_if>
-                    <do_else>
-                      <set_value name="$roiThreshold" exact="$roiThreshold * 0.5"/>
-                      <set_value name="$profitThreshold" exact="($profitThreshold * 0.5)i"/>
-                    </do_else>
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate trade thresholds -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeThresholds" result="$thresholds">
+                      <param name="minROI" value="$minROI"/>
+                      <param name="minAbsoluteProfit" value="$minAbsoluteProfit"/>
+                      <param name="useAdvancedAnalytics" value="$gt_AdvancedAnalytics"/>
+                      <param name="isIntraSector" value="true"/>
+                      <param name="isIsolated" value="$shipIsIsolated"/>
+                    </run_actions>
+                    <set_value name="$roiThreshold" exact="$thresholds.$ROIThreshold"/>
+                    <set_value name="$profitThreshold" exact="$thresholds.$ProfitThreshold"/>
                     
                     <do_if value="$roi lt $roiThreshold or $profit lt $profitThreshold">
                       <set_value name="$tradesRejectedProfit" operation="add"/>
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                        <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                        <set_value name="$buyStationName" exact="if $sellOfferOwner? then @$sellOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$sellStationName" exact="if $buyOfferOwner? then @$buyOfferOwner.knownname else 'NULL'"/>
+                        <set_value name="$thresholdLabel" exact="if $shipIsIsolated then ' (25% threshold for ISOLATED)' else ' (50% threshold for intra-sector)'"/>
+                        <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ❌ INTRA-SECTOR REJECTED (profit/ROI too low)' + $thresholdLabel + ': ' + $wareName + ' (Profit: ' + ($profit/100) + ' Cr lt ' + ($profitThreshold/100) + ' Cr, ROI: ' + ($roi/1) + '% lt ' + ($roiThreshold/1) + '%)'" chance="100"/>
+                      </do_if>
                       <continue/>
                     </do_if>
                     
@@ -734,44 +477,28 @@
                     <set_value name="$sellDistance" exact="0"/>
                     <set_value name="$routeDistance" exact="0"/>
                     
-                    <!-- Calculate efficiency (distance = 0, so efficiency = profit) -->
-                    <set_value name="$totalDistance" exact="0"/>
-                    <set_value name="$adjustedDistance" exact="0"/>
-                    <set_value name="$efficiency" exact="$profit"/>
-                    
-                    <!-- Apply faction priority boost -->
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate trade efficiency -->
                     <set_value name="$sellOfferOwnerOwner" exact="@$sellOfferOwner.owner"/>
                     <set_value name="$buyOfferOwnerOwner" exact="@$buyOfferOwner.owner"/>
-                    <do_if value="$factionPriority == 0">
-                      <do_if value="$sellOfferOwnerOwner == faction.player or $buyOfferOwnerOwner == faction.player">
-                        <set_value name="$boost" exact="$efficiency / 5"/>
-                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
-                      </do_if>
-                    </do_if>
-                    <do_elseif value="$factionPriority == 1">
-                      <do_if value="$sellOfferOwnerOwner != faction.player and $buyOfferOwnerOwner != faction.player">
-                        <set_value name="$boost" exact="$efficiency / 5"/>
-                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
-                      </do_if>
-                    </do_elseif>
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeEfficiency" result="$efficiency">
+                      <param name="profit" value="$profit"/>
+                      <param name="distance" value="0"/>
+                      <param name="distancePenaltyMultiplier" value="1.0"/>
+                      <param name="factionPriority" value="$factionPriority"/>
+                      <param name="buyStationOwner" value="$sellOfferOwnerOwner"/>
+                      <param name="sellStationOwner" value="$buyOfferOwnerOwner"/>
+                    </run_actions>
                     
                     <!-- Extract sectors (both are current sector for intra-sector trades) -->
                     <set_value name="$buySector" exact="@$sellOfferOwner.sector"/>
                     <set_value name="$sellSector" exact="@$buyOfferOwner.sector"/>
                     
-                    <!-- Check if this sector pair previously failed -->
-                    <set_value name="$isFailedSectorPair" exact="false"/>
-                    <do_if value="$failedTrades.count gt 0">
-                      <do_all exact="$failedTrades.count" counter="$failIdx">
-                        <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-                        <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-                          <do_if value="$buySector == $failedTrade.$BuySector and $sellSector == $failedTrade.$SellSector">
-                            <set_value name="$isFailedSectorPair" exact="true"/>
-                            <break/>
-                          </do_if>
-                        </do_if>
-                      </do_all>
-                    </do_if>
+                    <!-- ✅ OPTIMIZATION: Use library function to check failed sector pair -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CheckFailedSectorPair" result="$isFailedSectorPair">
+                      <param name="buySector" value="$buySector"/>
+                      <param name="sellSector" value="$sellSector"/>
+                      <param name="failedTrades" value="$failedTrades"/>
+                    </run_actions>
                     
                     <!-- ✅ INTRA-SECTOR: Create trade (respect ware quota) -->
                     <do_if value="not $isFailedSectorPair and $tradesForThisWare lt $maxTradesPerWare">
@@ -785,29 +512,32 @@
                           '\n  Profit (RAW): ' + $profit + ' = ' + ($profit/100) + ' Cr' +
                           '\n  Calculated profit check: (' + ($sellPrice/100) + ' - ' + ($buyPrice/100) + ') * ' + $maxAmount + ' = ' + (($sellPrice - $buyPrice) * $maxAmount / 100) + ' Cr'" chance="100"/>
                       </do_if>
-                      <set_value name="$trade" exact="table[
-                        $BuyOffer = $sellOffer,
-                        $SellOffer = $buyOffer,
-                        $BuyStation = $sellOfferOwner,
-                        $SellStation = $buyOfferOwner,
-                        $Amount = $maxAmount,
-                        $Profit = $profit,
-                        $ROI = $roi,
-                        $Score = $efficiency,
-                        $BuyPrice = $buyPrice,
-                        $SellPrice = $sellPrice,
-                        $Distance = $routeDistance,
-                        $Risk = 0
-                      ]"/>
+                      <!-- ✅ OPTIMIZATION: Use library function to create trade object -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_CreateTradeObject" result="$trade">
+                        <param name="sellOffer" value="$sellOffer"/>
+                        <param name="buyOffer" value="$buyOffer"/>
+                        <param name="sellStation" value="$sellOfferOwner"/>
+                        <param name="buyStation" value="$buyOfferOwner"/>
+                        <param name="amount" value="$maxAmount"/>
+                        <param name="profit" value="$profit"/>
+                        <param name="roi" value="$roi"/>
+                        <param name="efficiency" value="$efficiency"/>
+                        <param name="buyPrice" value="$buyPrice"/>
+                        <param name="sellPrice" value="$sellPrice"/>
+                        <param name="distance" value="$routeDistance"/>
+                        <param name="risk" value="0"/>
+                      </run_actions>
                       
                       <append_to_list name="$tradeList" exact="$trade"/>
-                      <set_value name="$tradesForThisWare" operation="add"/>
-                      <set_value name="$keysCheck" exact="@$tradesPerWare.keys"/>
-                      <set_value name="$countCheck" exact="@$keysCheck.count"/>
-                      <do_if value="not $countCheck? or $countCheck lt 0">
-                        <set_value name="$tradesPerWare" exact="table[]"/>
-                      </do_if>
-                      <set_value name="$tradesPerWare.{$ware}" exact="$tradesForThisWare"/>
+                      
+                      <!-- ✅ OPTIMIZATION: Use library function to update trade quota -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_UpdateTradeQuota" result="$quotaResult">
+                        <param name="tradesPerWare" value="$tradesPerWare"/>
+                        <param name="ware" value="$ware"/>
+                        <param name="increment" value="1"/>
+                      </run_actions>
+                      <set_value name="$tradesPerWare" exact="$quotaResult.$UpdatedTable"/>
+                      <set_value name="$tradesForThisWare" exact="$quotaResult.$NewCount"/>
                       
                       <do_if value="$tradesForThisWare ge $maxTradesPerWare">
                         <break/>
@@ -818,11 +548,13 @@
                         <set_value name="$crossStationBestTrade" exact="$trade"/>
                       </do_if>
                       
-                      <set_value name="$routeConflicted" exact="false"/>
-                      <do_if value="$reservedRoutes.count gt 0">
-                        <set_value name="$tradeCacheKey" exact="$sellOfferOwner.idcode + '_' + $buyOfferOwner.idcode + '_' + $sellOfferWare"/>
-                        <set_value name="$routeConflicted" exact="$reservedRoutes.indexof.{$tradeCacheKey}?"/>
-                      </do_if>
+                      <!-- ✅ OPTIMIZATION: Use library function to check route conflict -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_CheckRouteConflict" result="$routeConflicted">
+                        <param name="sellStation" value="$sellOfferOwner"/>
+                        <param name="buyStation" value="$buyOfferOwner"/>
+                        <param name="ware" value="$sellOfferWare"/>
+                        <param name="reservedRoutes" value="$reservedRoutes"/>
+                      </run_actions>
                       
                       <do_if value="not $routeConflicted and not $isFailedSectorPair and $efficiency gt $nonConflictedBestScore">
                         <set_value name="$nonConflictedBestScore" exact="$efficiency"/>
@@ -835,7 +567,6 @@
                         <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ✅ INTRA-SECTOR trade created' + $isolationLabel + ': ' + (if $sellOfferWare? then @$sellOfferWare.name else 'NULL') + ' in ' + @$currentSector.knownname + ' (Profit: ' + ($profit/100) + ' Cr, ROI: ' + ($roi/1) + '%, Score: ' + ($efficiency/1) + ')'" chance="100"/>
                       </do_if>
                     </do_if>
-                  </do_if>
                 </do_all>
                 
                 <do_if value="$tradesForThisWare ge $maxTradesPerWare">
@@ -843,57 +574,58 @@
                 </do_if>
               </do_all>
             </do_if>
+            <do_else>
+              <!-- ✅ DEBUG: Log when Phase 1 can't run -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and $shipIsIsolated">
+                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                <set_value name="$sectorName" exact="if $currentSector? then @$currentSector.knownname else 'NULL'"/>
+                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ⚠️ Phase 1 (INTRA-SECTOR) SKIPPED [ISOLATED]: ' + $wareName + ' in ' + $sectorName + ' - ' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy (need BOTH > 0)'" chance="100"/>
+              </do_if>
+            </do_else>
             
             <!-- Phase 2: Match all remaining offers (cross-sector with cross-sector, or mixed) -->
-            <!-- NOW run nested loops on LIMITED offers with CACHED docking -->
-            <do_all exact="$sellOffersForWare.count" counter="$i">
-              <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
-              
-              <!-- Validate sell offer is valid before processing -->
-              <!-- Use @ operator to safely check properties (prevents crashes on invalid trade objects) -->
-              <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
-              <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
-              <do_if value="not $sellOffer? or not $sellOfferOwner? or not $sellOfferPrice?">
-                <continue/>
-              </do_if>
-              
-              <do_all exact="$buyOffersForWare.count" counter="$j">
-                <set_value name="$buyOffer" exact="$buyOffersForWare.{$j}"/>
+            <!-- ✅ SKIP if ship is isolated - isolated ships can only trade intra-sector -->
+            <do_if value="not $shipIsIsolated">
+              <!-- NOW run nested loops on LIMITED offers with CACHED docking -->
+              <do_all exact="$sellOffersForWare.count" counter="$i">
+                <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
                 
-                <!-- Validate buy offer is valid before processing -->
-                <!-- Use @ operator to safely check properties (prevents crashes on invalid trade objects) -->
-                <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
-                <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
-                <do_if value="not $buyOffer? or not $buyOfferOwner? or not $buyOfferPrice?">
-                  <continue/>
-                </do_if>
-                
-                <!-- Different stations only -->
-                <do_if value="$sellOfferOwner != $buyOfferOwner">
-                  <!-- Skip if this is already an intra-sector match (we processed those separately) -->
-                  <set_value name="$sellOfferSector" exact="@$sellOfferOwner.sector"/>
-                  <set_value name="$buyOfferSector" exact="@$buyOfferOwner.sector"/>
-                  <do_if value="$sellOfferSector? and $buyOfferSector? and $currentSector?">
-                    <do_if value="$sellOfferSector == $currentSector and $buyOfferSector == $currentSector">
-                      <!-- This is an intra-sector match - skip since we already processed these -->
-                      <continue/>
-                    </do_if>
+                <do_all exact="$buyOffersForWare.count" counter="$j">
+                  <set_value name="$buyOffer" exact="$buyOffersForWare.{$j}"/>
+                  
+                  <!-- ✅ OPTIMIZATION: Use library function to validate offer pair -->
+                  <run_actions ref="md.GT_Trade_Utilities.GT_ValidateTradeOfferPair" result="$isValidPair">
+                    <param name="sellOffer" value="$sellOffer"/>
+                    <param name="buyOffer" value="$buyOffer"/>
+                  </run_actions>
+                  <do_if value="not $isValidPair">
+                    <continue/>
                   </do_if>
                   
-                  <!-- Process cross-sector or mixed trade -->
-                  <!-- ═══════════════════════════════════════════════════════════════════════════ -->
-                  <!-- OPTIMIZATION 3: Early profit rejection (skip impossible trades instantly) -->
-                  <!-- Use already-extracted safe values -->
-                  <set_value name="$buyPrice" exact="$sellOfferPrice"/>
-                  <set_value name="$sellPrice" exact="$buyOfferPrice"/>
-                    
-                    <!-- Calculate max affordable -->
-                    <set_value name="$maxAffordable" exact="99999"/>
-                    <do_if value="$buyPrice gt 0">
-                      <set_value name="$maxAffordable" exact="($availableMoney / $buyPrice)i"/>
+                  <!-- Extract offer properties after validation -->
+                  <set_value name="$sellOfferOwner" exact="@$sellOffer.owner"/>
+                  <set_value name="$sellOfferPrice" exact="@$sellOffer.unitprice"/>
+                  <set_value name="$buyOfferOwner" exact="@$buyOffer.owner"/>
+                  <set_value name="$buyOfferPrice" exact="@$buyOffer.unitprice"/>
+                  
+                  <!-- Skip if this is already an intra-sector match (we processed those separately) -->
+                    <set_value name="$sellOfferSector" exact="@$sellOfferOwner.sector"/>
+                    <set_value name="$buyOfferSector" exact="@$buyOfferOwner.sector"/>
+                    <do_if value="$sellOfferSector? and $buyOfferSector? and $currentSector?">
+                      <do_if value="$sellOfferSector == $currentSector and $buyOfferSector == $currentSector">
+                        <!-- This is an intra-sector match - skip since we already processed these -->
+                        <continue/>
+                      </do_if>
                     </do_if>
                     
-                    <!-- Calculate max cargo capacity -->
+                    <!-- Process cross-sector or mixed trade -->
+                    <!-- ═══════════════════════════════════════════════════════════════════════════ -->
+                    <!-- OPTIMIZATION 3: Early profit rejection (skip impossible trades instantly) -->
+                    <!-- Use already-extracted safe values -->
+                    <set_value name="$buyPrice" exact="$sellOfferPrice"/>
+                    <set_value name="$sellPrice" exact="$buyOfferPrice"/>
+                    
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate max tradeable amount -->
                     <!-- Use @ operator for safe property access -->
                     <set_value name="$sellOfferWare" exact="@$sellOffer.ware"/>
                     <set_value name="$sellOfferAmount" exact="@$sellOffer.amount"/>
@@ -901,19 +633,30 @@
                     <do_if value="not $sellOfferWare? or not $sellOfferAmount? or not $buyOfferAmount?">
                       <continue/>
                     </do_if>
-                    <set_value name="$maxCargoCapacity" exact="($ship.cargo.free.all / $sellOfferWare.volume)i"/>
-                    <set_value name="$maxAmount" exact="[$sellOfferAmount, $buyOfferAmount, $maxCargoCapacity, $maxAffordable].min"/>
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateMaxTradeableAmount" result="$maxAmount">
+                      <param name="ship" value="$ship"/>
+                      <param name="ware" value="$sellOfferWare"/>
+                      <param name="buyOfferAmount" value="$buyOfferAmount"/>
+                      <param name="sellOfferAmount" value="$sellOfferAmount"/>
+                      <param name="availableMoney" value="$availableMoney"/>
+                      <param name="buyPrice" value="$buyPrice"/>
+                    </run_actions>
                     
                     <do_if value="$maxAmount le 0">
                       <set_value name="$tradesRejectedAmount" operation="add"/>
                       <continue/>
                     </do_if>
                     
-                    <!-- Calculate profit and ROI -->
-                    <set_value name="$investment" exact="$buyPrice * $maxAmount"/>
-                    <set_value name="$revenue" exact="$sellPrice * $maxAmount"/>
-                    <set_value name="$profit" exact="$revenue - $investment"/>
-                    <set_value name="$roi" exact="if $investment gt 0 then (($profit * 100) / $investment) else 100"/>
+                    <!-- ✅ OPTIMIZATION: Use library functions to calculate profit and ROI -->
+                    <run_actions ref="md.GT_Utilities.GT_CalculateProfit" result="$profit">
+                      <param name="buyPrice" value="$buyPrice"/>
+                      <param name="sellPrice" value="$sellPrice"/>
+                      <param name="amount" value="$maxAmount"/>
+                    </run_actions>
+                    <run_actions ref="md.GT_Utilities.GT_CalculateROI" result="$roi">
+                      <param name="investment" value="$buyPrice * $maxAmount"/>
+                      <param name="profit" value="$profit"/>
+                    </run_actions>
                     
                     <!-- ═══════════════════════════════════════════════════════════════════════════ -->
                     <!-- CACHE FIRST: Cache ALL profitable trades BEFORE any filtering -->
@@ -968,7 +711,7 @@
                             </do_if>
                             <do_else>
                               <!-- ✅ UNIVERSAL CACHE: Use range-only distance (NO blacklist params) -->
-                                <set_value name="$routeDistance" exact="$buySector.gatedistance.{$sellSector}"/>
+                              <set_value name="$routeDistance" exact="$buySector.gatedistance.{$sellSector}"/>
                               <do_if value="$routeDistance lt 0">
                                 <!-- No path available - distance invalid -->
                                 <set_value name="$routeDistance" exact="-1"/>
@@ -1049,13 +792,16 @@
                       </do_if>
                     </do_if>
                     
-                    <!-- Check thresholds -->
-                    <set_value name="$roiThreshold" exact="$minROI"/>
-                    <set_value name="$profitThreshold" exact="$minAbsoluteProfit"/>
-                    <do_if value="$gt_AdvancedAnalytics">
-                      <set_value name="$roiThreshold" exact="$roiThreshold * 0.95"/>
-                      <set_value name="$profitThreshold" exact="($profitThreshold * 0.95)i"/>
-                    </do_if>
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate trade thresholds -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeThresholds" result="$thresholds">
+                      <param name="minROI" value="$minROI"/>
+                      <param name="minAbsoluteProfit" value="$minAbsoluteProfit"/>
+                      <param name="useAdvancedAnalytics" value="$gt_AdvancedAnalytics"/>
+                      <param name="isIntraSector" value="false"/>
+                      <param name="isIsolated" value="false"/>
+                    </run_actions>
+                    <set_value name="$roiThreshold" exact="$thresholds.$ROIThreshold"/>
+                    <set_value name="$profitThreshold" exact="$thresholds.$ProfitThreshold"/>
                     
                     <do_if value="$roi lt $roiThreshold or $profit lt $profitThreshold">
                       <set_value name="$tradesRejectedProfit" operation="add"/>
@@ -1121,92 +867,61 @@
                       <!-- ✅ UNIVERSAL CACHE: Use range-only distance (NO blacklist params) -->
                       <set_value name="$buyStationSector" exact="$buySector"/>
                       <set_value name="$sellStationSector" exact="$sellSector"/>
-                        <set_value name="$routeDistance" exact="$buyStationSector.gatedistance.{$sellStationSector}"/>
+                      <set_value name="$routeDistance" exact="$buyStationSector.gatedistance.{$sellStationSector}"/>
                     </do_else>
                     
-                    <!-- Calculate efficiency (uses total distance for scoring, but route distance for cache) -->
+                    <!-- ✅ OPTIMIZATION: Use library function to calculate trade efficiency -->
                     <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
-                    <set_value name="$adjustedDistance" exact="$totalDistance * $distancePenaltyMultiplier"/>
-                    <set_value name="$efficiency" exact="if $adjustedDistance gt 0 then ($profit / $adjustedDistance) else $profit"/>
-                    
-                    <!-- ✅ UNIVERSAL CACHE: No escape route priority - removed for universal processing -->
-                    
-                    <!-- Apply faction priority boost -->
                     <set_value name="$sellOfferOwnerOwner" exact="@$sellOfferOwner.owner"/>
                     <set_value name="$buyOfferOwnerOwner" exact="@$buyOfferOwner.owner"/>
-                    <do_if value="$factionPriority == 0">
-                      <do_if value="$sellOfferOwnerOwner == faction.player or $buyOfferOwnerOwner == faction.player">
-                        <set_value name="$boost" exact="$efficiency / 5"/>
-                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
-                      </do_if>
-                    </do_if>
-                    <do_elseif value="$factionPriority == 1">
-                      <do_if value="$sellOfferOwnerOwner != faction.player and $buyOfferOwnerOwner != faction.player">
-                        <set_value name="$boost" exact="$efficiency / 5"/>
-                        <set_value name="$efficiency" exact="$efficiency + $boost"/>
-                      </do_if>
-                    </do_elseif>
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeEfficiency" result="$efficiency">
+                      <param name="profit" value="$profit"/>
+                      <param name="distance" value="$totalDistance"/>
+                      <param name="distancePenaltyMultiplier" value="$distancePenaltyMultiplier"/>
+                      <param name="factionPriority" value="$factionPriority"/>
+                      <param name="buyStationOwner" value="$sellOfferOwnerOwner"/>
+                      <param name="sellStationOwner" value="$buyOfferOwnerOwner"/>
+                    </run_actions>
                     
                     <!-- ✅ UNIVERSAL CACHE: No blacklist filtering - removed for universal processing -->
                     <!-- Blacklist filtering happens per-ship during cache retrieval -->
                     
-                    <!-- Check if this sector pair previously failed -->
-                    <set_value name="$isFailedSectorPair" exact="false"/>
-                    <do_if value="$failedTrades.count gt 0">
-                      <do_all exact="$failedTrades.count" counter="$failIdx">
-                        <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-                        
-                        <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-                          <do_if value="$buySector == $failedTrade.$BuySector and 
-                                        $sellSector == $failedTrade.$SellSector">
-                            <set_value name="$isFailedSectorPair" exact="true"/>
-                            <break/>
-                          </do_if>
-                        </do_if>
-                      </do_all>
-                    </do_if>
+                    <!-- ✅ OPTIMIZATION: Use library function to check failed sector pair -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CheckFailedSectorPair" result="$isFailedSectorPair">
+                      <param name="buySector" value="$buySector"/>
+                      <param name="sellSector" value="$sellSector"/>
+                      <param name="failedTrades" value="$failedTrades"/>
+                    </run_actions>
                     
                     <!-- ✅ UNIVERSAL CACHE: Collect ALL valid trades (no blacklist filtering) -->
                     <!-- Respect ware quota to ensure diversity -->
                     <do_if value="not $isFailedSectorPair and $tradesForThisWare lt $maxTradesPerWare">
-                      <set_value name="$trade" exact="table[
-                        $BuyOffer = $sellOffer,
-                        $SellOffer = $buyOffer,
-                        $BuyStation = $sellOfferOwner,
-                        $SellStation = $buyOfferOwner,
-                        $Amount = $maxAmount,
-                        $Profit = $profit,
-                        $ROI = $roi,
-                        $Score = $efficiency,
-                        $BuyPrice = $buyPrice,
-                        $SellPrice = $sellPrice,
-                        $Distance = $routeDistance,
-                        $Risk = 0
-                      ]"/>
+                      <!-- ✅ OPTIMIZATION: Use library function to create trade object -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_CreateTradeObject" result="$trade">
+                        <param name="sellOffer" value="$sellOffer"/>
+                        <param name="buyOffer" value="$buyOffer"/>
+                        <param name="sellStation" value="$sellOfferOwner"/>
+                        <param name="buyStation" value="$buyOfferOwner"/>
+                        <param name="amount" value="$maxAmount"/>
+                        <param name="profit" value="$profit"/>
+                        <param name="roi" value="$roi"/>
+                        <param name="efficiency" value="$efficiency"/>
+                        <param name="buyPrice" value="$buyPrice"/>
+                        <param name="sellPrice" value="$sellPrice"/>
+                        <param name="distance" value="$routeDistance"/>
+                        <param name="risk" value="0"/>
+                      </run_actions>
                       
                       <append_to_list name="$tradeList" exact="$trade"/>
                       
-                      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
-                      <!-- WARE QUOTA: Increment counter for this ware -->
-                      <!-- Ensures we don't collect too many trades for a single ware -->
-                      <!-- ═══════════════════════════════════════════════════════════════════════════ -->
-                      <set_value name="$tradesForThisWare" operation="add"/>
-                      <!-- CRITICAL: X4 MD Problem - ? operator checks existence (not null), so null? = true -->
-                      <!-- The safest solution: Use try/catch pattern by checking if we can access .keys.count -->
-                      <!-- If $tradesPerWare is null, @$tradesPerWare.keys = null, and @null.count = null -->
-                      <!-- null? = true (exists but is null), so we check for .count property existence -->
-                      <set_value name="$keysCheck" exact="@$tradesPerWare.keys"/>
-                      <set_value name="$countCheck" exact="@$keysCheck.count"/>
-                      <!-- CRITICAL: null? = true in X4 MD, so we must check if countCheck is a NUMBER -->
-                      <!-- Valid tables: keys.count = integer (0 or higher) -->
-                      <!-- Null tables: keys = null, so keys.count = null (not a number) -->
-                      <!-- We check if countCheck exists AND is >= 0 (proves it's a number, not null) -->
-          <do_if value="not $countCheck? or $countCheck lt 0">
-            <!-- Table is invalid (null or negative) - must reinitialize -->
-            <set_value name="$tradesPerWare" exact="table[]"/>
-          </do_if>
-                      <!-- Now guaranteed safe to set property -->
-                      <set_value name="$tradesPerWare.{$ware}" exact="$tradesForThisWare"/>
+                      <!-- ✅ OPTIMIZATION: Use library function to update trade quota -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_UpdateTradeQuota" result="$quotaResult">
+                        <param name="tradesPerWare" value="$tradesPerWare"/>
+                        <param name="ware" value="$ware"/>
+                        <param name="increment" value="1"/>
+                      </run_actions>
+                      <set_value name="$tradesPerWare" exact="$quotaResult.$UpdatedTable"/>
+                      <set_value name="$tradesForThisWare" exact="$quotaResult.$NewCount"/>
                       
                       <!-- ✅ OPTIMIZATION #3: Early exit when quota reached -->
                       <!-- Break from inner loop (buy offers) when we have enough trades for this ware -->
@@ -1220,12 +935,13 @@
                         <set_value name="$crossStationBestTrade" exact="$trade"/>
                       </do_if>
                       
-                      <!-- Check for route conflicts -->
-                      <set_value name="$routeConflicted" exact="false"/>
-                      <do_if value="$reservedRoutes.count gt 0">
-                        <set_value name="$tradeCacheKey" exact="$sellOfferOwner.idcode + '_' + $buyOfferOwner.idcode + '_' + $sellOfferWare"/>
-                        <set_value name="$routeConflicted" exact="$reservedRoutes.indexof.{$tradeCacheKey}?"/>
-                      </do_if>
+                      <!-- ✅ OPTIMIZATION: Use library function to check route conflict -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_CheckRouteConflict" result="$routeConflicted">
+                        <param name="sellStation" value="$sellOfferOwner"/>
+                        <param name="buyStation" value="$buyOfferOwner"/>
+                        <param name="ware" value="$sellOfferWare"/>
+                        <param name="reservedRoutes" value="$reservedRoutes"/>
+                      </run_actions>
                       
                       <!-- Track best non-conflicted -->
                       <do_if value="not $routeConflicted and not $isFailedSectorPair and $efficiency gt $nonConflictedBestScore">
@@ -1233,14 +949,14 @@
                         <set_value name="$nonConflictedBestTrade" exact="$trade"/>
                       </do_if>
                     </do_if>
-                      </do_if>
                 </do_all>
                 
                 <!-- ✅ OPTIMIZATION #3: Early exit from outer loop if quota reached -->
                 <do_if value="$tradesForThisWare ge $maxTradesPerWare">
                   <break/>  <!-- Exit sell offers loop -->
                   </do_if>
-                </do_all>
+              </do_all>
+            </do_if>
             <!-- ✅ LINE 998: Closes do_if from line 194 -->
             </do_if>
           </do_all>
@@ -1258,15 +974,11 @@
           <set_value name="$state.$tradesRejectedAmount" exact="$tradesRejectedAmount"/>
           <set_value name="$state.$tradesRejectedDistance" exact="$tradesRejectedDistance"/>
           <!-- ✅ UNIVERSAL CACHE: No tradesRejectedBlacklist or sectorBlacklistCache - removed for universal processing -->
-          <!-- CRITICAL: Only save $tradesPerWare to state if it's a valid table (not null) -->
-          <set_value name="$verifyTableForSave" exact="@$tradesPerWare.keys"/>
-          <do_if value="$verifyTableForSave?">
-            <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
-          </do_if>
-          <do_else>
-            <!-- Was null - save empty table instead -->
-            <set_value name="$state.$tradesPerWare" exact="table[]"/>
-          </do_else>
+          <!-- ✅ OPTIMIZATION: Use library function to validate table before saving -->
+          <run_actions ref="md.GT_Utilities.GT_ValidateTableSafe" result="$validTradesPerWare">
+            <param name="table" value="$tradesPerWare"/>
+          </run_actions>
+          <set_value name="$state.$tradesPerWare" exact="$validTradesPerWare"/>
           <set_value name="$state.$bestRejectedProfit" exact="$bestRejectedProfit"/>
           <set_value name="$state.$bestRejectedTrade" exact="$bestRejectedTrade"/>
           
