@@ -181,14 +181,17 @@
         </do_if>
         
         <!-- ===== PHASE 1: CHECK TRADE CACHE WITH AGE VALIDATION ===== -->
-        <!-- Only run cache search if NOT continuing from live search -->
+        <!-- Only run cache search if NOT continuing from live search AND NOT forcing live search -->
         <set_value name="$cacheChecked" exact="false"/>
         <set_value name="$cacheCount" exact="0"/>
         <set_value name="$cacheTradeList" exact="[]"/>
         <set_value name="$cacheBestTrade" exact="null"/>
         <set_value name="$cacheBestScore" exact="0"/>
         
-        <do_if value="not $isLiveSearchContinuation">
+        <!-- ✅ NEW: Check if ForceLiveSearch flag is set (AI rejected all cached trades) -->
+        <set_value name="$forceLiveSearch" exact="@$params.$ForceLiveSearch"/>
+        
+        <do_if value="not $isLiveSearchContinuation and not $forceLiveSearch">
           <!-- Track search method for diagnostics -->
           <set_value name="$searchMethod" exact="'cache'"/>
           <set_value name="$cacheChecked" exact="true"/>
@@ -215,8 +218,17 @@
           <set_value name="$cacheTradeList" exact="@global.$GT_SearchResult.$TradeList"/>
         </do_if>
         <do_else>
-          <!-- Live search continuation - skip cache, use live results -->
+          <!-- Live search continuation OR ForceLiveSearch - skip cache, use live results -->
           <set_value name="$searchMethod" exact="'live'"/>
+          <do_if value="$forceLiveSearch">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔄 ForceLiveSearch flag set - skipping cache, going straight to live search'" chance="100"/>
+            </do_if>
+            <!-- Clear ForceLiveSearch flag after use -->
+            <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+              <remove_value name="global.$GT_AIParameters.{$ship}.$ForceLiveSearch"/>
+            </do_if>
+          </do_if>
         </do_else>
         
         <!-- ✅ CRITICAL FIX: Compare cache vs live results and use the best -->
@@ -815,10 +827,12 @@
             </do_if> -->
             
             <!-- Signal execution module (which will signal AI after storing trade LIST) -->
+            <!-- ✅ NEW: Pass searchMethod so AI knows if trades came from cache or live search -->
             <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
               $Ship = $ship,
               $Trade = $bestTrade,
-              $TradeList = $tradeList
+              $TradeList = $tradeList,
+              $SearchMethod = $searchMethod
             ]"/>
             
             <!-- GT_Trade_Found signal now sent FROM ExecuteTrade cue after storing pending trade -->
@@ -1286,14 +1300,16 @@
               <param name="sellStation" value="$cacheEntry.$SellOffer.owner"/>
             </run_actions>
             <!-- Extract individual distances for validation (backwards compatible) -->
+            <!-- ✅ FIX: Calculate distance from HOME to each station (not route distance) -->
             <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
-            <set_value name="$rangeCheckSell" exact="0"/>
-            <do_if value="$cacheEntry.$BuyOffer.owner.sector != $cacheEntry.$SellOffer.owner.sector">
-              <set_value name="$rangeCheckSell" exact="$cacheEntry.$BuyOffer.owner.sector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
-            </do_if>
+            <set_value name="$rangeCheckSell" exact="$homeSector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
+            
+            <!-- ✅ FIX: Validate using max distance from home (both stations must be within maxDistance from home) -->
+            <!-- This ensures stations are within operational range, regardless of ship's current position -->
+            <set_value name="$maxStationDistanceFromHome" exact="[$rangeCheckBuy, $rangeCheckSell].max"/>
             
             <!-- Skip if outside operational range -->
-            <do_if value="$rangeCheckBuy lt 0 or $rangeCheckSell lt 0 or $totalRangeDistance gt $maxDistance">
+            <do_if value="$rangeCheckBuy lt 0 or $rangeCheckSell lt 0 or $maxStationDistanceFromHome gt $maxDistance">
               <!-- Track as filtered (out of range) - $total already incremented above -->
               <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
               <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
@@ -1463,19 +1479,9 @@
                  The old logic read prices from cached tradeoffer objects which are stale.
                  We should only validate against fresh prices AFTER querying fresh offers. -->
             
-            <!-- Check distance constraint (use current blacklist-aware distance) -->
-            <do_if value="$currentDistance gt $maxDistance">
-              <!-- Track ware for statistics -->
-              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-              <do_if value="$ware? and $ware != null">
-                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                <set_value name="$wareStats.$distanceConstraint" exact="$wareStats.$distanceConstraint + 1"/>
-                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
-              </do_if>
-              <continue/>
-            </do_if>
+            <!-- ✅ REMOVED: Redundant distance constraint check -->
+            <!-- Distance validation already done at line 1310 using home-based distance -->
+            <!-- Actual travel distance ($currentDistance) is used for penalty scoring only (line 1513) -->
             
             <!-- Check profit constraint -->
             <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit lt $minAbsoluteProfit">
@@ -1501,6 +1507,11 @@
               <param name="factionPriority" value="$factionPriority"/>
               <param name="buyStationOwner" value="$cacheEntry.$BuyOffer.owner.owner"/>
               <param name="sellStationOwner" value="$cacheEntry.$SellOffer.owner.owner"/>
+              <param name="homeSector" value="$homeSector"/>
+              <param name="shipSector" value="$currentSector"/>
+              <param name="buySector" value="$buySector"/>
+              <param name="sellSector" value="$sellSector"/>
+              <param name="shipToBuyDistance" value="$buyDistance"/>
             </run_actions>
             
             <!-- ✅ DEBUG: Log efficiency calculation with distance penalty (if enabled) -->
@@ -1717,6 +1728,11 @@
                         <param name="factionPriority" value="$factionPriority"/>
                         <param name="buyStationOwner" value="$cacheEntry.$BuyOffer.owner.owner"/>
                         <param name="sellStationOwner" value="$cacheEntry.$SellOffer.owner.owner"/>
+                        <param name="homeSector" value="$homeSector"/>
+                        <param name="shipSector" value="$currentSector"/>
+                        <param name="buySector" value="$buySector"/>
+                        <param name="sellSector" value="$sellSector"/>
+                        <param name="shipToBuyDistance" value="$buyDistance"/>
                       </run_actions>
                       
                       <set_value name="$trade" exact="table[
@@ -1729,7 +1745,7 @@
                         $ROI = $freshROI,
                         $BuyPrice = $freshBuyPrice,
                         $SellPrice = $freshSellPrice,
-                        $Distance = $cacheEntry.$Distance,
+                        $Distance = $currentDistance,
                         $Score = $freshEfficiency,
                         $Risk = 0
                       ]"/>

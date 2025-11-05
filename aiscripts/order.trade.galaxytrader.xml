@@ -1109,6 +1109,7 @@
         <set_value name="$tradesRejectedDocking" exact="0"/>
         <set_value name="$tradesRejectedPath" exact="0"/>
         <set_value name="$tradesRejectedDistance" exact="0"/>
+        <set_value name="$tradesRejectedCargo" exact="0"/>
         
         <!-- Iterate through trade list -->
         <do_all exact="$tradeList.count" counter="$tradeIdx">
@@ -1458,6 +1459,50 @@
             <!-- Continue to next trade in list -->
             <continue/>
           </do_if>
+          
+          <!-- ✅ CRITICAL: Check if ship can carry this ware type (cargo bay compatibility) -->
+          <!-- Some wares (like Methane/gas) require special cargo bays that normal ships don't have -->
+          <set_value name="$ware" exact="@$currentTrade.$BuyOffer.ware"/>
+          <set_value name="$canCarryWareType" exact="this.ship.cargo.{$ware}.max gt 0"/>
+          
+          <do_if value="not $canCarryWareType">
+            <!-- SHIP CANNOT CARRY THIS WARE TYPE - Skip to next trade -->
+            <set_value name="$tradesRejectedCargo" operation="add"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ Trade ' + $tradeIdx + '/' + $tradeList.count + ' INCOMPATIBLE CARGO TYPE:' + 
+              '\n  Ware: ' + @$ware.name + 
+              '\n  Reason: Ship does not have required cargo bay type (e.g., liquid/gas requires special containment)' +
+              '\n  Ship cargo max for this ware: ' + this.ship.cargo.{$ware}.max +
+              '\n  → Trying next trade in list...'" 
+              chance="100"/>
+            
+            <!-- Continue to next trade in list -->
+            <continue/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Check cargo space BEFORE executing trade -->
+          <!-- The ship might have gained cargo between trade search and execution -->
+          <set_value name="$requiredCargoSpace" exact="$currentTrade.$Amount"/>
+          <set_value name="$availableCargoSpace" exact="this.ship.cargo.{$ware}.free"/>
+          <set_value name="$hasEnoughCargoSpace" exact="$availableCargoSpace ge $requiredCargoSpace"/>
+          
+          <do_if value="not $hasEnoughCargoSpace">
+            <!-- NOT ENOUGH CARGO SPACE - Skip to next trade -->
+            <set_value name="$tradesRejectedCargo" operation="add"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ Trade ' + $tradeIdx + '/' + $tradeList.count + ' INSUFFICIENT CARGO SPACE:' + 
+              '\n  Ware: ' + @$ware.name + 
+              '\n  Amount: ' + $requiredCargoSpace + ' units' +
+              '\n  Available: ' + $availableCargoSpace + '/' + this.ship.cargo.{$ware}.max + ' units' +
+              '\n  Needed: ' + ($requiredCargoSpace - $availableCargoSpace) + ' more units' +
+              '\n  Reason: Ship does not have enough free cargo space for this trade' +
+              '\n  → Trying next trade in list...'" 
+              chance="100"/>
+            
+            <!-- Continue to next trade in list -->
+            <continue/>
+          </do_if>
+          
           <do_else>
             <!-- ✅ VALIDATION PASSED - This trade is valid! -->
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Trade ' + $tradeIdx + '/' + $tradeList.count + ' is VALID - using this trade!'" chance="100"/>
@@ -1470,7 +1515,7 @@
         
         <!-- After loop: Check if we found a valid trade -->
         <do_if value="$validTradeFound">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesRejectedPath + ' unreachable, ' + $tradesRejectedDocking + ' docking denied, ' + $tradesRejectedDistance + ' distance exceeded, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ✅ Validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesRejectedPath + ' unreachable, ' + $tradesRejectedDocking + ' docking denied, ' + $tradesRejectedDistance + ' distance exceeded, ' + $tradesRejectedCargo + ' insufficient cargo, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
           
           <!-- ✅ CRITICAL FIX: Update pending trade entry with ACTUAL trade being executed -->
           <!-- Failure handler expects table with $BuyStation, $SellStation, $Ware -->
@@ -1621,9 +1666,37 @@
           </do_if>
         </do_if>
         <do_else>
-          <!-- All trades in list were blacklisted - request new search -->
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ ALL ' + $tradeList.count + ' trades were blacklisted - entering retry logic'" chance="100"/>
-          <resume label="no_trade_retry"/>
+          <!-- All trades in list were rejected - check reason -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⛔ ALL ' + $tradeList.count + ' trades were rejected (path: ' + $tradesRejectedPath + ', docking: ' + $tradesRejectedDocking + ', distance: ' + $tradesRejectedDistance + ', cargo: ' + $tradesRejectedCargo + ', blacklisted: ' + $tradesBlacklisted + ') - entering retry logic'" chance="100"/>
+          
+          <!-- ✅ CRITICAL: If ALL trades rejected due to cargo space, trigger cargo disposal -->
+          <do_if value="$tradesRejectedCargo gt 0 and $tradesRejectedCargo == $tradeList.count">
+            <set_value name="$hasCargo" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>
+            <do_if value="$hasCargo">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⚠️ ALL trades rejected due to insufficient cargo space - triggering cargo disposal'" chance="100"/>
+              <!-- Ship has cargo but not enough space for any trade - find buyer for existing cargo -->
+              <signal_objects object="player.galaxy" param="'GT_Find_Sell'" param2="table[$Ship = this.ship]"/>
+              <!-- Wait for cargo sale to complete before retrying -->
+              <resume label="main_loop"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ NEW: Check if trades came from cache - if so, trigger live search instead of retrying cache -->
+          <set_value name="$searchMethod" exact="@global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+          <do_if value="$searchMethod == 'cache'">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🔄 All cached trades rejected - triggering LIVE market search instead of retrying cache'" chance="100"/>
+            <!-- Clear pending trades to prevent retry -->
+            <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
+            <remove_value name="global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+            <!-- Send signal to force live search (bypass cache) -->
+            <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[$Ship = this.ship, $ForceLiveSearch = true]"/>
+            <!-- Resume main loop to wait for live search result -->
+            <resume label="main_loop"/>
+          </do_if>
+          <do_else>
+            <!-- Trades came from live search or search method unknown - use normal retry -->
+            <resume label="no_trade_retry"/>
+          </do_else>
         </do_else>
       </do_if>
       <do_else>
