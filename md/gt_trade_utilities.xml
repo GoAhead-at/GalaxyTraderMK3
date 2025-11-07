@@ -26,7 +26,7 @@
     <library name="GT_CalculateTradeEfficiency" purpose="run_actions">
       <params>
         <param name="profit" comment="Trade profit"/>
-        <param name="distance" comment="Trade distance (jumps)"/>
+        <param name="distance" default="0" comment="Trade distance (jumps) - legacy parameter, used as fallback"/>
         <param name="distancePenaltyMultiplier" default="1.0" comment="Distance penalty multiplier (0.0-2.0)"/>
         <param name="factionPriority" default="2" comment="Faction priority (0=Player, 1=Foreign, 2=Equal)"/>
         <param name="buyStationOwner" default="null" comment="Buy station owner faction"/>
@@ -36,38 +36,124 @@
         <param name="buySector" default="null" comment="Buy station sector"/>
         <param name="sellSector" default="null" comment="Sell station sector"/>
         <param name="shipToBuyDistance" default="-1" comment="Distance from ship to buy station (for path efficiency)"/>
+        <param name="buyToSellDistance" default="-1" comment="Distance from buy station to sell station"/>
+        <param name="homeToBuyDistance" default="-1" comment="Distance from home sector to buy station"/>
+        <param name="homeToSellDistance" default="-1" comment="Distance from home sector to sell station"/>
       </params>
       <actions>
-        <!-- Base efficiency calculation with NON-LINEAR distance penalty -->
-        <!-- Formula: adjustedDistance = distance * multiplier * (1 + (distance / 10)^2) -->
-        <!-- This creates quadratic penalty: longer distances get exponentially more penalized -->
-        <!-- Examples with multiplier=2.0:
-             - Distance 1:  1 * 2 * (1 + 0.01) = 2.02   (minimal penalty)
-             - Distance 5:  5 * 2 * (1 + 0.25) = 12.5   (25% extra)
-             - Distance 10: 10 * 2 * (1 + 1)   = 40     (100% extra = 2x)
-             - Distance 20: 20 * 2 * (1 + 4)   = 200    (400% extra = 5x)
+        <!-- ✅ NEW MULTI-FACTOR DISTANCE PENALTY SYSTEM -->
+        <!-- Improved scoring that separately penalizes:
+             1. Ship→Buy distance (HEAVY weight - ship must travel first)
+             2. Buy→Sell distance (MODERATE weight - trade route length)
+             3. Home distance (LIGHT weight - territorial control)
         -->
-        <set_value name="$distanceBase" exact="10.0"/>
-        <set_value name="$distanceRatio" exact="$distance / $distanceBase"/>
-        <set_value name="$nonLinearFactor" exact="1.0 + ($distanceRatio * $distanceRatio)"/>
-        <set_value name="$adjustedDistance" exact="$distance * $distancePenaltyMultiplier * $nonLinearFactor"/>
+        <set_value name="$adjustedDistance" exact="0.0"/>
+        
+        <!-- Check if we have all required parameters for new multi-factor system -->
+        <set_value name="$useMultiFactor" exact="false"/>
+        <do_if value="$shipToBuyDistance ge 0 and $buyToSellDistance ge 0 and $homeToBuyDistance ge 0 and $homeToSellDistance ge 0 and $buySector? and $sellSector?">
+          <set_value name="$useMultiFactor" exact="true"/>
+        </do_if>
+        
+        <!-- ✅ DEBUG: Log which system is being used -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Efficiency] Multi-factor=' + $useMultiFactor + ', Ship→Buy=' + $shipToBuyDistance + ', Buy→Sell=' + $buyToSellDistance + ', Home→Buy=' + $homeToBuyDistance + ', Home→Sell=' + $homeToSellDistance" chance="100"/>
+        </do_if>
+        
+        <do_if value="$useMultiFactor">
+          <!-- ✅ FACTOR 1: Ship→Buy Distance Penalty (HEAVY WEIGHT - ship must travel first) -->
+          <!-- This is the most important - ship has to get to buy station first -->
+          <!-- Weight: 4.0 (increased from 3.0), Quadratic base: 3.5 (steeper penalty for longer distances) -->
+          <!-- Example: 7 jumps = 7 * 4 * (1 + 4) = 140 penalty units (with multiplier=2: 280 units) -->
+          <!-- ✅ CRITICAL: Apply user's distance penalty multiplier setting -->
+          <set_value name="$shipToBuyBase" exact="3.5"/>
+          <set_value name="$shipToBuyRatio" exact="$shipToBuyDistance / $shipToBuyBase"/>
+          <set_value name="$shipToBuyNonLinear" exact="1.0 + ($shipToBuyRatio * $shipToBuyRatio)"/>
+          <set_value name="$shipToBuyPenalty" exact="$shipToBuyDistance * 4.0 * $shipToBuyNonLinear * $distancePenaltyMultiplier"/>
+          
+          <!-- ✅ FACTOR 2: Buy→Sell Distance Penalty (MODERATE WEIGHT - trade route length) -->
+          <!-- Encourages shorter trade routes between stations -->
+          <!-- Weight: 1.5, Quadratic base: 8.0 (moderate penalty) -->
+          <!-- ✅ CRITICAL: Apply user's distance penalty multiplier setting -->
+          <set_value name="$buyToSellBase" exact="8.0"/>
+          <set_value name="$buyToSellRatio" exact="$buyToSellDistance / $buyToSellBase"/>
+          <set_value name="$buyToSellNonLinear" exact="1.0 + ($buyToSellRatio * $buyToSellRatio)"/>
+          <set_value name="$buyToSellPenalty" exact="$buyToSellDistance * 1.5 * $buyToSellNonLinear * $distancePenaltyMultiplier"/>
+          
+          <!-- ✅ FACTOR 3: Home Distance Penalty (LIGHT WEIGHT - territorial control) -->
+          <!-- Penalize trades far from home (both stations) - encourages staying near home base -->
+          <!-- Weight: 0.5, Quadratic base: 10.0 (light penalty) -->
+          <!-- ✅ CRITICAL: Apply user's distance penalty multiplier setting -->
+          <set_value name="$maxHomeDistance" exact="[$homeToBuyDistance, $homeToSellDistance].max"/>
+          <set_value name="$homeDistanceBase" exact="10.0"/>
+          <set_value name="$homeDistanceRatio" exact="$maxHomeDistance / $homeDistanceBase"/>
+          <set_value name="$homeDistanceNonLinear" exact="1.0 + ($homeDistanceRatio * $homeDistanceRatio)"/>
+          <set_value name="$homeDistancePenalty" exact="$maxHomeDistance * 0.5 * $homeDistanceNonLinear * $distancePenaltyMultiplier"/>
+          
+          <!-- Combined Adjusted Distance -->
+          <set_value name="$adjustedDistance" exact="$shipToBuyPenalty + $buyToSellPenalty + $homeDistancePenalty"/>
+          
+          <!-- ✅ DEBUG: Log penalty breakdown -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Efficiency] Multi-factor penalties (multiplier=' + $distancePenaltyMultiplier + '): Ship→Buy=' + $shipToBuyPenalty + ', Buy→Sell=' + $buyToSellPenalty + ', Home=' + $homeDistancePenalty + ', Total=' + $adjustedDistance" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- ✅ FALLBACK: Legacy single-factor distance penalty (for batch processor, etc.) -->
+          <!-- Formula: adjustedDistance = distance * multiplier * (1 + (distance / 10)^2) -->
+          <!-- This creates quadratic penalty: longer distances get exponentially more penalized -->
+          <!-- Examples with multiplier=2.0:
+               - Distance 1:  1 * 2 * (1 + 0.01) = 2.02   (minimal penalty)
+               - Distance 5:  5 * 2 * (1 + 0.25) = 12.5   (25% extra)
+               - Distance 10: 10 * 2 * (1 + 1)   = 40     (100% extra = 2x)
+               - Distance 20: 20 * 2 * (1 + 4)   = 200    (400% extra = 5x)
+          -->
+          <set_value name="$distanceBase" exact="10.0"/>
+          <set_value name="$distanceRatio" exact="$distance / $distanceBase"/>
+          <set_value name="$nonLinearFactor" exact="1.0 + ($distanceRatio * $distanceRatio)"/>
+          <set_value name="$adjustedDistance" exact="$distance * $distancePenaltyMultiplier * $nonLinearFactor"/>
+        </do_else>
+        
         <!-- ✅ FIX: Convert money to number before division to avoid "Loss of data while converting floating point" error -->
         <!-- Convert profit (money in cents) to numeric value using f suffix to force float conversion -->
         <!-- Pattern from order.trade.perform.xml:243: (money / 1Cr)f forces float conversion -->
+        <!-- ✅ NEW: Apply non-linear profit scaling to reduce profit dominance in scoring -->
+        <!-- Formula: profitNum_scaled = profitNum / (1.0 + profitNum / profitBase) -->
+        <!-- This creates diminishing returns: higher profits get scaled down more -->
+        <!-- Examples:
+             - Profit 10,000 Cr → profitNum = 1,000,000 → scaled = 1,000,000 / (1 + 1) = 500,000 (50% reduction)
+             - Profit 20,000 Cr → profitNum = 2,000,000 → scaled = 2,000,000 / (1 + 2) = 666,667 (67% reduction)
+             - Profit 260,090 Cr → profitNum = 26,009,000 → scaled = 26,009,000 / (1 + 26) = 962,556 (96% reduction)
+        -->
+        <!-- This means: 2x profit → ~1.33x score (instead of 2x), significantly reducing profit's overwhelming influence -->
         <set_value name="$efficiency" exact="0.0"/>
         <do_if value="$adjustedDistance gt 0">
           <!-- Convert profit from money (cents) to number by dividing by 1ct, then scale by 100 -->
           <!-- Use f suffix to force float conversion (pattern from order.trade.perform.xml:243) -->
           <set_value name="$profitNum" exact="(($profit / 1ct) * 100)f"/>
+          
+          <!-- ✅ NON-LINEAR PROFIT SCALING: Apply diminishing returns to reduce profit dominance -->
+          <!-- profitBase controls where scaling kicks in - lower = more aggressive scaling -->
+          <!-- Formula: profitNum_scaled = profitNum / (1.0 + profitNum / profitBase) -->
+          <set_value name="$profitBase" exact="1000000.0"/>
+          <set_value name="$profitRatio" exact="$profitNum / $profitBase"/>
+          <set_value name="$profitScalingFactor" exact="1.0 + $profitRatio"/>
+          <set_value name="$profitNumScaled" exact="$profitNum / $profitScalingFactor"/>
+          
           <!-- Scale adjustedDistance by 10000 for precision -->
           <set_value name="$scaledDistance" exact="$adjustedDistance * 10000.0"/>
           <!-- Division: number / number = number (efficiency scaled by 10000) -->
           <!-- Note: Efficiency is now scaled by 10000, but all comparisons/scoring work correctly with scaled values -->
-          <set_value name="$efficiency" exact="$profitNum / $scaledDistance"/>
+          <set_value name="$efficiency" exact="$profitNumScaled / $scaledDistance"/>
         </do_if>
         <do_else>
-          <!-- If distance is 0, efficiency equals profit (converted to number) -->
-          <set_value name="$efficiency" exact="($profit / 1ct)f"/>
+          <!-- If distance is 0, efficiency equals profit (converted to number) with same scaling -->
+          <set_value name="$profitNum" exact="(($profit / 1ct) * 100)f"/>
+          <set_value name="$profitBase" exact="1000000.0"/>
+          <set_value name="$profitRatio" exact="$profitNum / $profitBase"/>
+          <set_value name="$profitScalingFactor" exact="1.0 + $profitRatio"/>
+          <set_value name="$profitNumScaled" exact="$profitNum / $profitScalingFactor"/>
+          <set_value name="$efficiency" exact="$profitNumScaled"/>
         </do_else>
         
         <!-- Apply faction priority boost -->
@@ -86,9 +172,21 @@
         <!-- Example: Home=E, Ship=B, Buy=E, Sell=C → Less efficient (backtracks) -->
         <set_value name="$pathBonus" exact="1.0"/>
         <do_if value="$homeSector? and $shipSector? and $buySector? and $sellSector? and $shipToBuyDistance ge 0">
-          <!-- Calculate distances from home to stations -->
-          <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buySector}"/>
-          <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellSector}"/>
+          <!-- ✅ OPTIMIZATION: Use passed distance parameters if available, otherwise calculate -->
+          <set_value name="$homeToBuy" exact="-1"/>
+          <set_value name="$homeToSell" exact="-1"/>
+          <do_if value="$homeToBuyDistance ge 0 and $homeToSellDistance ge 0">
+            <!-- Use passed parameters (from new multi-factor system) -->
+            <set_value name="$homeToBuy" exact="$homeToBuyDistance"/>
+            <set_value name="$homeToSell" exact="$homeToSellDistance"/>
+          </do_if>
+          <do_else>
+            <!-- Fallback: Calculate distances (for backward compatibility) -->
+            <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buySector}"/>
+            <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellSector}"/>
+          </do_else>
+          
+          <!-- Calculate ship→sell distance directly (path might differ from ship→buy + buy→sell) -->
           <set_value name="$shipToSell" exact="$shipSector.gatedistance.{$sellSector}"/>
           
           <!-- Only apply bonus if all distances are valid (non-negative, paths exist) -->
