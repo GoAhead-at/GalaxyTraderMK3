@@ -211,6 +211,47 @@
         <remove_value name="this.$training_order_created"/>
       </actions>
     </handler>
+    
+    <!-- ✅ PHASE 7: Order cancellation detection -->
+    <!-- CRITICAL: Detect when GT default order is cancelled -->
+    <!-- Pattern from vanilla orders.base.xml: event may fire after order is already removed -->
+    <!-- Check if order is still running - if not, it was cancelled -->
+    <handler comment="GT order cancelled">
+      <conditions>
+        <event_object_order_cancelled object="this.ship" immediate="true"/>
+        <!-- Important: The event may be received after the cancelled order returned or was already removed -->
+        <!-- A cancelled order cannot be running any more, so if there is a running order, it is a different one -->
+        <check_value value="not @this.ship.order.isrunning"/>
+      </conditions>
+      <actions>
+        <!-- Check which order was cancelled and current default order -->
+        <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
+        <set_value name="$cancelledOrderId" exact="@event.param.id"/>
+        
+        <!-- Only send Phase 7 if GT order is actually being cancelled -->
+        <do_if value="$cancelledOrderId == 'GalaxyTraderMK3'">
+          <!-- GT order is being cancelled → send Phase 7 signal -->
+          <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (interrupt handler, cancelled order: GalaxyTraderMK3, current default: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.ship,
+            $UpdateType = 'GT_Order_Cancelled'
+          ]"/>
+        </do_if>
+        <do_elseif value="not $cancelledOrderId and $currentDefaultOrder != 'GalaxyTraderMK3'">
+          <!-- Cancelled order ID is null AND current default is not GT → GT order was cancelled -->
+          <!-- This catches cases where event.param.id is null but GT order is gone -->
+          <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (interrupt handler, cancelled order: NONE, current default: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.ship,
+            $UpdateType = 'GT_Order_Cancelled'
+          ]"/>
+        </do_elseif>
+        <do_else>
+          <!-- Not GT order cancellation - skip -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Order cancelled interrupt fired but not GT order (cancelled: ' + (if $cancelledOrderId then $cancelledOrderId else 'NONE') + ', current default: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ', order running: ' + @this.ship.order.isrunning + ') - skipping Phase 7'" chance="100"/>
+        </do_else>
+      </actions>
+    </handler>
 
   </interrupts>
   
@@ -547,6 +588,28 @@
       <!-- ✅ SUBORDINATE REINITIALIZATION: Jump here to restart and re-inherit commander settings -->
       <label name="init"/>
       
+      <!-- ✅ PHASE 7: Initialize default order tracking -->
+      <!-- Track the current default order to detect when GT order is removed -->
+      <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
+      <do_if value="not this.$trackedDefaultOrder?">
+        <!-- First time - initialize tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_if>
+      <do_if value="this.$trackedDefaultOrder == 'GalaxyTraderMK3' and $currentDefaultOrder != 'GalaxyTraderMK3'">
+        <!-- GT order was removed → send Phase 7 signal -->
+        <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in init label, old: ' + this.$trackedDefaultOrder + ', new: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+          $Ship = this.ship,
+          $UpdateType = 'GT_Order_Cancelled'
+        ]"/>
+        <!-- Update tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_if>
+      <do_elseif value="this.$trackedDefaultOrder != $currentDefaultOrder">
+        <!-- Default order changed (but not GT removal) - just update tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_elseif>
+      
       <!-- ✅ PHASE 6: Initialize commander tracking and detect commander assignment -->
       <!-- This runs when script restarts (e.g., after commander assignment) -->
       <!-- CRITICAL: Check for changes BEFORE initializing trackedCommander -->
@@ -717,6 +780,28 @@
       <!-- =============================================== -->
       
       <label name="main_loop"/>
+      
+      <!-- ✅ PHASE 7: Check if GT order was removed (main loop detection) -->
+      <!-- This catches cases where GT order is manually removed but script continues running -->
+      <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
+      <do_if value="not this.$trackedDefaultOrder?">
+        <!-- First time - initialize tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_if>
+      <do_if value="this.$trackedDefaultOrder == 'GalaxyTraderMK3' and $currentDefaultOrder != 'GalaxyTraderMK3'">
+        <!-- GT order was removed → send Phase 7 signal -->
+        <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in main loop, old: ' + this.$trackedDefaultOrder + ', new: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+          $Ship = this.ship,
+          $UpdateType = 'GT_Order_Cancelled'
+        ]"/>
+        <!-- Update tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_if>
+      <do_elseif value="this.$trackedDefaultOrder != $currentDefaultOrder">
+        <!-- Default order changed (but not GT removal) - just update tracked order -->
+        <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+      </do_elseif>
       
       <!-- ======================================= -->
       <!-- MANDATORY TRAINING CHECK (BLOCKS ALL TRADING) -->
@@ -2464,6 +2549,41 @@
     
     <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Order terminating (actively trading: ' + $isActivelyTrading + ', training transition: ' + $isTrainingTransition + ', maintenance transition: ' + $isMaintenanceTransition + ')'" chance="100"/>
     
+    <!-- ✅ PHASE 7: Order cancellation detection -->
+    <!-- CRITICAL: Only send Phase 7 signal if GT default order is actually cancelled -->
+    <!-- on_abort can fire when trade orders are cancelled, but GT order might still be active -->
+    <!-- Check if GT default order still exists - if yes, this is NOT a GT order cancellation -->
+    <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
+    <set_value name="$isGTOrderCancelled" exact="false"/>
+    
+    <!-- Only send Phase 7 if GT order is actually cancelled (not just trade orders) -->
+    <do_if value="not $isTrainingTransition and not $isMaintenanceTransition">
+      <!-- Check if GT default order is still active -->
+      <!-- CRITICAL: If defaultorder.id is null, different, or not GalaxyTraderMK3, GT order was cancelled -->
+      <do_if value="not $currentDefaultOrder">
+        <!-- No default order → GT order was cancelled -->
+        <set_value name="$isGTOrderCancelled" exact="true"/>
+        <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: NONE)'" chance="100"/>
+        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+          $Ship = this.ship,
+          $UpdateType = 'GT_Order_Cancelled'
+        ]"/>
+      </do_if>
+      <do_elseif value="$currentDefaultOrder != 'GalaxyTraderMK3'">
+        <!-- Different default order → GT order was cancelled -->
+        <set_value name="$isGTOrderCancelled" exact="true"/>
+        <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ')'" chance="100"/>
+        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+          $Ship = this.ship,
+          $UpdateType = 'GT_Order_Cancelled'
+        ]"/>
+      </do_elseif>
+      <do_else>
+        <!-- GT order still active - this is just trade order cancellation, not GT order cancellation -->
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': on_abort fired but GT order still active (default order: ' + $currentDefaultOrder + ') - skipping Phase 7 (trade order cancellation, not GT order cancellation)'" chance="100"/>
+      </do_else>
+    </do_if>
+    
     <!-- Check if subordinate cleanup already sent signal (to avoid duplicate) -->
     <do_if value="this.$subordinate_cleanup_sent?">
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Subordinate cleanup signal already sent - skipping duplicate'" chance="100"/>
@@ -2471,7 +2591,6 @@
     <do_else>
       <!-- ✅ CRITICAL FIX: Check for permanent removal FIRST, regardless of trading state -->
       <!-- When player stops order, we MUST restore name even if TradePerform orders are still active -->
-      <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
       <set_value name="$isPermanentRemoval" exact="false"/>
       
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Current default order when GT order aborted: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE')" chance="100"/>
