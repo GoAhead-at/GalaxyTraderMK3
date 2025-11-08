@@ -385,6 +385,57 @@
             <set_value name="$hasGTOrder" exact="true"/>
           </do_if>
           
+          <!-- ✅ DETAILED LOGGING: Log all ship states for debugging -->
+          <set_value name="$currentCommand" exact="@$ship.command"/>
+          <set_value name="$currentCommandAction" exact="@$ship.commandaction"/>
+          <set_value name="$stateHasGTOrder" exact="false"/>
+          <do_if value="$state.$HasGTOrder? and $state.$HasGTOrder">
+            <set_value name="$stateHasGTOrder" exact="true"/>
+          </do_if>
+          <set_value name="$stateOperationalState" exact="'unknown'"/>
+          <do_if value="$state.$OperationalState?">
+            <set_value name="$stateOperationalState" exact="$state.$OperationalState"/>
+          </do_if>
+          <set_value name="$stateSubordinateState" exact="'unknown'"/>
+          <do_if value="$state.$SubordinateState?">
+            <set_value name="$stateSubordinateState" exact="$state.$SubordinateState"/>
+          </do_if>
+          <set_value name="$hasCommanderActual" exact="false"/>
+          <set_value name="$commanderIdcode" exact="'NONE'"/>
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <set_value name="$hasCommanderActual" exact="true"/>
+            <set_value name="$commanderIdcode" exact="$ship.commander.idcode"/>
+          </do_if>
+          <set_value name="$commanderHasGTActual" exact="false"/>
+          <do_if value="$hasCommanderActual">
+            <do_if value="$ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$commanderHasGTActual" exact="true"/>
+            </do_if>
+          </do_if>
+          <set_value name="$stateCommanderHasGT" exact="false"/>
+          <do_if value="$state.$CommanderHasGT? and $state.$CommanderHasGT">
+            <set_value name="$stateCommanderHasGT" exact="true"/>
+          </do_if>
+          <set_value name="$activeTradeOrders" exact="0"/>
+          <do_if value="$state.$ActiveTradeOrders?">
+            <set_value name="$activeTradeOrders" exact="$state.$ActiveTradeOrders"/>
+          </do_if>
+          
+          <debug_text text="'[GT-State] Phase 7: Periodic verification - ' + $ship.idcode + ':' +
+            '\n  State.HasGTOrder: ' + $stateHasGTOrder +
+            '\n  Ship has GT order: ' + $hasGTOrder +
+            '\n  Current default order: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') +
+            '\n  Current command: ' + (if $currentCommand? then $currentCommand else 'NONE') +
+            '\n  Current command action: ' + (if $currentCommandAction? then $currentCommandAction else 'NONE') +
+            '\n  State.OperationalState: ' + $stateOperationalState +
+            '\n  State.SubordinateState: ' + $stateSubordinateState +
+            '\n  Has commander (actual): ' + $hasCommanderActual +
+            '\n  Commander ID: ' + $commanderIdcode +
+            '\n  Commander has GT (actual): ' + $commanderHasGTActual +
+            '\n  State.CommanderHasGT: ' + $stateCommanderHasGT +
+            '\n  Active trade orders: ' + $activeTradeOrders" 
+            chance="100"/>
+          
           <!-- If state says ship has GT order but ship doesn't, GT order was removed -->
           <!-- Ship now has "Hold Position" or another default order -->
           <do_if value="$state.$HasGTOrder and not $hasGTOrder">
@@ -423,11 +474,102 @@
             </do_else>
             
             <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+            
+            <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled (direct or subordinate) -->
+            <set_value name="$isSubordinateOfGTCommander" exact="false"/>
+            <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+              <do_if value="$ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+                <set_value name="$isSubordinateOfGTCommander" exact="true"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Restore name if ship is not GT-controlled (no direct GT order and not subordinate to GT commander) -->
+            <do_if value="not $isSubordinateOfGTCommander and $ship.pilot?">
+              <set_value name="$originalName" exact="null"/>
+              <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+                <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+              </do_if>
+              <do_elseif value="$state.$OriginalShipName?">
+                <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+              </do_elseif>
+              
+              <do_if value="$originalName">
+                <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                  $Ship = $ship,
+                  $Pilot = $ship.pilot,
+                  $Reason = 'GT order removed - restoring original name (periodic verification)',
+                  $OriginalName = $originalName
+                ]"/>
+                <debug_text text="'[GT-State] Phase 7: Name restoration signal sent for ' + $ship.idcode + ' (original name: ' + $originalName + ', detected by periodic verification)'" chance="100"/>
+              </do_if>
+            </do_if>
           </do_if>
           <!-- If ship has GT order but state says it doesn't, update state -->
           <do_elseif value="not $state.$HasGTOrder and $hasGTOrder">
             <set_value name="$state.$HasGTOrder" exact="true"/>
             <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - GT order detected (state was false, now true)'" chance="100"/>
+          </do_elseif>
+          
+          <!-- ✅ CRITICAL FIX: Detect stale subordinate state -->
+          <!-- If state says ship is subordinate but ship is NOT actually subordinate, fix the state -->
+          <!-- This catches cases where commander was removed but state wasn't updated -->
+          <do_elseif value="not $state.$HasGTOrder and $state.$SubordinateState == 'subordinate'">
+            <!-- State says subordinate but ship doesn't have GT order -->
+            <!-- Check if ship is actually still subordinate -->
+            <do_if value="not $hasCommanderActual or not $commanderHasGTActual">
+              <!-- Ship is NOT actually subordinate - fix stale state -->
+              <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - Stale subordinate state detected (state says subordinate but ship is not), fixing state...' +
+                '\n  State.SubordinateState: ' + $stateSubordinateState +
+                '\n  Has commander (actual): ' + $hasCommanderActual +
+                '\n  Commander has GT (actual): ' + $commanderHasGTActual +
+                '\n  State.CommanderHasGT: ' + $stateCommanderHasGT" 
+                chance="100"/>
+              
+              <!-- Update state to reflect actual subordinate status -->
+              <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+              <set_value name="$state.$ActiveTradeOrders" exact="0"/>
+              
+              <!-- Update commander state -->
+              <do_if value="$hasCommanderActual">
+                <set_value name="$state.$Commander" exact="$ship.commander"/>
+                <set_value name="$state.$CommanderHasGT" exact="$commanderHasGTActual"/>
+                <do_if value="$commanderHasGTActual">
+                  <set_value name="$state.$SubordinateState" exact="'subordinate'"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+                </do_else>
+              </do_if>
+              <do_else>
+                <set_value name="$state.$Commander" exact="null"/>
+                <set_value name="$state.$CommanderHasGT" exact="false"/>
+                <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+              </do_else>
+              
+              <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+              
+              <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled -->
+              <!-- Ship was subordinate but is no longer subordinate to GT commander -->
+              <do_if value="not $commanderHasGTActual and $ship.pilot?">
+                <set_value name="$originalName" exact="null"/>
+                <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+                  <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+                </do_if>
+                <do_elseif value="$state.$OriginalShipName?">
+                  <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+                </do_elseif>
+                
+                <do_if value="$originalName">
+                  <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                    $Ship = $ship,
+                    $Pilot = $ship.pilot,
+                    $Reason = 'Subordinate removed from GT commander - restoring original name (stale state fix)',
+                    $OriginalName = $originalName
+                  ]"/>
+                  <debug_text text="'[GT-State] Phase 7: Name restoration signal sent for ' + $ship.idcode + ' (stale subordinate state fixed, original name: ' + $originalName + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
           </do_elseif>
         </do_all>
         
