@@ -1,6 +1,131 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.5.17 - 2025-11-12
+---------------------------
+
+FEATURE: One-Time Global Tables Initialization System
+  - Implemented centralized initialization system for all global table structures
+  - Problem: Multiple global tables were being checked and initialized repeatedly throughout the codebase, causing performance overhead and code duplication
+  - Solution: Created `GT_InitializeGlobalTables` library function that validates and initializes all global tables once at game start/load
+  - Implementation:
+    * New library function in `gt_configuration.xml` that runs automatically on `event_player_created` or `event_game_loaded`
+    * Validates table existence and structure (checks nested properties are valid tables, not null)
+    * Initializes missing or invalid tables with proper structure
+    * Logs initialization results for debugging
+  - Tables initialized (19 total):
+    * Core search/trading: `$GT_SearchResult.$LastRejectionStats`, `$GT_SearchQueue` (with `$Params`, `$Ships`, `$ActiveSearches`, `$MaxConcurrent`), `$GT_FallbackAttempted`
+    * Trade tracking: `$GT_TradeLogging.$LifetimeProfit`, `$GT_TradeStats` (with `$TotalTrades`, `$TotalProfit`), `$GT_PendingTrades`
+    * Batch processing: `$GT_BatchDataList`, `$GT_BatchResultsList`, `$GT_TradeCache`, `$GT_FilterState`
+    * Cooldowns/timing: `$GT_CacheMissCooldowns`, `$GT_ActiveTradeReservations`, `$GT_MaintenanceFailedResupply`, `$GT_LastResupplyTime`
+    * Maintenance: `$GT_RepairOrders`, `$GT_ResupplyOrders`, `$GT_MaintenanceOrders`
+    * Core registries: `$GT_Pilots`, `$GT_Ships`
+  - Code cleanup:
+    * Removed ~250+ lines of repetitive validation checks from multiple files
+    * Simplified table writes to use atomic operations (extract to local, modify, set back)
+    * All redundant checks removed from:
+      - md/gt_trading_search.xml (removed checks at start of SearchTradeRoutes and before all LastRejectionStats writes)
+      - md/gt_trading_queue.xml (removed checks from QueueSearch and ProcessSearchQueue)
+      - md/gt_trade_logging.xml (removed checks before LifetimeProfit updates)
+      - aiscripts/order.trade.galaxytrader.xml (removed checks before reading LastRejectionStats)
+  - Benefits:
+    * **Performance**: One-time initialization instead of checks on every access
+    * **Maintainability**: Centralized initialization logic - easy to add new tables
+    * **Reliability**: Tables guaranteed valid at startup, preventing save game compatibility issues
+    * **Code quality**: Cleaner, simpler code without repetitive validation
+    * **Save game compatibility**: Automatically fixes table structures from old save games
+  - Location:
+    * md/gt_configuration.xml (GT_InitializeGlobalTables library, called from ConfigInit cue)
+
+FIX: Null Reference Error in LastRejectionStats Storage
+  - Fixed crash when storing rejection statistics for logbook messages
+  - Problem: `global.$GT_SearchResult.$LastRejectionStats` could be `null`, causing "Failed to set null.{component...}" error when trying to store per-ship statistics
+  - Root cause: The `?` operator checks for existence, not null - a variable can exist but be `null`
+  - **Additional root cause discovered**: Old save games may have table structures from previous mod versions where nested properties were `null` or missing
+  - Solution: Added robust initialization checks to ensure `$LastRejectionStats` is always a valid table before use
+  - Implementation:
+    * **Save game compatibility**: Added initialization at start of `SearchTradeRoutes` cue to verify and fix table structure when loading from old saves
+    * First ensures `global.$GT_SearchResult` exists (initializes as empty table if missing)
+    * Validates `$LastRejectionStats` is a valid table by checking `.keys.count` property
+    * Preserves existing data if it's already a valid table
+    * Initializes as fresh table if it's `null` or invalid
+    * Restores preserved data after initialization to prevent data loss
+    * **Safety check layer 1**: Added safety validation right before each `set_value` operation to handle cases where `global.$GT_SearchResult` might be reset to `null` between initialization and use
+    * **Safety check layer 2**: Added final safety check right before set_value to prevent race conditions
+    * **Safety check layer 3**: Added absolute final check immediately before set_value to guarantee validity (handles any edge cases where global state might change between checks)
+    * Uses safe operator `@` to extract `$LastRejectionStats` before validation to prevent crashes
+    * Validates table validity by checking `.keys.count` property (returns number >= 0 for valid tables, null for invalid/null values)
+    * **Atomic operation**: Uses local variable to ensure atomicity when setting nested properties
+  - Benefits:
+    * Prevents crashes when storing rejection statistics
+    * Ensures logbook messages can always access rejection statistics
+    * Preserves existing statistics when re-initializing (no data loss)
+    * Handles edge cases where global variables might be reset or null
+    * Defensive programming: Multiple layers of safety checks prevent crashes even if global state changes
+    * Race condition protection: Multiple validation points ensure validity even if another cue modifies global state
+    * **Save game compatibility**: Automatically fixes table structure when loading from old save games
+  - Applied to all locations where `$LastRejectionStats` is set:
+    * Initial initialization at start of `SearchTradeRoutes` cue (save game compatibility)
+    * Initial initialization (continuation path and "No Trades Found" path)
+    * Right before set_value in continuation path (around line 456)
+    * Right before set_value in "No Trades Found" path (around line 1311)
+    * **Reading location**: Added initialization in AI script before reading `$LastRejectionStats` for logbook messages
+  - Location: 
+    * md/gt_trading_search.xml (lines ~15-38, ~388-413, ~456-510, ~1231-1256, ~1311-1361)
+    * aiscripts/order.trade.galaxytrader.xml (lines ~2662-2683)
+
+FIX: Save Game Compatibility for Other Global Tables
+  - Fixed potential null reference errors when loading from old save games
+  - Problem: Old save games may have global tables with `null` nested properties from previous mod versions
+  - Solution: Added initialization checks for other dynamically created tables with nested properties
+  - Tables fixed:
+    * `global.$GT_TradeLogging.$LifetimeProfit` - Per-ship lifetime profit tracking
+    * `global.$GT_SearchQueue.$Params` - Search parameters storage per ship
+  - Implementation:
+    * Verify parent table exists before accessing nested properties
+    * Validate nested property is a valid table (not null) using `.keys.count` check
+    * Initialize nested property as empty table if missing or invalid
+    * Applied at start of cues that use these tables
+  - Benefits:
+    * Prevents crashes when loading old save games
+    * Ensures table structure is always correct regardless of save game age
+    * No data loss - existing valid data is preserved
+  - Location:
+    * md/gt_trade_logging.xml (lines ~276-291) - Before setting lifetime profit
+    * md/gt_trading_queue.xml (lines ~427-440, ~475-498) - In QueueSearch and ProcessSearchQueue cues
+
+FIX: Null Check for .keys.count Property Access
+  - Fixed crash when accessing `.count` on `.keys` property that could be null
+  - Problem: `$existingStatsKeys.count` and `$existingKeys.count` could fail if `.keys` returned null
+  - Root cause: Even with `?` operator check, extracting `.keys` to a variable could result in null, and accessing `.count` on null causes crash
+  - Solution: Added additional null check by extracting `.count` with safe operator `@` and validating it before use
+  - Implementation:
+    * Extract `.count` to intermediate variable using safe operator `@`
+    * Verify count variable exists and is greater than 0 before using in `do_all` loops
+    * Applied to all locations where `.keys.count` is accessed in atomic write operations
+  - Benefits:
+    * Prevents crashes when copying existing table entries
+    * Handles edge cases where `.keys` might return null
+    * Ensures atomic write operations complete successfully
+  - Location:
+    * md/gt_trading_search.xml (lines ~1310-1340) - In atomic LastRejectionStats write operations
+
+FIX: Vanilla order.assist Null Reference Bug
+  - Fixed crash in vanilla Assist order when subordinate is removed
+  - Problem: Vanilla code at line 870 accesses `this.assignedcontrolled.order.isrunning` without checking if `order` is null
+  - Root cause: When a subordinate is removed from a GT commander, the Assist order is cancelled and becomes null, but vanilla code doesn't check for this
+  - Solution: Added null check using nested `do_if` blocks (X4 doesn't short-circuit boolean expressions)
+  - Implementation:
+    * First check: `this.assignedcontrolled.order?` (outer `do_if`)
+    * Second check: `this.assignedcontrolled.order.isrunning` (inner `do_if`, only runs if order exists)
+    * Uses nested blocks instead of `and` expression because X4 evaluates both sides of `and` expressions
+  - Benefits:
+    * Prevents crashes when Assist order is cancelled
+    * Fixes vanilla bug that affects GT mod when subordinates are removed
+    * Ensures smooth handling of subordinate removal scenarios
+  - Location:
+    * aiscripts/order.assist.xml (line ~124) - Patch to vanilla Assist order script
+
 Version 0.5.16 - 2025-11-12
 --------------------------
 
@@ -130,6 +255,7 @@ IMPROVEMENT: Fallback Search Logic Enhancement
     * Filtering uses originalMaxDistance (pilot's actual maxDistance) instead of fallback search distance (2)
     * OriginalMaxDistance passed through SearchFallbackTrades → SearchLiveTrades → batch state → SearchLiveTrades_Resume
   - Location: md/gt_trading_search.xml (fallback sector list building lines ~2659-2698, filtering logic lines ~3779-3787)
+
 
 
 Version 0.5.15 - 2025-11-06
