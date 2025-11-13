@@ -293,9 +293,22 @@ function gtMenu.displayPilotTable(frame, instance, yOffset)
         return
     end
     
+    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    -- X4 automatically creates shield/hull bars for selectable rows, and has a global limit of 50
+    -- Limit display to 50 rows to stay under the limit (header + 50 rows = 51 total, but header doesn't count)
+    local maxRows = 50
+    local pilotsToDisplay = pilots
+    if #pilots > maxRows then
+        pilotsToDisplay = {}
+        for i = 1, maxRows do
+            pilotsToDisplay[i] = pilots[i]
+        end
+        DebugError(string.format("[GT Menu] Limiting display to %d rows (out of %d total) to prevent shield/hull bar limit", maxRows, #pilots))
+    end
+    
     -- Add pilot rows - selectable through X4 table system (addRow first param = true)
     local selectedRowIndex = nil
-    for i, pilot in ipairs(pilots) do
+    for i, pilot in ipairs(pilotsToDisplay) do
         -- Track which row should be selected
         if pilot.shipId == gtMenu.selectedShipId then
             selectedRowIndex = i
@@ -329,7 +342,11 @@ function gtMenu.displayPilotTable(frame, instance, yOffset)
     
     -- Footer row with totals
     local footerRow = pilotTable:addRow(nil, { bgColor = Color["row_title_background"] })
-    footerRow[1]:setColSpan(7):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), {})  -- "Total Pilots: N"
+    if #pilots > maxRows then
+        footerRow[1]:setColSpan(7):createText(string.format("%s %d (Showing: %d)", ReadText(77000, 8402), #pilots, maxRows), {})  -- "Total Pilots: N (Showing: 50)"
+    else
+        footerRow[1]:setColSpan(7):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), {})  -- "Total Pilots: N"
+    end
     
     -- Calculate total pilot profit and total ship profit
     local totalPilotProfit = 0
@@ -562,9 +579,20 @@ function gtMenu.displayRenaming(frame, instance, yOffset)
         return
     end
     
+    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    local maxRows = 50
+    local pilotsToDisplay = pilots
+    if #pilots > maxRows then
+        pilotsToDisplay = {}
+        for i = 1, maxRows do
+            pilotsToDisplay[i] = pilots[i]
+        end
+        DebugError(string.format("[GT Menu] Limiting renaming display to %d rows (out of %d total) to prevent shield/hull bar limit", maxRows, #pilots))
+    end
+    
     -- Add pilot rows - interactive to allow editbox and buttons
     local selectedRowIndex = nil
-    for i, pilot in ipairs(pilots) do
+    for i, pilot in ipairs(pilotsToDisplay) do
         -- Track which row should be selected
         if pilot.shipId == gtMenu.selectedShipId then
             selectedRowIndex = i
@@ -644,7 +672,11 @@ function gtMenu.displayRenaming(frame, instance, yOffset)
     
     -- Footer row
     local footerRow = renamingTable:addRow(nil, { bgColor = Color["row_title_background"] })
-    footerRow[1]:setColSpan(5):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), { halign = "center" })
+    if #pilots > maxRows then
+        footerRow[1]:setColSpan(5):createText(string.format("%s %d (Showing: %d)", ReadText(77000, 8402), #pilots, maxRows), { halign = "center" })
+    else
+        footerRow[1]:setColSpan(5):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), { halign = "center" })
+    end
 end
 
 -- Display pilot control panel
@@ -753,9 +785,20 @@ function gtMenu.displayPilotControl(frame, instance, yOffset)
         return
     end
     
+    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    local maxRows = 50
+    local pilotsToDisplay = pilots
+    if #pilots > maxRows then
+        pilotsToDisplay = {}
+        for i = 1, maxRows do
+            pilotsToDisplay[i] = pilots[i]
+        end
+        DebugError(string.format("[GT Menu] Limiting control display to %d rows (out of %d total) to prevent shield/hull bar limit", maxRows, #pilots))
+    end
+    
     -- Add pilot rows - interactive rows allow buttons
     local selectedRowIndex = nil
-    for i, pilot in ipairs(pilots) do
+    for i, pilot in ipairs(pilotsToDisplay) do
         -- Track which row should be selected
         if pilot.shipId == gtMenu.selectedShipId then
             selectedRowIndex = i
@@ -858,7 +901,11 @@ function gtMenu.displayPilotControl(frame, instance, yOffset)
     
     -- Footer row with totals
     local footerRow = controlTable:addRow(nil, { bgColor = Color["row_title_background"] })
-    footerRow[1]:setColSpan(columnCount):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), { halign = "center" })
+    if #pilots > maxRows then
+        footerRow[1]:setColSpan(columnCount):createText(string.format("%s %d (Showing: %d)", ReadText(77000, 8402), #pilots, maxRows), { halign = "center" })
+    else
+        footerRow[1]:setColSpan(columnCount):createText(string.format("%s %d", ReadText(77000, 8402), #pilots), { halign = "center" })
+    end
 end
 
 -- Initialize and register callbacks

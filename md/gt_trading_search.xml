@@ -48,11 +48,20 @@
           </do_if>
         </do_if>
         
-        <!-- Validate params exist -->
-        <do_if value="not $params?">
+        <!-- ✅ CRITICAL FIX: Validate params exist and are not null -->
+        <!-- Check if $params exists AND has required $Ship property (handles null case) -->
+        <set_value name="$paramsValid" exact="false"/>
+        <do_if value="$params?">
+          <set_value name="$testShip" exact="@$params.$Ship"/>
+          <do_if value="$testShip?">
+            <set_value name="$paramsValid" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <do_if value="not $paramsValid">
           <!-- ✅ DEBUG MODE: Only log when debug is enabled -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Search] ⚠️ SearchTradeRoutes called without parameters - cannot proceed'" chance="100"/>
+            <debug_text text="'[GT-Search] ⚠️ SearchTradeRoutes called without valid parameters - cannot proceed'" chance="100"/>
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
@@ -62,6 +71,36 @@
         <set_value name="$minROI" exact="$params.$MinROI"/>
         <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
         <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
+        
+        <!-- ✅ DEBUG: Log profit threshold from params -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') 💰 Profit threshold from params: ' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+        </do_if>
+        
+        <!-- ✅ CRITICAL FIX: Detect continuation EARLY (before skill multiplier) -->
+        <!-- Check if we're continuing from live search completion BEFORE applying skill multiplier -->
+        <!-- When SearchLiveTrades_Resume signals SearchTradeRoutes, live results are already in global.$GT_SearchResult -->
+        <set_value name="$isLiveSearchContinuation" exact="false"/>
+        <do_if value="global.$GT_SearchResult.$Ship? and global.$GT_SearchResult.$Ship == $ship">
+          <set_value name="$savedWaitingForBatch" exact="@global.$GT_SearchResult.$WaitingForBatch"/>
+          <do_if value="not $savedWaitingForBatch">
+            <!-- Live search just completed for this ship - this is a continuation -->
+            <set_value name="$isLiveSearchContinuation" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ✅ CRITICAL FIX: Check if this is a fallback search continuation - if so, params already have skill multiplier applied -->
+        <!-- Fallback search receives already-multiplied values, relaxes them, then SearchLiveTrades_Resume signals SearchTradeRoutes -->
+        <!-- When SearchTradeRoutes runs as continuation, params already have relaxed values that shouldn't be multiplied again -->
+        <set_value name="$isFallbackContinuation" exact="false"/>
+        <do_if value="$isLiveSearchContinuation and $maxDistance == 2">
+          <set_value name="$isFallbackContinuation" exact="true"/>
+          <!-- ✅ CRITICAL FIX: For fallback continuation, params already have relaxed profit thresholds from SearchFallbackTrades -->
+          <!-- These were calculated from already-multiplied values, so don't apply multiplier again -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔄 Fallback continuation detected - skipping skill multiplier (params already relaxed)'" chance="100"/>
+          </do_if>
+        </do_if>
         
         <!-- ✅ FALLBACK COOLDOWN: Clear fallback flag at start of new search cycle -->
         <!-- This allows fallback to be attempted again if cache and live search both fail -->
@@ -94,21 +133,31 @@
         <set_value name="$gt_SatelliteIntel" exact="$skillLevel ge 9"/>
         <set_value name="$gt_FleetCoord" exact="$skillLevel ge 12"/>
         <set_value name="$gt_AdvancedAnalytics" exact="$skillLevel ge 15"/>
-
-        <!-- Level-based ROI and Absolute Profit thresholds (0.5x @Lv1 → 2.0x @Lv15) -->
-        <!-- Get skill-based multipliers (using library function) -->
-        <run_actions ref="md.GT_Trade_Utilities.GT_GetSkillMultiplier" result="$roiMultiplier">
-          <param name="skillLevel" value="$skillLevel"/>
-        </run_actions>
-        <set_value name="$profitMultiplier" exact="$roiMultiplier"/>
-        <set_value name="$minROI" exact="$minROI * $roiMultiplier"/>
-        <!-- ✅ FIX: Use integer math to avoid floating-point to money conversion warnings -->
-        <!-- Convert float multiplier to integer percentage (e.g., 1.25 → 125) -->
-        <!-- CRITICAL: Convert to integer to avoid float arithmetic with money values -->
-        <set_value name="$profitMultiplierPercent" exact="($profitMultiplier * 100)i"/>
-        <set_value name="$minAbsoluteProfit" exact="($minAbsoluteProfit * $profitMultiplierPercent / 100)Cr"/>
         
-        <!-- DEBUG: Trade search start -->
+        <!-- ✅ NEW: Profit threshold is now pilot level-based (set in gt_trading_queue.xml) -->
+        <!-- Level 1: 0 Cr, Level 2: 100 Cr, Level 3: 500 Cr, Level 4+: Config value with skill multiplier -->
+        <!-- Params already contain the correct pilot level-based threshold, so no need to apply multiplier here -->
+        <!-- ROI multiplier still applies for ROI threshold (not profit threshold) -->
+        <!-- ✅ CRITICAL FIX: Only apply ROI multiplier if NOT a fallback continuation -->
+        <!-- Fallback continuation params come from SearchFallbackTrades which already relaxed the already-multiplied values -->
+        <do_if value="not $isFallbackContinuation">
+          <run_actions ref="md.GT_Trade_Utilities.GT_GetSkillMultiplier" result="$roiMultiplier">
+            <param name="skillLevel" value="$skillLevel"/>
+          </run_actions>
+          <set_value name="$minROI" exact="$minROI * $roiMultiplier"/>
+          <!-- Note: $minAbsoluteProfit is already set correctly from params (pilot level-based) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ✅ Profit threshold unchanged (pilot level-based): ' + ($minAbsoluteProfit / 100) + ' Cr | ROI multiplier applied: ' + $minROI + '% (multiplier: ' + $roiMultiplier + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Fallback continuation - params already have relaxed thresholds -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ✅ Profit threshold from fallback continuation (already relaxed): ' + ($minAbsoluteProfit / 100) + ' Cr | ROI: ' + $minROI + '%'" chance="100"/>
+          </do_if>
+        </do_else>
+        
+        <!-- ✅ ENHANCED: Log search start for detailed diagnostics (debug mode only) -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
           <set_value name="$pilotInfo" exact="'No Pilot'"/>
           <do_if value="$ship.pilot">
@@ -124,9 +173,16 @@
             </do_elseif>
             <set_value name="$pilotInfo" exact="$ship.pilot.name + ' (Skill: ' + $shownSkill + ')'"/>
           </do_if>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === TRADE SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nPilot: ' + $pilotInfo + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin ROI: ' + $minROI + '%' + '\nMin Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr' + '\nShip Cargo: ' + ($ship.cargo.capacity.all - $ship.cargo.free.all) + '/' + $ship.cargo.capacity.all" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') === TRADE SEARCH START ===' + 
+            '\nShip: ' + $ship.knownname + 
+            '\nPilot: ' + $pilotInfo + 
+            '\nCurrent Sector: ' + $ship.sector.knownname + 
+            '\nMax Distance: ' + $maxDistance + ' jumps' + 
+            '\nMin ROI: ' + $minROI + '%' + 
+            '\nMin Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr' + 
+            '\nShip Cargo: ' + ($ship.cargo.capacity.all - $ship.cargo.free.all) + '/' + $ship.cargo.capacity.all +
+            '\nFaction Priority: ' + $factionPriorityText" 
+            chance="100"/>
         </do_if>
         
         <set_value name="$bestTrade" exact="null"/>
@@ -144,22 +200,20 @@
           </do_if>
         </do_if>
         
-        <!-- ✅ CRITICAL FIX: Detect if we're continuing from live search completion -->
+        <!-- ✅ CRITICAL FIX: Extract live search results if continuation (already detected earlier) -->
         <!-- When SearchLiveTrades_Resume signals SearchTradeRoutes, live results are already in global.$GT_SearchResult -->
         <!-- We should use those results instead of running cache search again -->
         <!-- CRITICAL: Extract and preserve live results IMMEDIATELY before cache search can overwrite them -->
-        <set_value name="$isLiveSearchContinuation" exact="false"/>
+        <!-- Note: $isLiveSearchContinuation already set earlier (before skill multiplier) - don't reset it! -->
         <set_value name="$liveTradeList" exact="[]"/>
         <set_value name="$liveBestTrade" exact="null"/>
         <set_value name="$liveBestScore" exact="0"/>
         
         <!-- ✅ FALLBACK SEARCH: Check if we're already in a fallback search (MaxDistance == 2 from previous call) -->
         <!-- If MaxDistance is 2 and we're being signaled from SearchLiveTrades_Resume, we're in fallback search -->
+        <!-- Note: $isLiveSearchContinuation already detected earlier (before skill multiplier) -->
         <set_value name="$isFallbackSearch" exact="false"/>
-        <!-- Check if we're continuing from live search (results already in global) -->
-        <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_SearchResult exists -->
-        <do_if value="global.$GT_SearchResult.$Ship? and global.$GT_SearchResult.$Ship == $ship">
-          <set_value name="$isLiveSearchContinuation" exact="true"/>
+        <do_if value="$isLiveSearchContinuation">
           <!-- If MaxDistance is 2, this is a fallback search continuation -->
           <do_if value="$maxDistance == 2">
             <set_value name="$isFallbackSearch" exact="true"/>
@@ -243,6 +297,11 @@
           <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
           <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
           
+          <!-- ✅ ENHANCED: Log cache check start (debug mode only) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔍 Checking trade cache (cache size: ' + $cacheCount + ' entries)'" chance="100"/>
+          </do_if>
+          
           <signal_cue_instantly cue="SearchCachedTrades" param="table[
             $Ship = $ship,
             $MaxDistance = $maxDistance,
@@ -260,6 +319,15 @@
           <set_value name="$cacheBestScore" exact="@global.$GT_SearchResult.$BestScore"/>
           <set_value name="$cacheBlacklistRejections" exact="@global.$GT_SearchResult.$BlacklistRejections"/>
           <set_value name="$cacheTradeList" exact="@global.$GT_SearchResult.$TradeList"/>
+          
+          <!-- ✅ ENHANCED: Log cache check results (debug mode only) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <set_value name="$cacheTradeCount" exact="0"/>
+            <do_if value="$cacheTradeList?">
+              <set_value name="$cacheTradeCount" exact="@$cacheTradeList.count"/>
+            </do_if>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') 📋 Cache check complete: Found=' + $foundCachedTrade + ', Trades=' + $cacheTradeCount + ', BestScore=' + $cacheBestScore" chance="100"/>
+          </do_if>
         </do_if>
         <do_else>
           <!-- Live search continuation OR ForceLiveSearch - skip cache, use live results -->
@@ -676,9 +744,13 @@
           </do_else>
           
           <do_if value="$canDoLiveSearch">
-            <!-- DEBUG: No cached trade, performing live search -->
+            <!-- ✅ ENHANCED: Log when live search starts (debug mode only) -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No suitable cached trade found, performing live market search'" chance="100"/>
+              <set_value name="$cacheTradeCountForLog" exact="0"/>
+              <do_if value="$cacheTradeList?">
+                <set_value name="$cacheTradeCountForLog" exact="@$cacheTradeList.count"/>
+              </do_if>
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔄 Starting LIVE market search (cache had ' + $cacheTradeCountForLog + ' trades, none suitable)'" chance="100"/>
             </do_if>
             
             <!-- Initialize cooldown tracking if not exists -->
@@ -1001,11 +1073,17 @@
                 </do_if>
                 <do_else>
                   <!-- Ship is isolated - signal no trade found (normal behavior for isolated ships) -->
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GT-Search] (' + $ship.idcode + ') ⚠️ Ship is isolated (no reachable sectors) - signaling no trade found'" chance="100"/>
+                  </do_if>
                   <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
                 </do_else>
               </do_if>
               <do_else>
                 <!-- Fallback search already triggered or cache search succeeded - signal no trade found -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') ✅ Search complete - signaling no trade found (fallback already triggered or cache succeeded)'" chance="100"/>
+                </do_if>
                 <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
               </do_else>
             </do_if>
@@ -1046,9 +1124,12 @@
             </do_if>
           </do_if>
           
-          <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_ActiveTradeReservations exists -->
           <!-- ✅ OPTIMIZED: Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
           <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
+            <!-- ✅ FIX: Initialize global.$GT_ActiveTradeReservations if it doesn't exist -->
+            <do_if value="not global.$GT_ActiveTradeReservations?">
+              <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
+            </do_if>
             
             <!-- ✅ FIX: Use safe operators to access bestTrade properties -->
             <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
@@ -1140,10 +1221,12 @@
                 '\n  Best ROI found: ' + (if $rejectedROI? then $rejectedROI else '0') + '% (needed: ' + $minROI + '%)'"/>
             </do_if>
             
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === NO TRADES FOUND ANALYSIS ===' + 
+            <!-- ✅ ENHANCED: Show detailed analysis when no trades found (debug mode only) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') === NO TRADES FOUND ANALYSIS ===' + 
                 '\nShip: ' + $ship.knownname + 
                 '\nSector: ' + $ship.sector.knownname + 
+                '\nSearch Method: ' + $searchMethod +
                 '\nSearch params: Dist=' + $maxDistance + ', MinROI=' + $minROI + '%, MinAbsoluteProfit=' + ($minAbsoluteProfit / 100) + ' Cr' +
                 $diagnosticInfo +
                 '\n\n📊 REJECTION STATISTICS:' +
@@ -1151,8 +1234,11 @@
                 '\n  💰 Insufficient profit: ' + $tradesRejectedProfit +
                 '\n  📏 Distance too far: ' + $tradesRejectedDistance +
                 '\n  📦 Amount zero/negative: ' + $tradesRejectedAmount +
+                '\n  🚫 Blacklisted/Path blocked: ' + $totalBlacklistFiltered +
                 '\n  ━━━━━━━━━━━━━━━━━━━━━━━━' +
                 '\n  TOTAL REJECTED: ' + $totalRejected +
+                '\n  TOTAL EVALUATED: ' + $totalEvaluated +
+                '\n  OFFERS FOUND: ' + $offersFound +
                 $bestRejectedInfo" 
                 chance="100"/>
             </do_if>
@@ -1459,6 +1545,10 @@
             <!-- ✅ FALLBACK SEARCH: Log if fallback search completed with no trades -->
             <do_if value="$isFallbackSearch and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
               <debug_text text="'[GT-Search] (' + $ship.idcode + ') ❌ Fallback search complete: No trades found (MaxDistance=2)'" chance="100"/>
+            </do_if>
+            <!-- ✅ ENHANCED: Log before signaling no trade found (debug mode only) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') ✅ Search complete - signaling GT_No_Trade_Found (TotalRejected=' + $totalRejected + ', TotalEvaluated=' + $totalEvaluated + ', OffersFound=' + $offersFound + ')'" chance="100"/>
             </do_if>
             <!-- Signal back to AI script: No Trade Found -->
             <!-- CRITICAL: Always send 'blacklist' param to prevent idle timeout escalation -->
@@ -4529,26 +4619,47 @@
         </do_else>
         
         <!-- 7. Extract original parameters BEFORE cleanup (so they're available when signaling) -->
-        <!-- Extract original parameters from search queue (stored when search was queued) -->
+        <!-- ✅ CRITICAL FIX: For fallback searches (maxDistance == 2), ALWAYS use batch data (has relaxed values) -->
+        <!-- For normal searches, use queue params if available, otherwise fall back to batch data -->
         <set_value name="$originalParams" exact="null"/>
-        <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
-          <!-- Parameters are stored in search queue when search was initiated -->
-          <set_value name="$originalParams" exact="global.$GT_SearchQueue.$Params.{$ship}"/>
+        <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$ship}"/>
+        <set_value name="$isFallbackFromBatch" exact="false"/>
+        <do_if value="$batchData? and $batchData.$maxDistance == 2">
+          <!-- This is a fallback search - batch data has relaxed profit thresholds, use those instead of queue -->
+          <set_value name="$isFallbackFromBatch" exact="true"/>
+          <set_value name="$allowIllegalDefault" exact="false"/>
+          <set_value name="$originalParams" exact="table[
+            $Ship = $ship,
+            $MaxDistance = @$batchData.$maxDistance,
+            $MinROI = @$batchData.$minROI,
+            $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+            $FactionPriority = @$batchData.$factionPriority,
+            $AllowIllegal = $allowIllegalDefault
+          ]"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') ✅ Using batch data params for fallback search (relaxed profit: ' + (@$batchData.$minAbsoluteProfit / 100) + ' Cr)'" chance="100"/>
+          </do_if>
         </do_if>
         <do_else>
-          <!-- Fallback: Reconstruct parameters from batch data (before cleanup) -->
-          <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$ship}"/>
-          <do_if value="$batchData?">
-            <set_value name="$allowIllegalDefault" exact="false"/>
-            <set_value name="$originalParams" exact="table[
-              $Ship = $ship,
-              $MaxDistance = @$batchData.$maxDistance,
-              $MinROI = @$batchData.$minROI,
-              $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
-              $FactionPriority = @$batchData.$factionPriority,
-              $AllowIllegal = $allowIllegalDefault
-            ]"/>
+          <!-- Normal search - try queue first, then batch data -->
+          <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <!-- Parameters are stored in search queue when search was initiated -->
+            <set_value name="$originalParams" exact="global.$GT_SearchQueue.$Params.{$ship}"/>
           </do_if>
+          <do_else>
+            <!-- Fallback: Reconstruct parameters from batch data (before cleanup) -->
+            <do_if value="$batchData?">
+              <set_value name="$allowIllegalDefault" exact="false"/>
+              <set_value name="$originalParams" exact="table[
+                $Ship = $ship,
+                $MaxDistance = @$batchData.$maxDistance,
+                $MinROI = @$batchData.$minROI,
+                $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+                $FactionPriority = @$batchData.$factionPriority,
+                $AllowIllegal = $allowIllegalDefault
+              ]"/>
+            </do_if>
+          </do_else>
         </do_else>
         
         <!-- 8. Return results (including rejection statistics for diagnostics) -->
@@ -4845,11 +4956,31 @@
         
         <!-- ✅ FALLBACK PROFIT RELAXATION: Reduce profit thresholds to allow lower-profit trades -->
         <!-- Fallback is last resort, so accept lower profits to find ANY trade -->
+        <!-- ✅ NEW: Relax profit thresholds based on pilot level -->
+        <!-- Level 1: Keep at 0 Cr (already accepts 0 profit trades) -->
+        <!-- Level 2+: Halve the threshold, but respect pilot level minimums -->
         <set_value name="$fallbackMinROI" exact="[$params.$MinROI / 2, 0].max"/>  <!-- Half of normal ROI, minimum 0% -->
-        <set_value name="$fallbackMinAbsoluteProfit" exact="[$params.$MinAbsoluteProfit / 2, 1000Cr].max"/>  <!-- Half of normal profit, minimum 1000 Cr -->
+        <set_value name="$fallbackMinAbsoluteProfit" exact="$params.$MinAbsoluteProfit / 2"/>  <!-- Half of normal profit -->
+        
+        <!-- ✅ NEW: For level 1 pilots, ensure threshold stays at 0 Cr (they accept 0 profit trades) -->
+        <!-- For level 2+, ensure minimum threshold based on pilot level -->
+        <set_value name="$pilotLevel" exact="if $params.$SkillLevel? then $params.$SkillLevel else 1"/>
+        <do_if value="$pilotLevel == 1">
+          <!-- Level 1: Accept 0 profit trades even in fallback -->
+          <set_value name="$fallbackMinAbsoluteProfit" exact="0"/>
+        </do_if>
+        <do_elseif value="$pilotLevel == 2">
+          <!-- Level 2: Minimum 50 Cr (half of 100 Cr base) -->
+          <set_value name="$fallbackMinAbsoluteProfit" exact="[$fallbackMinAbsoluteProfit, 5000].max"/>
+        </do_elseif>
+        <do_elseif value="$pilotLevel == 3">
+          <!-- Level 3: Minimum 250 Cr (half of 500 Cr base) -->
+          <set_value name="$fallbackMinAbsoluteProfit" exact="[$fallbackMinAbsoluteProfit, 25000].max"/>
+        </do_elseif>
+        <!-- Level 4+: Use halved value as-is (already has skill multiplier applied) -->
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GT-Search] (' + $ship.idcode + ') 💰 Fallback profit thresholds relaxed: ROI ' + $params.$MinROI + '% → ' + $fallbackMinROI + '%, Profit ' + ($params.$MinAbsoluteProfit / 100) + ' Cr → ' + ($fallbackMinAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') 💰 Fallback profit thresholds relaxed: ROI ' + $params.$MinROI + '% → ' + $fallbackMinROI + '%, Profit ' + ($params.$MinAbsoluteProfit / 100) + ' Cr → ' + ($fallbackMinAbsoluteProfit / 100) + ' Cr (Level ' + $pilotLevel + ')'" chance="100"/>
         </do_if>
         
         <!-- Call SearchLiveTrades with MaxDistance forced to 2 and relaxed profit thresholds -->

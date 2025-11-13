@@ -59,6 +59,148 @@ PERFORMANCE: Event-Driven Architecture Conversion - Eliminated All Polling Overh
     * MD scripts: `md/gt_trading_signals.xml`, `md/gt_buy_tracking.xml`, `md/gt_xp_training.xml`, `md/gt_market_intelligence.xml`, `md/gt_territory_management.xml`, `md/gt_ware_filter.xml`, `md/gt_configuration.xml`, `md/gt_debug.xml`
   - Note: This conversion builds on the previous event-driven improvements for resupply/repair completion (version 0.5.18)
 
+FIX: Property Lookup Failures - Missing Variable Initializations
+  - Fixed multiple property lookup failures caused by variables/globals not being initialized before use
+  - Problem: Race conditions and missing initialization checks caused "Property lookup failed" errors
+  - Solution: Added proper initialization checks and defensive programming throughout the codebase
+  - Fixes:
+    * **GT_Maintenance.DoMaintenance** - Fixed `$pilotLevel` property lookup failure
+      - Problem: `$pilotLevel` was used in conditions before being initialized
+      - Solution: Added initialization from `global.$GT_Pilots.{$ship.pilot}.$Level` with safe fallback to level 1
+      - File: `md/gt_maintenance.xml` (lines 20-24)
+    * **GT_TradingAI.ProcessDelayedTradeRequest** - Fixed `global.$GT_SearchLocks` and `global.$GT_AIParameters` property lookup failures
+      - Problem: Code accessed global tables without checking if they existed first
+      - Solution: Added existence checks and initialization before accessing nested properties
+      - File: `md/gt_trading_ai.xml` (lines 225-233)
+    * **GT_Trading_Queue.CheckTradeCache** - Fixed `global.$GT_SearchQueue.$Params` property lookup failure
+      - Problem: Code tried to set `global.$GT_SearchQueue.$Params.{$ship}` without ensuring `$Params` table existed
+      - Solution: Added comprehensive initialization checks for all `$GT_SearchQueue` properties including `$Params`
+      - File: `md/gt_trading_queue.xml` (lines 413-439)
+    * **GT_Trading_Queue.ProcessSearchQueue** - Fixed missing global table initialization and null parameter handling
+      - Problem: Code accessed `global.$GT_SearchQueue.$Params.{$ship}` without validation, causing null parameter errors
+      - Solution: Added initialization checks for all required properties and validation before using parameters
+      - File: `md/gt_trading_queue.xml` (lines 475-521)
+    * **GT_Trading_Search.SearchTradeRoutes** - Fixed null parameter validation
+      - Problem: `$params` could be null but code only checked existence (not null), causing property access failures
+      - Solution: Improved validation to check if `$params.$Ship` exists (handles null case properly)
+      - File: `md/gt_trading_search.xml` (lines 51-67)
+  - Technical details:
+    * All fixes follow the pattern: Check existence → Initialize if missing → Use safely
+    * Used safe operators (`@`) where appropriate
+    * Added defensive checks even though initialization should guarantee existence (handles race conditions)
+  - Files modified:
+    * `md/gt_maintenance.xml`
+    * `md/gt_trading_ai.xml`
+    * `md/gt_trading_queue.xml`
+    * `md/gt_trading_search.xml`
+
+FIX: Fallback Search Skill Multiplier Applied Twice - Inflated Profit Thresholds
+  - Critical bug fix: Fallback search was applying skill multiplier twice, causing profit thresholds to be massively inflated
+  - Problem: When fallback search continuation ran, it applied skill multiplier to already-multiplied values
+    * Example: Level 1 pilot (0.5x multiplier) with 5000 Cr threshold
+    * First application: 5000 Cr → 2500 Cr (correct)
+    * Fallback relaxation: 2500 Cr → 1250 Cr (correct)
+    * Continuation re-application: 1250 Cr → 125000 Cr (WRONG - 25x inflation!)
+  - Solution: Added detection for fallback search continuations and skip skill multiplier application
+    * Fallback search receives already-multiplied values, relaxes them, then passes to continuation
+    * Continuation now detects fallback search (maxDistance == 2 + isLiveSearchContinuation) and skips multiplier
+  - Impact: Ships were rejecting all trades because profit thresholds were 25-50x higher than intended
+  - File: `md/gt_trading_search.xml` (lines 107-135)
+  - Result: Fallback search now correctly uses relaxed profit thresholds, allowing trades to be found
+
+FEATURE: Pilot-Level Based Profit Thresholds
+  - New feature: Profit thresholds now scale with pilot skill level using non-linear progression
+  - Formula: `5000000 * ((skillLevel - 1) / 14)^2` (quadratic curve)
+  - Thresholds:
+    * Level 1: 0 Cr (accepts trades with 0 profit - perfect for beginners)
+    * Level 2: ~255 Cr
+    * Level 3: ~1,020 Cr
+    * Level 4: ~2,296 Cr
+    * Level 5: ~4,082 Cr
+    * Level 10: ~18,367 Cr
+    * Level 15: 50,000 Cr (very selective traders)
+  - Implementation:
+    * New library function: `GT_GetPilotLevelProfitThreshold` in `gt_trade_utilities.xml`
+    * Integrated into trade search queue (`gt_trading_queue.xml`) and trade search (`gt_trading_search.xml`)
+    * Fallback search also respects pilot level thresholds
+  - Rationale: Lower-level pilots are more forgiving (accept lower profits), higher-level pilots are more selective (require higher profits)
+  - Files modified:
+    * `md/gt_trade_utilities.xml` (new library function)
+    * `md/gt_trading_queue.xml` (uses pilot level for threshold calculation)
+    * `md/gt_trading_search.xml` (uses pilot level from parameters)
+  - Result: Profit thresholds now scale appropriately with pilot skill, making trading progression more meaningful
+
+FIX: Critical Profit Threshold Calculation Bug - 100x Inflation for Intra-Sector Trades
+  - Critical bug fix: Intra-sector profit thresholds were calculated incorrectly, causing 100x inflation
+  - Problem: `GT_CalculateTradeThresholds` was applying `Cr` suffix after multiplication, causing X4 to misinterpret values
+    * Example: Base threshold 2500 Cr (250000 raw centicredits)
+    * Intra-sector should be: 250000 / 2 = 125000 raw = 1250 Cr
+    * Bug was calculating: (250000 * 50 / 100)Cr = 125000Cr = 125000 Cr (100x too high!)
+  - Impact: All intra-sector trades were being rejected because thresholds were 100x higher than intended
+    * Trades with profit 2108 Cr, 31390 Cr, 1386 Cr, 26506 Cr were all rejected
+    * Threshold showed as 125000 Cr instead of 1250 Cr
+    * This affected ALL intra-sector trade evaluation (Phase 1 in batch processor)
+  - Solution: Removed `Cr` suffix from threshold calculations - values are already in raw format (centicredits)
+    * Intra-sector (50%): Changed from `($profitThreshold * 50 / 100)Cr` to `$profitThreshold / 2`
+    * Isolated intra-sector (25%): Changed from `($profitThreshold * 25 / 100)Cr` to `$profitThreshold * 25 / 100`
+    * Advanced analytics (95%): Changed from `($profitThreshold * 95 / 100)Cr` to `$profitThreshold * 95 / 100`
+  - Technical details:
+    * `$profitThreshold` is already in raw format (centicredits), so no `Cr` suffix needed
+    * Applying `Cr` suffix after calculation causes X4 to interpret result as credits, multiplying by 100
+    * Example: 125000 raw → 125000Cr = 125000 Cr (wrong) vs 125000 raw = 1250 Cr (correct)
+  - Files modified:
+    * `md/gt_trade_utilities.xml` (GT_CalculateTradeThresholds library, lines 838-860)
+  - Result: Intra-sector trades now correctly evaluated with proper thresholds (1250 Cr instead of 125000 Cr)
+    * Trades that were previously rejected are now correctly accepted
+    * Fallback search can now find profitable intra-sector trades
+
+FIX: Resupply Loop Bug - Immediate Re-Trigger After Successful Resupply
+  - Critical bug fix: Ships were immediately re-triggering resupply after completing it successfully
+  - Note: This bug was observed after removing the resupply cooldown
+  - Problem: After resupply completed, maintenance check ran again immediately and saw CM=0 (even though CM wasn't needed originally), triggering another resupply
+  - Root cause: Incorrect property access - using `@` operator on `.count` properties caused incorrect reads
+  - Solution:
+    * Removed `@` operator from all `.count` property accesses (matches vanilla pattern)
+    * Added verification after resupply completion - only check if what was originally needed is satisfied
+    * Store what was actually needed (`$NeededCM`, `$NeededUnits`) when creating maintenance order
+    * After resupply, verify that what we needed is now satisfied (ignore items that weren't needed)
+  - Technical details:
+    * Vanilla uses `$ship.ammostorage.countermeasure.count` directly (no `@` operator)
+    * `.count` properties always return integer (0+), so `@` operator causes incorrect reads
+    * Fixed inconsistent usage: storing "before" values with `@` but reading "current" without `@`
+  - Files modified: md/gt_maintenance.xml
+    * Lines 67-68, 72-73, 76-77: Removed `@` from initial equipment checks
+    * Lines 520-521, 524-525: Removed `@` from station evaluation checks
+    * Lines 746-748: Removed `@` from "before" value storage
+    * Lines 751-752, 755-756, 759-760: Removed `@` from shopping list calculations
+    * Lines 1015-1017: Removed `@` from post-resupply value reads
+    * Lines 975-985: Added `$NeededCM` and `$NeededUnits` tracking
+    * Lines 1043-1107: Added verification logic to check if what was needed is satisfied
+  - Result: Ships no longer immediately re-trigger resupply after successful completion
+
+FIX: UI Shield/Hull Bar Limit Exceeded - Widget System Error
+  - Fixed "Widget system error. Already displaying 50 shield/hull bar elements" error in info menu
+  - Problem: X4 automatically creates shield/hull bars for selectable table rows (`addRow(true, {})`), and has a global limit of 50 shield/hull bars
+  - Root cause: With 64+ ships, each selectable row in the info menu tables created a shield/hull bar, exceeding X4's 50-element limit
+  - Solution: Limited all three info menu tables (Overview, Renaming, Control) to display maximum 50 rows to stay under the limit
+  - Implementation:
+    * Added row limiting logic before creating rows in all three display functions (`displayPilotTable`, `displayRenaming`, `displayPilotControl`)
+    * If more than 50 pilots exist, only first 50 are displayed
+    * Footer text updated to show "Total Pilots: N (Showing: 50)" when limit is applied
+    * Applied consistently across all three tabs (Overview, Renaming, Control)
+  - Technical details:
+    * X4's widget system has a hard limit of 50 shield/hull bar elements globally
+    * Selectable rows (`addRow(true, {})`) automatically create shield/hull bars for ship-related data
+    * Non-selectable rows (`addRow(false, {})`) or `addRow(nil, {})` do not create shield/hull bars
+    * Header rows use `fixed = true` which also doesn't count toward limit
+  - Benefits:
+    * Prevents widget system errors when displaying large fleets (64+ ships)
+    * Menu remains functional with clear indication when limit is applied
+    * Consistent behavior across all three tabs
+    * No performance impact - simply limits visible rows
+  - Location:
+    * ui/gt_info_menu.lua (lines ~296-307, ~582-591, ~788-797, ~343-349, ~674-679, ~903-908)
+
 Version 0.5.18 - 2025-11-12
 ---------------------------
 
