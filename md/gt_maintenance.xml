@@ -34,7 +34,9 @@
           </do_if>
         </do_if>
         
-        <debug_text text="'[GT-Maintenance] 🔧 Starting maintenance check for ' + $ship.idcode" chance="100"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] 🔧 Starting maintenance check for ' + $ship.idcode" chance="100"/>
+        </do_if>
         
         <!-- ✅ CRITICAL FIX: Initialize pilot level before use -->
         <set_value name="$pilotLevel" exact="1"/>
@@ -185,21 +187,24 @@
           </run_actions>
           
           <do_if value="$repairStation and $repairStation.exists">
-            <!-- ✅ FIX: Final reachability check using blacklist-aware pathfinding BEFORE creating order -->
-            <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <!-- ✅ FIX: Final reachability check BEFORE creating order using library function -->
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_IsStationReachable" result="$reachabilityCheck">
               <param name="ship" value="$ship"/>
-            </run_actions>
-            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$finalPathDistance">
-              <param name="ship" value="$ship"/>
-              <param name="fromSector" value="$ship.sector"/>
-              <param name="toSector" value="$repairStation.sector"/>
-              <param name="blacklistgroup" value="$blacklistgroup"/>
-              <param name="useEscapeMode" value="false"/>
+              <param name="station" value="$repairStation"/>
+              <param name="returnDetails" value="true"/>
             </run_actions>
             
-            <do_if value="$finalPathDistance lt 0">
-              <!-- Station is unreachable due to blacklists - log and continue trading -->
-              <debug_text text="'[GT-Maintenance] 🚫 Repair station ' + $repairStation.knownname + ' is unreachable for ' + $ship.idcode + ' (blacklist-aware path distance: ' + $finalPathDistance + ') - will continue with trading'" chance="100"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] 🔍 Final reachability check for repair station ' + $repairStation.knownname + ':'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Station known: ' + $reachabilityCheck.$StationKnown" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Basic path (vanilla check): ' + $reachabilityCheck.$BasicPathDistance + ' jumps'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Blacklist-aware path: ' + $reachabilityCheck.$BlacklistAwarePathDistance + ' jumps'" chance="100"/>
+            </do_if>
+            
+            <!-- Station is unreachable if check fails -->
+            <do_if value="not $reachabilityCheck.$IsReachable">
+              <!-- Station is unreachable - log and continue trading -->
+              <debug_text text="'[GT-Maintenance] 🚫 Repair station ' + $repairStation.knownname + ' is unreachable for ' + $ship.idcode + ' (' + $reachabilityCheck.$FailureReason + ') - will continue with trading'" chance="100"/>
               
               <!-- ✅ FIX: Write logbook message when repair station unreachable -->
               <run_actions ref="md.GT_Logbook_Utilities.GT_IsLogbookEnabled" result="$logbookEnabled">
@@ -269,7 +274,10 @@
               <!-- Prepare repair data for AI script -->
               <debug_text text="'[GT-Maintenance] ✅ Repair data prepared for ' + $ship.idcode + ' at ' + $repairStation.knownname + ' (cost: ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
               
-              <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_RepairOrders exists -->
+              <!-- ✅ RACE CONDITION FIX: Ensure table exists before accessing (handles race condition) -->
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
               
               <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
                 $Station = $repairStation,
@@ -307,7 +315,10 @@
               <!-- Prepare partial repair data -->
               <debug_text text="'[GT-Maintenance] ✅ Partial repair data prepared for ' + $ship.idcode + ' (max: ' + ($playerMoney/100) + ' Cr)'" chance="100"/>
               
-              <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_RepairOrders exists -->
+              <!-- ✅ RACE CONDITION FIX: Ensure table exists before accessing (handles race condition) -->
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
               
               <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
                 $Station = $repairStation,
@@ -480,16 +491,29 @@
               <param name="ship" value="$ship"/>
             </run_actions>
             
-            <!-- SAFETY CHECK 1: Check distance to station using BLACKLIST-AWARE pathfinding -->
-            <!-- ✅ FIX: Use blacklist-aware pathfinding (same as trading system and repair) -->
-            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$distance">
+            <!-- SAFETY CHECK 1: Full reachability check (station known + basic path + blacklist-aware path) -->
+            <!-- ✅ FIX: Check ALL reachability requirements BEFORE evaluating stock -->
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_IsStationReachable" result="$reachabilityCheck">
               <param name="ship" value="$ship"/>
-              <param name="fromSector" value="$ship.sector"/>
-              <param name="toSector" value="$station.sector"/>
+              <param name="station" value="$station"/>
               <param name="blacklistgroup" value="$blacklistgroup"/>
-              <param name="useEscapeMode" value="false"/>
+              <param name="returnDetails" value="true"/>
             </run_actions>
+            
+            <do_if value="not $reachabilityCheck.$IsReachable">
+              <!-- Station is unreachable - skip it -->
+              <set_value name="$stationsSkippedDistance" operation="add"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]    ❌ SKIPPED - Not reachable (' + $reachabilityCheck.$FailureReason + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]      Station known: ' + $reachabilityCheck.$StationKnown + ', Basic path: ' + $reachabilityCheck.$BasicPathDistance + ', Blacklist-aware: ' + $reachabilityCheck.$BlacklistAwarePathDistance" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- Extract distance from reachability check (use blacklist-aware distance) -->
+            <set_value name="$distance" exact="$reachabilityCheck.$BlacklistAwarePathDistance"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]    Reachability check PASSED'" chance="100"/>
               <debug_text text="'[GT-Maintenance]    Distance (blacklist-aware): ' + $distance + ' jumps (max allowed: ' + $maxJumpDistance + ')'" chance="100"/>
             </do_if>
             
@@ -521,15 +545,7 @@
               <continue/>
             </do_if>
             
-            <!-- SAFETY CHECK 3: Skip if distance is -1 (no path/blacklisted route) or too far -->
-            <do_if value="$distance lt 0">
-              <set_value name="$stationsSkippedDistance" operation="add"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance]    ❌ SKIPPED - No valid path (distance = -1)'" chance="100"/>
-              </do_if>
-              <continue/>
-            </do_if>
-            
+            <!-- SAFETY CHECK 3: Skip if distance is too far -->
             <do_if value="$distance gt $maxJumpDistance">
               <set_value name="$stationsSkippedDistance" operation="add"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -687,47 +703,6 @@
           <do_if value="not $equipmentStation and $potentialStations.count == 0">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Maintenance] ⚠️ WARNING: NO stations found in galaxy - check if player owns any wharfs/equipment docks/shipyards'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <do_if value="$equipmentStation and $equipmentStation.exists">
-            <!-- ✅ FIX: Final reachability check using blacklist-aware pathfinding BEFORE creating order -->
-            <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
-              <param name="ship" value="$ship"/>
-            </run_actions>
-            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$finalPathDistance">
-              <param name="ship" value="$ship"/>
-              <param name="fromSector" value="$ship.sector"/>
-              <param name="toSector" value="$equipmentStation.sector"/>
-              <param name="blacklistgroup" value="$blacklistgroup"/>
-              <param name="useEscapeMode" value="false"/>
-            </run_actions>
-            
-            <do_if value="$finalPathDistance lt 0">
-              <!-- Station is unreachable due to blacklists - log and continue trading -->
-              <debug_text text="'[GT-Maintenance] 🚫 Equipment station ' + $equipmentStation.knownname + ' is unreachable for ' + $ship.idcode + ' (blacklist-aware path distance: ' + $finalPathDistance + ') - will continue with trading'" chance="100"/>
-              
-              <!-- ✅ FIX: Write logbook message when equipment station unreachable -->
-              <run_actions ref="md.GT_Logbook_Utilities.GT_IsLogbookEnabled" result="$logbookEnabled">
-                <param name="ship" value="$ship"/>
-              </run_actions>
-              <do_if value="$logbookEnabled">
-                <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                <set_value name="$logbookMessage" exact="{77000,3213}.[$equipmentStation.knownname,$ship.knownname]"/>
-                
-                <run_actions ref="md.GT_Logbook_Utilities.WriteLogbookMessage">
-                  <param name="Message" value="$logbookMessage"/>
-                  <param name="Category" value="'alerts'"/>
-                  <param name="Title" value="'Auto-Resupply Unreachable: ' + $ship.knownname"/>
-                  <param name="Object" value="$ship"/>
-                  <param name="Interaction" value="'showonmap'"/>
-                  <param name="Highlighted" value="true"/>
-                  <param name="CheckGlobalSettings" value="false"/>
-                </run_actions>
-              </do_if>
-              
-              <!-- Clear equipment station so we don't try to create order -->
-              <set_value name="$equipmentStation" exact="null"/>
             </do_if>
           </do_if>
           
@@ -1003,7 +978,10 @@
             </do_else>
             
             <!-- Store shopping list for AI script -->
-            <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_ResupplyOrders exists -->
+            <!-- ✅ RACE CONDITION FIX: Ensure table exists before accessing (handles race condition) -->
+            <do_if value="not global.$GT_ResupplyOrders?">
+              <set_value name="global.$GT_ResupplyOrders" exact="table[]"/>
+            </do_if>
             
             <!-- ✅ FIX: Ensure currentCM is initialized (defensive check) -->
             <set_value name="$storedCurrentCM" exact="if $currentCM? then $currentCM else $ship.ammostorage.countermeasure.count"/>
@@ -1610,9 +1588,24 @@
             </do_if>
           </do_if>
           
-          <!-- SAFETY CHECK 2: Check if station is reachable using BLACKLIST-AWARE pathfinding -->
+          <!-- SAFETY CHECK 2: Full reachability check (station known + basic path + blacklist-aware path) -->
           <do_if value="$isValid">
-            <!-- ✅ FIX: Use blacklist-aware pathfinding (same as trading system) -->
+            <!-- ✅ FIX: Check ALL reachability requirements BEFORE selecting station -->
+            <run_actions ref="md.GT_Pathfinding_Utilities.GT_IsStationReachable" result="$reachabilityCheck">
+              <param name="ship" value="$ship"/>
+              <param name="station" value="$station"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="returnDetails" value="false"/>
+            </run_actions>
+            <do_if value="not $reachabilityCheck">
+              <set_value name="$isValid" exact="false"/>
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - not reachable (station unknown or no path)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- SAFETY CHECK 3: Get distance and check if station is within max jump distance -->
+          <do_if value="$isValid">
+            <!-- Get blacklist-aware distance for distance check -->
             <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$gateDistance">
               <param name="ship" value="$ship"/>
               <param name="fromSector" value="$ship.sector"/>
@@ -1620,14 +1613,6 @@
               <param name="blacklistgroup" value="$blacklistgroup"/>
               <param name="useEscapeMode" value="false"/>
             </run_actions>
-            <do_if value="$gateDistance lt 0">
-              <set_value name="$isValid" exact="false"/>
-              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - no safe path (blacklist-aware distance: ' + $gateDistance + ')'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <!-- SAFETY CHECK 3: Check if station is within max jump distance -->
-          <do_if value="$isValid">
             <do_if value="$gateDistance gt $maxJumpDistance">
               <set_value name="$isValid" exact="false"/>
               <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - beyond max jump distance (' + $gateDistance + ' jumps, max: ' + $maxJumpDistance + ')'" chance="100"/>
