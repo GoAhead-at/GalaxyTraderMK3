@@ -57,12 +57,52 @@ REFACTOR: Comprehensive Global Tables Initialization and Race Condition Fixes
     * **Code quality**: Cleaner, simpler code without repetitive validation
     * **Save game compatibility**: Automatically fixes table structures from old save games
     * **Robustness**: Defensive checks handle edge cases even if initialization hasn't completed
-  - Documentation:
-    * Created comprehensive documentation in `docs/spec/global_tables_initialization_refactor.md`
-    * Documents problem statement, solution architecture, and impact on runtime code
   - Location:
     * md/gt_configuration.xml (GT_InitializeGlobalTables library, expanded initialization)
     * Multiple MD files (race condition fixes and redundant check removal)
+
+FEATURE: Enhanced Sector Blacklist Logbook Messages with Enemy Ship Details
+  - Added detailed enemy ship information to logbook messages when sectors are blacklisted
+  - Problem: When a sector gets blacklisted, players had no visibility into which specific enemy ships triggered the blacklist
+  - Solution: Logbook messages now include all tracked enemy ships, sorted by size class with ship names and IDs
+  - Implementation:
+    * When a sector is blacklisted in `ReceiveThreatWarning`, enemy ships are retrieved from threat intelligence tracking
+    * Ships are sorted by size class (XL, L, M, S) in descending order
+    * Each ship entry includes the ship's class name (knownname) followed by its ID code
+    * Ships are grouped by size class with labels (XL:, L:, M:, S:)
+    * Multiple ships per class are comma-separated on the same line
+    * Only size classes with detected ships are included in the message
+  - Message format:
+    * TextDB entry: `{77000,3220}.[sector name, '', ship details string]` (3 parameters: sector, empty destination, ship list)
+    * Ship details format: "XL: ShipName ID, ShipName ID\nL: ShipName ID\nM: ShipName ID, ShipName ID\nS: ShipName ID"
+    * Example: "XL: Destroyer XEN-001, Carrier XEN-002\nL: Frigate ARG-123\nM: Corvette HOP-456, Gunboat HOP-789"
+    * Note: Empty string provided as second parameter since destination sector is unknown when blacklisting
+  - Benefits:
+    * **Visibility**: Players can see exactly which enemy ships caused the blacklist
+    * **Intelligence**: Ship class names help identify threat types (Destroyer, Carrier, Frigate, etc.)
+    * **Organization**: Ships sorted by size class make it easy to assess threat level
+    * **Actionable**: Ship IDs allow players to track specific threats
+  - Location:
+    * md/gt_threat_intelligence.xml (ReceiveThreatWarning cue, lines ~990-1108)
+
+FIX: Dedicated TextDB Entry for Sector Blacklist Logbook Messages
+  - Created dedicated TextDB entry for sector blacklisting messages instead of reusing "enemy ship escaped" entry
+  - Problem: TextDB entry `{77000,3220}` is designed for "enemy ship escaped" messages (3 params: sector, destination, ship) but was being reused for "sector blacklisted" messages (2 params: sector, ship list)
+  - Root cause: Reusing TextDB entry with mismatched parameters required workaround (empty destination parameter) and wording didn't match the use case
+  - Solution: Created new TextDB entry `{77000,3222}` specifically designed for sector blacklisting with ship lists (2 parameters: sector, ship list)
+  - Implementation:
+    * Created new TextDB entry `{77000,3222}` in all translation files (8 languages: English, German, Italian, Russian, French, Portuguese, Spanish, and default)
+    * Updated code to use new entry: `{77000,3222}.[$sector.knownname, $shipIDString]`
+    * Removed workaround empty parameter that was needed for old entry
+    * Message format: "SECTOR BLACKLISTED" with detected enemy ships listed by size class (XL, L, M, S)
+  - Benefits:
+    * **Accuracy**: Message wording now perfectly matches the blacklist use case
+    * **Clarity**: No confusion with "enemy ship escaped" message format
+    * **Maintainability**: Dedicated entry makes future improvements easier
+    * **Localization**: Proper translations for all supported languages
+  - Location:
+    * md/gt_threat_intelligence.xml (ReceiveThreatWarning cue, line 1097)
+    * t/0001-L001.xml, t/0001-L007.xml, t/0001-L033.xml, t/0001-L034.xml, t/0001-L039.xml, t/0001-L044.xml, t/0001-L049.xml, t/0001-L055.xml (TextDB entry 3222)
 
 FIX: Null Check for Batch Processor List Properties
   - Fixed crash when accessing `.count` on batch processor lists that could be null
@@ -82,6 +122,87 @@ FIX: Null Check for Batch Processor List Properties
     * Save game compatibility: Automatically handles stale batch data from previous versions
   - Location:
     * md/gt_trading_batch_processor.xml (lines ~50-74, ~135-152, ~203-229) - List extraction, validation, and count access
+
+FIX: Training Station Search Improvements - Trading Stations Only with Enhanced Safety Checks
+  - Improved training station search to only use trading stations and added comprehensive safety checks
+  - Problem: Ships could be sent to unreachable training stations (shipyards, wharves, equipment docks) that were in blacklisted sectors or lacked proper docking capability
+  - Solution: Restricted training station search to trading stations only and added blacklist-aware pathfinding with docking capability validation
+  - Implementation:
+    * Removed shipyard/wharf and equipment dock searches from training station finder
+    * Now only searches for trading stations (`tradestation="true"`)
+    * Added blacklist-aware pathfinding using `GT_Pathfinding_Utilities.GT_CalculatePathDistance`
+    * Added comprehensive validation checks in order:
+      1. Blacklist-aware distance check (filters unreachable stations)
+      2. Blacklist checks (station + sector travel/activity blacklists)
+      3. Technical docking capability (verifies station has docking bay for ship size using `find_dockingbay`)
+      4. Docking permission check (verifies `station.dockingallowed.{$ship}`)
+    * Nearest station selection now uses blacklist-aware pathfinding to ensure selected station is actually reachable
+  - Benefits:
+    * **Reliability**: Ships only sent to trading stations that can actually be reached
+    * **Safety**: Prevents ships from being sent to blacklisted sectors or stations
+    * **Docking**: Ensures station has proper docking bay for ship size before sending
+    * **Permission**: Verifies docking is allowed before sending ship
+    * **Consistency**: Uses same blacklist-aware pathfinding as repair/resupply systems
+  - Location:
+    * md/gt_xp_training.xml (FindTrainingStation cue, lines ~1786-1921)
+
+PERFORMANCE: Increased Early Exit Threshold for Batch Processing
+  - Increased early exit threshold to improve batch processing performance
+  - Problem: Early exit threshold was too low, causing batch processor to exit prematurely before finding optimal trades
+  - Solution: Increased `$GT_GlobalSettings.$Performance.$EarlyExitThreshold` value
+  - Benefits:
+    * **Performance**: Batch processor now searches more thoroughly before early exit
+    * **Trade Quality**: Allows more time to find better trade matches
+    * **Efficiency**: Better balance between search thoroughness and performance
+  - Location:
+    * md/gt_global_settings.xml (Performance settings, EarlyExitThreshold)
+
+FIX: Repair Station Search - Capability-Based Instead of Station Type-Based
+  - Fixed repair station search to use actual repair capabilities instead of station type assumptions
+  - Problem: Previous logic relied on station types (Wharf, Shipyard, Equipment Dock) to infer repair capability, which is not always accurate
+  - Root cause: Station type alone does not guarantee repair capability - stations must have `shiptrader` control entity AND be able to build OR supply the ship's class
+  - Solution: Switched to capability-based search that directly queries for stations with repair capabilities, aligning with vanilla game logic
+  - Implementation:
+    * Removed ship class detection logic (`Detect_Ship_Class`) and conditional searches for different station types
+    * Replaced with single `find_station` query that searches for stations with `hascontrolentity="controlpost.shiptrader"`
+    * After initial search, validates each station manually:
+      - Verifies repair capability: `station.canbuildclass.{$ship.class}` OR `station.cansupplyclass.{$ship.class}`
+      - Verifies docking capability: `find_dockingbay` for ship's docksize
+    * Existing safety checks (blacklist, pathfinding, max jump distance, docking permission, excluded sectors) preserved and now operate on accurately filtered station list
+  - Vanilla pattern reference:
+    * Source: `interrupt.restock.xml:778`, `order.repair.xml:71-73`
+    * Vanilla checks: `station.shiptrader?` AND (`canbuildclass.{ship.class}` OR `cansupplyclass.{ship.class}`)
+  - Benefits:
+    * **Accuracy**: Only finds stations that can actually repair the ship
+    * **Reliability**: No false positives from station types that don't have repair capability
+    * **Consistency**: Uses same logic as vanilla game repair system
+    * **Robustness**: Works correctly regardless of station type or configuration
+  - Location:
+    * md/gt_maintenance.xml (FindNearestRepairStation library, lines ~1406-1541)
+
+FIX: Resupply Station Search - Capability-Based Instead of Station Type-Based
+  - Fixed resupply station search to use actual resupply capabilities instead of station type assumptions
+  - Problem: Previous logic relied on station types (Wharf, Shipyard, Equipment Dock) and ship class detection to infer resupply capability, which is not always accurate
+  - Root cause: Station type alone does not guarantee resupply capability - stations must be able to supply the ship's class (`cansupplyclass`)
+  - Solution: Switched to capability-based search that validates stations can actually supply equipment to the ship's class, aligning with vanilla game logic
+  - Implementation:
+    * Removed ship class detection logic (`Detect_Ship_Class`) and conditional searches for different station types based on ship class
+    * Replaced with unified search that queries for all potential equipment stations (equipment docks, wharfs, shipyards)
+    * After initial search, validates each station manually:
+      - Verifies resupply capability: `station.cansupplyclass.{$ship.class}` (station must be able to supply this ship class)
+      - Verifies docking capability: `find_dockingbay` for ship's docksize
+    * Existing safety checks (blacklist, pathfinding, max jump distance, docking permission, excluded sectors, stock availability) preserved and now operate on accurately filtered station list
+  - Vanilla pattern reference:
+    * Source: `interrupt.restock.xml` - vanilla checks `cansupplyclass.{ship.class}` for equipment stations
+    * Vanilla logic: Station must be able to supply equipment to the ship's class to resupply
+  - Benefits:
+    * **Accuracy**: Only finds stations that can actually resupply the ship
+    * **Reliability**: No false positives from station types that don't have resupply capability for the ship's class
+    * **Consistency**: Uses same logic as vanilla game resupply system
+    * **Robustness**: Works correctly regardless of station type or ship class configuration
+    * **Simplicity**: Removed complex ship class detection and conditional logic
+  - Location:
+    * md/gt_maintenance.xml (ExecuteMaintenance cue, equipment station search section, lines ~360-459)
 
 Version 0.5.17 - 2025-11-12
 ---------------------------
