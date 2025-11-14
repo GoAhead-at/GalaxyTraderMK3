@@ -2858,12 +2858,15 @@
         
         <!-- Extract sector -->
         <set_value name="$homeSector" exact="null"/>
+        <set_value name="$homeSectorAnchor" exact="null"/>
         <do_if value="$homeBase? and $homeBase.exists">
           <do_if value="$homeBase.isclass.station">
             <set_value name="$homeSector" exact="$homeBase.sector"/>
+            <set_value name="$homeSectorAnchor" exact="$homeBase"/>
           </do_if>
           <do_elseif value="$homeBase.isclass.sector">
             <set_value name="$homeSector" exact="$homeBase"/>
+            <set_value name="$homeSectorAnchor" exact="$homeBase"/>
           </do_elseif>
         </do_if>
         
@@ -2872,6 +2875,12 @@
           <debug_text text="'[GT-ERROR] Failed to extract home sector from homeBase for ' + $ship.idcode + ' - using ship.sector as emergency fallback (THIS WILL CAUSE DRIFT!)'" chance="100"/>
           <!-- Emergency fallback only - this should never happen -->
           <set_value name="$homeSector" exact="$ship.sector"/>
+          <set_value name="$homeSectorAnchor" exact="$ship.sector"/>
+        </do_if>
+        
+        <!-- ✅ PERFORMANCE OPTIMIZATION: Ensure homeSectorAnchor is set (for match_gate_distance) -->
+        <do_if value="not $homeSectorAnchor? or not $homeSectorAnchor.exists">
+          <set_value name="$homeSectorAnchor" exact="$homeSector"/>
         </do_if>
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -2982,93 +2991,167 @@
         <!-- ✅ NATIVE C++ ACTION: Find all sell offers (ship buys FROM these stations) -->
         <!-- This single call replaces ~2000 station iterations! -->
         <!-- ✅ FIX: Check for null before accessing .count (memory:10529400) -->
-        <!-- ✅ FALLBACK SEARCH: tradepartner filters by distance from ship's current position -->
-        <!-- We still need to filter by max distance (2 jumps) ourselves after collection -->
+        <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector using match_gate_distance -->
+        <!-- For fallback searches, skip match_gate_distance (filter by current position instead) -->
         <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
           <!-- Manual ware selection: query specific wares -->
-          <find_sell_offer 
-            tradepartner="$ship" 
-            space="$searchSpace" 
-            result="$allSellOffers" 
-            wares="$wareBasket" 
-            multiple="true">
-            <match_seller tradesknownto="$ship.owner">
-              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
-              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
-              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
-              <!-- Blacklist filtering happens per-ship during cache retrieval -->
-            </match_seller>
-            <relativeprice max="$sellPriceMax"/>  <!-- Normal: 0.0 (at average or below), Isolated: 0.5 (expanded range) -->
-            <amount min="10"/>  <!-- Only offers with at least 100 items -->
-            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
-          </find_sell_offer>
+          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
+            <!-- Normal search: Use match_gate_distance with home sector anchor -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allSellOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
+              <!-- MD will do accurate blacklist-aware filtering later -->
+              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_if>
+          <do_else>
+            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allSellOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_else>
         </do_if>
         <do_else>
           <!-- Auto wares: query all compatible wares -->
-          <find_sell_offer 
-            tradepartner="$ship" 
-            space="$searchSpace" 
-            result="$allSellOffers" 
-            multiple="true">
-            <match_seller tradesknownto="$ship.owner">
-              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
-              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
-              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
-              <!-- Blacklist filtering happens per-ship during cache retrieval -->
-            </match_seller>
-            <relativeprice max="$sellPriceMax"/>  <!-- Normal: 0.0 (at average or below), Isolated: 0.5 (expanded range) -->
-            <amount min="10"/>  <!-- Only offers with at least 100 items -->
-            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
-          </find_sell_offer>
+          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
+            <!-- Normal search: Use match_gate_distance with home sector anchor -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allSellOffers" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
+              <!-- MD will do accurate blacklist-aware filtering later -->
+              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_if>
+          <do_else>
+            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allSellOffers" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_else>
         </do_else>
         
         <!-- ✅ NATIVE C++ ACTION: Find all buy offers (ship sells TO these stations) -->
         <!-- Note: $wareBasket already initialized above as empty list if null -->
         <!-- ✅ FIX: Check for null before accessing .count (memory:10529400) -->
-        <!-- ✅ FALLBACK SEARCH: tradepartner filters by distance from ship's current position -->
-        <!-- We still need to filter by max distance (2 jumps) ourselves after collection -->
+        <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector using match_gate_distance -->
+        <!-- For fallback searches, skip match_gate_distance (filter by current position instead) -->
         <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
-          <find_buy_offer 
-            tradepartner="$ship" 
-            space="$searchSpace" 
-            result="$allBuyOffers" 
-            wares="$wareBasket" 
-            multiple="true">
-            <match_buyer tradesknownto="$ship.owner">
-              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
-              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
-              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
-              <!-- Blacklist filtering happens per-ship during cache retrieval -->
-            </match_buyer>
-            <relativeprice min="$buyPriceMin"/>  <!-- Normal: 0.0 (at average or above), Isolated: -0.5 (expanded range) -->
-            <amount min="10"/>  <!-- Only offers with at least 100 items -->
-            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
-          </find_buy_offer>
+          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
+            <!-- Normal search: Use match_gate_distance with home sector anchor -->
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allBuyOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
+              <!-- MD will do accurate blacklist-aware filtering later -->
+              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_if>
+          <do_else>
+            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allBuyOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_else>
         </do_if>
         <do_else>
-          <find_buy_offer 
-            tradepartner="$ship" 
-            space="$searchSpace" 
-            result="$allBuyOffers" 
-            multiple="true">
-            <match_buyer tradesknownto="$ship.owner">
-              <!-- ✅ CRITICAL: Filter by docking relation - only stations ship can dock at -->
-              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-              <!-- ✅ CRITICAL: Exclude enemy factions - only stations with non-enemy relation -->
-              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              <!-- ✅ UNIVERSAL CACHE: No blacklist filtering in native query -->
-              <!-- Blacklist filtering happens per-ship during cache retrieval -->
-            </match_buyer>
-            <relativeprice min="$buyPriceMin"/>  <!-- Normal: 0.0 (at average or above), Isolated: -0.5 (expanded range) -->
-            <amount min="10"/>  <!-- Only offers with at least 100 items -->
-            <totalvolume min="100"/>  <!-- Minimum total volume (amount × volume per unit) -->
-          </find_buy_offer>
+          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
+            <!-- Normal search: Use match_gate_distance with home sector anchor -->
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allBuyOffers" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
+              <!-- MD will do accurate blacklist-aware filtering later -->
+              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_if>
+          <do_else>
+            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$searchSpace" 
+              result="$allBuyOffers" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_else>
         </do_else>
         
         <!-- ✅ FALLBACK SEARCH: Filter offers by distance from CURRENT POSITION (max 2 jumps) -->
@@ -3151,7 +3234,8 @@
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
           <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ⚡ NATIVE ACTIONS: Collected ' + $allSellOffers.count + ' sell + ' + $allBuyOffers.count + ' buy offers (instant C++ query)'" chance="100"/>
           <!-- ✅ DIAGNOSTIC: If native query returns 0 offers, test with minimal filters to find blocker -->
-          <do_if value="$offersFound == 0">
+          <!-- ✅ PERFORMANCE OPTIMIZATION: Guard diagnostic queries behind dedicated flag (4 galaxy-wide scans are expensive!) -->
+          <do_if value="$offersFound == 0 and global.$GT_Config.$Debug.$DiagnosticQueries">
             <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') ⚠️ Native query returned 0 offers with filters: dockable=true, enemy=false, amount≥100, totalvolume≥100, sellPrice≤average, buyPrice≥average'" chance="100"/>
             <!-- Test query with ONLY tradesknownto (no other filters) to see if offers exist -->
             <set_value name="$testSellOffers" exact="[]"/>
@@ -3227,6 +3311,10 @@
               <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') ❌ Even MINIMAL query (tradesknownto only) returns 0 offers - ship may not know about any stations'" chance="100"/>
             </do_else>
           </do_if>
+          <!-- ✅ PERFORMANCE OPTIMIZATION: End of diagnostic queries block (guarded by DiagnosticQueries flag) -->
+          <do_elseif value="$offersFound == 0">
+            <!-- Silent skip when diagnostic queries disabled (normal play) -->
+          </do_elseif>
         </do_if>
         
         <!-- ✅ UNIVERSAL CACHE: Native actions filtered by:
