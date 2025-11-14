@@ -2015,28 +2015,38 @@
         </do_if>
         
         <!-- ✅ CRITICAL FIX: Validate distance from HOME SECTOR (not ship position) -->
+        <!-- ✅ CRITICAL: Subordinates ALWAYS use commander's home sector (via $effectiveHome) -->
+        <!-- ✅ For non-subordinates: Always use defaultorder.$home as PRIMARY source (fixed value in order) -->
+        <!-- Home sector is a fixed value in the order settings and should NEVER drift -->
         <!-- Ships must only trade with stations within maxbuy/maxsell from home sector -->
+        <!-- Note: $effectiveHome already handles subordinates correctly (set at initialization) -->
         <set_value name="$homeBase" exact="this.$effectiveHome"/>
+        
+        <!-- Fallback: Only if effectiveHome is not available, check defaultorder.$home -->
         <do_if value="not $homeBase? or not $homeBase.exists">
           <set_value name="$homeBase" exact="@this.ship.defaultorder.$home"/>
           <do_if value="not $homeBase? or not $homeBase.exists">
+            <!-- ❌ REMOVED: Never fall back to ship.sector (causes cascading drift) -->
+            <debug_text text="'[GT-AI-ERROR] Home sector not found for ' + this.ship.idcode + ' - effectiveHome and defaultorder.$home are null! This should never happen.'" chance="100"/>
+            <!-- Emergency fallback only - this should never happen -->
             <set_value name="$homeBase" exact="this.ship.sector"/>
           </do_if>
         </do_if>
         
         <!-- Extract home sector -->
         <set_value name="$homeSector" exact="null"/>
-        <do_if value="$homeBase.isclass.station">
-          <set_value name="$homeSector" exact="$homeBase.sector"/>
+        <do_if value="$homeBase? and $homeBase.exists">
+          <do_if value="$homeBase.isclass.station">
+            <set_value name="$homeSector" exact="$homeBase.sector"/>
+          </do_if>
+          <do_elseif value="$homeBase.isclass.sector">
+            <set_value name="$homeSector" exact="$homeBase"/>
+          </do_elseif>
         </do_if>
-        <do_elseif value="$homeBase.isclass.sector">
-          <set_value name="$homeSector" exact="$homeBase"/>
-        </do_elseif>
-        <do_else>
-          <set_value name="$homeSector" exact="this.ship.sector"/>
-        </do_else>
         
         <do_if value="not $homeSector? or not $homeSector.exists">
+          <debug_text text="'[GT-AI-ERROR] Failed to extract home sector from homeBase for ' + this.ship.idcode + ' - using ship.sector as emergency fallback (THIS WILL CAUSE DRIFT!)'" chance="100"/>
+          <!-- Emergency fallback only - this should never happen -->
           <set_value name="$homeSector" exact="this.ship.sector"/>
         </do_if>
         
@@ -3035,15 +3045,41 @@
         </do_if>
       </do_if>
       <do_elseif value="$currentDefaultOrder != 'GalaxyTraderMK3'">
-        <!-- Different default order → GT order was cancelled -->
-        <set_value name="$isGTOrderCancelled" exact="true"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ')'" chance="100"/>
+        <!-- Different default order → Check if GT order was actually cancelled -->
+        <!-- CRITICAL: Only send GT_Order_Cancelled if ship NO LONGER has GT as default order -->
+        <!-- For subordinates, default order is Assist, but GT order is still active via commander -->
+        <!-- Check if ship has direct GT order OR is subordinate to GT commander -->
+        <set_value name="$hasGTOrder" exact="false"/>
+        
+        <!-- Check for direct GT order (re-check defaultorder.id directly) -->
+        <set_value name="$actualDefaultOrder" exact="@this.ship.defaultorder.id"/>
+        <do_if value="$actualDefaultOrder == 'GalaxyTraderMK3'">
+          <set_value name="$hasGTOrder" exact="true"/>
         </do_if>
-        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
-          $Ship = this.ship,
-          $UpdateType = 'GT_Order_Cancelled'
-        ]"/>
+        
+        <!-- Check if subordinate to GT commander -->
+        <do_if value="not $hasGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+          <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasGTOrder" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only send GT_Order_Cancelled if GT order is actually gone -->
+        <do_if value="not $hasGTOrder">
+          <set_value name="$isGTOrderCancelled" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ', no GT order found)'" chance="100"/>
+          </do_if>
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.ship,
+            $UpdateType = 'GT_Order_Cancelled'
+          ]"/>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ⚠️ PHASE 7: Trade order aborted but GT order still active for ' + this.ship.idcode + ' (default order: ' + $currentDefaultOrder + ', actual default: ' + (if $actualDefaultOrder then $actualDefaultOrder else 'NONE') + ', has GT: ' + $hasGTOrder + ') - NOT sending GT_Order_Cancelled'" chance="100"/>
+          </do_if>
+        </do_else>
         
         <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled (direct or subordinate) -->
         <!-- CRITICAL: Check if ship WAS a subordinate BEFORE GT order was cancelled -->
