@@ -318,6 +318,200 @@
       </actions>
     </library>
     
+    <!-- Find Sectors In Range (Vanilla Pattern) -->
+    <!-- Replicates vanilla lib.find.sectors.inrange logic for MD scripts -->
+    <!-- Pre-filters sectors by gate distance and blacklist BEFORE native trade queries -->
+    <library name="GT_FindSectorsInRange" purpose="run_actions">
+      <params>
+        <param name="refobject" comment="Reference object (sector/station) from which gate distance is measured"/>
+        <param name="mingatedistance" default="0" comment="Minimum gate distance from refobject"/>
+        <param name="maxgatedistance" default="1" comment="Maximum gate distance from refobject"/>
+        <param name="ship" comment="Ship for blacklist checks"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group (auto-determined if null)"/>
+        <param name="applyblacklist" default="true" comment="Apply blacklist filtering"/>
+      </params>
+      <actions>
+        <!-- Get blacklist group if not provided -->
+        <do_if value="not $blacklistgroup? or $blacklistgroup == null">
+          <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Extract reference sector from refobject -->
+        <set_value name="$refsector" exact="null"/>
+        <do_if value="$refobject.isclass.sector">
+          <set_value name="$refsector" exact="$refobject"/>
+        </do_if>
+        <do_elseif value="$refobject.sector?">
+          <set_value name="$refsector" exact="$refobject.sector"/>
+        </do_elseif>
+        <do_else>
+          <!-- Try to find sector containing refobject -->
+          <find_sector name="$locsectors" space="$refobject" multiple="true"/>
+          <do_if value="$locsectors.count gt 0">
+            <!-- Use closest sector (first one found) -->
+            <set_value name="$refsector" exact="$locsectors.{1}"/>
+          </do_if>
+        </do_else>
+        
+        <!-- Validate refsector -->
+        <do_if value="not $refsector? or not $refsector.exists">
+          <debug_text text="'[GT-Pathfinding] ERROR: Failed to extract sector from refobject in GT_FindSectorsInRange'" chance="100"/>
+          <return value="[]"/>
+        </do_if>
+        
+        <!-- Get commander sector (ships can always operate in commander's sector regardless of blacklist) -->
+        <set_value name="$commandersector" exact="null"/>
+        <do_if value="$ship.commander? and $ship.commander.exists">
+          <set_value name="$commandersector" exact="@$ship.commander.sector"/>
+        </do_if>
+        
+        <!-- Get ship's current sector (fallback if all sectors blacklisted) -->
+        <set_value name="$mysector" exact="$ship.sector"/>
+        <do_if value="@$ship.zone.issuperhighway">
+          <set_value name="$mysector" exact="@$ship.zone.destination.sector"/>
+        </do_if>
+        
+        <!-- Use native find_cluster_in_range to find sectors within range -->
+        <!-- This is the vanilla pattern - uses native C++ pathfinding for performance -->
+        <set_value name="$locclusters" exact="table[]"/>
+        <find_cluster_in_range distances="$locclusters" multiple="true" object="$refobject" mindistance="$mingatedistance" maxdistance="$maxgatedistance"/>
+        
+        <!-- Build sector table from clusters -->
+        <set_value name="$sectortable" exact="table[]"/>
+        <do_for_each name="$loccluster" valuename="$jumpdist" in="$locclusters">
+          <find_sector name="$sectorlist" space="$loccluster" multiple="true"/>
+          <do_if value="$sectorlist.count == 1">
+            <!-- Single-sector cluster -->
+            <set_value name="$locsector" exact="$sectorlist.{1}"/>
+            <do_if value="not player.entity.isknown.{$locsector}? or @player.entity.isknown.{$locsector}">
+              <!-- Check gate distance (for multi-sector clusters with one-way superhighways) -->
+              <set_value name="$locgatedist" exact="$refsector.gatedistance.{$locsector}"/>
+              <do_if value="($locgatedist ge 0) and ($locgatedist ge $mingatedistance) and ($locgatedist le $maxgatedistance)">
+                <!-- Check return path distance -->
+                <set_value name="$locreturngatedist" exact="$locsector.gatedistance.{$refsector}"/>
+                <do_if value="($locreturngatedist ge 0) and ($locreturngatedist le $maxgatedistance)">
+                  <!-- Apply blacklist filtering if enabled -->
+                  <set_value name="$sectorValid" exact="true"/>
+                  <do_if value="$applyblacklist">
+                    <!-- Always allow commander's sector and ship's current sector -->
+                    <do_if value="$locsector != $commandersector and $locsector != $mysector">
+                      <!-- Check blacklist (sectoractivity AND sectortravel) -->
+                      <set_value name="$sectorActivityBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+                      <set_value name="$sectorTravelBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+                      <do_if value="$sectorActivityBlacklisted or $sectorTravelBlacklisted">
+                        <set_value name="$sectorValid" exact="false"/>
+                      </do_if>
+                      <do_else>
+                        <!-- Check blacklist-aware path distance (for return path) -->
+                        <set_value name="$blacklistAwareDist" exact="$refsector.gatedistance.{$locsector}.{$blacklistgroup}.{$ship}"/>
+                        <do_if value="$blacklistAwareDist lt 0">
+                          <!-- No blacklist-aware path exists -->
+                          <set_value name="$sectorValid" exact="false"/>
+                        </do_if>
+                        <do_else>
+                          <!-- Check return path with blacklist -->
+                          <set_value name="$blacklistAwareReturnDist" exact="$locsector.gatedistance.{$refsector}.{$blacklistgroup}.{$ship}"/>
+                          <do_if value="$blacklistAwareReturnDist lt 0 or $blacklistAwareReturnDist gt $maxgatedistance">
+                            <set_value name="$sectorValid" exact="false"/>
+                          </do_if>
+                        </do_else>
+                      </do_else>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Add sector if valid -->
+                  <do_if value="$sectorValid">
+                    <set_value name="$sectortable.{$locsector}" exact="$locgatedist"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Multi-sector cluster -->
+            <do_for_each name="$locsector" in="$sectorlist">
+              <do_if value="not player.entity.isknown.{$locsector}? or @player.entity.isknown.{$locsector}">
+                <!-- Check gate distance -->
+                <set_value name="$locgatedist" exact="$refsector.gatedistance.{$locsector}"/>
+                <do_if value="($locgatedist ge 0) and ($locgatedist ge $mingatedistance) and ($locgatedist le $maxgatedistance)">
+                  <!-- Check return path distance -->
+                  <set_value name="$locreturngatedist" exact="$locsector.gatedistance.{$refsector}"/>
+                  <do_if value="($locreturngatedist ge 0) and ($locreturngatedist le $maxgatedistance)">
+                    <!-- Apply blacklist filtering if enabled -->
+                    <set_value name="$sectorValid" exact="true"/>
+                    <do_if value="$applyblacklist">
+                      <!-- Always allow commander's sector and ship's current sector -->
+                      <do_if value="$locsector != $commandersector and $locsector != $mysector">
+                        <!-- Check blacklist (sectoractivity AND sectortravel) -->
+                        <set_value name="$sectorActivityBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+                        <set_value name="$sectorTravelBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+                        <do_if value="$sectorActivityBlacklisted or $sectorTravelBlacklisted">
+                          <set_value name="$sectorValid" exact="false"/>
+                        </do_if>
+                        <do_else>
+                          <!-- Check blacklist-aware path distance -->
+                          <set_value name="$blacklistAwareDist" exact="$refsector.gatedistance.{$locsector}.{$blacklistgroup}.{$ship}"/>
+                          <do_if value="$blacklistAwareDist lt 0">
+                            <set_value name="$sectorValid" exact="false"/>
+                          </do_if>
+                          <do_else>
+                            <!-- Check return path with blacklist -->
+                            <set_value name="$blacklistAwareReturnDist" exact="$locsector.gatedistance.{$refsector}.{$blacklistgroup}.{$ship}"/>
+                            <do_if value="$blacklistAwareReturnDist lt 0 or $blacklistAwareReturnDist gt $maxgatedistance">
+                              <set_value name="$sectorValid" exact="false"/>
+                            </do_if>
+                          </do_else>
+                        </do_else>
+                      </do_if>
+                    </do_if>
+                    
+                    <!-- Add sector if valid -->
+                    <do_if value="$sectorValid">
+                      <set_value name="$sectortable.{$locsector}" exact="$locgatedist"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_for_each>
+          </do_else>
+        </do_for_each>
+        
+        <!-- If mingatedistance <= 0, include the refsector itself -->
+        <do_if value="($mingatedistance le 0) and not $sectortable.{$refsector}?">
+          <set_value name="$sectortable.{$refsector}" exact="0"/>
+        </do_if>
+        
+        <!-- If no valid sectors found (probably due to blacklist), add ship's current sector as fallback -->
+        <do_if value="not $sectortable.keys.count">
+          <do_if value="$mysector? and $mysector.exists">
+            <set_value name="$sectortable.{$mysector}" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Sort sectors by gate distance (vanilla pattern) -->
+        <set_value name="$spaces" exact="$sectortable.keys.list"/>
+        <shuffle_list list="$spaces"/>
+        <sort_list list="$spaces" sortbyvalue="$sectortable.{loop.element}"/>
+        
+        <!-- If mingatedistance <= 0, ensure refsector is first -->
+        <do_if value="($mingatedistance le 0) and $refsector? and not $spaces.indexof.{$refsector}?">
+          <set_value name="$spaces.{1}" exact="$refsector" operation="insert"/>
+        </do_if>
+        
+        <!-- If still no sectors, add ship's current sector -->
+        <do_if value="not $spaces.count">
+          <do_if value="$mysector? and $mysector.exists">
+            <set_value name="$spaces.{1}" exact="$mysector" operation="insert"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Return sorted list of sectors -->
+        <return value="$spaces"/>
+      </actions>
+    </library>
+    
     <!-- Build Station Distance Cache from Offers -->
     <library name="GT_BuildStationDistanceCache" purpose="run_actions">
       <params>
