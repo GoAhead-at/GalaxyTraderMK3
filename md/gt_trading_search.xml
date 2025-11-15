@@ -2869,24 +2869,11 @@
         <!-- Get AI parameters for filtering -->
         <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
         
-        <!-- ✅ CRITICAL: Initialize $wareBasket safely (memory:10529400 - ? checks existence, not null) -->
-        <!-- Step 1: Initialize to safe default FIRST -->
-        <set_value name="$wareBasket" exact="[]"/>
-        <!-- Step 2: Check if source exists -->
-        <do_if value="global.$GT_AIParameters.{$ship}.$WareBasket?">
-          <!-- Step 3: Get value with @ (returns null if missing) -->
-          <set_value name="$tempBasket" exact="@global.$GT_AIParameters.{$ship}.$WareBasket"/>
-          <!-- Step 4: Check if tempBasket is not null before accessing properties -->
-          <do_if value="$tempBasket? and $tempBasket != null">
-            <!-- Step 5: Extract count property with @ to check if result is valid list -->
-            <set_value name="$tempCount" exact="@$tempBasket.count"/>
-            <!-- Step 6: Check if COUNT result exists and is valid (>= 0 means it's a list, not null) -->
-            <do_if value="$tempCount? and $tempCount != null and $tempCount ge 0">
-              <!-- Step 7: Now safe to use the original temp value -->
-              <set_value name="$wareBasket" exact="$tempBasket"/>
-            </do_if>
-          </do_if>
-        </do_if>
+        <!-- ✅ CRITICAL: Initialize $wareBasket safely (using library function) -->
+        <!-- Use library function for safe ware basket retrieval -->
+        <run_actions ref="md.GT_Utilities.GT_GetWareBasketSafe" result="$wareBasket">
+          <param name="ship" value="$ship"/>
+        </run_actions>
         
         <!-- Determine ship's blacklistgroup -->
         <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
@@ -2896,18 +2883,6 @@
         <!-- ✅ VANILLA PATTERN: Pre-filter sectors BEFORE native queries -->
         <!-- Build sector lists using native C++ pathfinding (find_cluster_in_range) -->
         <!-- This restricts native queries to in-range, non-blacklisted sectors only -->
-        <!-- Price range: Load from global config with defaults -->
-        <set_value name="$sellPriceMax" exact="0.5"/>  <!-- Default fallback -->
-        <set_value name="$buyPriceMin" exact="-0.5"/>  <!-- Default fallback -->
-        <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
-          <do_if value="global.$GT_Config.$Trading.$SellPriceMax?">
-            <set_value name="$sellPriceMax" exact="@global.$GT_Config.$Trading.$SellPriceMax"/>
-          </do_if>
-          <do_if value="global.$GT_Config.$Trading.$BuyPriceMin?">
-            <set_value name="$buyPriceMin" exact="@global.$GT_Config.$Trading.$BuyPriceMin"/>
-          </do_if>
-        </do_if>
-        
         <!-- ✅ ISOLATION CHECK: For isolated ships, collect offers from current sector ONLY -->
         <set_value name="$currentSector" exact="$ship.sector"/>
         <set_value name="$shipIsIsolated" exact="false"/>
@@ -2923,21 +2898,20 @@
             <!-- Ship is isolated - use current sector only -->
             <set_value name="$buyspaces" exact="[$currentSector]"/>
             <set_value name="$sellspaces" exact="[$currentSector]"/>
-            <!-- ✅ ISOLATION PRICE RELAXATION: Use isolated-specific price ranges from config -->
-            <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
-              <do_if value="global.$GT_Config.$Trading.$IsolatedSellPriceMax?">
-                <set_value name="$sellPriceMax" exact="@global.$GT_Config.$Trading.$IsolatedSellPriceMax"/>
-              </do_if>
-              <do_if value="global.$GT_Config.$Trading.$IsolatedBuyPriceMin?">
-                <set_value name="$buyPriceMin" exact="@global.$GT_Config.$Trading.$IsolatedBuyPriceMin"/>
-              </do_if>
-            </do_if>
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
               <set_value name="$sectorName" exact="@$currentSector.knownname"/>
               <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔒 ISOLATED: Using current sector only: ' + (if $sectorName? then $sectorName else 'NULL') + ' (price range expanded)'" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
+        
+        <!-- Price range: Load from global config with defaults (using library function) -->
+        <!-- Use library function for price range loading (handles isolation automatically) -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_GetPriceRange" result="$priceRange">
+          <param name="shipIsIsolated" value="$shipIsIsolated"/>
+        </run_actions>
+        <set_value name="$sellPriceMax" exact="$priceRange.$SellPriceMax"/>
+        <set_value name="$buyPriceMin" exact="$priceRange.$BuyPriceMin"/>
         
         <!-- ✅ VANILLA PATTERN: Build sector lists BEFORE native queries -->
         <!-- Use GT_FindSectorsInRange to pre-filter sectors by distance and blacklist -->
@@ -4265,28 +4239,11 @@
             <debug_text text="$summaryLog" chance="100"/>
           </do_if>
           
-          <!-- ✅ STEP 2: Sort by distance (simple selection sort - shortest first) -->
-          <set_value name="$sortedTrades" exact="[]"/>
-          <do_all exact="$tradesWithDistance.count" counter="$sortIdx">
-            <set_value name="$minDistance" exact="999999999"/>
-            <set_value name="$minIdx" exact="-1"/>
-            <do_all exact="$tradesWithDistance.count" counter="$i">
-              <set_value name="$alreadySorted" exact="false"/>
-              <do_all exact="$sortedTrades.count" counter="$j">
-                <do_if value="$sortedTrades.{$j}.$Trade == $tradesWithDistance.{$i}.$Trade">
-                  <set_value name="$alreadySorted" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
-              <do_if value="not $alreadySorted and $tradesWithDistance.{$i}.$Distance lt $minDistance">
-                <set_value name="$minDistance" exact="$tradesWithDistance.{$i}.$Distance"/>
-                <set_value name="$minIdx" exact="$i"/>
-              </do_if>
-            </do_all>
-            <do_if value="$minIdx ge 0">
-              <append_to_list name="$sortedTrades" exact="$tradesWithDistance.{$minIdx}"/>
-            </do_if>
-          </do_all>
+          <!-- ✅ STEP 2: Sort by distance (shortest first) -->
+          <!-- Use library function for distance-based sorting -->
+          <run_actions ref="md.GT_Trade_Utilities.GT_SortTradesByDistance" result="$sortedTrades">
+            <param name="tradesWithDistance" value="$tradesWithDistance"/>
+          </run_actions>
           
           <!-- ✅ STEP 3: Select top 5 by Score, with early exit when distance exceeds limit -->
           <!-- ✅ FIX: For fallback search, distance from current position is used ONLY for sorting, not filtering -->
