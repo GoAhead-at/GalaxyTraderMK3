@@ -4217,17 +4217,16 @@
             <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') 🔍 Evaluating ' + $wareTrades.count + ' trades for ' + $wareName + ' | Current sector: ' + $currentSectorName + ' | Home sector: ' + $homeSectorName + ' | Max distance from current: 2 | Max distance from home: ' + $filterMaxDistance" chance="100"/>
           </do_if>
           
-          <!-- ✅ STEP 1: For fallback search, calculate distance from CURRENT POSITION first, then filter by home distance -->
-          <!-- FALLBACK SEARCH LOGIC:
+          <!-- ✅ STEP 1: For fallback search, filter by HOME SECTOR distance first, then use current distance for sorting -->
+          <!-- ✅ FIX: Distance penalties should only affect SCORING, not FILTERING -->
+          <!-- FALLBACK SEARCH LOGIC (UPDATED):
                1. Search: Native search collects ALL trades galaxy-wide (can't avoid this)
-               2. Filter: Calculate distance from CURRENT POSITION for each trade
-               3. Early Exit: Skip trades > 2 jumps from current position immediately (no further evaluation)
-               4. Filter: For remaining trades (<= 2 jumps), check distance from HOME SECTOR
-               5. Reject: If home distance > pilot's maxJumps (capped by pilot level), reject
-               6. Sort: Sort remaining trades by distance from current position
-               7. Early Exit: After sorting, skip trades > 2 jumps (redundant but safe)
+               2. Filter: Check distance from HOME SECTOR first (primary filter)
+               3. Filter: If within home distance, also check distance from CURRENT POSITION (for scoring/prioritization)
+               4. Sort: Sort by distance from current position (prioritize closer trades)
+               5. Select: Choose best trades regardless of distance from current (as long as within home distance)
                
-               Result: Only trades within 2 jumps from current AND within maxJumps from home are evaluated -->
+               Result: Trades within maxJumps from home are considered, sorted by distance from current position -->
           <set_value name="$currentSector" exact="$ship.sector"/>
           <set_value name="$tradesWithDistance" exact="[]"/>
           
@@ -4244,6 +4243,12 @@
           <set_value name="$rejectedByUnreachable" exact="0"/>
           <set_value name="$evaluatedCount" exact="0"/>
           
+          <!-- ✅ FALLBACK SEARCH: Get filterMaxDistance (home sector distance limit) -->
+          <set_value name="$filterMaxDistance" exact="$maxDistance"/>  <!-- Default: use maxDistance -->
+          <do_if value="$isFallbackSearch? and $isFallbackSearch and $originalMaxDistance?">
+            <set_value name="$filterMaxDistance" exact="$originalMaxDistance"/>  <!-- Fallback: use original pilot maxDistance -->
+          </do_if>
+          
           <do_all exact="$wareTrades.count" counter="$i">
             <set_value name="$trade" exact="$wareTrades.{$i}"/>
             <set_value name="$buySector" exact="@$trade.$BuyStation.sector"/>
@@ -4252,64 +4257,9 @@
             <set_value name="$sellStation" exact="@$trade.$SellStation"/>
             <set_value name="$ware" exact="@$trade.$BuyOffer.ware"/>
             
-            <!-- ✅ FALLBACK SEARCH: Calculate distance from CURRENT POSITION FIRST (before counting as evaluated) -->
-            <!-- CRITICAL: This check happens FIRST - trades > 2 jumps are skipped immediately -->
-            <set_value name="$currentToBuyDistance" exact="-1"/>
-            <set_value name="$currentToSellDistance" exact="-1"/>
-            <set_value name="$maxDistanceFromCurrent" exact="-1"/>  <!-- Initialize for non-fallback searches -->
-            <do_if value="$isFallbackSearch? and $isFallbackSearch">
-              <do_if value="$buySector == $currentSector">
-                <set_value name="$currentToBuyDistance" exact="0"/>
-              </do_if>
-              <do_else>
-                <set_value name="$currentToBuyDistance" exact="$currentSector.gatedistance.{$buySector}"/>
-              </do_else>
-              <do_if value="$sellSector == $currentSector">
-                <set_value name="$currentToSellDistance" exact="0"/>
-              </do_if>
-              <do_else>
-                <set_value name="$currentToSellDistance" exact="$currentSector.gatedistance.{$sellSector}"/>
-              </do_else>
-              
-              <!-- ✅ FALLBACK SEARCH: Early exit if distance from current position > 2 -->
-              <!-- CRITICAL: Trades > 2 jumps from current position are skipped IMMEDIATELY -->
-              <!-- No further evaluation (home distance, profit, etc.) happens for these trades -->
-              <!-- These trades are NOT counted as "evaluated" - they're skipped before evaluation -->
-              <set_value name="$maxDistanceFromCurrent" exact="[$currentToBuyDistance, $currentToSellDistance].max"/>
-              <do_if value="$maxDistanceFromCurrent lt 0">
-                <!-- Unreachable from current position - skip silently (early exit) -->
-                <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
-                <!-- ✅ DEBUG: Log first few skipped trades to verify distance calculation -->
-                <do_if value="$rejectedByUnreachable le 3 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
-                  <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
-                  <set_value name="$currentSectorName" exact="if $currentSector? then @$currentSector.knownname else 'Unknown'"/>
-                  <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ⚠️ SKIP (unreachable): Buy=' + $buySectorName + ' (dist: ' + $currentToBuyDistance + '), Sell=' + $sellSectorName + ' (dist: ' + $currentToSellDistance + ') from current=' + $currentSectorName" chance="100"/>
-                </do_if>
-                <continue/>  <!-- Skip all further checks for this trade -->
-              </do_if>
-              <do_if value="$maxDistanceFromCurrent gt 2">
-                <!-- Too far from current position (> 2 jumps) - skip silently (early exit) -->
-                <!-- REQUIREMENT: No stations farther than 2 jumps from current position should be evaluated -->
-                <set_value name="$rejectedByCurrentDistance" exact="$rejectedByCurrentDistance + 1"/>
-                <!-- ✅ DEBUG: Log first few skipped trades to verify distance calculation -->
-                <do_if value="$rejectedByCurrentDistance le 3 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
-                  <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
-                  <set_value name="$currentSectorName" exact="if $currentSector? then @$currentSector.knownname else 'Unknown'"/>
-                  <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ⚠️ SKIP (too far): Buy=' + $buySectorName + ' (dist: ' + $currentToBuyDistance + '), Sell=' + $sellSectorName + ' (dist: ' + $currentToSellDistance + ') from current=' + $currentSectorName + ' | Max distance from current: ' + $maxDistanceFromCurrent + ' jumps'"/>
-                </do_if>
-                <continue/>  <!-- Skip all further checks for this trade -->
-              </do_if>
-            </do_if>
-            
-            <!-- ✅ FALLBACK SEARCH: Only count trades that passed the distance check as "evaluated" -->
-            <!-- Trades that were skipped due to distance > 2 are NOT counted here -->
-            <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
-            <set_value name="$rejectionReason" exact="''"/>
-            <set_value name="$tradeAccepted" exact="false"/>
-            
-            <!-- Calculate distance from HOME SECTOR to stations (for final filtering) -->
+            <!-- ✅ FALLBACK SEARCH: Calculate distance from HOME SECTOR FIRST (primary filter) -->
+            <!-- ✅ FIX: Distance penalties should only affect SCORING, not FILTERING -->
+            <!-- Filter by home distance first, then use current distance for sorting/prioritization -->
             <set_value name="$buyDistance" exact="-1"/>
             <set_value name="$sellDistance" exact="-1"/>
             
@@ -4329,36 +4279,27 @@
               <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
             </do_else>
             
-            <!-- Use max distance (farthest station from home) for sorting -->
+            <!-- Use max distance (farthest station from home) for filtering -->
             <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
             
-            <!-- ✅ FALLBACK SEARCH: For fallback search, filter by originalMaxDistance from home sector -->
-            <!-- REQUIREMENT: Resulting stations must not be farther from HOME SECTOR than pilot's maxJumps (capped by pilot level) -->
-            <!-- This is the SECOND filter - only trades that passed the "<= 2 jumps from current" check reach here -->
-            <!-- Fallback search searches 2 jumps from current position, but stations must be within pilot's maxDistance from home -->
-            <set_value name="$filterMaxDistance" exact="$maxDistance"/>  <!-- Default: use maxDistance -->
-            <do_if value="$isFallbackSearch? and $isFallbackSearch and $originalMaxDistance?">
-              <set_value name="$filterMaxDistance" exact="$originalMaxDistance"/>  <!-- Fallback: use original pilot maxDistance -->
-            </do_if>
-            
+            <!-- ✅ FALLBACK SEARCH: Filter by home distance FIRST (primary filter) -->
             <!-- Only include trades where BOTH stations are within filterMaxDistance from home AND paths exist -->
-            <!-- REQUIREMENT: Trade is within 2 jumps from current AND within maxJumps from home = PASS -->
-            <!-- REQUIREMENT: Trade is within 2 jumps from current BUT exceeds maxJumps from home = REJECT -->
             <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+              <!-- Unreachable from home sector - skip -->
               <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
-              <set_value name="$rejectionReason" exact="'Unreachable from home sector (buy: ' + $buyDistance + ', sell: ' + $sellDistance + ')'"/>
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$buyStationName" exact="if $buyStation? then @$buyStation.knownname else 'Unknown'"/>
                 <set_value name="$sellStationName" exact="if $sellStation? then @$sellStation.knownname else 'Unknown'"/>
                 <set_value name="$wareName" exact="if $ware? then @$ware.name else 'Unknown'"/>
                 <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
                 <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
-                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ❌ Trade #' + $evaluatedCount + ' REJECTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ') | Reason: ' + $rejectionReason" chance="100"/>
+                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ❌ Trade REJECTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ') | Reason: Unreachable from home sector'" chance="100"/>
               </do_if>
+              <continue/>
             </do_if>
-            <do_elseif value="$maxStationDistance gt $filterMaxDistance">
+            <do_if value="$maxStationDistance gt $filterMaxDistance">
+              <!-- Too far from home sector - skip -->
               <set_value name="$rejectedByHomeDistance" exact="$rejectedByHomeDistance + 1"/>
-              <set_value name="$rejectionReason" exact="'Too far from home sector (' + $maxStationDistance + ' jumps, max: ' + $filterMaxDistance + ')'"/>
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$buyStationName" exact="if $buyStation? then @$buyStation.knownname else 'Unknown'"/>
                 <set_value name="$sellStationName" exact="if $sellStation? then @$sellStation.knownname else 'Unknown'"/>
@@ -4366,44 +4307,85 @@
                 <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
                 <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
                 <set_value name="$homeSectorName" exact="if $homeSector? then @$homeSector.knownname else 'Unknown'"/>
-                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ❌ Trade #' + $evaluatedCount + ' REJECTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ', home dist: ' + $buyDistance + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ', home dist: ' + $sellDistance + ') | Home: ' + $homeSectorName + ' | Reason: ' + $rejectionReason" chance="100"/>
+                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ❌ Trade REJECTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ', home dist: ' + $buyDistance + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ', home dist: ' + $sellDistance + ') | Home: ' + $homeSectorName + ' | Reason: Too far from home sector (' + $maxStationDistance + ' jumps, max: ' + $filterMaxDistance + ')'" chance="100"/>
               </do_if>
-            </do_elseif>
-            <do_else>
-              <!-- Trade passed all filters -->
-              <set_value name="$tradeAccepted" exact="true"/>
-              <!-- For fallback search, sort by distance from current position; otherwise sort by distance from home -->
-              <set_value name="$sortDistance" exact="$maxStationDistance"/>  <!-- Default: sort by home distance -->
-              <do_if value="$isFallbackSearch? and $isFallbackSearch">
-                <set_value name="$sortDistance" exact="$maxDistanceFromCurrent"/>  <!-- Fallback: sort by current position distance -->
+              <continue/>
+            </do_if>
+            
+            <!-- ✅ FALLBACK SEARCH: Trade passed home distance filter - now calculate distance from current for SCORING/SORTING -->
+            <!-- Distance from current position is used ONLY for sorting/prioritization, NOT for filtering -->
+            <set_value name="$currentToBuyDistance" exact="-1"/>
+            <set_value name="$currentToSellDistance" exact="-1"/>
+            <set_value name="$maxDistanceFromCurrent" exact="-1"/>  <!-- Initialize for non-fallback searches -->
+            <do_if value="$isFallbackSearch? and $isFallbackSearch">
+              <do_if value="$buySector == $currentSector">
+                <set_value name="$currentToBuyDistance" exact="0"/>
               </do_if>
-              <append_to_list name="$tradesWithDistance" exact="table[
-                $Trade = $trade,
-                $Distance = $sortDistance,
-                $HomeDistance = $maxStationDistance
-              ]"/>
+              <do_else>
+                <set_value name="$currentToBuyDistance" exact="$currentSector.gatedistance.{$buySector}"/>
+              </do_else>
+              <do_if value="$sellSector == $currentSector">
+                <set_value name="$currentToSellDistance" exact="0"/>
+              </do_if>
+              <do_else>
+                <set_value name="$currentToSellDistance" exact="$currentSector.gatedistance.{$sellSector}"/>
+              </do_else>
+              
+              <!-- Calculate max distance from current (for sorting/prioritization only) -->
+              <set_value name="$maxDistanceFromCurrent" exact="[$currentToBuyDistance, $currentToSellDistance].max"/>
+              
+              <!-- ✅ DEBUG: Log distance from current (for sorting info, not filtering) -->
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <set_value name="$buyStationName" exact="if $buyStation? then @$buyStation.knownname else 'Unknown'"/>
-                <set_value name="$sellStationName" exact="if $sellStation? then @$sellStation.knownname else 'Unknown'"/>
-                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'Unknown'"/>
                 <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
                 <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
                 <set_value name="$currentSectorName" exact="if $currentSector? then @$currentSector.knownname else 'Unknown'"/>
-                <set_value name="$homeSectorName" exact="if $homeSector? then @$homeSector.knownname else 'Unknown'"/>
-                <set_value name="$distanceInfo" exact="if $isFallbackSearch? and $isFallbackSearch then 'current: ' + $maxDistanceFromCurrent + ', home: ' + $maxStationDistance else 'home: ' + $maxStationDistance"/>
-                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ✅ Trade #' + $evaluatedCount + ' ACCEPTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ') | Distances: ' + $distanceInfo" chance="100"/>
+                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'Unknown'"/>
+                <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ✅ Trade ACCEPTED (within home distance): ' + $wareName + ' | Buy=' + $buySectorName + ' (current dist: ' + $currentToBuyDistance + ', home dist: ' + $buyDistance + '), Sell=' + $sellSectorName + ' (current dist: ' + $currentToSellDistance + ', home dist: ' + $sellDistance + ') from current=' + $currentSectorName + ' | Will be sorted by current distance: ' + $maxDistanceFromCurrent + ' jumps'" chance="100"/>
               </do_if>
-            </do_else>
+            </do_if>
+            
+            <!-- ✅ FALLBACK SEARCH: Count trade as evaluated (passed home distance filter) -->
+            <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
+            <set_value name="$rejectionReason" exact="''"/>
+            <set_value name="$tradeAccepted" exact="false"/>
+            
+            <!-- ✅ NOTE: Home distance already calculated above (lines 4264-4284) -->
+            <!-- ✅ NOTE: filterMaxDistance already set above (lines 4247-4251) -->
+            <!-- ✅ NOTE: Home distance filtering already done above (lines 4286-4314) -->
+            <!-- Trade passed home distance filter - continue with profit/ROI validation and other filters -->
+            <!-- Trade passed all filters -->
+            <set_value name="$tradeAccepted" exact="true"/>
+            <!-- For fallback search, sort by distance from current position; otherwise sort by distance from home -->
+            <set_value name="$sortDistance" exact="$maxStationDistance"/>  <!-- Default: sort by home distance -->
+            <do_if value="$isFallbackSearch? and $isFallbackSearch">
+              <set_value name="$sortDistance" exact="$maxDistanceFromCurrent"/>  <!-- Fallback: sort by current position distance -->
+            </do_if>
+            <append_to_list name="$tradesWithDistance" exact="table[
+              $Trade = $trade,
+              $Distance = $sortDistance,
+              $HomeDistance = $maxStationDistance
+            ]"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$buyStationName" exact="if $buyStation? then @$buyStation.knownname else 'Unknown'"/>
+              <set_value name="$sellStationName" exact="if $sellStation? then @$sellStation.knownname else 'Unknown'"/>
+              <set_value name="$wareName" exact="if $ware? then @$ware.name else 'Unknown'"/>
+              <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'Unknown'"/>
+              <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'Unknown'"/>
+              <set_value name="$currentSectorName" exact="if $currentSector? then @$currentSector.knownname else 'Unknown'"/>
+              <set_value name="$homeSectorName" exact="if $homeSector? then @$homeSector.knownname else 'Unknown'"/>
+              <set_value name="$distanceInfo" exact="if $isFallbackSearch? and $isFallbackSearch then 'current: ' + $maxDistanceFromCurrent + ', home: ' + $maxStationDistance else 'home: ' + $maxStationDistance"/>
+              <debug_text text="'[GT-Fallback] (' + $ship.idcode + ') ✅ Trade #' + $evaluatedCount + ' ACCEPTED: ' + $wareName + ' | Buy: ' + $buyStationName + ' (' + $buySectorName + ') | Sell: ' + $sellStationName + ' (' + $sellSectorName + ') | Distances: ' + $distanceInfo" chance="100"/>
+            </do_if>
           </do_all>
           
           <!-- ✅ FALLBACK SEARCH: Log summary statistics -->
-          <!-- NOTE: "Evaluated" only counts trades that passed the distance check (<= 2 jumps from current) -->
-          <!-- Trades skipped due to distance > 2 are NOT counted as "evaluated" -->
+          <!-- NOTE: "Evaluated" counts trades that passed the home distance filter (within maxDistance from home) -->
+          <!-- Distance from current position is used only for sorting/prioritization, not filtering -->
           <do_if value="$isFallbackSearch? and $isFallbackSearch and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <set_value name="$wareName" exact="if $ware? then @$ware.name else 'Unknown'"/>
             <set_value name="$totalTrades" exact="$wareTrades.count"/>
-            <set_value name="$skippedByDistance" exact="$rejectedByCurrentDistance + $rejectedByUnreachable"/>
-            <set_value name="$summaryLog" exact="'[GT-Fallback] (' + $ship.idcode + ') 📊 Ware: ' + $wareName + ' | Total trades: ' + $totalTrades + ' | Evaluated (within 2 jumps): ' + $evaluatedCount + ' | Accepted: ' + $tradesWithDistance.count + ' | Rejected: ' + ($evaluatedCount - $tradesWithDistance.count) + ' | Skipped (beyond 2 jumps): ' + $skippedByDistance + ' (current dist: ' + $rejectedByCurrentDistance + ', unreachable: ' + $rejectedByUnreachable + ', home dist: ' + $rejectedByHomeDistance + ')'"/>
+            <set_value name="$skippedByDistance" exact="$rejectedByUnreachable + $rejectedByHomeDistance"/>
+            <set_value name="$summaryLog" exact="'[GT-Fallback] (' + $ship.idcode + ') 📊 Ware: ' + $wareName + ' | Total trades: ' + $totalTrades + ' | Evaluated (within home distance): ' + $evaluatedCount + ' | Accepted: ' + $tradesWithDistance.count + ' | Rejected: ' + ($evaluatedCount - $tradesWithDistance.count) + ' | Skipped (unreachable/home dist): ' + $skippedByDistance + ' (unreachable: ' + $rejectedByUnreachable + ', home dist: ' + $rejectedByHomeDistance + ')'"/>
             <debug_text text="$summaryLog" chance="100"/>
           </do_if>
           
@@ -4431,20 +4413,25 @@
           </do_all>
           
           <!-- ✅ STEP 3: Select top 5 by Score, with early exit when distance exceeds limit -->
-          <!-- For fallback search: early exit when distance from current position > 2 -->
+          <!-- ✅ FIX: For fallback search, distance from current position is used ONLY for sorting, not filtering -->
+          <!-- All trades have already passed the home distance filter, so we don't need an early exit based on current distance -->
           <!-- For normal search: early exit when distance from home > maxDistance -->
           <set_value name="$top3" exact="[]"/>
           <set_value name="$skippedDueToDistance" exact="0"/>
-          <set_value name="$distanceLimit" exact="$maxDistance"/>  <!-- Default: use maxDistance -->
+          <set_value name="$distanceLimit" exact="$maxDistance"/>  <!-- Default: use maxDistance (home sector) -->
           <do_if value="$isFallbackSearch? and $isFallbackSearch">
-            <set_value name="$distanceLimit" exact="2"/>  <!-- Fallback: use 2 jumps from current position -->
+            <!-- ✅ FIX: For fallback search, use home distance limit (not current distance) since we already filtered by home distance -->
+            <!-- Distance from current position is only used for sorting, not filtering -->
+            <set_value name="$distanceLimit" exact="$filterMaxDistance"/>  <!-- Fallback: use home distance limit -->
           </do_if>
           <do_all exact="$sortedTrades.count" counter="$i">
             <!-- Early exit: If this trade exceeds distance limit, all subsequent trades are also too far (sorted by distance) -->
-            <do_if value="$sortedTrades.{$i}.$Distance gt $distanceLimit">
+            <!-- ✅ NOTE: For fallback search, this checks home distance (already filtered), not current distance -->
+            <!-- ✅ NOTE: For normal search, this checks home distance (sorted by home distance) -->
+            <do_if value="$sortedTrades.{$i}.$HomeDistance gt $distanceLimit">
               <set_value name="$skippedDueToDistance" exact="$sortedTrades.count - $i"/>
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <set_value name="$distanceType" exact="if $isFallbackSearch? and $isFallbackSearch then 'current position' else 'home sector'"/>
+                <set_value name="$distanceType" exact="'home sector'"/>  <!-- Always home sector for distance limit check -->
                 <debug_text text="'[GT-Resume] (' + $ship.idcode + ') ⚡ EARLY EXIT for ware ' + @$ware.name + ': Reached distance limit (' + $distanceLimit + ' jumps from ' + $distanceType + ') at trade ' + $i + '/' + $sortedTrades.count + ' (skipped ' + $skippedDueToDistance + ' trades)'" chance="100"/>
               </do_if>
               <break/>
