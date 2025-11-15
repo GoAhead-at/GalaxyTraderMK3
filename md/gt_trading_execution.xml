@@ -40,7 +40,8 @@
           <cancel_cue cue="this"/>
         </do_if>
         
-        <!-- Enhanced execution logging -->
+        <!-- Enhanced execution logging (will be updated if fallback trade is used) -->
+        <set_value name="$executionLogDone" exact="false"/>
         <do_if value="$tradeValid">
           <set_value name="$profit" exact="@$trade.$Profit"/>
           <set_value name="$amount" exact="@$trade.$Amount"/>
@@ -50,7 +51,8 @@
           <set_value name="$wareName" exact="@$trade.$BuyOffer.ware.name"/>
           <set_value name="$buyStationName" exact="@$trade.$BuyOffer.owner.knownname"/>
           <set_value name="$sellStationName" exact="@$trade.$SellOffer.owner.knownname"/>
-          <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+          <!-- Note: This log will be skipped if trade becomes invalid and fallback is used -->
+          <!-- Fallback trade logging happens in the fallback block -->
         </do_if>
         
         <!-- Only proceed if trade is valid -->
@@ -67,10 +69,63 @@
           </do_if>
           <set_value name="$canExecute" exact="true"/>
           
+          <!-- Log original trade execution (only if trade is still valid) -->
+          <do_if value="$buyOfferValid and $sellOfferValid">
+            <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+          </do_if>
+          
+          <!-- ✅ RACE CONDITION FIX: If selected trade is invalid, try fallback trades from list -->
           <do_if value="not $buyOfferValid or not $sellOfferValid">
-            <debug_text text="'[GalaxyTrader MK3] ⚠ Trade offer(s) no longer valid for ' + $ship.knownname" chance="100"/>
-            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-            <set_value name="$canExecute" exact="false"/>
+            <debug_text text="'[GT-Execution] ⚠ Selected trade offer(s) no longer valid for ' + $ship.idcode + ' - trying fallback trades'" chance="100"/>
+            
+            <!-- Try fallback trades from tradeList -->
+            <set_value name="$foundValidTrade" exact="false"/>
+            <set_value name="$fallbackTrade" exact="null"/>
+            <do_if value="$tradeList? and $tradeList.count gt 0">
+              <do_all exact="$tradeList.count" counter="$i">
+                <do_if value="not $foundValidTrade">
+                  <set_value name="$candidateTrade" exact="$tradeList.{$i}"/>
+                  <do_if value="$candidateTrade?">
+                    <set_value name="$candidateBuyOffer" exact="@$candidateTrade.$BuyOffer"/>
+                    <set_value name="$candidateSellOffer" exact="@$candidateTrade.$SellOffer"/>
+                    <set_value name="$candidateBuyValid" exact="false"/>
+                    <set_value name="$candidateSellValid" exact="false"/>
+                    <do_if value="$candidateBuyOffer? and $candidateSellOffer?">
+                      <set_value name="$candidateBuyValid" exact="$candidateBuyOffer.available and $candidateBuyOffer.amount gt 0"/>
+                      <set_value name="$candidateSellValid" exact="$candidateSellOffer.available and $candidateSellOffer.amount gt 0"/>
+                    </do_if>
+                    <do_if value="$candidateBuyValid and $candidateSellValid">
+                      <set_value name="$foundValidTrade" exact="true"/>
+                      <set_value name="$fallbackTrade" exact="$candidateTrade"/>
+                      <set_value name="$trade" exact="$candidateTrade"/>  <!-- Replace selected trade with valid fallback -->
+                      <set_value name="$buyOffer" exact="$candidateBuyOffer"/>
+                      <set_value name="$sellOffer" exact="$candidateSellOffer"/>
+                      <set_value name="$buyOfferValid" exact="true"/>
+                      <set_value name="$sellOfferValid" exact="true"/>
+                      <set_value name="$canExecute" exact="true"/>
+                      <!-- Update execution logging variables for fallback trade -->
+                      <set_value name="$profit" exact="@$candidateTrade.$Profit"/>
+                      <set_value name="$amount" exact="@$candidateTrade.$Amount"/>
+                      <set_value name="$buyPrice" exact="@$candidateTrade.$BuyPrice"/>
+                      <set_value name="$sellPrice" exact="@$candidateTrade.$SellPrice"/>
+                      <set_value name="$distance" exact="@$candidateTrade.$Distance"/>
+                      <set_value name="$wareName" exact="@$candidateBuyOffer.ware.name"/>
+                      <set_value name="$buyStationName" exact="@$candidateBuyOffer.owner.knownname"/>
+                      <set_value name="$sellStationName" exact="@$candidateSellOffer.owner.knownname"/>
+                      <debug_text text="'[GT-Execution] ✅ Found valid fallback trade #' + ($i + 1) + ' for ' + $ship.idcode + ': ' + $wareName + ' (Profit: ' + ($profit / 100) + ' Cr)'" chance="100"/>
+                      <break/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- If no valid fallback trade found, signal no trade found -->
+            <do_if value="not $foundValidTrade">
+              <debug_text text="'[GT-Execution] ❌ No valid trades found in fallback list for ' + $ship.idcode + ' - restarting search'" chance="100"/>
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+              <set_value name="$canExecute" exact="false"/>
+            </do_if>
           </do_if>
           
           <!-- CRITICAL FIX: Verify ship can carry the ware -->
