@@ -1366,5 +1366,214 @@
       </actions>
     </library>
     
+    <!-- Calculate Fallback Trade Distances -->
+    <library name="GT_CalculateFallbackTradeDistances" purpose="run_actions">
+      <params>
+        <param name="wareTrades" comment="List of trades for a specific ware"/>
+        <param name="ship" comment="Ship executing the trade"/>
+        <param name="homeSector" comment="Home sector for distance calculations"/>
+        <param name="currentSector" comment="Current sector (ship's current position)"/>
+        <param name="maxDistance" comment="Maximum distance from home sector"/>
+        <param name="originalMaxDistance" comment="Original max distance (for fallback search)"/>
+        <param name="isFallbackSearch" default="false" comment="Whether this is a fallback search"/>
+      </params>
+      <actions>
+        <!-- Calculates distances for fallback search trades -->
+        <!-- Filters by home sector distance, calculates current distance for sorting -->
+        <!-- Returns: $tradesWithDistance list, $rejectionStats -->
+        <set_value name="$tradesWithDistance" exact="[]"/>
+        <set_value name="$rejectedByUnreachable" exact="0"/>
+        <set_value name="$rejectedByHomeDistance" exact="0"/>
+        <set_value name="$evaluatedCount" exact="0"/>
+        
+        <!-- Get filterMaxDistance (home sector distance limit) -->
+        <set_value name="$filterMaxDistance" exact="$maxDistance"/>  <!-- Default: use maxDistance -->
+        <do_if value="$isFallbackSearch and $originalMaxDistance?">
+          <set_value name="$filterMaxDistance" exact="$originalMaxDistance"/>  <!-- Fallback: use original pilot maxDistance -->
+        </do_if>
+        
+        <do_all exact="$wareTrades.count" counter="$i">
+          <set_value name="$trade" exact="$wareTrades.{$i}"/>
+          <set_value name="$buySector" exact="@$trade.$BuyStation.sector"/>
+          <set_value name="$sellSector" exact="@$trade.$SellStation.sector"/>
+          <set_value name="$buyStation" exact="@$trade.$BuyStation"/>
+          <set_value name="$sellStation" exact="@$trade.$SellStation"/>
+          <set_value name="$ware" exact="@$trade.$BuyOffer.ware"/>
+          
+          <!-- Calculate distance from HOME SECTOR FIRST (primary filter) -->
+          <set_value name="$buyDistance" exact="-1"/>
+          <set_value name="$sellDistance" exact="-1"/>
+          
+          <do_if value="$buySector == $homeSector">
+            <set_value name="$buyDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+          </do_else>
+          
+          <do_if value="$sellSector == $homeSector">
+            <set_value name="$sellDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+          </do_else>
+          
+          <!-- Use max distance (farthest station from home) for filtering -->
+          <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
+          
+          <!-- Filter by home distance FIRST (primary filter) -->
+          <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+            <!-- Unreachable from home sector - skip -->
+            <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
+            <continue/>
+          </do_if>
+          <do_if value="$maxStationDistance gt $filterMaxDistance">
+            <!-- Too far from home sector - skip -->
+            <set_value name="$rejectedByHomeDistance" exact="$rejectedByHomeDistance + 1"/>
+            <continue/>
+          </do_if>
+          
+          <!-- Trade passed home distance filter - calculate distance from current for SCORING/SORTING -->
+          <set_value name="$currentToBuyDistance" exact="-1"/>
+          <set_value name="$currentToSellDistance" exact="-1"/>
+          <set_value name="$maxDistanceFromCurrent" exact="-1"/>
+          <do_if value="$isFallbackSearch">
+            <do_if value="$buySector == $currentSector">
+              <set_value name="$currentToBuyDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$currentToBuyDistance" exact="$currentSector.gatedistance.{$buySector}"/>
+            </do_else>
+            <do_if value="$sellSector == $currentSector">
+              <set_value name="$currentToSellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$currentToSellDistance" exact="$currentSector.gatedistance.{$sellSector}"/>
+            </do_else>
+            <set_value name="$maxDistanceFromCurrent" exact="[$currentToBuyDistance, $currentToSellDistance].max"/>
+          </do_if>
+          
+          <!-- Count trade as evaluated (passed home distance filter) -->
+          <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
+          
+          <!-- For fallback search, sort by distance from current position; otherwise sort by distance from home -->
+          <set_value name="$sortDistance" exact="$maxStationDistance"/>  <!-- Default: sort by home distance -->
+          <do_if value="$isFallbackSearch">
+            <set_value name="$sortDistance" exact="$maxDistanceFromCurrent"/>  <!-- Fallback: sort by current position distance -->
+          </do_if>
+          <append_to_list name="$tradesWithDistance" exact="table[
+            $Trade = $trade,
+            $Distance = $sortDistance,
+            $HomeDistance = $maxStationDistance
+          ]"/>
+        </do_all>
+        
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$TradesWithDistance" exact="$tradesWithDistance"/>
+        <set_value name="$result.$RejectedByUnreachable" exact="$rejectedByUnreachable"/>
+        <set_value name="$result.$RejectedByHomeDistance" exact="$rejectedByHomeDistance"/>
+        <set_value name="$result.$EvaluatedCount" exact="$evaluatedCount"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Select Best Trades With Diversity -->
+    <library name="GT_SelectBestTradesWithDiversity" purpose="run_actions">
+      <params>
+        <param name="sortedTrades" comment="List of trades sorted by distance"/>
+        <param name="maxDistance" comment="Maximum distance limit"/>
+        <param name="filterMaxDistance" comment="Filter max distance (for fallback search)"/>
+        <param name="isFallbackSearch" default="false" comment="Whether this is a fallback search"/>
+        <param name="ware" comment="Ware being traded (for logging)"/>
+        <param name="ship" comment="Ship executing the trade"/>
+      </params>
+      <actions>
+        <!-- Selects top 5 trades with station pair diversity -->
+        <!-- Returns: $topTrades list (up to 5 trades), $skippedDueToDistance -->
+        <set_value name="$topTrades" exact="[]"/>
+        <set_value name="$skippedDueToDistance" exact="0"/>
+        <set_value name="$distanceLimit" exact="$maxDistance"/>  <!-- Default: use maxDistance (home sector) -->
+        <do_if value="$isFallbackSearch">
+          <set_value name="$distanceLimit" exact="$filterMaxDistance"/>  <!-- Fallback: use home distance limit -->
+        </do_if>
+        
+        <do_all exact="$sortedTrades.count" counter="$i">
+          <!-- Early exit: If this trade exceeds distance limit, all subsequent trades are also too far -->
+          <do_if value="$sortedTrades.{$i}.$HomeDistance gt $distanceLimit">
+            <set_value name="$skippedDueToDistance" exact="$sortedTrades.count - $i"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <set_value name="$distanceType" exact="'home sector'"/>  <!-- Always home sector for distance limit check -->
+              <debug_text text="'[GT-Resume] (' + $ship.idcode + ') ⚡ EARLY EXIT for ware ' + @$ware.name + ': Reached distance limit (' + $distanceLimit + ' jumps from ' + $distanceType + ') at trade ' + $i + '/' + $sortedTrades.count + ' (skipped ' + $skippedDueToDistance + ' trades)'" chance="100"/>
+            </do_if>
+            <break/>
+          </do_if>
+          
+          <!-- Trade is within distance - select top 5 by Score with STATION PAIR DIVERSITY -->
+          <set_value name="$trade" exact="$sortedTrades.{$i}.$Trade"/>
+          <set_value name="$buyStation" exact="$trade.$BuyStation"/>
+          <set_value name="$sellStation" exact="$trade.$SellStation"/>
+          
+          <!-- Check if this station pair already exists in topTrades -->
+          <set_value name="$stationPairExists" exact="false"/>
+          <do_all exact="$topTrades.count" counter="$j">
+            <set_value name="$existingBuyStation" exact="$topTrades.{$j}.$BuyStation"/>
+            <set_value name="$existingSellStation" exact="$topTrades.{$j}.$SellStation"/>
+            <do_if value="$existingBuyStation == $buyStation and $existingSellStation == $sellStation">
+              <set_value name="$stationPairExists" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          
+          <!-- Skip if station pair already exists (ensure diversity) -->
+          <do_if value="not $stationPairExists">
+            <set_value name="$shouldAdd" exact="false"/>
+            <do_if value="$topTrades.count lt 5">
+              <!-- Still building initial top 5 - add unique station pair -->
+              <set_value name="$shouldAdd" exact="true"/>
+            </do_if>
+            <do_else>
+              <!-- Top 5 full - check if this trade's Score is better than worst -->
+              <set_value name="$worstScore" exact="999999999"/>
+              <set_value name="$worstIdx" exact="-1"/>
+              <do_all exact="5" counter="$j">
+                <do_if value="$topTrades.{$j}.$Score lt $worstScore">
+                  <set_value name="$worstScore" exact="$topTrades.{$j}.$Score"/>
+                  <set_value name="$worstIdx" exact="$j"/>
+                </do_if>
+              </do_all>
+              <do_if value="$trade.$Score gt $worstScore">
+                <!-- Replace worst with this trade (unique station pair) -->
+                <set_value name="$shouldAdd" exact="true"/>
+              </do_if>
+            </do_else>
+            <do_if value="$shouldAdd">
+              <do_if value="$topTrades.count lt 5">
+                <append_to_list name="$topTrades" exact="$trade"/>
+              </do_if>
+              <do_else>
+                <!-- Replace worst trade in top5 -->
+                <set_value name="$worstScore" exact="999999999"/>
+                <set_value name="$worstIdx" exact="-1"/>
+                <do_all exact="5" counter="$j">
+                  <do_if value="$topTrades.{$j}.$Score lt $worstScore">
+                    <set_value name="$worstScore" exact="$topTrades.{$j}.$Score"/>
+                    <set_value name="$worstIdx" exact="$j"/>
+                  </do_if>
+                </do_all>
+                <do_if value="$worstIdx ge 0">
+                  <set_value name="$topTrades.{$worstIdx}" exact="$trade"/>
+                </do_if>
+              </do_else>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$TopTrades" exact="$topTrades"/>
+        <set_value name="$result.$SkippedDueToDistance" exact="$skippedDueToDistance"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
   </cues>
 </mdscript>
