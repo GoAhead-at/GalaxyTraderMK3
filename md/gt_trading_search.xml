@@ -1714,20 +1714,53 @@
             <debug_text text="'[GT-Cache-DEBUG] Cache has ' + global.$GT_TradeCache.count + ' trade entries'" chance="100"/>
           </do_if>
           
-          <!-- Iterate through flat list of cached trades BACKWARDS to safely remove invalid entries -->
+          <!-- ✅ PERFORMANCE OPTIMIZATION: Use home sector index if available -->
+          <!-- ✅ FIX: Sectors don't have .id property - use sector object directly as key -->
+          <set_value name="$cacheIndicesToCheck" exact="null"/>
+          <set_value name="$useIndex" exact="false"/>
+          <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCacheIndex?">
+            <do_if value="global.$GT_TradeCacheIndex.{$homeSector}?">
+              <set_value name="$cacheIndicesToCheck" exact="global.$GT_TradeCacheIndex.{$homeSector}"/>
+              <set_value name="$useIndex" exact="true"/>
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+                <set_value name="$sectorName" exact="@$homeSector.knownname"/>
+                <debug_text text="'[GT-Cache-DEBUG] Using home sector index: ' + (if $sectorName? then $sectorName else 'Unknown') + ' (' + $cacheIndicesToCheck.count + ' entries)'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Fallback to full cache scan if index not available -->
+          <do_if value="not $useIndex">
+            <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
+            <set_value name="$cacheIndicesToCheck" exact="[]"/>
+            <!-- Build list of all indices [1, 2, 3, ..., cacheCount] -->
+            <do_all exact="$cacheCount" counter="$idx">
+              <append_to_list name="$cacheIndicesToCheck" exact="$idx"/>
+            </do_all>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GT-Cache-DEBUG] Index not available - using full cache scan (' + $cacheCount + ' entries)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Iterate through indexed cache entries BACKWARDS to safely remove invalid entries -->
           <!-- When we remove entry N, entries 1 to N-1 remain at same indices (already processed) -->
-          <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
+          <!-- ✅ FIX: Validate cache entry exists (index may be stale if entries were removed) -->
+          <set_value name="$cacheCount" exact="$cacheIndicesToCheck.count"/>
           <do_all exact="$cacheCount" counter="$idx" reverse="true">
-            <set_value name="$i" exact="$idx"/>
-            <set_value name="$cacheEntry" exact="global.$GT_TradeCache.{$i}"/>
-            <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
+            <set_value name="$cacheIndex" exact="$cacheIndicesToCheck.{$idx}"/>
+            <set_value name="$i" exact="$cacheIndex"/>
             
-            <!-- Track ware in statistics (even if entry will be filtered) -->
-            <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-            <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-            <do_if value="$ware? and $ware != null">
-              <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
-                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+            <!-- ✅ FIX: Validate cache entry exists before accessing (index may be stale) -->
+            <do_if value="$i ge 1 and $i le global.$GT_TradeCache.count">
+              <set_value name="$cacheEntry" exact="global.$GT_TradeCache.{$i}"/>
+              <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
+              
+              <!-- Track ware in statistics (even if entry will be filtered) -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
                   $total=0, 
                   $filtered=0, 
                   $valid=0,
@@ -1753,42 +1786,57 @@
                   $profitTooLow=0,
                   $roiDropTooHigh=0
                 ]"/>
-              </do_if>
-              <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-              <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
-              <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
-            </do_if>
-            
-            <!-- Validate cache entry structure -->
-            <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
-              <!-- Track as filtered (invalid structure) - $total already incremented above -->
-              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-              <do_if value="$ware? and $ware != null">
+                  </do_if>
                 <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                <set_value name="$wareStats.$invalidStructure" exact="$wareStats.$invalidStructure + 1"/>
+                <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
                 <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
               </do_if>
-              <continue/>
-            </do_if>
-            
-            <!-- Check if entry is too old (TTL filter) -->
-            <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
-            <do_if value="$entryAge gt $cacheMaxAge">
-              <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
-              <!-- Track as filtered (expired) - $total already incremented above -->
-              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-              <do_if value="$ware? and $ware != null">
-                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                <set_value name="$wareStats.$expired" exact="$wareStats.$expired + 1"/>
-                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              
+              <!-- Validate cache entry structure -->
+              <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
+                <!-- Track as filtered (invalid structure) - $total already incremented above -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$invalidStructure" exact="$wareStats.$invalidStructure + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+                <continue/>
               </do_if>
-              <remove_value name="global.$GT_TradeCache.{$idx}"/>
-              <continue/>
-            </do_if>
+              
+              <!-- Check if entry is too old (TTL filter) -->
+              <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
+              <do_if value="$entryAge gt $cacheMaxAge">
+                <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
+                <!-- Track as filtered (expired) - $total already incremented above -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$expired" exact="$wareStats.$expired + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+                <!-- ✅ PERFORMANCE OPTIMIZATION: Remove from index when removing from cache -->
+                <!-- ✅ FIX: Use sector object directly (stored as $HomeSector, not $HomeSectorId) -->
+                <do_if value="$cacheEntry.$HomeSector? and $cacheEntry.$HomeSector.exists and global.$GT_TradeCacheIndex?">
+                  <set_value name="$expiredHomeSector" exact="$cacheEntry.$HomeSector"/>
+                  <do_if value="global.$GT_TradeCacheIndex.{$expiredHomeSector}?">
+                    <!-- Remove index from sector index list -->
+                    <set_value name="$sectorIndexList" exact="global.$GT_TradeCacheIndex.{$expiredHomeSector}"/>
+                    <set_value name="$indexPosition" exact="$sectorIndexList.indexof.{$i}"/>
+                    <do_if value="$indexPosition? and $indexPosition gt 0">
+                      <!-- ✅ FIX: Use remove_from_list instead of set_value operation="remove" -->
+                      <remove_from_list name="$sectorIndexList" exact="$i"/>
+                      <set_value name="global.$GT_TradeCacheIndex.{$expiredHomeSector}" exact="$sectorIndexList"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                <remove_value name="global.$GT_TradeCache.{$i}"/>
+                <continue/>
+              </do_if>
             
             <!-- Validate offers still exist and are available -->
             <do_if value="not $cacheEntry.$BuyOffer.exists or not $cacheEntry.$SellOffer.exists">
@@ -2525,6 +2573,7 @@
                   <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
                 </do_if>
               </do_else>
+              </do_if>
             </do_if>
           </do_all>
           
@@ -2991,167 +3040,77 @@
         <!-- ✅ NATIVE C++ ACTION: Find all sell offers (ship buys FROM these stations) -->
         <!-- This single call replaces ~2000 station iterations! -->
         <!-- ✅ FIX: Check for null before accessing .count (memory:10529400) -->
-        <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector using match_gate_distance -->
-        <!-- For fallback searches, skip match_gate_distance (filter by current position instead) -->
+        <!-- NOTE: match_gate_distance is NOT supported in find_sell_offer/find_buy_offer (X4 limitation) -->
+        <!-- Distance filtering happens at MD level after native query returns results -->
         <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
           <!-- Manual ware selection: query specific wares -->
-          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
-            <!-- Normal search: Use match_gate_distance with home sector anchor -->
-            <find_sell_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allSellOffers" 
-              wares="$wareBasket" 
-              multiple="true">
-              <match_seller tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_seller>
-              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
-              <!-- MD will do accurate blacklist-aware filtering later -->
-              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
-              <relativeprice max="$sellPriceMax"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_sell_offer>
-          </do_if>
-          <do_else>
-            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
-            <find_sell_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allSellOffers" 
-              wares="$wareBasket" 
-              multiple="true">
-              <match_seller tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_seller>
-              <relativeprice max="$sellPriceMax"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_sell_offer>
-          </do_else>
+          <find_sell_offer 
+            tradepartner="$ship" 
+            space="$searchSpace" 
+            result="$allSellOffers" 
+            wares="$wareBasket" 
+            multiple="true">
+            <match_seller tradesknownto="$ship.owner">
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+            </match_seller>
+            <relativeprice max="$sellPriceMax"/>
+            <amount min="10"/>
+            <totalvolume min="100"/>
+          </find_sell_offer>
         </do_if>
         <do_else>
           <!-- Auto wares: query all compatible wares -->
-          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
-            <!-- Normal search: Use match_gate_distance with home sector anchor -->
-            <find_sell_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allSellOffers" 
-              multiple="true">
-              <match_seller tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_seller>
-              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
-              <!-- MD will do accurate blacklist-aware filtering later -->
-              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
-              <relativeprice max="$sellPriceMax"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_sell_offer>
-          </do_if>
-          <do_else>
-            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
-            <find_sell_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allSellOffers" 
-              multiple="true">
-              <match_seller tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_seller>
-              <relativeprice max="$sellPriceMax"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_sell_offer>
-          </do_else>
+          <find_sell_offer 
+            tradepartner="$ship" 
+            space="$searchSpace" 
+            result="$allSellOffers" 
+            multiple="true">
+            <match_seller tradesknownto="$ship.owner">
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+            </match_seller>
+            <relativeprice max="$sellPriceMax"/>
+            <amount min="10"/>
+            <totalvolume min="100"/>
+          </find_sell_offer>
         </do_else>
         
         <!-- ✅ NATIVE C++ ACTION: Find all buy offers (ship sells TO these stations) -->
         <!-- Note: $wareBasket already initialized above as empty list if null -->
         <!-- ✅ FIX: Check for null before accessing .count (memory:10529400) -->
-        <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector using match_gate_distance -->
-        <!-- For fallback searches, skip match_gate_distance (filter by current position instead) -->
+        <!-- NOTE: match_gate_distance is NOT supported in find_sell_offer/find_buy_offer (X4 limitation) -->
+        <!-- Distance filtering happens at MD level after native query returns results -->
         <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
-          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
-            <!-- Normal search: Use match_gate_distance with home sector anchor -->
-            <find_buy_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allBuyOffers" 
-              wares="$wareBasket" 
-              multiple="true">
-              <match_buyer tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
-              <!-- MD will do accurate blacklist-aware filtering later -->
-              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
-              <relativeprice min="$buyPriceMin"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_buy_offer>
-          </do_if>
-          <do_else>
-            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
-            <find_buy_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allBuyOffers" 
-              wares="$wareBasket" 
-              multiple="true">
-              <match_buyer tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <relativeprice min="$buyPriceMin"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_buy_offer>
-          </do_else>
+          <find_buy_offer 
+            tradepartner="$ship" 
+            space="$searchSpace" 
+            result="$allBuyOffers" 
+            wares="$wareBasket" 
+            multiple="true">
+            <match_buyer tradesknownto="$ship.owner">
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+            </match_buyer>
+            <relativeprice min="$buyPriceMin"/>
+            <amount min="10"/>
+            <totalvolume min="100"/>
+          </find_buy_offer>
         </do_if>
         <do_else>
-          <do_if value="not $isFallbackSearch and $homeSectorAnchor? and $homeSectorAnchor.exists">
-            <!-- Normal search: Use match_gate_distance with home sector anchor -->
-            <find_buy_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allBuyOffers" 
-              multiple="true">
-              <match_buyer tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-filter by distance from home sector (basic pathfinding, rough filter) -->
-              <!-- MD will do accurate blacklist-aware filtering later -->
-              <match_gate_distance object="$homeSectorAnchor" max="$maxDistance"/>
-              <relativeprice min="$buyPriceMin"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_buy_offer>
-          </do_if>
-          <do_else>
-            <!-- Fallback search or no home anchor: Don't use match_gate_distance (filter by current position later) -->
-            <find_buy_offer 
-              tradepartner="$ship" 
-              space="$searchSpace" 
-              result="$allBuyOffers" 
-              multiple="true">
-              <match_buyer tradesknownto="$ship.owner">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <relativeprice min="$buyPriceMin"/>
-              <amount min="10"/>
-              <totalvolume min="100"/>
-            </find_buy_offer>
-          </do_else>
+          <find_buy_offer 
+            tradepartner="$ship" 
+            space="$searchSpace" 
+            result="$allBuyOffers" 
+            multiple="true">
+            <match_buyer tradesknownto="$ship.owner">
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+            </match_buyer>
+            <relativeprice min="$buyPriceMin"/>
+            <amount min="10"/>
+            <totalvolume min="100"/>
+          </find_buy_offer>
         </do_else>
         
         <!-- ✅ FALLBACK SEARCH: Filter offers by distance from CURRENT POSITION (max 2 jumps) -->

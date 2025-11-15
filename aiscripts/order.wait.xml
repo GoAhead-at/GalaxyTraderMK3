@@ -14,8 +14,21 @@
     <do_if value="global.$GT_Ship_State? and global.$GT_Ship_State.{this.assignedcontrolled}?">
       <set_value name="$state" exact="global.$GT_Ship_State.{this.assignedcontrolled}"/>
       
+      <!-- ✅ FIX: First check if ship ACTUALLY has GT order - if yes, don't send cancellation signal -->
+      <!-- This prevents false positives when state is stale but ship still has GT order -->
+      <set_value name="$actuallyHasGTOrder" exact="false"/>
+      <do_if value="this.assignedcontrolled.defaultorder? and @this.assignedcontrolled.defaultorder.id == 'GalaxyTraderMK3'">
+        <set_value name="$actuallyHasGTOrder" exact="true"/>
+      </do_if>
+      <do_if value="not $actuallyHasGTOrder and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
+        <do_if value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3'">
+          <set_value name="$actuallyHasGTOrder" exact="true"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Only check for cancellation if ship does NOT currently have GT order -->
       <!-- If state says ship has GT order but ship now has Hold Position, GT order was removed -->
-      <do_if value="$state.$HasGTOrder">
+      <do_if value="not $actuallyHasGTOrder and $state.$HasGTOrder">
         <set_value name="$currentDefaultOrder" exact="@this.assignedcontrolled.defaultorder.id"/>
         
         <!-- Check if current default order is Hold Position (Wait) or another non-GT order -->
@@ -40,46 +53,60 @@
           
           <!-- Only proceed if GT order is actually gone -->
           <do_if value="not $hasGTOrder">
-            <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - GT order removed (detected in Hold Position order, new default order: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+            <!-- ✅ FIX: Prevent duplicate signals - only send if we haven't already sent cancellation recently -->
+            <!-- Check if cancellation signal was already sent recently (within last 10 seconds) -->
+            <set_value name="$lastCancellationTime" exact="0"/>
+            <do_if value="$state.$LastCancellationSignalTime?">
+              <set_value name="$lastCancellationTime" exact="@$state.$LastCancellationSignalTime"/>
+            </do_if>
             
-            <!-- Update state to reflect GT order cancellation -->
-            <set_value name="$state.$HasGTOrder" exact="false"/>
-            <set_value name="$state.$OperationalState" exact="'orphaned'"/>
-            <set_value name="$state.$ActiveTradeOrders" exact="0"/>
-            
-            <!-- Determine subordinate state -->
-            <set_value name="$hasCommander" exact="false"/>
-            <do_if value="this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
-              <set_value name="$hasCommander" exact="true"/>
-              <set_value name="$state.$Commander" exact="this.assignedcontrolled.commander"/>
+            <set_value name="$timeSinceLastCancellation" exact="player.age - $lastCancellationTime"/>
+            <do_if value="$timeSinceLastCancellation gt 10s or $lastCancellationTime == 0">
+              <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - GT order removed (detected in Hold Position order, new default order: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
               
-              <!-- Check if commander has GT order -->
-              <set_value name="$commanderHasGT" exact="false"/>
-              <do_if value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3'">
-                <set_value name="$commanderHasGT" exact="true"/>
-              </do_if>
-              <set_value name="$state.$CommanderHasGT" exact="$commanderHasGT"/>
+              <!-- Update state to reflect GT order cancellation -->
+              <set_value name="$state.$HasGTOrder" exact="false"/>
+              <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+              <set_value name="$state.$ActiveTradeOrders" exact="0"/>
               
-              <do_if value="$commanderHasGT">
-                <set_value name="$state.$SubordinateState" exact="'subordinate'"/>
+              <!-- Determine subordinate state -->
+              <set_value name="$hasCommander" exact="false"/>
+              <do_if value="this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
+                <set_value name="$hasCommander" exact="true"/>
+                <set_value name="$state.$Commander" exact="this.assignedcontrolled.commander"/>
+                
+                <!-- Check if commander has GT order -->
+                <set_value name="$commanderHasGT" exact="false"/>
+                <do_if value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3'">
+                  <set_value name="$commanderHasGT" exact="true"/>
+                </do_if>
+                <set_value name="$state.$CommanderHasGT" exact="$commanderHasGT"/>
+                
+                <do_if value="$commanderHasGT">
+                  <set_value name="$state.$SubordinateState" exact="'subordinate'"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+                </do_else>
               </do_if>
               <do_else>
+                <set_value name="$state.$Commander" exact="null"/>
+                <set_value name="$state.$CommanderHasGT" exact="false"/>
                 <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
               </do_else>
+              
+              <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+              <set_value name="$state.$LastCancellationSignalTime" exact="player.age"/>
+              
+              <!-- ✅ MOD REMOVAL: Send GT_Ship_State_Update signal for mod removal system -->
+              <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+                $Ship = this.assignedcontrolled,
+                $UpdateType = 'GT_Order_Cancelled'
+              ]"/>
             </do_if>
             <do_else>
-              <set_value name="$state.$Commander" exact="null"/>
-              <set_value name="$state.$CommanderHasGT" exact="false"/>
-              <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+              <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Skipping duplicate GT_Order_Cancelled signal (sent ' + ($timeSinceLastCancellation / 1s) + 's ago)'" chance="100"/>
             </do_else>
-            
-            <set_value name="$state.$LastStateUpdate" exact="player.age"/>
-            
-            <!-- ✅ MOD REMOVAL: Send GT_Ship_State_Update signal for mod removal system -->
-            <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
-              $Ship = this.assignedcontrolled,
-              $UpdateType = 'GT_Order_Cancelled'
-            ]"/>
           </do_if>
           <do_else>
             <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Hold Position assigned but GT order still active (default order: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ', actual default: ' + (if $actualDefaultOrder then $actualDefaultOrder else 'NONE') + ', has GT: ' + $hasGTOrder + ') - NOT sending GT_Order_Cancelled'" chance="100"/>

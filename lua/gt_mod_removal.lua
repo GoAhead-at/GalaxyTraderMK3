@@ -65,8 +65,9 @@ end
 
 -- Remove modification from ship
 local function GT_DismantleMod(_, params)
-    -- Parse parameters: "type|shipId|componentId|contextId|group"
-    -- Format: "ship|12345|0|0|null" or "engine|12345|0|0|null"
+    -- Parse parameters: "type|shipId|shipIdCode|componentId|contextId|group"
+    -- Format: "ship|12345|ABC-123|0|0|null" or "engine|12345|ABC-123|0|0|null"
+    -- Note: shipIdCode is optional (for backward compatibility), defaults to numeric ID if not provided
     if not params then
         logDebug("ERROR: GT_DismantleMod called with nil params", "ERROR")
         return
@@ -80,46 +81,50 @@ local function GT_DismantleMod(_, params)
     
     local type = tPackets[1]
     local shipIdStr = tPackets[2]
+    local shipIdCode = tPackets[3] or shipIdStr  -- Use shipIdCode if provided, otherwise fall back to numeric ID
     local shipId = ConvertStringTo64Bit(shipIdStr)
     
-    logDebug(string.format("Removing %s mod from ship ID string: %s (converted: %s)", type, shipIdStr, tostring(shipId)))
+    -- ✅ FIX: Include readable ship ID code in log messages
+    logDebug(string.format("Removing %s mod from ship ID string: %s (converted: %s) => %s", type, shipIdStr, tostring(shipId), shipIdCode))
     
     if type == "ship" then
         C.DismantleShipMod(shipId)
-        logDebug(string.format("✅ Removed ship mod from ship ID: %s", tostring(shipId)))
+        logDebug(string.format("✅ Removed ship mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "engine" then
         C.DismantleEngineMod(shipId)
-        logDebug(string.format("✅ Removed engine mod from ship ID: %s", tostring(shipId)))
+        logDebug(string.format("✅ Removed engine mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "shield" then
         -- For shield mods, we need context (ship) and group
         -- If group is "null" or not provided, we need to remove from all groups
         -- For now, try removing with ship as context and nil group
+        -- Note: Parameters shifted - componentId is now tPackets[4], contextId is tPackets[5], group is tPackets[6]
         local contextId = shipId -- Ship is the context
-        local group = (tPackets[5] and tPackets[5] ~= "null") and tPackets[5] or nil
+        local group = (tPackets[6] and tPackets[6] ~= "null") and tPackets[6] or nil
         
         if group then
             C.DismantleShieldMod(shipId, contextId, group)
-            logDebug(string.format("✅ Removed shield mod from ship ID: %s, group: %s", tostring(shipId), group))
+            logDebug(string.format("✅ Removed shield mod from ship ID: %s => %s, group: %s", tostring(shipId), shipIdCode, group))
         else
             -- Try removing with nil group (may remove from all groups)
             -- Note: This might need iteration through actual shield groups
             C.DismantleShieldMod(shipId, contextId, nil)
-            logDebug(string.format("✅ Removed shield mod from ship ID: %s (all groups)", tostring(shipId)))
+            logDebug(string.format("✅ Removed shield mod from ship ID: %s => %s (all groups)", tostring(shipId), shipIdCode))
         end
     elseif type == "weapon" then
         -- For weapon mods, we need the component ID
         -- Component ID is provided from MD script iteration
-        local componentId = (tPackets[3] and tonumber(tPackets[3]) ~= 0) and ConvertStringTo64Bit(tostring(tonumber(tPackets[3]))) or nil
+        -- Note: Parameters shifted - componentId is now tPackets[4]
+        local componentId = (tPackets[4] and tonumber(tPackets[4]) ~= 0) and ConvertStringTo64Bit(tostring(tonumber(tPackets[4]))) or nil
         
         if componentId then
             C.DismantleWeaponMod(componentId)
-            logDebug(string.format("✅ Removed weapon mod from component ID: %s", tostring(componentId)))
+            logDebug(string.format("✅ Removed weapon mod from component ID: %s (ship: %s)", tostring(componentId), shipIdCode))
         else
-            logDebug(string.format("⚠ WARNING: No component ID provided for weapon mod - cannot remove individual weapon mods without component ID"), "WARNING")
+            logDebug(string.format("⚠ WARNING: No component ID provided for weapon mod - cannot remove individual weapon mods without component ID (ship: %s)", shipIdCode), "WARNING")
         end
     elseif type == "thruster" then
         C.DismantleThrusterMod(shipId)
-        logDebug(string.format("✅ Removed thruster mod from ship ID: %s", tostring(shipId)))
+        logDebug(string.format("✅ Removed thruster mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     else
         logDebug(string.format("❌ ERROR: Unknown mod type: %s", type), "ERROR")
     end
