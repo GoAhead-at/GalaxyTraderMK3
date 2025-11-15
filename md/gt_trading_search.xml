@@ -294,8 +294,17 @@
           <!-- Track search method for diagnostics -->
           <set_value name="$searchMethod" exact="'cache'"/>
           <set_value name="$cacheChecked" exact="true"/>
-          <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
-          <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
+          <!-- ✅ PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
+          <!-- global.$GT_TradeCache is now a table indexed by home sector -->
+          <set_value name="$cacheCount" exact="0"/>
+          <do_if value="global.$GT_TradeCache?">
+            <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
+              <set_value name="$sectorCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$sectorIdx}}"/>
+              <do_if value="$sectorCache? and $sectorCache.count?">
+                <set_value name="$cacheCount" exact="$cacheCount + $sectorCache.count"/>
+              </do_if>
+            </do_all>
+          </do_if>
           
           <!-- ✅ ENHANCED: Log cache check start (debug mode only) -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1659,12 +1668,22 @@
             <debug_text text="'[GT-Cache-DIAG] ⚠ Cache is DISABLED (global.$GT_GlobalSettings.$Fleet.$EnableTradeCache = false) - cannot use cache'" chance="100"/>
           </do_if>
         </do_if>
-        <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
-        <do_if value="global.$GT_TradeCache.count lt 10">
+        <!-- ✅ PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
+        <!-- global.$GT_TradeCache is now a table indexed by home sector -->
+        <set_value name="$totalCacheCount" exact="0"/>
+        <do_if value="global.$GT_TradeCache?">
+          <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
+            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$sectorIdx}}"/>
+            <do_if value="$sectorCache? and $sectorCache.count?">
+              <set_value name="$totalCacheCount" exact="$totalCacheCount + $sectorCache.count"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$totalCacheCount lt 10">
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
-            <debug_text text="'[GT-Cache] ⚠ Cache too small (' + global.$GT_TradeCache.count + ' entries) - forcing live search to replenish'" chance="100"/>
+            <debug_text text="'[GT-Cache] ⚠ Cache too small (' + $totalCacheCount + ' entries) - forcing live search to replenish'" chance="100"/>
             <!-- ✅ DIAGNOSTIC: If cache is enabled but empty, log threshold info -->
-            <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache and global.$GT_TradeCache.count == 0">
+            <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache and $totalCacheCount == 0">
               <set_value name="$cacheThreshold" exact="20"/>
               <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
                 <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
@@ -1697,9 +1716,8 @@
           <cancel_cue cue="this"/>
         </do_if>
         
-        <!-- ✅ LIST-BASED CACHE: Iterate through flat list of trade entries -->
-        <!-- NOTE: No per-ware limiting needed for cache (small size, pre-validated entries) -->
-        <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
+        <!-- ✅ PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
+        <!-- Each home sector has its own cache list - ships only search their own home sector's cache -->
         <!-- ✅ FIX: Initialize variables BEFORE conditional block to ensure they exist even if cache is empty -->
         <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
         <set_value name="$checkedEntries" exact="0"/>
@@ -1707,60 +1725,38 @@
         <set_value name="$expiredEntries" exact="0"/>
         <set_value name="$tradesByWareBeforeFiltering" exact="table[]"/>
         
-        <do_if value="global.$GT_TradeCache.count gt 0">
+        <!-- Get THIS home sector's cache (only trades cached for this home sector) -->
+        <set_value name="$homeSectorCache" exact="null"/>
+        <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+          <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+        </do_if>
+        
+        <!-- ✅ FIX: Check if cache exists, is not null, and has entries -->
+        <do_if value="$homeSectorCache? and $homeSectorCache != null and $homeSectorCache.count? and $homeSectorCache.count gt 0">
           
           <!-- DEBUG: Log cache status -->
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
-            <debug_text text="'[GT-Cache-DEBUG] Cache has ' + global.$GT_TradeCache.count + ' trade entries'" chance="100"/>
+            <set_value name="$sectorName" exact="@$homeSector.knownname"/>
+            <debug_text text="'[GT-Cache-DEBUG] Home sector cache (' + (if $sectorName? then $sectorName else 'Unknown') + ') has ' + $homeSectorCache.count + ' trade entries'" chance="100"/>
           </do_if>
           
-          <!-- ✅ PERFORMANCE OPTIMIZATION: Use home sector index if available -->
-          <!-- ✅ FIX: Sectors don't have .id property - use sector object directly as key -->
-          <set_value name="$cacheIndicesToCheck" exact="null"/>
-          <set_value name="$useIndex" exact="false"/>
-          <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCacheIndex?">
-            <do_if value="global.$GT_TradeCacheIndex.{$homeSector}?">
-              <set_value name="$cacheIndicesToCheck" exact="global.$GT_TradeCacheIndex.{$homeSector}"/>
-              <set_value name="$useIndex" exact="true"/>
-              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
-                <set_value name="$sectorName" exact="@$homeSector.knownname"/>
-                <debug_text text="'[GT-Cache-DEBUG] Using home sector index: ' + (if $sectorName? then $sectorName else 'Unknown') + ' (' + $cacheIndicesToCheck.count + ' entries)'" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_if>
-          
-          <!-- Fallback to full cache scan if index not available -->
-          <do_if value="not $useIndex">
-            <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
-            <set_value name="$cacheIndicesToCheck" exact="[]"/>
-            <!-- Build list of all indices [1, 2, 3, ..., cacheCount] -->
-            <do_all exact="$cacheCount" counter="$idx">
-              <append_to_list name="$cacheIndicesToCheck" exact="$idx"/>
-            </do_all>
-            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
-              <debug_text text="'[GT-Cache-DEBUG] Index not available - using full cache scan (' + $cacheCount + ' entries)'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <!-- Iterate through indexed cache entries BACKWARDS to safely remove invalid entries -->
+          <!-- Iterate through THIS home sector's cache entries BACKWARDS to safely remove invalid entries -->
           <!-- When we remove entry N, entries 1 to N-1 remain at same indices (already processed) -->
-          <!-- ✅ FIX: Validate cache entry exists (index may be stale if entries were removed) -->
-          <set_value name="$cacheCount" exact="$cacheIndicesToCheck.count"/>
-          <do_all exact="$cacheCount" counter="$idx" reverse="true">
-            <set_value name="$cacheIndex" exact="$cacheIndicesToCheck.{$idx}"/>
-            <set_value name="$i" exact="$cacheIndex"/>
+          <!-- ✅ PERFORMANCE OPTIMIZATION v5: Only check entries from THIS home sector's cache -->
+          <!-- This ensures ships only validate trades cached for their own home sector -->
+          <set_value name="$cacheCount" exact="$homeSectorCache.count"/>
+          <do_all exact="$cacheCount" counter="$i" reverse="true">
+            <set_value name="$cacheEntry" exact="$homeSectorCache.{$i}"/>
+            <!-- ✅ FIX: Store loop index in a variable accessible in nested scopes -->
+            <set_value name="$cacheEntryIndex" exact="$i"/>
+            <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
             
-            <!-- ✅ FIX: Validate cache entry exists before accessing (index may be stale) -->
-            <do_if value="$i ge 1 and $i le global.$GT_TradeCache.count">
-              <set_value name="$cacheEntry" exact="global.$GT_TradeCache.{$i}"/>
-              <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
-              
-              <!-- Track ware in statistics (even if entry will be filtered) -->
-              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-              <do_if value="$ware? and $ware != null">
-                <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
-                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+            <!-- Track ware in statistics (even if entry will be filtered) -->
+            <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+            <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+            <do_if value="$ware? and $ware != null">
+              <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
                   $total=0, 
                   $filtered=0, 
                   $valid=0,
@@ -1786,57 +1782,47 @@
                   $profitTooLow=0,
                   $roiDropTooHigh=0
                 ]"/>
-                  </do_if>
+              </do_if>
+              <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+              <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
+              <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+            </do_if>
+            
+            <!-- Validate cache entry structure -->
+            <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
+              <!-- Track as filtered (invalid structure) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
                 <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$invalidStructure" exact="$wareStats.$invalidStructure + 1"/>
                 <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
               </do_if>
-              
-              <!-- Validate cache entry structure -->
-              <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
-                <!-- Track as filtered (invalid structure) - $total already incremented above -->
-                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-                <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-                <do_if value="$ware? and $ware != null">
-                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                  <set_value name="$wareStats.$invalidStructure" exact="$wareStats.$invalidStructure + 1"/>
-                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
-                </do_if>
-                <continue/>
+              <continue/>
+            </do_if>
+            
+            <!-- Check if entry is too old (TTL filter) -->
+            <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
+            <do_if value="$entryAge gt $cacheMaxAge">
+              <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
+              <!-- Track as filtered (expired) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$expired" exact="$wareStats.$expired + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
               </do_if>
-              
-              <!-- Check if entry is too old (TTL filter) -->
-              <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
-              <do_if value="$entryAge gt $cacheMaxAge">
-                <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
-                <!-- Track as filtered (expired) - $total already incremented above -->
-                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-                <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-                <do_if value="$ware? and $ware != null">
-                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                  <set_value name="$wareStats.$expired" exact="$wareStats.$expired + 1"/>
-                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
-                </do_if>
-                <!-- ✅ PERFORMANCE OPTIMIZATION: Remove from index when removing from cache -->
-                <!-- ✅ FIX: Use sector object directly (stored as $HomeSector, not $HomeSectorId) -->
-                <do_if value="$cacheEntry.$HomeSector? and $cacheEntry.$HomeSector.exists and global.$GT_TradeCacheIndex?">
-                  <set_value name="$expiredHomeSector" exact="$cacheEntry.$HomeSector"/>
-                  <do_if value="global.$GT_TradeCacheIndex.{$expiredHomeSector}?">
-                    <!-- Remove index from sector index list -->
-                    <set_value name="$sectorIndexList" exact="global.$GT_TradeCacheIndex.{$expiredHomeSector}"/>
-                    <set_value name="$indexPosition" exact="$sectorIndexList.indexof.{$i}"/>
-                    <do_if value="$indexPosition? and $indexPosition gt 0">
-                      <!-- ✅ FIX: Use remove_from_list instead of set_value operation="remove" -->
-                      <remove_from_list name="$sectorIndexList" exact="$i"/>
-                      <set_value name="global.$GT_TradeCacheIndex.{$expiredHomeSector}" exact="$sectorIndexList"/>
-                    </do_if>
-                  </do_if>
-                </do_if>
-                <remove_value name="global.$GT_TradeCache.{$i}"/>
-                <continue/>
+              <!-- ✅ PERFORMANCE OPTIMIZATION v5: Remove from per-home-sector cache -->
+              <!-- ✅ FIX: Use $cacheEntryIndex (stored at loop start) instead of $i -->
+              <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe -->
+              <do_if value="$cacheEntryIndex?">
+                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
               </do_if>
+              <continue/>
+            </do_if>
             
             <!-- Validate offers still exist and are available -->
             <do_if value="not $cacheEntry.$BuyOffer.exists or not $cacheEntry.$SellOffer.exists">
@@ -1922,16 +1908,17 @@
               2. Reachability check: Can ship reach it from current position? (basic connectivity)
             -->
             
-            <!-- STAGE 1: Range check from home base (no blacklist) - using library function -->
-            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculateTradeRouteDistance" result="$totalRangeDistance">
-              <param name="homeSector" value="$homeSector"/>
-              <param name="buyStation" value="$cacheEntry.$BuyOffer.owner"/>
-              <param name="sellStation" value="$cacheEntry.$SellOffer.owner"/>
-            </run_actions>
-            <!-- Extract individual distances for validation (backwards compatible) -->
-            <!-- ✅ FIX: Calculate distance from HOME to each station (not route distance) -->
-            <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
-            <set_value name="$rangeCheckSell" exact="$homeSector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
+            <!-- STAGE 1: Range check from home base (no blacklist) -->
+            <!-- ✅ PERFORMANCE OPTIMIZATION v5: Use pre-computed distances from cache entry -->
+            <!-- Distances were calculated ONCE during caching - no recalculation needed! -->
+            <set_value name="$rangeCheckBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
+            <set_value name="$rangeCheckSell" exact="@$cacheEntry.$HomeToSellDistance"/>
+            
+            <!-- Fallback: Recalculate if not pre-computed (backward compatibility with old cache entries) -->
+            <do_if value="not $rangeCheckBuy? or not $rangeCheckSell?">
+              <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
+              <set_value name="$rangeCheckSell" exact="$homeSector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
+            </do_if>
             
             <!-- ✅ FIX: Validate using max distance from home (both stations must be within maxDistance from home) -->
             <!-- This ensures stations are within operational range, regardless of ship's current position -->
@@ -1985,22 +1972,8 @@
               <continue/> <!-- Skip to next cache entry -->
             </do_if>
             
-            <!-- ✅ ESCAPE LOGIC: Block buying in blacklisted sector (force escape) -->
-            <!-- Ship in blacklisted sector must NOT buy in that sector -->
-            <set_value name="$buySectorActivityBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
-            <set_value name="$buySectorTravelBlacklisted" exact="@$buySector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
-            <do_if value="$buySectorActivityBlacklisted or $buySectorTravelBlacklisted">
-              <!-- Block buying in blacklisted sector (even if ship is already there) -->
-              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
-              <do_if value="$ware? and $ware != null">
-                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
-                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                <set_value name="$wareStats.$outOfRange" exact="$wareStats.$outOfRange + 1"/>
-                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
-              </do_if>
-              <continue/> <!-- Skip to next cache entry -->
-            </do_if>
+            <!-- ✅ PERFORMANCE: Removed buy/sell sector blacklist checks during cache iteration -->
+            <!-- Blacklist validation now happens only for best trade(s) before returning (CPU-efficient) -->
             
             <!-- ✅ ESCAPE LOGIC: Use non-blacklist-aware gatedistance for escape trades -->
             <!-- If ship is in blacklisted sector and buying from different sector, use non-blacklist-aware pathfinding -->
@@ -2020,11 +1993,15 @@
             <!-- Sell distance: BuyOffer station to SellOffer station -->
             <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
               <set_value name="$sellDistance" exact="0"/>
+              <set_value name="$sellSector" exact="$cacheEntry.$SellOffer.owner.sector"/>
             </do_if>
             <do_else>
               <set_value name="$sellSector" exact="$cacheEntry.$SellOffer.owner.sector"/>
               <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
             </do_else>
+            
+            <!-- ✅ PERFORMANCE: Removed sell sector blacklist check during cache iteration -->
+            <!-- Blacklist validation now happens only for best trade(s) before returning (CPU-efficient) -->
             
             <!-- If trade route is unreachable (disconnected sectors), skip this trade -->
             <!-- NOTE: This is an early check for efficiency, but we also check later at line 749 -->
@@ -2060,7 +2037,10 @@
             <!-- NOTE: Unreachable check already handled at line 714 (early exit for efficiency) -->
             <!-- No need to check again here - unreachable entries already filtered and tracked -->
             
-            <!-- Note: Station/sector blacklist checks removed - vanilla will handle when trade executes -->
+            <!-- ✅ PERFORMANCE: Sector blacklist checks are now performed ONLY for best trade(s) before returning -->
+            <!-- This avoids checking hundreds of cache entries (CPU-efficient) -->
+            <!-- If best trade is blacklisted, we try the next trade in list before giving up -->
+            <!-- Station blacklist checks are still handled by vanilla during trade execution -->
             
             <!-- Calculate total distance (ship → buy → sell) for filtering/validation -->
             <set_value name="$currentDistance" exact="$buyDistance + $sellDistance"/>
@@ -2517,8 +2497,14 @@
                         <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
                       </do_if>
                       
-                      <remove_value name="global.$GT_TradeCache.{$idx}"/>
-                      <!-- Skip to next entry (idx will auto-increment) -->
+                      <!-- ✅ PERFORMANCE OPTIMIZATION v5: Remove from per-home-sector cache -->
+                      <!-- Note: $cacheEntry is from $homeSectorCache, so it's already from the correct home sector -->
+                      <!-- ✅ FIX: Use $cacheEntryIndex (stored at loop start) to remove from the correct home sector's cache -->
+                      <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe (already processed entries remain at same indices) -->
+                      <do_if value="$cacheEntryIndex?">
+                        <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+                      </do_if>
+                      <!-- Skip to next entry -->
                       <continue/>
                     </do_else>
                   </do_if>
@@ -2573,7 +2559,6 @@
                   <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
                 </do_if>
               </do_else>
-              </do_if>
             </do_if>
           </do_all>
           
@@ -2796,6 +2781,10 @@
           </do_if>
         </do_if>
         
+        <!-- ✅ PERFORMANCE: Blacklist validation removed from cache search -->
+        <!-- Blacklist checks now happen ONLY in ExecuteTrade (catches mid-search updates) -->
+        <!-- ExecuteTrade will try next trade from TradeList if current trade is blacklisted -->
+        
         <!-- Return results via global variable (include valid entries count for diagnostics) -->
         <!-- ✅ CRITICAL FIX: Preserve LastRejectionStats when updating global.$GT_SearchResult -->
         <set_value name="$preservedLastRejectionStats" exact="null"/>
@@ -2805,7 +2794,7 @@
         </do_if>
         
         <set_value name="global.$GT_SearchResult" exact="table[
-          $Found = ($foundCachedTrade and $tradeList.count gt 0),
+          $Found = ($foundCachedTrade and $tradeList.count gt 0 and $bestTrade?),
           $BestTrade = $bestTrade,
           $BestScore = $bestScore,
           $TradeList = $tradeList,
@@ -4557,21 +4546,31 @@
         <!-- TODO: Track if new trades were added to cache during this search -->
         <!-- For now, assume cache was refreshed if batch processor ran -->
         <set_value name="$cacheRefreshed" exact="true"/>
-        <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
+        <!-- ✅ PERFORMANCE OPTIMIZATION v5: Cleanup per-home-sector cache -->
+        <!-- Iterate through all home sectors in cache -->
         <do_if value="$cacheRefreshed">
           <set_value name="$cacheMaxAge" exact="15min"/>
-          <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
           <set_value name="$deletedCount" exact="0"/>
-          <do_all exact="$cacheCount" counter="$i" reverse="true">
-            <set_value name="$entry" exact="global.$GT_TradeCache.{$i}"/>
-            <do_if value="$entry? and $entry.$Timestamp?">
-              <set_value name="$entryAge" exact="player.age - $entry.$Timestamp"/>
-              <do_if value="$entryAge gt $cacheMaxAge">
-                <remove_value name="global.$GT_TradeCache.{$i}"/>
-                <set_value name="$deletedCount" operation="add"/>
+          <do_if value="global.$GT_TradeCache?">
+            <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
+              <set_value name="$cacheHomeSector" exact="global.$GT_TradeCache.keys.{$sectorIdx}"/>
+              <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$cacheHomeSector}"/>
+              <do_if value="$sectorCache? and $sectorCache.count gt 0">
+                <!-- Iterate backwards through this home sector's cache -->
+                <set_value name="$sectorCacheCount" exact="$sectorCache.count"/>
+                <do_all exact="$sectorCacheCount" counter="$i" reverse="true">
+                  <set_value name="$entry" exact="$sectorCache.{$i}"/>
+                  <do_if value="$entry? and $entry.$Timestamp?">
+                    <set_value name="$entryAge" exact="player.age - $entry.$Timestamp"/>
+                    <do_if value="$entryAge gt $cacheMaxAge">
+                      <remove_value name="global.$GT_TradeCache.{$cacheHomeSector}.{$i}"/>
+                      <set_value name="$deletedCount" operation="add"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
               </do_if>
-            </do_if>
-          </do_all>
+            </do_all>
+          </do_if>
           <do_if value="$deletedCount gt 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Cache cleanup: Deleted ' + $deletedCount + ' entries older than 15 minutes'" chance="100"/>
           </do_if>

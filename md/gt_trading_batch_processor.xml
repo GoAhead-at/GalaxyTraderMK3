@@ -720,9 +720,16 @@
                       </do_if>
                       
                       <!-- ✅ DIAGNOSTIC: Log why trades aren't being cached (only if cache is empty) -->
+                      <!-- ✅ PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
+                      <!-- global.$GT_TradeCache is now a table indexed by home sector -->
                       <set_value name="$currentCacheCount" exact="0"/>
                       <do_if value="global.$GT_TradeCache?">
-                        <set_value name="$currentCacheCount" exact="global.$GT_TradeCache.count"/>
+                        <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
+                          <set_value name="$sectorCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$sectorIdx}}"/>
+                          <do_if value="$sectorCache? and $sectorCache.count?">
+                            <set_value name="$currentCacheCount" exact="$currentCacheCount + $sectorCache.count"/>
+                          </do_if>
+                        </do_all>
                       </do_if>
                       <do_if value="$currentCacheCount == 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
                         <!-- Cache is empty - log why trades aren't meeting cache requirements -->
@@ -761,79 +768,87 @@
                             </do_else>
                           </do_if>
                           
-                          <!-- ✅ CACHE DIVERSITY: Per-ware limit of 50 entries -->
-                          <!-- Count existing entries for this ware -->
-                          <set_value name="$wareEntryCount" exact="0"/>
-                          <set_value name="$oldestWareEntryIdx" exact="-1"/>
-                          <set_value name="$oldestWareEntryTimestamp" exact="player.age"/>
-                          <do_all exact="global.$GT_TradeCache.count" counter="$cacheIdx">
-                            <set_value name="$cachedEntry" exact="global.$GT_TradeCache.{$cacheIdx}"/>
-                            <do_if value="$cachedEntry? and $cachedEntry.$WareId == $sellOfferWare.id">
-                              <set_value name="$wareEntryCount" exact="$wareEntryCount + 1"/>
-                              <!-- Track oldest entry for this ware (for replacement if at limit) -->
-                              <do_if value="$cachedEntry.$Timestamp? and $cachedEntry.$Timestamp lt $oldestWareEntryTimestamp">
-                                <set_value name="$oldestWareEntryTimestamp" exact="$cachedEntry.$Timestamp"/>
-                                <set_value name="$oldestWareEntryIdx" exact="$cacheIdx"/>
+                          <!-- ✅ PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
+                          <!-- Only cache if home sector is valid -->
+                          <do_if value="$homeSector? and $homeSector.exists">
+                            <!-- Initialize home sector cache if needed -->
+                            <do_if value="not global.$GT_TradeCache.{$homeSector}?">
+                              <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
+                            </do_if>
+                            
+                            <!-- ✅ CACHE DIVERSITY: Per-ware limit of 50 entries (per home sector) -->
+                            <!-- Count existing entries for this ware in THIS home sector's cache -->
+                            <set_value name="$wareEntryCount" exact="0"/>
+                            <set_value name="$oldestWareEntryIdx" exact="-1"/>
+                            <set_value name="$oldestWareEntryTimestamp" exact="player.age"/>
+                            <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                            <do_all exact="$homeSectorCache.count" counter="$cacheIdx">
+                              <set_value name="$cachedEntry" exact="$homeSectorCache.{$cacheIdx}"/>
+                              <do_if value="$cachedEntry? and $cachedEntry.$WareId == $sellOfferWare.id">
+                                <set_value name="$wareEntryCount" exact="$wareEntryCount + 1"/>
+                                <!-- Track oldest entry for this ware (for replacement if at limit) -->
+                                <do_if value="$cachedEntry.$Timestamp? and $cachedEntry.$Timestamp lt $oldestWareEntryTimestamp">
+                                  <set_value name="$oldestWareEntryTimestamp" exact="$cachedEntry.$Timestamp"/>
+                                  <set_value name="$oldestWareEntryIdx" exact="$cacheIdx"/>
+                                </do_if>
+                              </do_if>
+                            </do_all>
+                            
+                            <!-- If this ware already has 50 entries in this home sector, replace the oldest one -->
+                            <do_if value="$wareEntryCount ge 50">
+                              <do_if value="$oldestWareEntryIdx ge 0">
+                                <!-- Remove oldest entry for this ware from this home sector's cache -->
+                                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$oldestWareEntryIdx}"/>
                               </do_if>
                             </do_if>
-                          </do_all>
-                          
-                          <!-- If this ware already has 50 entries, replace the oldest one -->
-                          <do_if value="$wareEntryCount ge 50">
-                            <do_if value="$oldestWareEntryIdx ge 0">
-                              <!-- Remove oldest entry for this ware -->
-                              <remove_value name="global.$GT_TradeCache.{$oldestWareEntryIdx}"/>
-                            </do_if>
-                          </do_if>
-                          <!-- ✅ Note: Global 300 limit removed - per-ware limit (50) handles cache size control -->
-                          <!-- Cache size is naturally bounded by per-ware diversity limits -->
-                          
-                          <!-- Calculate total volume for cache entry (amount × ware.volume) -->
-                          <set_value name="$totalVolume" exact="$maxAmount * $sellOfferWare.volume"/>
-                          
-                          <!-- Append trade entry as flat table to list -->
-                          <!-- ✅ CRITICAL: Store route distance (buy station → sell station) for position-independent validation -->
-                          <!-- ✅ PERFORMANCE OPTIMIZATION: Store home sector object for indexing -->
-                          <!-- ✅ FIX: Sectors don't have .id property - store sector object directly -->
-                          <set_value name="$cacheIndex" exact="global.$GT_TradeCache.count"/>
-                          <append_to_list name="global.$GT_TradeCache" exact="table[
-                            $WareId = $sellOfferWare.id,
-                            $WareName = $sellOfferWare.name,
-                            $SellStationId = $buyOfferOwner.idcode,
-                            $BuyStationId = $sellOfferOwner.idcode,
-                            $BuyOffer = $sellOffer,
-                            $SellOffer = $buyOffer,
-                            $Amount = $maxAmount,
-                            $TotalVolume = $totalVolume,
-                            $Profit = $profit,
-                            $ROI = $roi,
-                            $BuyPrice = $buyPrice,
-                            $SellPrice = $sellPrice,
-                            $Distance = $routeDistance,
-                            $Timestamp = player.age,
-                            $HomeSector = if $homeSector? and $homeSector.exists then $homeSector else null
-                          ]"/>
-                          
-                          <!-- ✅ PERFORMANCE OPTIMIZATION: Add to home sector index -->
-                          <!-- ✅ FIX: Use sector object directly as key (X4 supports object keys) -->
-                          <do_if value="$homeSector? and $homeSector.exists">
-                            <!-- Initialize index if needed -->
-                            <do_if value="not global.$GT_TradeCacheIndex?">
-                              <set_value name="global.$GT_TradeCacheIndex" exact="table[]"/>
+                            
+                            <!-- Calculate total volume for cache entry (amount × ware.volume) -->
+                            <set_value name="$totalVolume" exact="$maxAmount * $sellOfferWare.volume"/>
+                            
+                            <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-compute distances from home sector ONCE during caching -->
+                            <!-- These distances are the same for all ships with this home sector -->
+                            <set_value name="$homeToBuyDistance" exact="-1"/>
+                            <set_value name="$homeToSellDistance" exact="-1"/>
+                            <do_if value="$buySector? and $sellSector?">
+                              <set_value name="$homeToBuyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+                              <set_value name="$homeToSellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+                              <!-- Handle invalid distances -->
+                              <do_if value="$homeToBuyDistance lt 0">
+                                <set_value name="$homeToBuyDistance" exact="-1"/>
+                              </do_if>
+                              <do_if value="$homeToSellDistance lt 0">
+                                <set_value name="$homeToSellDistance" exact="-1"/>
+                              </do_if>
                             </do_if>
                             
-                            <!-- Initialize sector index if needed -->
-                            <do_if value="not global.$GT_TradeCacheIndex.{$homeSector}?">
-                              <set_value name="global.$GT_TradeCacheIndex.{$homeSector}" exact="[]"/>
-                            </do_if>
-                            
-                            <!-- Add cache index to sector index -->
-                            <append_to_list name="global.$GT_TradeCacheIndex.{$homeSector}" exact="$cacheIndex"/>
+                            <!-- Append trade entry to THIS home sector's cache list -->
+                            <!-- ✅ CRITICAL: Store route distance (buy station → sell station) for position-independent validation -->
+                            <!-- ✅ PERFORMANCE OPTIMIZATION: Pre-computed distances from home sector -->
+                            <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="table[
+                              $WareId = $sellOfferWare.id,
+                              $WareName = $sellOfferWare.name,
+                              $SellStationId = $buyOfferOwner.idcode,
+                              $BuyStationId = $sellOfferOwner.idcode,
+                              $BuyOffer = $sellOffer,
+                              $SellOffer = $buyOffer,
+                              $Amount = $maxAmount,
+                              $TotalVolume = $totalVolume,
+                              $Profit = $profit,
+                              $ROI = $roi,
+                              $BuyPrice = $buyPrice,
+                              $SellPrice = $sellPrice,
+                              $Distance = $routeDistance,
+                              $Timestamp = player.age,
+                              $HomeSector = $homeSector,
+                              $HomeToBuyDistance = $homeToBuyDistance,
+                              $HomeToSellDistance = $homeToSellDistance
+                            ]"/>
                           </do_if>
                           
                           <!-- Debug logging for cache population -->
                           <!-- ✅ DIAGNOSTIC: Always log first few cache entries (helps diagnose empty cache issues) -->
-                          <set_value name="$cacheCount" exact="global.$GT_TradeCache.count"/>
+                          <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                          <set_value name="$cacheCount" exact="$homeSectorCache.count"/>
                           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                             <!-- Log first 5 entries and every 10th entry after that (calculate remainder using division) -->
                             <set_value name="$shouldLog" exact="false"/>
