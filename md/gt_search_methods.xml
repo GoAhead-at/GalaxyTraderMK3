@@ -1,0 +1,1900 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Search_Methods" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- ========================================
+         SEARCH METHODS
+         Extracted from gt_trading_search.xml for better organization
+         ======================================== -->
+    
+    <cue name="SearchCachedTrades" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
+        <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
+        <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
+        <set_value name="$distancePenaltyMultiplier" exact="$params.$DistancePenaltyMultiplier"/>
+        <set_value name="$skillLevel" exact="$params.$SkillLevel"/>
+        <set_value name="$allowIllegal" exact="@$params.$AllowIllegal"/> <!-- Default to false if not provided -->
+        
+        <!-- Get ware basket for filtering (using library function with safe null-checking) -->
+        <run_actions ref="md.GT_Utilities.GT_GetWareBasketSafe" result="$wareBasket">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- âœ… NEW: Collect top trades instead of just best one -->
+        <!-- Use global setting for max trades to return -->
+        <set_value name="$tradeList" exact="[]"/>
+        <set_value name="$maxTradesToReturn" exact="200"/> <!-- Default fallback -->
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+          <set_value name="$maxTradesToReturn" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        </do_if>
+        <set_value name="$bestTrade" exact="null"/>
+        <set_value name="$bestScore" exact="0"/>
+        <set_value name="$foundCachedTrade" exact="false"/>
+        
+        <!-- ===== DETERMINE HOME SECTOR (using library function) ===== -->
+        <run_actions ref="md.GT_Utilities.GT_GetHomeSector" result="$homeSector">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Cache age check removed - not needed, individual entries have $Timestamp -->
+        <set_value name="$cacheAge" exact="0s"/>
+        
+        <!-- Get failed trades for this ship -->
+        <set_value name="$failedTrades" exact="[]"/>
+        <do_if value="global.$GT_FailedTrades? and global.$GT_FailedTrades.{$ship}?">
+          <set_value name="$failedTrades" exact="global.$GT_FailedTrades.{$ship}"/>
+        </do_if>
+        
+        <!-- âœ… CACHE REPLENISHMENT: Force live search if cache too small -->
+        <!-- âœ… DIAGNOSTIC: Check if cache is disabled first -->
+        <do_if value="not global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? or not global.$GT_GlobalSettings.$Fleet.$EnableTradeCache">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
+            <debug_text text="'[GT-Cache-DIAG] âš  Cache is DISABLED (global.$GT_GlobalSettings.$Fleet.$EnableTradeCache = false) - cannot use cache'" chance="100"/>
+          </do_if>
+        </do_if>
+        <!-- âœ… PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
+        <!-- Use library function for cache count calculation -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTotalCacheCount" result="$totalCacheCount"/>
+        <do_if value="$totalCacheCount lt 10">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 1">
+            <debug_text text="'[GT-Cache] âš  Cache too small (' + $totalCacheCount + ' entries) - forcing live search to replenish'" chance="100"/>
+            <!-- âœ… DIAGNOSTIC: If cache is enabled but empty, log threshold info -->
+            <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableTradeCache? and global.$GT_GlobalSettings.$Fleet.$EnableTradeCache and $totalCacheCount == 0">
+              <set_value name="$cacheThreshold" exact="20"/>
+              <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+                <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+              </do_if>
+              <debug_text text="'[GT-Cache-DIAG] Cache is empty but enabled - threshold is ' + ($cacheThreshold/1) + '% ROI (check batch processor logs for why trades are rejected)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Return empty result via global variable to trigger live search -->
+          <!-- âœ… CRITICAL FIX: Preserve LastRejectionStats when updating global.$GT_SearchResult -->
+          <set_value name="$preservedLastRejectionStats" exact="null"/>
+          <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_SearchResult exists -->
+          <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
+            <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
+          </do_if>
+          
+          <set_value name="global.$GT_SearchResult" exact="table[
+            $Found = false,
+            $BestTrade = null,
+            $BestScore = 0,
+            $BlacklistRejections = 0,
+            $TradeList = []
+          ]"/>
+          
+          <!-- âœ… CRITICAL FIX: Restore LastRejectionStats after updating global.$GT_SearchResult -->
+          <do_if value="$preservedLastRejectionStats?">
+            <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
+          </do_if>
+          
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- âœ… PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
+        <!-- Each home sector has its own cache list - ships only search their own home sector's cache -->
+        <!-- âœ… FIX: Initialize variables BEFORE conditional block to ensure they exist even if cache is empty -->
+        <set_value name="$cacheMaxAge" exact="600s"/>  <!-- 10 minutes -->
+        <set_value name="$checkedEntries" exact="0"/>
+        <set_value name="$validEntries" exact="0"/>
+        <set_value name="$expiredEntries" exact="0"/>
+        <set_value name="$tradesByWareBeforeFiltering" exact="table[]"/>
+        
+        <!-- Get THIS home sector's cache (only trades cached for this home sector) -->
+        <!-- Use library function for cache retrieval -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_GetHomeSectorCache" result="$homeSectorCache">
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        
+        <!-- âœ… FIX: Check if cache exists, is not null, and has entries -->
+        <do_if value="$homeSectorCache? and $homeSectorCache != null and $homeSectorCache.count? and $homeSectorCache.count gt 0">
+          
+          <!-- DEBUG: Log cache status -->
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+            <set_value name="$sectorName" exact="@$homeSector.knownname"/>
+            <debug_text text="'[GT-Cache-DEBUG] Home sector cache (' + (if $sectorName? then $sectorName else 'Unknown') + ') has ' + $homeSectorCache.count + ' trade entries'" chance="100"/>
+          </do_if>
+          
+          <!-- Iterate through THIS home sector's cache entries BACKWARDS to safely remove invalid entries -->
+          <!-- When we remove entry N, entries 1 to N-1 remain at same indices (already processed) -->
+          <!-- âœ… PERFORMANCE OPTIMIZATION v5: Only check entries from THIS home sector's cache -->
+          <!-- This ensures ships only validate trades cached for their own home sector -->
+          <set_value name="$cacheCount" exact="$homeSectorCache.count"/>
+          <do_all exact="$cacheCount" counter="$i" reverse="true">
+            <set_value name="$cacheEntry" exact="$homeSectorCache.{$i}"/>
+            <!-- âœ… FIX: Store loop index in a variable accessible in nested scopes -->
+            <set_value name="$cacheEntryIndex" exact="$i"/>
+            <set_value name="$checkedEntries" exact="$checkedEntries + 1"/>
+            
+            <!-- Track ware in statistics (even if entry will be filtered) -->
+            <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+            <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+            <do_if value="$ware? and $ware != null">
+              <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+                  $total=0, 
+                  $filtered=0, 
+                  $valid=0,
+                  $invalidStructure=0,
+                  $expired=0,
+                  $offersNoLongerExist=0,
+                  $offersNotAvailable=0,
+                  $insufficientAmount=0,
+                  $stationNotOperational=0,
+                  $failedSectorPair=0,
+                  $outOfRange=0,
+                  $unreachable=0,
+                  $incompatibleCargo=0,
+                  $illegal=0,
+                  $wareBasket=0,
+                  $distanceConstraint=0,
+                  $profitConstraint=0,
+                  $efficiencyThreshold=0,
+                  $stationsWaresNoLongerExist=0,
+                  $freshOffersNotAvailable=0,
+                  $insufficientTradeableAmount=0,
+                  $roiBelowThreshold=0,
+                  $profitTooLow=0,
+                  $roiDropTooHigh=0
+                ]"/>
+              </do_if>
+              <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+              <set_value name="$wareStats.$total" exact="$wareStats.$total + 1"/>
+              <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+            </do_if>
+            
+            <!-- Validate cache entry structure -->
+            <do_if value="not $cacheEntry? or not $cacheEntry.$BuyOffer? or not $cacheEntry.$SellOffer? or not $cacheEntry.$Timestamp?">
+              <!-- Track as filtered (invalid structure) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$invalidStructure" exact="$wareStats.$invalidStructure + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- Check if entry is too old (TTL filter) -->
+            <set_value name="$entryAge" exact="player.age - $cacheEntry.$Timestamp"/>
+            <do_if value="$entryAge gt $cacheMaxAge">
+              <set_value name="$expiredEntries" exact="$expiredEntries + 1"/>
+              <!-- Track as filtered (expired) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$expired" exact="$wareStats.$expired + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <!-- âœ… PERFORMANCE OPTIMIZATION v5: Remove from per-home-sector cache -->
+              <!-- âœ… FIX: Use $cacheEntryIndex (stored at loop start) instead of $i -->
+              <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe -->
+              <do_if value="$cacheEntryIndex?">
+                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- Validate offers still exist and are available -->
+            <do_if value="not $cacheEntry.$BuyOffer.exists or not $cacheEntry.$SellOffer.exists">
+              <!-- Track as filtered (offers no longer exist) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$offersNoLongerExist" exact="$wareStats.$offersNoLongerExist + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- CRITICAL: Validate offers are still available (not out of stock) -->
+            <do_if value="not $cacheEntry.$BuyOffer.available or not $cacheEntry.$SellOffer.available">
+              <!-- Track as filtered (offers not available) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$offersNotAvailable" exact="$wareStats.$offersNotAvailable + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- âœ… REMOVED: Pre-query amount check - amount validation happens after querying fresh offers -->
+            <!-- Rationale: Even if cached amount dropped, trade may still be valid if ROI is within dropoff tolerance -->
+            <!-- Amount validation now happens at line 1067 after querying fresh offers -->
+            
+            <!-- Validate stations still operational -->
+            <do_if value="not @$cacheEntry.$BuyOffer.owner.isoperational or not @$cacheEntry.$SellOffer.owner.isoperational">
+              <!-- Track as filtered (station not operational) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$stationNotOperational" exact="$wareStats.$stationNotOperational + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- CRITICAL: Filter out sector pairs that previously failed for THIS ship -->
+            <!-- One failure in a sector pair blocks ALL station combinations in that route -->
+            <do_if value="$failedTrades.count gt 0">
+              <set_value name="$skipThisCacheEntry" exact="false"/>
+              <do_all exact="$failedTrades.count" counter="$failIdx">
+                <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+                
+                <!-- Check if SECTOR PAIR matches (buy sector â†’ sell sector) -->
+                <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
+                <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                  <do_if value="@$cacheEntry.$BuyOffer.owner.sector == @$failedTrade.$BuySector and 
+                                @$cacheEntry.$SellOffer.owner.sector == @$failedTrade.$SellSector">
+                    <set_value name="$skipThisCacheEntry" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <do_if value="$skipThisCacheEntry">
+                <!-- Track as filtered (failed sector pair) - $total already incremented above -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$failedSectorPair" exact="$wareStats.$failedSectorPair + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+                <continue/> <!-- Skip to next cache entry -->
+              </do_if>
+            </do_if>
+            
+            <!-- 
+              TWO-STAGE DISTANCE VALIDATION:
+              1. Range check: Is trade within ship's operational range from home base? (NO blacklist)
+              2. Reachability check: Can ship reach it from current position? (basic connectivity)
+            -->
+            
+            <!-- STAGE 1: Range check from home base (no blacklist) -->
+            <!-- âœ… PERFORMANCE OPTIMIZATION v5: Use pre-computed distances from cache entry -->
+            <!-- Distances were calculated ONCE during caching - no recalculation needed! -->
+            <set_value name="$rangeCheckBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
+            <set_value name="$rangeCheckSell" exact="@$cacheEntry.$HomeToSellDistance"/>
+            
+            <!-- Fallback: Recalculate if not pre-computed (backward compatibility with old cache entries) -->
+            <do_if value="not $rangeCheckBuy? or not $rangeCheckSell?">
+              <set_value name="$rangeCheckBuy" exact="$homeSector.gatedistance.{$cacheEntry.$BuyOffer.owner.sector}"/>
+              <set_value name="$rangeCheckSell" exact="$homeSector.gatedistance.{$cacheEntry.$SellOffer.owner.sector}"/>
+            </do_if>
+            
+            <!-- âœ… FIX: Validate using max distance from home (both stations must be within maxDistance from home) -->
+            <!-- This ensures stations are within operational range, regardless of ship's current position -->
+            <set_value name="$maxStationDistanceFromHome" exact="[$rangeCheckBuy, $rangeCheckSell].max"/>
+            
+            <!-- Skip if outside operational range -->
+            <do_if value="$rangeCheckBuy lt 0 or $rangeCheckSell lt 0 or $maxStationDistanceFromHome gt $maxDistance">
+              <!-- Track as filtered (out of range) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$outOfRange" exact="$wareStats.$outOfRange + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- STAGE 2: Basic reachability check from current position -->
+            <!-- Use BLACKLIST-AWARE gatedistance so blocked paths return -1 -->
+            <set_value name="$buySector" exact="$cacheEntry.$BuyOffer.owner.sector"/>
+            
+            <!-- âœ… FIX: Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            
+            <set_value name="$currentSector" exact="$ship.sector"/>
+            
+            <!-- âœ… FIX: Block intra-sector trades in blacklisted sectors (force escape) -->
+            <!-- If ship is in blacklisted sector and both buy/sell are same sector, block trade -->
+            <set_value name="$skipIntraSectorTrade" exact="false"/>
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <do_if value="$buySector == $currentSector and $cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
+                <!-- Intra-sector trade in blacklisted sector - BLOCK to force escape -->
+                <set_value name="$skipIntraSectorTrade" exact="true"/>
+                <!-- Track as filtered (intra-sector in blacklisted sector) -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                  <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                  <do_if value="$ware? and $ware != null">
+                    <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                    <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                    <set_value name="$wareStats.$outOfRange" exact="$wareStats.$outOfRange + 1"/>
+                    <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                  </do_if>
+              </do_if>
+            </do_if>
+            
+            <do_if value="$skipIntraSectorTrade">
+              <continue/> <!-- Skip to next cache entry -->
+            </do_if>
+            
+            <!-- âœ… PERFORMANCE: Removed buy/sell sector blacklist checks during cache iteration -->
+            <!-- Blacklist validation now happens only for best trade(s) before returning (CPU-efficient) -->
+            
+            <!-- âœ… ESCAPE LOGIC: Use non-blacklist-aware gatedistance for escape trades -->
+            <!-- If ship is in blacklisted sector and buying from different sector, use non-blacklist-aware pathfinding -->
+            <set_value name="$currentSectorIsBlacklistedForEscape" exact="false"/>
+            <do_if value="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}">
+              <set_value name="$currentSectorIsBlacklistedForEscape" exact="true"/>
+            </do_if>
+            <do_if value="$currentSectorIsBlacklistedForEscape and $buySector != $currentSector">
+              <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
+              <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}"/>
+            </do_if>
+            <do_else>
+              <!-- Normal case: Use blacklist-aware gatedistance -->
+              <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+            </do_else>
+            
+            <!-- Sell distance: BuyOffer station to SellOffer station -->
+            <do_if value="$cacheEntry.$BuyOffer.owner.sector == $cacheEntry.$SellOffer.owner.sector">
+              <set_value name="$sellDistance" exact="0"/>
+              <set_value name="$sellSector" exact="$cacheEntry.$SellOffer.owner.sector"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellSector" exact="$cacheEntry.$SellOffer.owner.sector"/>
+              <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+            </do_else>
+            
+            <!-- âœ… PERFORMANCE: Removed sell sector blacklist check during cache iteration -->
+            <!-- Blacklist validation now happens only for best trade(s) before returning (CPU-efficient) -->
+            
+            <!-- If trade route is unreachable (disconnected sectors), skip this trade -->
+            <!-- NOTE: This is an early check for efficiency, but we also check later at line 749 -->
+            <!-- Track here to ensure all unreachable entries are counted -->
+            <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+              <!-- Track as filtered (unreachable) - $total already incremented above -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$unreachable" exact="$wareStats.$unreachable + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <!-- Commented out to reduce log spam - uncomment if needed for debugging -->
+              <!-- <debug_text text="'[GT-Cache] âš  PATH BLOCKED: Trade route unreachable (disconnected sectors)' +
+                '\n  Ship: ' + $ship.idcode +
+                '\n  Ware: ' + @$cacheEntry.$BuyOffer.ware.name +
+                '\n  Buy: ' + @$cacheEntry.$BuyOffer.owner.knownname + ' (distance: ' + $buyDistance + ')' +
+                '\n  Sell: ' + @$cacheEntry.$SellOffer.owner.knownname + ' (distance: ' + $sellDistance + ')'"
+                chance="100"/> -->
+              <continue/>
+            </do_if>
+            
+            <!-- Safe defaults for null values (should be rare - only if sectors are completely disconnected) -->
+            <do_if value="not $buyDistance? or typeof $buyDistance != datatype.integer">
+              <set_value name="$buyDistance" exact="-1"/>
+            </do_if>
+            <do_if value="not $sellDistance? or typeof $sellDistance != datatype.integer">
+              <set_value name="$sellDistance" exact="-1"/>
+            </do_if>
+            
+            <!-- NOTE: Unreachable check already handled at line 714 (early exit for efficiency) -->
+            <!-- No need to check again here - unreachable entries already filtered and tracked -->
+            
+            <!-- âœ… PERFORMANCE: Sector blacklist checks are now performed ONLY for best trade(s) before returning -->
+            <!-- This avoids checking hundreds of cache entries (CPU-efficient) -->
+            <!-- If best trade is blacklisted, we try the next trade in list before giving up -->
+            <!-- Station blacklist checks are still handled by vanilla during trade execution -->
+            
+            <!-- Calculate total distance (ship â†’ buy â†’ sell) for filtering/validation -->
+            <set_value name="$currentDistance" exact="$buyDistance + $sellDistance"/>
+            
+            <!-- âœ… CARGO TYPE COMPATIBILITY FILTER: Skip wares ship cannot carry -->
+            <!-- Some wares (like Methane/gas, Feststoffe/solids) require special cargo bays -->
+            <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+            <set_value name="$canCarryWareType" exact="false"/>
+            <do_if value="$ware? and $ware != null">
+              <!-- Check if ship has cargo bay capacity for this specific ware type -->
+              <set_value name="$canCarryWareType" exact="$ship.cargo.{$ware}.max gt 0"/>
+            </do_if>
+            <do_if value="not $canCarryWareType">
+              <!-- Track ware for statistics -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <!-- Initialize incompatibleCargo field if it doesn't exist -->
+                <do_if value="not $wareStats.$incompatibleCargo?">
+                  <set_value name="$wareStats.$incompatibleCargo" exact="0"/>
+                </do_if>
+                <set_value name="$wareStats.$incompatibleCargo" exact="$wareStats.$incompatibleCargo + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- âœ… ILLEGAL WARE FILTER: Skip illegal wares if ship doesn't allow illegal trades -->
+            <do_if value="not $allowIllegal and $cacheEntry.$BuyOffer.ware.illegal">
+              <!-- Track ware for statistics -->
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$illegal" exact="$wareStats.$illegal + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- âœ… WARE BASKET FILTER: Only consider manually selected wares (using library function) -->
+            <run_actions ref="md.GT_Utilities.GT_GetWareBasketSafe" result="$wareBasket">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_if value="$wareBasket.count gt 0">
+              <!-- Check if ware is in basket (using library function) -->
+              <run_actions ref="md.GT_Utilities.GT_IsWareInBasket" result="$wareInBasket">
+                <param name="ware" value="$cacheEntry.$BuyOffer.ware"/>
+                <param name="basket" value="$wareBasket"/>
+              </run_actions>
+              <do_if value="not $wareInBasket">
+                <!-- Track ware for statistics -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$wareBasket" exact="$wareStats.$wareBasket + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+                <continue/>
+              </do_if>
+            </do_if>
+            
+            <!-- CRITICAL: Validate prices haven't changed unfavorably (allow 10% variance) -->
+            <!-- âŒ REMOVED: Stale price check was filtering out valid entries before querying fresh offers!
+                 The old logic read prices from cached tradeoffer objects which are stale.
+                 We should only validate against fresh prices AFTER querying fresh offers. -->
+            
+            <!-- âœ… REMOVED: Redundant distance constraint check -->
+            <!-- Distance validation already done at line 1310 using home-based distance -->
+            <!-- Actual travel distance ($currentDistance) is used for penalty scoring only (line 1513) -->
+            
+            <!-- Check profit constraint -->
+            <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit lt $minAbsoluteProfit">
+              <!-- Track ware for statistics -->
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <set_value name="$wareStats.$profitConstraint" exact="$wareStats.$profitConstraint + 1"/>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- âœ… CRITICAL: Calculate current score with ship's distance penalty setting -->
+            <!-- This ensures trades are scored based on THIS ship's preferences, not the cache population settings -->
+            <!-- Cache stores universal trade data (profit, distance, etc.) but Score is recalculated per-ship -->
+            <!-- âœ… NEW: Multi-factor distance penalty system (shipâ†’buy, buyâ†’sell, home distance) -->
+            <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeEfficiency" result="$efficiency">
+              <param name="profit" value="$cacheEntry.$Profit"/>
+              <param name="distance" value="$currentDistance"/>
+              <param name="distancePenaltyMultiplier" value="$distancePenaltyMultiplier"/>
+              <param name="factionPriority" value="$factionPriority"/>
+              <param name="buyStationOwner" value="$cacheEntry.$BuyOffer.owner.owner"/>
+              <param name="sellStationOwner" value="$cacheEntry.$SellOffer.owner.owner"/>
+              <param name="homeSector" value="$homeSector"/>
+              <param name="shipSector" value="$currentSector"/>
+              <param name="buySector" value="$buySector"/>
+              <param name="sellSector" value="$sellSector"/>
+              <param name="shipToBuyDistance" value="$buyDistance"/>
+              <param name="buyToSellDistance" value="$sellDistance"/>
+              <param name="homeToBuyDistance" value="$rangeCheckBuy"/>
+              <param name="homeToSellDistance" value="$rangeCheckSell"/>
+            </run_actions>
+            
+            <!-- âœ… DEBUG: Log efficiency calculation with distance penalty (if enabled) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$cacheEntryWare" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <do_if value="$cacheEntryWare?">
+                <debug_text text="'[GT-Cache] (' + $ship.idcode + ') Trade score recalculation: Ware=' + @$cacheEntryWare.name + ', Profit=' + ($cacheEntry.$Profit / 100) + 'Cr, Shipâ†’Buy=' + $buyDistance + ', Buyâ†’Sell=' + $sellDistance + ', Homeâ†’Buy=' + $rangeCheckBuy + ', Homeâ†’Sell=' + $rangeCheckSell + ', Efficiency=' + $efficiency" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- âœ… CACHE AS HINT: Re-query FRESH trade offers from the cached stations -->
+            <!-- âœ… FIX: Distance penalties should only affect SCORING/RANKING, not FILTERING -->
+            <!-- Query ALL profitable trades (profit >= minAbsoluteProfit, ROI >= cacheThreshold) -->
+            <!-- Efficiency/score is used ONLY for ranking - we always select the best available trade -->
+            <!-- Get cache threshold early (needed for profit/ROI check) -->
+            <set_value name="$cacheThreshold" exact="20"/>
+            <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+              <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+            </do_if>
+            
+            <!-- âœ… FIX: Query ALL trades that meet profit/ROI thresholds, regardless of efficiency/score -->
+            <!-- Efficiency is calculated for ranking only - we want "the best of the worst" if that's all that's available -->
+            <set_value name="$shouldQuery" exact="false"/>
+            <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit ge $minAbsoluteProfit">
+              <do_if value="$cacheEntry.$ROI? and $cacheEntry.$ROI ge $cacheThreshold">
+                <!-- Trade meets profit and ROI thresholds - query fresh offers for ranking -->
+                <set_value name="$shouldQuery" exact="true"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Track entries that don't meet profit/ROI thresholds -->
+            <do_if value="not $shouldQuery">
+              <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+              <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+              <do_if value="$ware? and $ware != null">
+                <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+                    $total=0, 
+                    $filtered=0, 
+                    $valid=0,
+                    $invalidStructure=0,
+                    $expired=0,
+                    $offersNoLongerExist=0,
+                    $offersNotAvailable=0,
+                    $insufficientAmount=0,
+                    $stationNotOperational=0,
+                    $failedSectorPair=0,
+                    $outOfRange=0,
+                    $unreachable=0,
+                    $illegal=0,
+                    $wareBasket=0,
+                    $distanceConstraint=0,
+                    $profitConstraint=0,
+                    $efficiencyThreshold=0,
+                    $stationsWaresNoLongerExist=0,
+                    $freshOffersNotAvailable=0,
+                    $insufficientTradeableAmount=0,
+                    $roiBelowThreshold=0,
+                    $profitTooLow=0,
+                    $roiDropTooHigh=0
+                  ]"/>
+                </do_if>
+                <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                <!-- Track why it was filtered (profit or ROI too low) -->
+                <do_if value="not $cacheEntry.$Profit? or $cacheEntry.$Profit lt $minAbsoluteProfit">
+                  <set_value name="$wareStats.$profitTooLow" exact="$wareStats.$profitTooLow + 1"/>
+                </do_if>
+                <do_if value="not $cacheEntry.$ROI? or $cacheEntry.$ROI lt $cacheThreshold">
+                  <set_value name="$wareStats.$roiBelowThreshold" exact="$wareStats.$roiBelowThreshold + 1"/>
+                </do_if>
+                <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+              </do_if>
+              <!-- Skip to next entry (doesn't meet profit/ROI thresholds) -->
+              <continue/>
+            </do_if>
+            
+            <do_if value="$shouldQuery">
+              <!-- âœ… CRITICAL FIX: Get ware and station objects from cached IDs, not stale tradeoffer references! -->
+              <!-- Ware objects don't go stale, so we can use the cached ware object directly -->
+              <set_value name="$ware" exact="$cacheEntry.$BuyOffer.ware"/>
+              
+              <!-- Stations: Try using cached station references first (faster) -->
+              <set_value name="$buyStation" exact="$cacheEntry.$BuyOffer.owner"/>
+              <set_value name="$sellStation" exact="$cacheEntry.$SellOffer.owner"/>
+              
+              <!-- Validate stations still exist and are operational -->
+              <do_if value="$buyStation.exists and $buyStation.isoperational and $sellStation.exists and $sellStation.isoperational and $ware">
+                <!-- Query FRESH sell offer from buy station (ship buys from their sell offer) -->
+                <find_sell_offer seller="$buyStation" wares="$ware" result="$freshBuyOffer">
+                  <match_seller tradesknownto="$ship.owner"/>
+                </find_sell_offer>
+                
+                <!-- Query FRESH buy offer from sell station (ship sells to their buy offer) -->
+                <find_buy_offer buyer="$sellStation" wares="$ware" result="$freshSellOffer">
+                  <match_buyer tradesknownto="$ship.owner"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <!-- Stations or ware no longer exist/operational - skip this entry -->
+                <set_value name="$freshBuyOffer" exact="null"/>
+                <set_value name="$freshSellOffer" exact="null"/>
+                
+                <!-- Track as filtered (stations/wares no longer exist) -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$stationsWaresNoLongerExist" exact="$wareStats.$stationsWaresNoLongerExist + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+                
+                <continue/>
+              </do_else>
+              
+              <!-- Validate fresh offers exist and are available -->
+              <do_if value="$freshBuyOffer and $freshBuyOffer.available and $freshSellOffer and $freshSellOffer.available">
+                <!-- Calculate fresh prices and profit -->
+                <set_value name="$freshBuyPrice" exact="$freshBuyOffer.unitprice"/>
+                <set_value name="$freshSellPrice" exact="$freshSellOffer.unitprice"/>
+                
+                <!-- Calculate max tradeable amount (using library function) -->
+                <run_actions ref="md.GT_Trade_Utilities.GT_CalculateMaxTradeableAmount" result="$freshMaxAmount">
+                  <param name="ship" value="$ship"/>
+                  <param name="ware" value="$freshBuyOffer.ware"/>
+                  <param name="buyOfferAmount" value="$freshBuyOffer.amount"/>
+                  <param name="sellOfferAmount" value="$freshSellOffer.amount"/>
+                </run_actions>
+                
+                <!-- Skip if no tradeable amount -->
+                <do_if value="$freshMaxAmount le 0">
+                  <!-- Track as filtered (insufficient tradeable amount) -->
+                  <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                  <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                  <do_if value="$ware? and $ware != null">
+                    <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                    <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                    <set_value name="$wareStats.$insufficientTradeableAmount" exact="$wareStats.$insufficientTradeableAmount + 1"/>
+                    <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                  </do_if>
+                  <continue/>
+                </do_if>
+                <do_if value="$freshMaxAmount gt 0">
+                  <set_value name="$freshProfit" exact="($freshSellPrice - $freshBuyPrice) * $freshMaxAmount"/>
+                  
+                  <!-- âœ… CORRECT LOGIC: Calculate fresh ROI and check relative percentage drop -->
+                  <do_if value="$freshProfit gt 0">
+                    <!-- Calculate fresh ROI as percentage (using library function) -->
+                    <run_actions ref="md.GT_Trade_Utilities.GT_CalculateROIFromPrices" result="$freshROI">
+                      <param name="buyPrice" value="$freshBuyPrice"/>
+                      <param name="sellPrice" value="$freshSellPrice"/>
+                    </run_actions>
+                    
+                    <!-- Get cache threshold from global settings (default 20%) -->
+                    <set_value name="$cacheThreshold" exact="20"/>
+                    <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
+                      <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
+                    </do_if>
+                    
+                    <!-- Get cached original ROI -->
+                    <set_value name="$cachedROI" exact="@$cacheEntry.$ROI"/>
+                    <do_if value="not $cachedROI? or $cachedROI le 0">
+                      <set_value name="$cachedROI" exact="$cacheThreshold"/>  <!-- Fallback for old cache entries -->
+                    </do_if>
+                    
+                    <!-- Get dropoff tolerance from global settings (default 15%) -->
+                    <set_value name="$dropoffTolerance" exact="@global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance"/>
+                    <do_if value="not $dropoffTolerance?">
+                      <set_value name="$dropoffTolerance" exact="15"/>  <!-- Default 15% -->
+                    </do_if>
+                    
+                    <!-- Calculate relative percentage drop: ((original - current) / original) * 100 -->
+                    <set_value name="$roiDrop" exact="0"/>
+                    <do_if value="$cachedROI gt 0">
+                      <set_value name="$roiDrop" exact="(($cachedROI - $freshROI) * 100) / $cachedROI"/>
+                    </do_if>
+                    
+                    <!-- Check if fresh ROI meets minimum threshold AND relative drop is within tolerance -->
+                    <do_if value="$freshROI ge $cacheThreshold and $freshProfit ge $minAbsoluteProfit and $roiDrop le $dropoffTolerance">
+                      <!-- âœ… CACHE HIT: Fresh trade meets threshold and within dropoff tolerance! -->
+                      <!-- âœ… CRITICAL: Recalculate efficiency with FRESH profit and ship's distance penalty setting -->
+                      <!-- This ensures each ship's distance preference affects trade selection, not the cache population settings -->
+                      <!-- Previous efficiency calculation used cached profit - now recalculate with actual fresh profit -->
+                      <!-- âœ… NEW: Multi-factor distance penalty system (shipâ†’buy, buyâ†’sell, home distance) -->
+                      <run_actions ref="md.GT_Trade_Utilities.GT_CalculateTradeEfficiency" result="$freshEfficiency">
+                        <param name="profit" value="$freshProfit"/>
+                        <param name="distance" value="$currentDistance"/>
+                        <param name="distancePenaltyMultiplier" value="$distancePenaltyMultiplier"/>
+                        <param name="factionPriority" value="$factionPriority"/>
+                        <param name="buyStationOwner" value="$cacheEntry.$BuyOffer.owner.owner"/>
+                        <param name="sellStationOwner" value="$cacheEntry.$SellOffer.owner.owner"/>
+                        <param name="homeSector" value="$homeSector"/>
+                        <param name="shipSector" value="$currentSector"/>
+                        <param name="buySector" value="$buySector"/>
+                        <param name="sellSector" value="$sellSector"/>
+                        <param name="shipToBuyDistance" value="$buyDistance"/>
+                        <param name="buyToSellDistance" value="$sellDistance"/>
+                        <param name="homeToBuyDistance" value="$rangeCheckBuy"/>
+                        <param name="homeToSellDistance" value="$rangeCheckSell"/>
+                      </run_actions>
+                      
+                      <set_value name="$trade" exact="table[
+                        $BuyOffer = $freshBuyOffer,
+                        $SellOffer = $freshSellOffer,
+                        $BuyStation = $freshBuyOffer.owner,
+                        $SellStation = $freshSellOffer.owner,
+                        $Amount = $freshMaxAmount,
+                        $Profit = $freshProfit,
+                        $ROI = $freshROI,
+                        $BuyPrice = $freshBuyPrice,
+                        $SellPrice = $freshSellPrice,
+                        $Distance = $currentDistance,
+                        $Score = $freshEfficiency,
+                        $Risk = 0
+                      ]"/>
+                      
+                      <!-- âœ… NEW: Add to trade list (up to max) with STATION PAIR DEDUPLICATION -->
+                      <!-- Prevent duplicate station pairs in the same retrieval (even if cache has duplicates) -->
+                      <set_value name="$stationPairExists" exact="false"/>
+                      <set_value name="$currentBuyStation" exact="$trade.$BuyStation"/>
+                      <set_value name="$currentSellStation" exact="$trade.$SellStation"/>
+                      <do_all exact="$tradeList.count" counter="$j">
+                        <set_value name="$existingBuyStation" exact="$tradeList.{$j}.$BuyStation"/>
+                        <set_value name="$existingSellStation" exact="$tradeList.{$j}.$SellStation"/>
+                        <do_if value="$existingBuyStation == $currentBuyStation and $existingSellStation == $currentSellStation">
+                          <set_value name="$stationPairExists" exact="true"/>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                      
+                      <!-- Only add if station pair is unique and we haven't reached max -->
+                      <do_if value="not $stationPairExists and $tradeList.count lt $maxTradesToReturn">
+                        <append_to_list name="$tradeList" exact="$trade"/>
+                        
+                        <!-- Track valid trade per ware -->
+                        <set_value name="$tradeWare" exact="@$trade.$BuyOffer.ware"/>
+                        <do_if value="$tradeWare?">
+                          <do_if value="not $tradesByWareBeforeFiltering.{$tradeWare}?">
+                            <set_value name="$tradesByWareBeforeFiltering.{$tradeWare}" exact="table[$total=0, $filtered=0, $valid=0]"/>
+                          </do_if>
+                          <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$tradeWare}"/>
+                          <set_value name="$wareStats.$valid" exact="$wareStats.$valid + 1"/>
+                          <set_value name="$tradesByWareBeforeFiltering.{$tradeWare}" exact="$wareStats"/>
+                        </do_if>
+                      </do_if>
+                      
+                      <!-- Also track best trade for backward compatibility -->
+                      <!-- âœ… FIX: Validate trade before setting bestTrade for consistency -->
+                      <!-- âœ… CRITICAL: Use freshEfficiency (calculated with fresh profit and ship's distance penalty) -->
+                      <do_if value="$freshEfficiency gt $bestScore">
+                        <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$isValid">
+                          <param name="trade" value="$trade"/>
+                          <param name="minScore" value="0"/>
+                        </run_actions>
+                        <do_if value="$isValid">
+                          <set_value name="$bestScore" exact="$freshEfficiency"/>
+                          <set_value name="$bestTrade" exact="$trade"/>
+                        </do_if>
+                      </do_if>
+                      
+                      <set_value name="$foundCachedTrade" exact="true"/>
+                      <set_value name="$validEntries" exact="$validEntries + 1"/>
+                      
+                    </do_if>
+                    <do_else>
+                      <!-- âœ… CACHE MAINTENANCE: ROI dropped below threshold - DELETE stale cache entry -->
+                      <!-- Track why entry was rejected for statistics -->
+                      <set_value name="$rejectionReason" exact="''"/>
+                      <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                      <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                      <do_if value="$ware? and $ware != null">
+                        <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                          <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+                            $total=0, 
+                            $filtered=0, 
+                            $valid=0,
+                            $invalidStructure=0,
+                            $expired=0,
+                            $offersNoLongerExist=0,
+                            $offersNotAvailable=0,
+                            $insufficientAmount=0,
+                            $stationNotOperational=0,
+                            $failedSectorPair=0,
+                            $outOfRange=0,
+                            $unreachable=0,
+                            $illegal=0,
+                            $wareBasket=0,
+                            $distanceConstraint=0,
+                            $profitConstraint=0,
+                            $efficiencyThreshold=0,
+                            $stationsWaresNoLongerExist=0,
+                            $freshOffersNotAvailable=0,
+                            $insufficientTradeableAmount=0,
+                            $roiBelowThreshold=0,
+                            $profitTooLow=0,
+                            $roiDropTooHigh=0
+                          ]"/>
+                        </do_if>
+                        <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                        <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                        
+                        <!-- Track specific rejection reasons -->
+                        <do_if value="$freshROI lt $cacheThreshold">
+                          <set_value name="$wareStats.$roiBelowThreshold" exact="$wareStats.$roiBelowThreshold + 1"/>
+                          <set_value name="$rejectionReason" exact="$rejectionReason + 'ROI below threshold (' + $freshROI + '% lt ' + $cacheThreshold + '%)'"/>
+                        </do_if>
+                        <do_if value="$freshProfit lt $minAbsoluteProfit">
+                          <set_value name="$wareStats.$profitTooLow" exact="$wareStats.$profitTooLow + 1"/>
+                          <do_if value="$rejectionReason != ''">
+                            <set_value name="$rejectionReason" exact="$rejectionReason + ', '"/>
+                          </do_if>
+                          <set_value name="$rejectionReason" exact="$rejectionReason + 'Profit too low (' + ($freshProfit/100) + ' Cr lt ' + ($minAbsoluteProfit/100) + ' Cr)'"/>
+                        </do_if>
+                        <do_if value="$roiDrop gt $dropoffTolerance">
+                          <set_value name="$wareStats.$roiDropTooHigh" exact="$wareStats.$roiDropTooHigh + 1"/>
+                          <do_if value="$rejectionReason != ''">
+                            <set_value name="$rejectionReason" exact="$rejectionReason + ', '"/>
+                          </do_if>
+                          <set_value name="$rejectionReason" exact="$rejectionReason + 'ROI drop too high (' + $roiDrop + '% gt ' + $dropoffTolerance + '%)'"/>
+                        </do_if>
+                        
+                        <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                      </do_if>
+                      
+                      <!-- âœ… PERFORMANCE OPTIMIZATION v5: Remove from per-home-sector cache -->
+                      <!-- Note: $cacheEntry is from $homeSectorCache, so it's already from the correct home sector -->
+                      <!-- âœ… FIX: Use $cacheEntryIndex (stored at loop start) to remove from the correct home sector's cache -->
+                      <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe (already processed entries remain at same indices) -->
+                      <do_if value="$cacheEntryIndex?">
+                        <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+                      </do_if>
+                      <!-- Skip to next entry -->
+                      <continue/>
+                    </do_else>
+                  </do_if>
+                  <do_else>
+                    <!-- Track filtered trade per ware (rejected due to zero/negative profit) -->
+                    <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                    <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                    <do_if value="$ware? and $ware != null">
+                      <do_if value="not $tradesByWareBeforeFiltering.{$ware}?">
+                        <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="table[
+                          $total=0, 
+                          $filtered=0, 
+                          $valid=0,
+                          $invalidStructure=0,
+                          $expired=0,
+                          $offersNoLongerExist=0,
+                          $offersNotAvailable=0,
+                          $insufficientAmount=0,
+                          $stationNotOperational=0,
+                          $failedSectorPair=0,
+                          $outOfRange=0,
+                          $unreachable=0,
+                          $illegal=0,
+                          $wareBasket=0,
+                          $distanceConstraint=0,
+                          $profitConstraint=0,
+                          $efficiencyThreshold=0,
+                          $stationsWaresNoLongerExist=0,
+                          $freshOffersNotAvailable=0,
+                          $insufficientTradeableAmount=0,
+                          $roiBelowThreshold=0,
+                          $profitTooLow=0,
+                          $roiDropTooHigh=0
+                        ]"/>
+                      </do_if>
+                      <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                      <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                      <set_value name="$wareStats.$profitTooLow" exact="$wareStats.$profitTooLow + 1"/>
+                      <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                    </do_if>
+                  </do_else>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Track as filtered (fresh offers not available) -->
+                <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <!-- âœ… FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
+                <do_if value="$ware? and $ware != null">
+                  <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
+                  <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
+                  <set_value name="$wareStats.$freshOffersNotAvailable" exact="$wareStats.$freshOffersNotAvailable + 1"/>
+                  <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
+                </do_if>
+              </do_else>
+            </do_if>
+          </do_all>
+          
+          <!-- âœ… BUILD DIVERSE LIST: Top 5 per ware (same logic as SearchLiveTrades_Resume) -->
+          <do_if value="$tradeList.count gt 0">
+            
+            <!-- Group trades by ware -->
+            <set_value name="$tradesByWare" exact="table[]"/>
+            <do_all exact="$tradeList.count" counter="$i">
+              <set_value name="$trade" exact="$tradeList.{$i}"/>
+              <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
+              <do_if value="not $tradesByWare.{$ware}?">
+                <set_value name="$tradesByWare.{$ware}" exact="[]"/>
+              </do_if>
+              <append_to_list name="$tradesByWare.{$ware}" exact="$trade"/>
+            </do_all>
+            
+            <!-- DEBUG: Log wares found -->
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$wareDebug" exact="'[GT-Cache] Found ' + $tradesByWare.keys.count + ' wares with trades:'"/>
+              <do_all exact="$tradesByWare.keys.count" counter="$wareIdx">
+                <set_value name="$ware" exact="$tradesByWare.keys.{$wareIdx}"/>
+                <set_value name="$wareCount" exact="$tradesByWare.{$ware}.count"/>
+                <set_value name="$wareDebug" exact="$wareDebug + '\n  - ' + @$ware.name + ': ' + $wareCount + ' trades'"/>
+              </do_all>
+              <debug_text text="$wareDebug" chance="100"/>
+            </do_if>
+            
+            <!-- Select top 5 per ware by Score -->
+            <set_value name="$diverseList" exact="[]"/>
+            <do_all exact="$tradesByWare.keys.count" counter="$wareIdx">
+              <set_value name="$ware" exact="$tradesByWare.keys.{$wareIdx}"/>
+              <set_value name="$wareTrades" exact="$tradesByWare.{$ware}"/>
+              
+              <!-- Simple selection sort to get top 5 by Score with STATION PAIR DIVERSITY -->
+              <set_value name="$top3" exact="[]"/>
+              <set_value name="$maxCount" exact="[$wareTrades.count, 5].min"/>
+              <do_all exact="$maxCount" counter="$rank">
+                <set_value name="$maxScore" exact="-999999999"/>
+                <set_value name="$maxIdx" exact="-1"/>
+                <do_all exact="$wareTrades.count" counter="$i">
+                  <set_value name="$trade" exact="$wareTrades.{$i}"/>
+                  <set_value name="$buyStation" exact="$trade.$BuyStation"/>
+                  <set_value name="$sellStation" exact="$trade.$SellStation"/>
+                  
+                  <!-- âœ… STATION PAIR DIVERSITY: Check if this station pair already exists in top3 -->
+                  <set_value name="$stationPairExists" exact="false"/>
+                  <do_all exact="$top3.count" counter="$j">
+                    <set_value name="$existingBuyStation" exact="$top3.{$j}.$BuyStation"/>
+                    <set_value name="$existingSellStation" exact="$top3.{$j}.$SellStation"/>
+                    <do_if value="$existingBuyStation == $buyStation and $existingSellStation == $sellStation">
+                      <set_value name="$stationPairExists" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  
+                  <!-- Only consider if station pair is unique and Score is better -->
+                  <do_if value="not $stationPairExists and $trade.$Score gt $maxScore">
+                    <set_value name="$maxScore" exact="$trade.$Score"/>
+                    <set_value name="$maxIdx" exact="$i"/>
+                  </do_if>
+                </do_all>
+                <do_if value="$maxIdx ge 0">
+                  <append_to_list name="$top3" exact="$wareTrades.{$maxIdx}"/>
+                </do_if>
+                <!-- If we couldn't find a unique station pair, break early (we have all unique pairs already) -->
+                <do_if value="$maxIdx lt 0">
+                  <break/>
+                </do_if>
+              </do_all>
+              
+              <!-- Add up to 5 trades per ware (if less than 5, still include what we have) -->
+              <do_if value="$top3.count gt 0">
+                <do_all exact="$top3.count" counter="$i">
+                  <append_to_list name="$diverseList" exact="$top3.{$i}"/>
+                </do_all>
+              </do_if>
+            </do_all>
+            
+            <!-- DEBUG: Log diverse list result -->
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2">
+              <debug_text text="'[GT-Cache] Diverse list built: ' + $diverseList.count + ' trades from ' + $tradesByWare.keys.count + ' wares'" chance="100"/>
+            </do_if>
+            
+            <!-- Update tradeList to be the diverse list -->
+            <set_value name="$tradeList" exact="$diverseList"/>
+            
+            <!-- âœ… SORT TRADE LIST BY SCORE (highest first) before using it -->
+            <!-- This ensures AI validates the best trades first -->
+            <!-- Use library function for sorting -->
+            <run_actions ref="md.GT_Trade_Utilities.GT_SortTradesByScore" result="$tradeList">
+              <param name="tradeList" value="$tradeList"/>
+            </run_actions>
+            
+            <!-- Update bestTrade and bestScore from diverse list for backward compatibility -->
+            <!-- âœ… FIX: Use library function for consistent validation -->
+            <set_value name="$bestTrade" exact="null"/>
+            <set_value name="$bestScore" exact="0"/>
+            <do_all exact="$tradeList.count" counter="$i">
+              <set_value name="$trade" exact="$tradeList.{$i}"/>
+              <run_actions ref="md.GT_Trade_Utilities.GT_IsTradeValid" result="$isValid">
+                <param name="trade" value="$trade"/>
+                <param name="minScore" value="$bestScore"/>
+              </run_actions>
+              <do_if value="$isValid">
+                <set_value name="$testScore" exact="@$trade.$Score"/>
+                <set_value name="$bestScore" exact="$testScore"/>
+                <set_value name="$bestTrade" exact="$trade"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- âœ… RESET COOLDOWN: If cache hit, reset cooldown for this ship -->
+          <do_if value="$foundCachedTrade">
+            <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_CacheMissCooldowns exists -->
+            <do_if value="global.$GT_CacheMissCooldowns.{$ship}?">
+              <!-- Cache worked - reset cooldown to allow immediate live search if needed in future -->
+              <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+            </do_if>
+            <!-- âœ… FALLBACK COOLDOWN: Clear fallback flag when cache search succeeds (new successful cycle) -->
+            <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_FallbackAttempted exists -->
+            <do_if value="global.$GT_FallbackAttempted.{$ship}?">
+              <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
+            </do_if>
+          </do_if>
+          
+          <!-- DEBUG: Log cache retrieval results -->
+          <do_if value="@global.$GT_Config.$Debug.$Enabled">
+            <do_if value="@global.$GT_Config.$Debug.$LogLevel ge 2">
+              <do_if value="$foundCachedTrade">
+                <debug_text text="'[GT-Cache] âœ… Cache HIT for ' + $ship.idcode + ': Found cached trade (Score: ' + $bestScore + ', checked: ' + $checkedEntries + ', valid: ' + $validEntries + ', expired: ' + $expiredEntries + ', diverse list: ' + $tradeList.count + ' trades)'" chance="100"/>
+              </do_if>
+              <do_else>
+                <!-- Log why cache miss occurred -->
+                <set_value name="$missReason" exact="''"/>
+                <do_if value="$checkedEntries == 0">
+                  <set_value name="$missReason" exact="'Cache empty'"/>
+                </do_if>
+                <do_else>
+                  <!-- Count filtered entries from statistics -->
+                  <set_value name="$totalFiltered" exact="0"/>
+                  <set_value name="$filterBreakdown" exact="''"/>
+                  <do_all exact="$tradesByWareBeforeFiltering.keys.count" counter="$wIdx">
+                    <set_value name="$w" exact="$tradesByWareBeforeFiltering.keys.{$wIdx}"/>
+                    <set_value name="$wStats" exact="$tradesByWareBeforeFiltering.{$w}"/>
+                    <set_value name="$totalFiltered" exact="$totalFiltered + $wStats.$filtered"/>
+                    <!-- Build breakdown for top filter reasons -->
+                    <set_value name="$topFilters" exact="''"/>
+                    <do_if value="$wStats.$outOfRange gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$outOfRange + ' outOfRange'"/>
+                    </do_if>
+                    <do_if value="$wStats.$distanceConstraint gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$distanceConstraint + ' tooFar'"/>
+                    </do_if>
+                    <do_if value="$wStats.$unreachable gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$unreachable + ' unreachable'"/>
+                    </do_if>
+                    <do_if value="$wStats.$efficiencyThreshold gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$efficiencyThreshold + ' lowEfficiency'"/>
+                    </do_if>
+                    <do_if value="$wStats.$roiBelowThreshold gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$roiBelowThreshold + ' roiLow'"/>
+                    </do_if>
+                    <do_if value="$wStats.$profitTooLow gt 0">
+                      <set_value name="$topFilters" exact="$topFilters + (if $topFilters != '' then ', ' else '') + $wStats.$profitTooLow + ' profitLow'"/>
+                    </do_if>
+                    <do_if value="$topFilters != ''">
+                      <set_value name="$filterBreakdown" exact="$filterBreakdown + (if $filterBreakdown != '' then ' | ' else '') + @$w.name + ': [' + $topFilters + ']'"/>
+                    </do_if>
+                  </do_all>
+                  <set_value name="$missReason" exact="$totalFiltered + ' filtered (' + (if $filterBreakdown != '' then $filterBreakdown else 'no details') + ')'"/>
+                </do_else>
+                <debug_text text="'[GT-Cache] âŒ Cache MISS for ' + $ship.idcode + ': No valid cached trades (checked: ' + $checkedEntries + ', expired: ' + $expiredEntries + ', ' + $missReason + ', maxDistance: ' + $maxDistance + ')'" chance="100"/>
+              </do_else>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- âœ… PERFORMANCE: Blacklist validation removed from cache search -->
+        <!-- Blacklist checks now happen ONLY in ExecuteTrade (catches mid-search updates) -->
+        <!-- ExecuteTrade will try next trade from TradeList if current trade is blacklisted -->
+        
+        <!-- Return results via global variable (include valid entries count for diagnostics) -->
+        <!-- âœ… CRITICAL FIX: Preserve LastRejectionStats when updating global.$GT_SearchResult -->
+        <set_value name="$preservedLastRejectionStats" exact="null"/>
+        <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_SearchResult exists -->
+        <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
+          <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
+        </do_if>
+        
+        <set_value name="global.$GT_SearchResult" exact="table[
+          $Found = ($foundCachedTrade and $tradeList.count gt 0 and $bestTrade?),
+          $BestTrade = $bestTrade,
+          $BestScore = $bestScore,
+          $TradeList = $tradeList,
+          $ValidEntries = $validEntries,
+          $DiverseListCount = $tradeList.count
+        ]"/>
+        
+        <!-- âœ… CRITICAL FIX: Restore LastRejectionStats after updating global.$GT_SearchResult -->
+        <do_if value="$preservedLastRejectionStats?">
+          <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
+        </do_if>
+      </actions>
+    </cue>
+    <cue name="SearchLiveTrades" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <!-- Extract all parameters -->
+        <set_value name="$ship" exact="$params.$Ship"/>
+        <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
+        <set_value name="$originalMaxDistance" exact="$maxDistance"/>  <!-- Default: same as maxDistance for normal searches -->
+        <do_if value="$params.$OriginalMaxDistance?">
+          <set_value name="$originalMaxDistance" exact="$params.$OriginalMaxDistance"/>  <!-- Fallback search: use original pilot maxDistance -->
+        </do_if>
+        <set_value name="$minROI" exact="$params.$MinROI"/>
+        <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
+        <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
+        <set_value name="$factionPriorityText" exact="$params.$FactionPriorityText"/>
+        <set_value name="$distancePenaltyMultiplier" exact="$params.$DistancePenaltyMultiplier"/>
+        <set_value name="$skillLevel" exact="$params.$SkillLevel"/>
+        <set_value name="$gt_ThreatIntel" exact="$params.$ThreatIntel"/>
+        <set_value name="$gt_FleetCoord" exact="$params.$FleetCoord"/>
+        <set_value name="$gt_AdvancedAnalytics" exact="$params.$AdvancedAnalytics"/>
+        
+        <!-- NOTE: Do NOT clear failed trades here - we need to check them AFTER finding best trade -->
+        <!-- Failed trades are only cleared on success (in gt_trading_signals.xml) -->
+        
+        <!-- VERSION LOG - COMMENTED OUT (reduces log spam) -->
+        <!-- <debug_text text="'[GT-Search] ðŸš€ CODE VERSION: 2025-10-25-v5 (Score Bug Fixed) | Ship: ' + $ship.idcode" chance="100"/> -->
+        
+        <!-- Get failed trades for this ship (needed for filtering during best trade selection) -->
+        <set_value name="$failedTrades" exact="[]"/>
+        <do_if value="global.$GT_FailedTrades? and global.$GT_FailedTrades.{$ship}?">
+          <set_value name="$failedTrades" exact="global.$GT_FailedTrades.{$ship}"/>
+        </do_if>
+        
+        <!-- âœ… NEW: Collect top trades instead of just best one -->
+        <!-- Use global setting for max trades to return -->
+        <set_value name="$tradeList" exact="[]"/>
+        <set_value name="$maxTradesToReturn" exact="200"/> <!-- Default fallback -->
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+          <set_value name="$maxTradesToReturn" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        </do_if>
+        <set_value name="$bestTrade" exact="null"/>
+        <set_value name="$bestScore" exact="0"/>
+        <set_value name="$stationsEvaluated" exact="0"/>
+        <set_value name="$offersFound" exact="0"/>
+        
+        <!-- ===== DETERMINE HOME SECTOR ===== -->
+        <!-- âœ… CRITICAL: Subordinates ALWAYS use commander's home sector (not a fallback!) -->
+        <set_value name="$homeBase" exact="null"/>
+        <set_value name="$homeBaseSource" exact="'unknown'"/>
+        <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+          <!-- Ship is a subordinate - ALWAYS use commander's home sector -->
+          <do_if value="$ship.commander.defaultorder?">
+            <set_value name="$commanderHome" exact="@$ship.commander.defaultorder.$home"/>
+            <do_if value="$commanderHome? and $commanderHome.exists">
+              <set_value name="$homeBase" exact="$commanderHome"/>
+              <set_value name="$homeBaseSource" exact="'commander (subordinate)'"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- âœ… For non-subordinates: Always use defaultorder.$home as PRIMARY source (fixed value in order) -->
+        <!-- Home sector is a fixed value in the order settings and should NEVER drift -->
+        <do_if value="not $homeBase? or not $homeBase.exists">
+          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+          <set_value name="$homeBaseSource" exact="'defaultorder'"/>
+        </do_if>
+        
+        <!-- Fallback: Only if defaultorder.$home is not available, check GT_AIParameters -->
+        <do_if value="not $homeBase? or not $homeBase.exists">
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$HomeBase?">
+            <set_value name="$homeBase" exact="global.$GT_AIParameters.{$ship}.$HomeBase"/>
+            <set_value name="$homeBaseSource" exact="'GT_AIParameters (fallback)'"/>
+          </do_if>
+          <do_else>
+            <!-- âŒ REMOVED: Never fall back to $ship.sector (causes cascading drift) -->
+            <debug_text text="'[GT-ERROR] Home sector not found for ' + $ship.idcode + ' - defaultorder.$home is null! This should never happen.'" chance="100"/>
+            <!-- Emergency fallback only - this should never happen -->
+            <set_value name="$homeBase" exact="$ship.sector"/>
+            <set_value name="$homeBaseSource" exact="'ship.sector (EMERGENCY - WILL CAUSE DRIFT!)'"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Extract sector -->
+        <set_value name="$homeSector" exact="null"/>
+        <set_value name="$homeSectorAnchor" exact="null"/>
+        <do_if value="$homeBase? and $homeBase.exists">
+          <do_if value="$homeBase.isclass.station">
+            <set_value name="$homeSector" exact="$homeBase.sector"/>
+            <set_value name="$homeSectorAnchor" exact="$homeBase"/>
+          </do_if>
+          <do_elseif value="$homeBase.isclass.sector">
+            <set_value name="$homeSector" exact="$homeBase"/>
+            <set_value name="$homeSectorAnchor" exact="$homeBase"/>
+          </do_elseif>
+        </do_if>
+        
+        <!-- Validate -->
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <debug_text text="'[GT-ERROR] Failed to extract home sector from homeBase for ' + $ship.idcode + ' - using ship.sector as emergency fallback (THIS WILL CAUSE DRIFT!)'" chance="100"/>
+          <!-- Emergency fallback only - this should never happen -->
+          <set_value name="$homeSector" exact="$ship.sector"/>
+          <set_value name="$homeSectorAnchor" exact="$ship.sector"/>
+        </do_if>
+        
+        <!-- âœ… PERFORMANCE OPTIMIZATION: Ensure homeSectorAnchor is set (for match_gate_distance) -->
+        <do_if value="not $homeSectorAnchor? or not $homeSectorAnchor.exists">
+          <set_value name="$homeSectorAnchor" exact="$homeSector"/>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ðŸ  Home base: ' + @$homeBase.knownname + ' (sector: ' + $homeSector.knownname + ') [source: ' + $homeBaseSource + ']'" chance="100"/>
+        </do_if>
+        
+        <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+        <!-- âœ… NATIVE ACTION REFACTORING: Use C++ trade offer search instead of MD loops  -->
+        <!-- Replaces 2000+ station iterations with single galaxy-wide native C++ queries  -->
+        <!-- Performance: 10-100Ã— faster, ZERO stutter (C++ code executes in one frame)   -->
+        <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+        
+        <!-- Get AI parameters for filtering -->
+        <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+        
+        <!-- âœ… CRITICAL: Initialize $wareBasket safely (using library function) -->
+        <!-- Use library function for safe ware basket retrieval -->
+        <run_actions ref="md.GT_Utilities.GT_GetWareBasketSafe" result="$wareBasket">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Determine ship's blacklistgroup -->
+        <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- âœ… VANILLA PATTERN: Pre-filter sectors BEFORE native queries -->
+        <!-- Build sector lists using native C++ pathfinding (find_cluster_in_range) -->
+        <!-- This restricts native queries to in-range, non-blacklisted sectors only -->
+        <!-- Use library function for sector list building (handles isolation automatically) -->
+        <run_actions ref="md.GT_Pathfinding_Utilities.GT_BuildTradeSectorLists" result="$sectorLists">
+          <param name="ship" value="$ship"/>
+          <param name="homeSector" value="$homeSector"/>
+          <param name="maxDistance" value="$maxDistance"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+        </run_actions>
+        <set_value name="$buyspaces" exact="$sectorLists.$BuySpaces"/>
+        <set_value name="$sellspaces" exact="$sectorLists.$SellSpaces"/>
+        <set_value name="$shipIsIsolated" exact="$sectorLists.$ShipIsIsolated"/>
+        
+        <!-- Price range: Load from global config with defaults (using library function) -->
+        <!-- Use library function for price range loading (handles isolation automatically) -->
+        <run_actions ref="md.GT_Trade_Utilities.GT_GetPriceRange" result="$priceRange">
+          <param name="shipIsIsolated" value="$shipIsIsolated"/>
+        </run_actions>
+        <set_value name="$sellPriceMax" exact="$priceRange.$SellPriceMax"/>
+        <set_value name="$buyPriceMin" exact="$priceRange.$BuyPriceMin"/>
+        
+        <!-- âœ… VANILLA PATTERN: Iterate over sector lists and call native queries per sector -->
+        <!-- This restricts native queries to pre-filtered sectors only (much more efficient) -->
+        <set_value name="$allSellOffers" exact="[]"/>
+        <set_value name="$allBuyOffers" exact="[]"/>
+        
+        <!-- Query sell offers (ship buys FROM these stations) - iterate over buy sectors -->
+        <do_all exact="$buyspaces.count" counter="$i">
+          <set_value name="$sector" exact="$buyspaces.{$i}"/>
+          <do_if value="not $sector? or not $sector.exists">
+            <continue/>
+          </do_if>
+          
+          <!-- Initialize per-sector offer list to avoid residual data when find_sell_offer returns nothing -->
+          <set_value name="$sectorSellOffers" exact="[]"/>
+          
+          <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
+            <!-- Manual ware selection: query specific wares -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$sector" 
+              result="$sectorSellOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_if>
+          <do_else>
+            <!-- Auto wares: query all compatible wares -->
+            <find_sell_offer 
+              tradepartner="$ship" 
+              space="$sector" 
+              result="$sectorSellOffers" 
+              multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <relativeprice max="$sellPriceMax"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_sell_offer>
+          </do_else>
+          
+          <!-- Safely append sector's offers to main list -->
+          <set_value name="$sectorSellOffersCount" exact="0"/>
+          <do_if value="$sectorSellOffers?">
+            <set_value name="$sectorSellOffersCountTemp" exact="@$sectorSellOffers.count"/>
+            <do_if value="$sectorSellOffersCountTemp?">
+              <set_value name="$sectorSellOffersCount" exact="$sectorSellOffersCountTemp"/>
+            </do_if>
+          </do_if>
+          <do_all exact="$sectorSellOffersCount" counter="$j">
+            <append_to_list name="$allSellOffers" exact="$sectorSellOffers.{$j}"/>
+          </do_all>
+        </do_all>
+        
+        <!-- Query buy offers (ship sells TO these stations) - iterate over sell sectors -->
+        <do_all exact="$sellspaces.count" counter="$i">
+          <set_value name="$sector" exact="$sellspaces.{$i}"/>
+          <do_if value="not $sector? or not $sector.exists">
+            <continue/>
+          </do_if>
+          
+          <!-- Initialize per-sector offer list to avoid residual data when find_buy_offer returns nothing -->
+          <set_value name="$sectorBuyOffers" exact="[]"/>
+          
+          <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0">
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$sector" 
+              result="$sectorBuyOffers" 
+              wares="$wareBasket" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_if>
+          <do_else>
+            <find_buy_offer 
+              tradepartner="$ship" 
+              space="$sector" 
+              result="$sectorBuyOffers" 
+              multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <relativeprice min="$buyPriceMin"/>
+              <amount min="10"/>
+              <totalvolume min="100"/>
+            </find_buy_offer>
+          </do_else>
+          
+          <!-- Safely append sector's offers to main list -->
+          <set_value name="$sectorBuyOffersCount" exact="0"/>
+          <do_if value="$sectorBuyOffers?">
+            <set_value name="$sectorBuyOffersCountTemp" exact="@$sectorBuyOffers.count"/>
+            <do_if value="$sectorBuyOffersCountTemp?">
+              <set_value name="$sectorBuyOffersCount" exact="$sectorBuyOffersCountTemp"/>
+            </do_if>
+          </do_if>
+          <do_all exact="$sectorBuyOffersCount" counter="$j">
+            <append_to_list name="$allBuyOffers" exact="$sectorBuyOffers.{$j}"/>
+          </do_all>
+        </do_all>
+        
+        <!-- âœ… REMOVED: Post-query distance filtering no longer needed -->
+        <!-- Sector lists already restrict queries to in-range sectors -->
+        <!-- Distance filtering is handled during sector list building (vanilla pattern) -->
+        
+        <!-- Initialize counters -->
+        <set_value name="$totalFilteredIllegal" exact="0"/>
+        <set_value name="$stationsSkipped" exact="0"/>
+        <set_value name="$tradesRejectedDocking" exact="0"/>
+        <!-- âœ… OPTIMIZATION 1: $tradesRejectedBlacklist removed (safety net eliminated) -->
+        <set_value name="$tradesRejectedProfit" exact="0"/>
+        <set_value name="$tradesRejectedDistance" exact="0"/>
+        <set_value name="$tradesRejectedAmount" exact="0"/>
+        <set_value name="$offersFound" exact="$allSellOffers.count + $allBuyOffers.count"/>
+        <set_value name="$stationsEvaluated" exact="0"/>  <!-- Not applicable with native actions -->
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') âš¡ NATIVE ACTIONS: Collected ' + $allSellOffers.count + ' sell + ' + $allBuyOffers.count + ' buy offers (instant C++ query)'" chance="100"/>
+          <!-- âœ… DIAGNOSTIC: If native query returns 0 offers, test with minimal filters to find blocker -->
+          <!-- âœ… PERFORMANCE OPTIMIZATION: Guard diagnostic queries behind dedicated flag (4 galaxy-wide scans are expensive!) -->
+          <do_if value="$offersFound == 0 and global.$GT_Config.$Debug.$DiagnosticQueries">
+            <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') âš ï¸ Native query returned 0 offers with filters: dockable=true, enemy=false, amountâ‰¥100, totalvolumeâ‰¥100, sellPriceâ‰¤average, buyPriceâ‰¥average'" chance="100"/>
+            <!-- Test query with ONLY tradesknownto (no other filters) to see if offers exist -->
+            <set_value name="$testSellOffers" exact="[]"/>
+            <set_value name="$testBuyOffers" exact="[]"/>
+            <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$testSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner"/>
+              <!-- NO other filters - just test if offers exist -->
+            </find_sell_offer>
+            <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$testBuyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner"/>
+              <!-- NO other filters - just test if offers exist -->
+            </find_buy_offer>
+            <set_value name="$testOffersFound" exact="$testSellOffers.count + $testBuyOffers.count"/>
+            <do_if value="$testOffersFound gt 0">
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') âœ… Found ' + $testOffersFound + ' offers with MINIMAL filters (tradesknownto only) - testing individual filters...'" chance="100"/>
+              
+              <!-- Test 1: tradesknownto + dock (no enemy, no relativeprice) -->
+              <set_value name="$test1Sell" exact="[]"/>
+              <set_value name="$test1Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test1Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                </match_seller>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test1Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                </match_buyer>
+              </find_buy_offer>
+              <set_value name="$test1Found" exact="$test1Sell.count + $test1Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 1 (tradesknownto+dock): ' + $test1Found + ' offers'" chance="100"/>
+              
+              <!-- Test 2: tradesknownto + dock + enemy (no relativeprice) -->
+              <set_value name="$test2Sell" exact="[]"/>
+              <set_value name="$test2Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test2Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test2Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+              </find_buy_offer>
+              <set_value name="$test2Found" exact="$test2Sell.count + $test2Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 2 (+enemy filter): ' + $test2Found + ' offers'" chance="100"/>
+              
+              <!-- Test 3: tradesknownto + dock + enemy + relativeprice -->
+              <set_value name="$test3Sell" exact="[]"/>
+              <set_value name="$test3Buy" exact="[]"/>
+              <find_sell_offer tradepartner="$ship" space="player.galaxy" result="$test3Sell" multiple="true">
+                <match_seller tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <relativeprice max="0.0"/>
+              </find_sell_offer>
+              <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$test3Buy" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <relativeprice min="0.0"/>
+              </find_buy_offer>
+              <set_value name="$test3Found" exact="$test3Sell.count + $test3Buy.count"/>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') Test 3 (+relativeprice): ' + $test3Found + ' offers (BLOCKING FILTER IDENTIFIED!)'" chance="100"/>
+              
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Cache-DIAG] (' + $ship.idcode + ') âŒ Even MINIMAL query (tradesknownto only) returns 0 offers - ship may not know about any stations'" chance="100"/>
+            </do_else>
+          </do_if>
+          <!-- âœ… PERFORMANCE OPTIMIZATION: End of diagnostic queries block (guarded by DiagnosticQueries flag) -->
+          <do_elseif value="$offersFound == 0">
+            <!-- Silent skip when diagnostic queries disabled (normal play) -->
+          </do_elseif>
+        </do_if>
+        
+        <!-- âœ… UNIVERSAL CACHE: Native actions filtered by:
+             - known stations (tradesknownto)
+             - docking relation (match_relation_to dock) - only dockable stations
+             - faction relations (match_relation_to enemy not) - exclude enemy factions
+             - sell price (relativeprice max=0.0) - average price or below (was 0.5 - too lenient)
+             - buy price (relativeprice min=0.0) - at least average selling price (was 1.0 - too strict!)
+             - amount (min=100) - minimum 100 items
+             - total volume (min=100) - minimum total trade volume
+             âŒ NO blacklist filtering (ship-specific, applied at retrieval)
+             âŒ NO illegal ware filtering (ship-specific, applied at retrieval)
+             âœ… Distance range filtering only (universal validation)
+        -->
+        
+        <!-- ===== PRE-FILTER DISTANCE (RANGE-ONLY) ===== -->
+        <!-- âœ… UNIVERSAL CACHE: Filter by distance range only (from home sector) -->
+        <!-- âœ… FALLBACK SEARCH: For fallback search, use originalMaxDistance (pilot's maxDistance) instead of maxDistance (2) -->
+        <!-- Path validation is ship-specific and happens during cache retrieval -->
+        <do_if value="($allSellOffers.count gt 0 or $allBuyOffers.count gt 0) and $maxDistance? and $maxDistance gt 0">
+          <set_value name="$sellOffersDistanceFiltered" exact="0"/>
+          <set_value name="$buyOffersDistanceFiltered" exact="0"/>
+          
+          <!-- âœ… FALLBACK SEARCH: Use originalMaxDistance for filtering from home sector if available -->
+          <set_value name="$homeSectorMaxDistance" exact="$maxDistance"/>
+          <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+            <set_value name="$homeSectorMaxDistance" exact="$originalMaxDistance"/>
+          </do_if>
+          
+          <!-- Filter sell offers by distance range (using library function) -->
+          <do_if value="$allSellOffers.count gt 0">
+            <run_actions ref="md.GT_Trade_Utilities.GT_FilterOffersByDistance" result="$sellFilterResult">
+              <param name="offersList" value="$allSellOffers"/>
+              <param name="homeSector" value="$homeSector"/>
+              <param name="maxDistance" value="$homeSectorMaxDistance"/>
+            </run_actions>
+            <set_value name="$allSellOffers" exact="$sellFilterResult.$FilteredOffers"/>
+            <set_value name="$sellOffersDistanceFiltered" exact="$sellFilterResult.$FilteredCount"/>
+          </do_if>
+          
+          <!-- Filter buy offers by distance range (using library function) -->
+          <do_if value="$allBuyOffers.count gt 0">
+            <run_actions ref="md.GT_Trade_Utilities.GT_FilterOffersByDistance" result="$buyFilterResult">
+              <param name="offersList" value="$allBuyOffers"/>
+              <param name="homeSector" value="$homeSector"/>
+              <param name="maxDistance" value="$homeSectorMaxDistance"/>
+            </run_actions>
+            <set_value name="$allBuyOffers" exact="$buyFilterResult.$FilteredOffers"/>
+            <set_value name="$buyOffersDistanceFiltered" exact="$buyFilterResult.$FilteredCount"/>
+          </do_if>
+          
+          <!-- Debug logging -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <do_if value="$sellOffersDistanceFiltered gt 0 or $buyOffersDistanceFiltered gt 0">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ðŸ“ PRE-FILTERED distance (range-only): ' + $sellOffersDistanceFiltered + ' sell, ' + $buyOffersDistanceFiltered + ' buy (max: ' + $homeSectorMaxDistance + ' jumps from home)'" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') âœ… Offers within range: ' + $allSellOffers.count + ' sell, ' + $allBuyOffers.count + ' buy'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- ===== CROSS-STATION TRADE MATCHING ===== -->
+        <do_if value="$allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Total offers before indexing: ' + $allSellOffers.count + ' sell, ' + $allBuyOffers.count + ' buy'" chance="100"/>
+          </do_if>
+          
+          <!-- âœ… OPTIMIZATION: Calculate available money ONCE (before loops, not inside) -->
+          <set_value name="$availableMoney" exact="player.money"/>
+          <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
+          <do_if value="$homeBase? and $homeBase.exists and $homeBase.isclass.station">
+            <set_value name="$availableMoney" exact="$homeBase.money"/>
+          </do_if>
+          
+          <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+          <!-- âœ… CRITICAL OPTIMIZATION: Index & Limit BEFORE Distance Calculation -->
+          <!-- OLD: Calculate gatedistance for 3,859 stations, THEN limit to top 5 per ware -->
+          <!-- NEW: Limit to top 5 per ware FIRST, THEN calculate gatedistance for ~250 stations -->
+          <!-- Impact: 3,859 â†’ 250 pathfinding calls = 93.5% reduction = ELIMINATES STUTTER! -->
+          <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+          
+          <!-- STEP 1: Index offers by ware (using library function) -->
+          <run_actions ref="md.GT_Trade_Utilities.GT_IndexOffersByWare" result="$sellOffersByWare">
+            <param name="offersList" value="$allSellOffers"/>
+          </run_actions>
+          <run_actions ref="md.GT_Trade_Utilities.GT_IndexOffersByWare" result="$buyOffersByWare">
+            <param name="offersList" value="$allBuyOffers"/>
+          </run_actions>
+          
+          <!-- STEP 2: Per-ware sort & limit (reduces to ~5 per ware Ã— 50 wares = ~250 stations) -->
+          <!-- Use global setting for max offers per ware -->
+          <set_value name="$maxOffersPerWare" exact="200"/> <!-- Default fallback -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWare?">
+            <set_value name="$maxOffersPerWare" exact="global.$GT_GlobalSettings.$Performance.$MaxOffersPerWare"/>
+          </do_if>
+          <set_value name="$limitedSellOffers" exact="[]"/>
+          <set_value name="$limitedBuyOffers" exact="[]"/>
+          
+          <!-- Process each ware's sell offers (using library function) -->
+          <do_all exact="$sellOffersByWare.keys.count" counter="$wareIdx">
+            <set_value name="$ware" exact="$sellOffersByWare.keys.{$wareIdx}"/>
+            <set_value name="$offersForWare" exact="$sellOffersByWare.{$ware}"/>
+            
+            <!-- Sort and limit (ascending = lowest price for buy offers) -->
+            <run_actions ref="md.GT_Trade_Utilities.GT_SortAndLimitOffers" result="$limitedForWare">
+              <param name="offersList" value="$offersForWare"/>
+              <param name="maxCount" value="$maxOffersPerWare"/>
+              <param name="sortAscending" value="true"/>
+            </run_actions>
+            <do_all exact="$limitedForWare.count" counter="$idx">
+              <append_to_list name="$limitedSellOffers" exact="$limitedForWare.{$idx}"/>
+            </do_all>
+          </do_all>
+          
+          <!-- Process each ware's buy offers (using library function) -->
+          <do_all exact="$buyOffersByWare.keys.count" counter="$wareIdx">
+            <set_value name="$ware" exact="$buyOffersByWare.keys.{$wareIdx}"/>
+            <set_value name="$offersForWare" exact="$buyOffersByWare.{$ware}"/>
+            
+            <!-- Sort and limit (descending = highest price for sell offers) -->
+            <run_actions ref="md.GT_Trade_Utilities.GT_SortAndLimitOffers" result="$limitedForWare">
+              <param name="offersList" value="$offersForWare"/>
+              <param name="maxCount" value="$maxOffersPerWare"/>
+              <param name="sortAscending" value="false"/>
+            </run_actions>
+            <do_all exact="$limitedForWare.count" counter="$idx">
+              <append_to_list name="$limitedBuyOffers" exact="$limitedForWare.{$idx}"/>
+            </do_all>
+          </do_all>
+          
+          <!-- Replace original lists with limited lists -->
+          <set_value name="$allSellOffers" exact="$limitedSellOffers"/>
+          <set_value name="$allBuyOffers" exact="$limitedBuyOffers"/>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') âš¡ OPTIMIZED: Limited to ' + $allSellOffers.count + ' sell + ' + $allBuyOffers.count + ' buy offers (top ' + $maxOffersPerWare + ' per ware)'" chance="100"/>
+          </do_if>
+          
+          <!-- STEP 3: NOW calculate distances for LIMITED set only (93.5% fewer calls!) -->
+          <!-- Re-index limited offers by ware for matching (using library function) -->
+          <run_actions ref="md.GT_Trade_Utilities.GT_IndexOffersByWare" result="$sellOffersByWare">
+            <param name="offersList" value="$allSellOffers"/>
+          </run_actions>
+          <run_actions ref="md.GT_Trade_Utilities.GT_IndexOffersByWare" result="$buyOffersByWare">
+            <param name="offersList" value="$allBuyOffers"/>
+          </run_actions>
+          
+          <!-- STEP 4: Calculate distances for LIMITED offers only (using library function) -->
+          <run_actions ref="md.GT_Pathfinding_Utilities.GT_BuildStationDistanceCache" result="$stationDistanceCache">
+            <param name="sellOffers" value="$allSellOffers"/>
+            <param name="buyOffers" value="$allBuyOffers"/>
+            <param name="homeSector" value="$homeSector"/>
+          </run_actions>
+          
+          <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+          <!-- âœ… BATCH PROCESSOR PREPARATION: Build data structures for per-ware processing -->
+          <!-- Trade matching will be done by batch processor (one ware per batch, 10ms delay) -->
+          <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
+          
+          <!-- Get failed trades and reserved routes -->
+          <set_value name="$failedTrades" exact="[]"/>
+          <do_if value="global.$GT_FailedTrades? and global.$GT_FailedTrades.{$ship}?">
+            <set_value name="$failedTrades" exact="global.$GT_FailedTrades.{$ship}"/>
+          </do_if>
+          
+          <set_value name="$reservedRoutes" exact="[]"/>
+          <do_if value="global.$GT_ActiveTradeReservations? and global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
+            <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$resIdx">
+              <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$resIdx}"/>
+              <do_if value="$otherShip != $ship and $otherShip.exists">
+                <set_value name="$otherRoute" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
+                <do_if value="$otherRoute.$BuyStation? and $otherRoute.$SellStation? and $otherRoute.$Ware?">
+                  <do_if value="$otherRoute.$BuyStation.idcode? and $otherRoute.$SellStation.idcode?">
+                    <set_value name="$cacheKey" exact="$otherRoute.$BuyStation.idcode + '_' + $otherRoute.$SellStation.idcode + '_' + $otherRoute.$Ware"/>
+                    <append_to_list name="$reservedRoutes" exact="$cacheKey"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- Build list of wares that have BOTH sell and buy offers -->
+          <set_value name="$wareKeysList" exact="[]"/>
+          <do_all exact="$sellOffersByWare.keys.count" counter="$wareIdx">
+            <set_value name="$ware" exact="$sellOffersByWare.keys.{$wareIdx}"/>
+            <do_if value="$buyOffersByWare.{$ware}?">
+              <append_to_list name="$wareKeysList" exact="$ware"/>
+            </do_if>
+          </do_all>
+          
+          <!-- Build sell offers list (one entry per ware) -->
+          <set_value name="$sellOffersList" exact="[]"/>
+          <do_all exact="$wareKeysList.count" counter="$i">
+            <set_value name="$ware" exact="$wareKeysList.{$i}"/>
+            <append_to_list name="$sellOffersList" exact="table[
+              $ware = $ware,
+              $offers = $sellOffersByWare.{$ware}
+            ]"/>
+          </do_all>
+          
+          <!-- Build buy offers list (one entry per ware) -->
+          <set_value name="$buyOffersList" exact="[]"/>
+          <do_all exact="$wareKeysList.count" counter="$i">
+            <set_value name="$ware" exact="$wareKeysList.{$i}"/>
+            <append_to_list name="$buyOffersList" exact="table[
+              $ware = $ware,
+              $offers = $buyOffersByWare.{$ware}
+            ]"/>
+          </do_all>
+          
+          <!-- Generate unique batch index (use ship object as key - X4 supports object keys) -->
+          <set_value name="$batchIndex" exact="'' + player.age + $ship.idcode"/>
+          
+          <!-- âœ… CRITICAL: Ensure global.$GT_BatchDataList is initialized as TABLE (not list) -->
+          <!-- Previous versions initialized this as a list - must always ensure it's a table -->
+          <!-- Strategy: Check migration flag, if not migrated yet, clear and convert -->
+          <!-- After migration, it's safe to assume it's a table (SystemInit ensures it) -->
+          <do_if value="not global.$GT_BatchDataListMigrated?">
+            <!-- First time in this session - clear if exists (might be list from old save) -->
+            <do_if value="global.$GT_BatchDataList?">
+              <remove_value name="global.$GT_BatchDataList"/>
+            </do_if>
+            <!-- Initialize as table -->
+            <set_value name="global.$GT_BatchDataList" exact="table[]"/>
+            <!-- Also ensure results list is a table -->
+            <do_if value="global.$GT_BatchResultsList?">
+              <remove_value name="global.$GT_BatchResultsList"/>
+            </do_if>
+            <set_value name="global.$GT_BatchResultsList" exact="table[]"/>
+            <!-- Mark as migrated -->
+            <set_value name="global.$GT_BatchDataListMigrated" exact="true"/>
+          </do_if>
+          
+          <!-- Store state for batch processor - build state table first, then assign -->
+          <!-- âœ… CRITICAL: Use ship object as key (not string) - X4 supports object keys in tables -->
+          <!-- âœ… Use global settings for batch processing limits -->
+          <set_value name="$maxTradesPerWare" exact="20"/> <!-- Default fallback -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+            <set_value name="$maxTradesPerWare" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+          </do_if>
+          <set_value name="$earlyExitThreshold" exact="500"/> <!-- Default fallback -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold?">
+            <set_value name="$earlyExitThreshold" exact="global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold"/>
+          </do_if>
+          <set_value name="$stateData" exact="table[
+            $batchId = $batchIndex,
+            $waitingCue = null,
+            $ship = $ship,
+            $wareKeysList = $wareKeysList,
+            $sellOffersList = $sellOffersList,
+            $buyOffersList = $buyOffersList,
+            $stationDistanceCache = $stationDistanceCache,
+            $tradeList = [],
+            $crossStationBestScore = 0,
+            $crossStationBestTrade = null,
+            $nonConflictedBestScore = 0,
+            $nonConflictedBestTrade = null,
+            $reservedRoutes = $reservedRoutes,
+            $failedTrades = $failedTrades,
+            $currentWareIndex = 0,
+            $tradesPerWare = table[],
+            $maxTradesPerWare = $maxTradesPerWare,
+            $batchSize = 1,
+            $earlyExitThreshold = $earlyExitThreshold,
+            $maxDistance = $maxDistance,
+            $originalMaxDistance = $originalMaxDistance,
+            $distancePenaltyMultiplier = $distancePenaltyMultiplier,
+            $factionPriority = $factionPriority,
+            $minROI = $minROI,
+            $minAbsoluteProfit = $minAbsoluteProfit,
+            $gt_AdvancedAnalytics = $gt_AdvancedAnalytics,
+            $availableMoney = $availableMoney,
+            $tradesRejectedProfit = 0,
+            $tradesRejectedDocking = 0,
+            $tradesRejectedAmount = 0,
+            $tradesRejectedDistance = 0,
+            $bestRejectedProfit = null,
+            $bestRejectedTrade = null,
+            $homeSector = $homeSector
+          ]"/>
+          
+          <!-- âœ… CRITICAL FIX: Use ship object as table key (X4 supports object keys, not variable string keys) -->
+          <set_value name="global.$GT_BatchDataList.{$ship}" exact="$stateData"/>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Prepared batch data: ' + $wareKeysList.count + ' wares, batchIndex=' + $batchIndex" chance="100"/>
+          </do_if>
+          
+          <!-- Signal batch processor to start first batch (pass ship object as key) -->
+          <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+          
+          <!-- Exit - SearchLiveTrades_Resume will handle results -->
+          <!-- Include offer counts for diagnostics (even though batch processing hasn't completed yet) -->
+          <set_value name="$totalSellOffers" exact="0"/>
+          <set_value name="$totalBuyOffers" exact="0"/>
+          <do_all exact="$sellOffersList.count" counter="$i">
+            <set_value name="$wareOffers" exact="$sellOffersList.{$i}.$offers"/>
+            <set_value name="$totalSellOffers" exact="$totalSellOffers + $wareOffers.count"/>
+          </do_all>
+          <do_all exact="$buyOffersList.count" counter="$i">
+            <set_value name="$wareOffers" exact="$buyOffersList.{$i}.$offers"/>
+            <set_value name="$totalBuyOffers" exact="$totalBuyOffers + $wareOffers.count"/>
+          </do_all>
+          
+          <!-- Note: StationsEvaluated not calculated during preparation, will be updated by batch processor -->
+          <!-- âœ… CRITICAL FIX: Preserve LastRejectionStats when updating global.$GT_SearchResult -->
+          <set_value name="$preservedLastRejectionStats" exact="null"/>
+          <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_SearchResult exists -->
+          <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
+            <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
+          </do_if>
+          
+          <set_value name="global.$GT_SearchResult" exact="table[
+            $Found = false,
+            $BestTrade = null,
+            $BestScore = 0,
+            $TradeList = [],
+            $WaitingForBatch = true,
+            $Ship = $ship,
+            $OffersFound = $totalSellOffers + $totalBuyOffers,
+            $StationsEvaluated = 0
+          ]"/>
+          
+          <!-- âœ… CRITICAL FIX: Restore LastRejectionStats after updating global.$GT_SearchResult -->
+          <do_if value="$preservedLastRejectionStats?">
+            <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    <cue name="SearchFallbackTrades" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        
+        <!-- âœ… DEBUG: Log fallback search trigger -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ”„ Fallback search triggered: MaxDistance=2, Ship not isolated'" chance="100"/>
+        </do_if>
+        
+        <!-- âœ… FALLBACK PROFIT RELAXATION: Reduce profit thresholds to allow lower-profit trades -->
+        <!-- Fallback is last resort, so accept lower profits to find ANY trade -->
+        <!-- âœ… FIX: Fallback uses fixed 100 Cr threshold regardless of pilot level -->
+        <set_value name="$fallbackMinROI" exact="[$params.$MinROI / 2, 0].max"/>  <!-- Half of normal ROI, minimum 0% -->
+        <set_value name="$fallbackMinAbsoluteProfit" exact="10000"/>  <!-- Fixed 100 Cr for all levels -->
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ’° Fallback profit thresholds relaxed: ROI ' + $params.$MinROI + '% â†’ ' + $fallbackMinROI + '%, Profit fixed at 100 Cr (all levels)'" chance="100"/>
+        </do_if>
+        
+        <!-- Call SearchLiveTrades with MaxDistance set to maxJumps/3 and relaxed profit thresholds -->
+        <!-- âœ… DESIGN: Fallback uses lower profit thresholds, so we compensate by restricting travel distance -->
+        <!-- Use maxJumps / 3 to balance: closer trades (less travel time) but still within reasonable range -->
+        <!-- Minimum: 2 jumps, Maximum: pilot's maxDistance / 3 -->
+        <!-- FilterTradeList_Resume will then filter by home distance and sort by current distance -->
+        <!-- All other parameters are inherited from original search request -->
+        <!-- Use library function for fallback distance calculation -->
+        <set_value name="$fallbackMaxDistance" exact="2"/>  <!-- Default fallback to 2 if originalMaxDistance not available -->
+        <do_if value="$params.$OriginalMaxDistance?">
+          <run_actions ref="md.GT_Trade_Utilities.GT_CalculateFallbackDistance" result="$fallbackMaxDistance">
+            <param name="maxDistance" value="$params.$OriginalMaxDistance"/>
+          </run_actions>
+        </do_if>
+        <set_value name="$liveSearchParams" exact="table[
+          $Ship = $ship,
+          $MaxDistance = $fallbackMaxDistance,
+          $OriginalMaxDistance = $params.$OriginalMaxDistance,
+          $MinROI = $fallbackMinROI,
+          $MinAbsoluteProfit = $fallbackMinAbsoluteProfit,
+          $FactionPriority = $params.$FactionPriority,
+          $FactionPriorityText = $params.$FactionPriorityText,
+          $DistancePenaltyMultiplier = $params.$DistancePenaltyMultiplier,
+          $SkillLevel = $params.$SkillLevel,
+          $ThreatIntel = $params.$ThreatIntel,
+          $FleetCoord = $params.$FleetCoord,
+          $AdvancedAnalytics = $params.$AdvancedAnalytics
+        ]"/>
+        <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$liveSearchParams"/>
+        
+        <!-- âœ… CRITICAL FIX: Check if batch processing started after signaling SearchLiveTrades -->
+        <!-- SearchLiveTrades sets $WaitingForBatch = true when it prepares batch data -->
+        <!-- If batch started, exit immediately - SearchLiveTrades_Resume will signal us again when complete -->
+        <set_value name="$batchStarted" exact="false"/>
+        <do_if value="global.$GT_SearchResult.$WaitingForBatch?">
+          <set_value name="$batchStarted" exact="global.$GT_SearchResult.$WaitingForBatch"/>
+        </do_if>
+        
+        <do_if value="$batchStarted">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') â¸ï¸ Batch processing started (fallback) - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+          </do_if>
+          <!-- Exit - SearchLiveTrades_Resume will signal this cue again when batch completes -->
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- SearchLiveTrades will handle the rest (signals SearchLiveTrades_Resume, which signals SearchTradeRoutes) -->
+        <!-- Results will be processed the same way as normal live search -->
+      </actions>
+    </cue>
+
+  </cues>
+</mdscript>

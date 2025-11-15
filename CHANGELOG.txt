@@ -1,34 +1,25 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.6.0 - 2025-11-14
+Version 0.6.0 - 2025-11-15
 ---------------------------
 
-PERFORMANCE OPTIMIZATION: Phase 1 Quick Wins (2024-12-XX)
+PERFORMANCE OPTIMIZATION:
   - Overview: Implemented three high-impact, low-risk performance optimizations
-  - Step 1.1: Guard Diagnostic Queries Behind Debug Flag ✅
+  - Step 1: Guard Diagnostic Queries Behind Debug Flag
     * Added new debug flag: `global.$GT_Config.$Debug.$DiagnosticQueries` (default: false)
     * Diagnostic queries (4 galaxy-wide scans) now only run when flag is enabled
     * Impact: Eliminates unnecessary C++ queries in normal play
     * Files Modified: `md/gt_configuration.xml`, `md/gt_trading_search.xml`
-  - Step 1.2: Add match_gate_distance to Native Queries ✅
-    * Added `match_gate_distance` filter to all native `find_sell_offer` and `find_buy_offer` queries
-    * Uses home sector anchor for distance pre-filtering (basic pathfinding)
-    * Only applies to normal searches (skipped for fallback searches)
-    * MD still does accurate blacklist-aware filtering after native query
-    * Impact: Reduces C++ query results by 80-90% (filters at native level)
-    * Files Modified: `md/gt_trading_search.xml`
-  - Step 1.3: Reorder Filtering Checks (Cheap First) ✅
+  - Step 2: Reorder Filtering Checks (Cheap First)
     * Added early returns in `GT_FilterTradeForShip` after ware basket and illegal checks
     * Pathfinding now only runs if cheap checks pass
     * Impact: Reduces pathfinding calls by 50-70% (skips expensive checks when cheap checks fail)
     * Files Modified: `md/gt_trade_utilities.xml`
   - Expected Performance Improvement:
     * Diagnostic queries: 100% reduction in normal play (0 scans vs 4 per cache miss)
-    * Native query results: 80-90% reduction (filtered at C++ level)
+    * Native query results: No reduction (X4 limitation prevents C++-level distance filtering)
     * Pathfinding calls: 50-70% reduction (early returns from cheap checks)
-  - Status: Phase 1 complete. Phase 2 (cache optimizations) ready for implementation.
-  - Documentation: See `DOCS/TECHNICAL/PERFORMANCE_OPTIMIZATION_PLAN.md` for full details.
 
 
 CRITICAL FIX: Home Sector Drift Prevention
@@ -56,7 +47,7 @@ CRITICAL FIX: Home Sector Drift Prevention
     * No more cascading drift - home sector remains stable
     * Ships far from home will correctly search for trades within maxDistance from their actual home sector
     * Error logging will help detect if defaultorder.$home is somehow null
-  - User Report: "Ships were getting stuck far from home sector, especially S-class and small M-class ships. After manually sending ships to home sector, all ships found trades again (cache refresh)."
+
 
 NEW FEATURE: Ship Modifications System (Initial Implementation)
   - Overview: Automatic installation and removal of Trade Consortium modifications on ships with active GT orders
@@ -101,7 +92,81 @@ NEW FEATURE: Ship Modifications System (Initial Implementation)
     * Mission unlock system: Mods will require completing a special mission (first pilot to reach Level 15 MAX XP)
     * Maximum equipment check: Mods will only install on ships with maximum equipment (MK3 shields/thrusters/engines)
     * Additional modification slots may be added based on user feedback
-  - Status: ✅ Basic functionality implemented and tested. Feature will be expanded in future updates.
+  - Status: Basic functionality implemented and tested. Feature will be expanded in future updates.
+
+
+CODE REFACTORING: Search Methods Extraction
+  - Overview: Extracted three main search methods into separate file for better code organization and maintainability
+  - Implementation:
+    * **New File**: `md/gt_search_methods.xml` - Contains all three search method cues
+      - `SearchCachedTrades` (~1115 lines) - Searches cached trade entries
+      - `SearchLiveTrades` (~710 lines) - Performs live trade searches with batch processing
+      - `SearchFallbackTrades` (~76 lines) - Fallback search with relaxed parameters
+    * **Updated References**: All signal calls in `gt_trading_search.xml` updated to use `md.GT_Search_Methods.CueName`
+    * **Signal Updates**: 
+      - `SearchCachedTrades` → `md.GT_Search_Methods.SearchCachedTrades`
+      - `SearchLiveTrades` → `md.GT_Search_Methods.SearchLiveTrades`
+      - `SearchFallbackTrades` → `md.GT_Search_Methods.SearchFallbackTrades`
+    * **Internal Signal**: `SearchFallbackTrades` signals `md.GT_Search_Methods.SearchLiveTrades` internally
+  - Benefits:
+    * **Code Organization**: Reduced `gt_trading_search.xml` from 4676 lines to 2779 lines (~40% reduction)
+    * **Maintainability**: Search methods now isolated in dedicated file, easier to locate and modify
+    * **Separation of Concerns**: Search logic separated from main trade route coordination logic
+    * **No Functional Changes**: All functionality preserved, only organizational improvement
+  - Files Created:
+    * `md/gt_search_methods.xml` (new file with 1901 lines)
+  - Files Modified:
+    * `md/gt_trading_search.xml` (removed 3 cues, updated signal references)
+
+
+FIX: Integer Division Bug in Profit Threshold Calculation
+  - Issue: Level 11 pilot showing "Profit threshold calculated: 0 Cr" despite formula expecting ~6,122 Cr
+  - Root Cause: Integer division bug in `GT_GetPilotLevelProfitThreshold` library function
+  - Problem: Formula `1000000 * ((skillLevel - 1) / 14)^2` was performing integer division, causing `(skillLevel - 1) / 14` to evaluate to 0 for skillLevel < 15
+  - Solution: Changed formula to `((skillLevel - 1)^2 * 1000000) / 196` to ensure correct floating-point calculation
+  - Impact:
+    * Level 1: 0 Cr (unchanged)
+    * Level 11: Now correctly calculates ~6,122 Cr (was 0 Cr due to integer division)
+    * Level 15: 10,000 Cr (unchanged)
+  - Files Modified:
+    * `md/gt_trade_utilities.xml` (GT_GetPilotLevelProfitThreshold function, lines 303-311)
+
+
+FIX: Race Condition in Trade Execution - Trade Becomes Invalid Between Selection and Execution
+  - Issue: Selected trade offers were consumed by another ship between selection and execution, causing "trade no longer valid" errors
+  - Root Cause: Trade offers can be consumed between `SearchTradeRoutes` selecting a trade and `ExecuteTrade` executing it
+  - Problem: When trade becomes invalid, ship would immediately restart search, wasting time and potentially missing other valid trades from the same search
+  - Solution: Implemented fallback mechanism in `ExecuteTrade` to iterate through `$tradeList` and find next valid trade
+    * If selected trade's buy/sell offers are no longer `available` or `amount gt 0`, iterate through `$tradeList`
+    * Find first valid trade (both offers available and have amount > 0)
+    * Replace current trade with valid fallback and continue execution
+    * If no valid fallback found, signal `GT_No_Trade_Found` to trigger new search
+  - Benefits:
+    * **Reduced Search Restarts**: Ship tries fallback trades before restarting search
+    * **Better Trade Utilization**: Uses other valid trades from same search result
+    * **Improved Performance**: Avoids unnecessary search restarts when valid alternatives exist
+  - Files Modified:
+    * `md/gt_trading_execution.xml` (ExecuteTrade cue, lines 70-113)
+    * `md/gt_trading_search.xml` (SearchTradeRoutes now passes `$tradeList` to ExecuteTrade)
+
+
+FIX: Maintenance Station Selection - Stations Not Sorted by Distance After Combining Lists
+  - Issue: Ships were flying past closer stations to reach farther stations for equipment resupply
+  - Root Cause: Station lists (equipment docks, wharfs, shipyards) were found separately and sorted individually, but when combined, the final list was NOT re-sorted by distance
+  - Problem: Final list order was: all equipment docks (sorted) + all wharfs (sorted) + all shipyards (sorted)
+    * A shipyard 2 jumps away would come after an equipment dock 6 jumps away
+    * Ship would select the equipment dock 6 jumps away instead of the closer shipyard
+  - Solution: After combining all station types, re-sort the combined list by distance from ship
+    * Create temporary table mapping stations to their `gatedistance` from ship
+    * Sort combined list using `sort_list` with distance table
+    * Unreachable stations (distance < 0) sorted last (distance set to 999999)
+  - Impact:
+    * Ships now always select the nearest station regardless of station type
+    * Equipment docks, wharfs, and shipyards are evaluated in distance order
+    * Reduces unnecessary travel time for equipment resupply
+  - Files Modified:
+    * `md/gt_maintenance.xml` (ExecuteMaintenance cue, lines 414-431)
+
 
 Version 0.5.20 - 2025-11-13
 ---------------------------
