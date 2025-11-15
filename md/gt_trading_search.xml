@@ -67,26 +67,42 @@
         </do_if>
         
         <!-- ✅ CRITICAL: Check batch status FIRST, before ANY other processing -->
-        <!-- If batch is in progress, exit IMMEDIATELY - don't do ANY processing -->
+        <!-- If batch is in progress FOR THIS SHIP, exit IMMEDIATELY - don't do ANY processing -->
         <!-- This prevents race conditions where SearchTradeRoutes continues executing after SearchLiveTrades starts batch processing -->
+        <!-- ✅ FIX: Check if batch is for THIS ship, not just if ANY batch is in progress -->
         <set_value name="$waitingForBatch" exact="false"/>
-        <do_if value="global.$GT_SearchResult.$WaitingForBatch?">
-          <set_value name="$waitingForBatch" exact="global.$GT_SearchResult.$WaitingForBatch"/>
+        <set_value name="$batchShip" exact="null"/>
+        <do_if value="global.$GT_SearchResult.$WaitingForBatch? and global.$GT_SearchResult.$WaitingForBatch">
+          <set_value name="$waitingForBatch" exact="true"/>
+          <do_if value="global.$GT_SearchResult.$Ship?">
+            <set_value name="$batchShip" exact="global.$GT_SearchResult.$Ship"/>
+          </do_if>
         </do_if>
         
-        <!-- ✅ SIMPLIFIED: If batch is in progress, exit IMMEDIATELY -->
-        <!-- Don't check continuation, don't extract results, don't do ANYTHING -->
-        <!-- SearchLiveTrades_Resume will signal this cue again when batch completes -->
-        <do_if value="$waitingForBatch">
+        <!-- ✅ FIX: Only exit if batch is in progress FOR THIS SHIP -->
+        <!-- If batch is for a different ship, proceed normally -->
+        <do_if value="$waitingForBatch and $batchShip == $params.$Ship">
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') ⏸️ Batch processing in progress - waiting for completion (will resume when batch completes)'" chance="100"/>
+            <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') ⏸️ Batch processing in progress FOR THIS SHIP - waiting for completion (will resume when batch completes)'" chance="100"/>
           </do_if>
           <!-- Exit - SearchLiveTrades_Resume will signal this cue again when results are ready -->
           <cancel_cue cue="this"/>
         </do_if>
+        <do_elseif value="$waitingForBatch and $batchShip != $params.$Ship">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') ⚠️ Batch processing in progress FOR DIFFERENT SHIP (' + (if $batchShip? then $batchShip.idcode else 'UNKNOWN') + ') - proceeding normally'" chance="100"/>
+          </do_if>
+        </do_elseif>
         
-        <!-- ✅ CRITICAL: Only run the heavy processing when batch is NOT in progress -->
-        <do_if value="not $waitingForBatch">
+        <!-- ✅ CRITICAL: Only run the heavy processing when batch is NOT in progress FOR THIS SHIP -->
+        <!-- If batch is for a different ship, proceed normally -->
+        <set_value name="$shouldProceed" exact="true"/>
+        <do_if value="$waitingForBatch and $batchShip == $params.$Ship">
+          <!-- Batch is in progress for THIS ship - don't proceed -->
+          <set_value name="$shouldProceed" exact="false"/>
+        </do_if>
+        
+        <do_if value="$shouldProceed">
         <set_value name="$ship" exact="$params.$Ship"/>
         <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
         <set_value name="$minROI" exact="$params.$MinROI"/>
@@ -1220,8 +1236,23 @@
         <do_else>
           <!-- No valid trades found -->
           
-          <!-- ✅ REMOVED: Redundant batch check - already handled at the beginning of the cue -->
-          <!-- Batch processing is complete (checked at start) - safe to proceed with "no trade found" logic -->
+          <!-- ✅ CRITICAL FIX: Check batch status BEFORE executing "no trade found" logic -->
+          <!-- If batch is in progress, exit immediately - don't process stale data or signal failure -->
+          <!-- SearchLiveTrades_Resume will signal this cue again when batch completes -->
+          <set_value name="$batchStillInProgress" exact="false"/>
+          <do_if value="global.$GT_SearchResult.$WaitingForBatch?">
+            <set_value name="$batchStillInProgress" exact="global.$GT_SearchResult.$WaitingForBatch"/>
+          </do_if>
+          
+          <do_if value="$batchStillInProgress">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') ⏸️ Batch processing still in progress - skipping no-trade-found logic (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+            </do_if>
+            <!-- Exit - SearchLiveTrades_Resume will signal this cue again when batch completes -->
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <!-- Batch processing is complete - safe to proceed with "no trade found" logic -->
             
             <!-- DEBUG: No trades found (only if not waiting for batch) -->
             <do_if value="not $waitingForBatch and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1601,55 +1632,71 @@
             <!-- Better UX: Don't escalate to 60s timeout when ship might just need blacklist adjustment -->
             <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
           </do_else>
-        </do_else>
+          </do_else>  <!-- ✅ FIX: Close do_else for batch check (batch NOT in progress) -->
+        </do_else>  <!-- ✅ FIX: Close do_else for bestTradeIsValidForExecution -->
+        </do_if>  <!-- ✅ FIX: Close do_if for $shouldProceed -->
         
-        <!-- CRITICAL: Release search lock ONLY if NOT waiting for batch processing -->
+        <!-- CRITICAL: Release search lock ONLY if NOT waiting for batch processing FOR THIS SHIP -->
         <!-- If waiting for batch, SearchLiveTrades_Resume will signal SearchTradeRoutes again -->
         <!-- and we'll release the lock after processing live search results -->
         <!-- If we're continuing from live search, this IS the final completion, so release the lock -->
-        <do_if value="not $waitingForBatch or $isLiveSearchContinuation">
-          <do_if value="global.$GT_SearchLocks.{$ship}?">
-            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+        <!-- ✅ FIX: Use $params.$Ship instead of $ship (available even if $shouldProceed was false) -->
+        <set_value name="$shipForCleanup" exact="$params.$Ship"/>
+        <do_if value="$shouldProceed and $ship?">
+          <!-- If we proceeded, use the processed $ship (might have been modified) -->
+          <set_value name="$shipForCleanup" exact="$ship"/>
+        </do_if>
+        
+        <set_value name="$isWaitingForThisShipBatch" exact="false"/>
+        <do_if value="$waitingForBatch and $batchShip == $params.$Ship">
+          <set_value name="$isWaitingForThisShipBatch" exact="true"/>
+        </do_if>
+        
+        <do_if value="not $isWaitingForThisShipBatch or $isLiveSearchContinuation">
+          <do_if value="global.$GT_SearchLocks.{$shipForCleanup}?">
+            <remove_value name="global.$GT_SearchLocks.{$shipForCleanup}"/>
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$lockReason" exact="if $isLiveSearchContinuation then 'live search continuation complete' else 'search complete'"/>
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search lock released (' + $lockReason + ')'" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock released (' + $lockReason + ')'" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
         <do_else>
-          <!-- Batch processing in progress - keep lock until live search completes -->
+          <!-- Batch processing in progress FOR THIS SHIP - keep lock until live search completes -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search lock retained (waiting for live search batch to complete)'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock retained (waiting for live search batch to complete)'" chance="100"/>
           </do_if>
         </do_else>
         
-        <!-- CRITICAL: Clean up AI parameters ONLY if NOT waiting for batch processing -->
+        <!-- CRITICAL: Clean up AI parameters ONLY if NOT waiting for batch processing FOR THIS SHIP -->
         <!-- If waiting for batch, we'll need these parameters when processing live search results -->
         <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
-        <do_if value="not $waitingForBatch or $isLiveSearchContinuation">
+        <do_if value="not $isWaitingForThisShipBatch or $isLiveSearchContinuation">
           <!-- ✅ SIMPLIFIED: Initialization guarantees global.$GT_AIParameters exists -->
-          <do_if value="global.$GT_AIParameters.{$ship}?">
-            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          <do_if value="global.$GT_AIParameters.{$shipForCleanup}?">
+            <remove_value name="global.$GT_AIParameters.{$shipForCleanup}"/>
           </do_if>
         </do_if>
         
         <!-- ✅ PERFORMANCE FIX: Mark search complete and process next ship in queue -->
-        <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
-          <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+        <!-- ✅ FIX: Use $shipForCleanup instead of $ship (available even if $shouldProceed was false) -->
+        <set_value name="$shipForQueue" exact="$shipForCleanup"/>
+        
+        <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$shipForQueue}?">
+          <remove_value name="global.$GT_SearchQueue.$Params.{$shipForQueue}"/>
         </do_if>
         
         <!-- Decrement active search counter -->
         <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
         
         <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') 🔍 SEARCH COMPLETE (active: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + global.$GT_SearchQueue.$MaxConcurrent + ', queued: ' + global.$GT_SearchQueue.$Ships.count + ')'" chance="100"/>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForQueue.idcode + ') 🔍 SEARCH COMPLETE (active: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + global.$GT_SearchQueue.$MaxConcurrent + ', queued: ' + global.$GT_SearchQueue.$Ships.count + ')'" chance="100"/>
         </do_if>
         
         <!-- Continue processing search queue if there are ships waiting -->
         <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
           <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
         </do_if>
-        </do_if>  <!-- ✅ End of "batch NOT in progress" block -->
       </actions>
     </cue>
     
@@ -2195,57 +2242,26 @@
             </do_if>
             
             <!-- ✅ CACHE AS HINT: Re-query FRESH trade offers from the cached stations -->
-            <!-- Query entries that are either:
-                1. Better than current best (might improve our best trade), OR
-                2. We haven't reached max trades yet (need to build diverse list)
-                3. CRITICAL: Efficiency comparison only makes sense WITHIN same ware, NOT across wares
-                4. For diversity: If we don't have trades for this ware yet, query based on profit/ROI only
-            -->
-            <!-- Get cache threshold early (needed for diversity check) -->
+            <!-- ✅ FIX: Distance penalties should only affect SCORING/RANKING, not FILTERING -->
+            <!-- Query ALL profitable trades (profit >= minAbsoluteProfit, ROI >= cacheThreshold) -->
+            <!-- Efficiency/score is used ONLY for ranking - we always select the best available trade -->
+            <!-- Get cache threshold early (needed for profit/ROI check) -->
             <set_value name="$cacheThreshold" exact="20"/>
             <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
               <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
             </do_if>
             
+            <!-- ✅ FIX: Query ALL trades that meet profit/ROI thresholds, regardless of efficiency/score -->
+            <!-- Efficiency is calculated for ranking only - we want "the best of the worst" if that's all that's available -->
             <set_value name="$shouldQuery" exact="false"/>
-            <do_if value="$efficiency gt $bestScore">
-              <!-- Always query if better than current best -->
-              <set_value name="$shouldQuery" exact="true"/>
+            <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit ge $minAbsoluteProfit">
+              <do_if value="$cacheEntry.$ROI? and $cacheEntry.$ROI ge $cacheThreshold">
+                <!-- Trade meets profit and ROI thresholds - query fresh offers for ranking -->
+                <set_value name="$shouldQuery" exact="true"/>
+              </do_if>
             </do_if>
-            <do_elseif value="$tradeList.count lt $maxTradesToReturn">
-              <!-- Check if we already have trades for this ware -->
-              <set_value name="$hasTradesForThisWare" exact="false"/>
-              <set_value name="$currentWare" exact="@$cacheEntry.$BuyOffer.ware"/>
-              <do_if value="$currentWare?">
-                <do_all exact="$tradeList.count" counter="$i">
-                  <do_if value="$tradeList.{$i}.$BuyOffer.ware == $currentWare">
-                    <set_value name="$hasTradesForThisWare" exact="true"/>
-                    <break/>
-                  </do_if>
-                </do_all>
-              </do_if>
-              
-              <!-- Calculate whether to query based on ware diversity -->
-              <do_if value="$hasTradesForThisWare">
-                <!-- We already have trades for this ware - use efficiency threshold (compare within same ware) -->
-                <!-- Use 50% of best score as threshold (only meaningful for same ware) -->
-                <set_value name="$efficiencyThreshold" exact="$bestScore / 2"/>
-                <do_if value="$bestScore == 0 or $efficiency ge $efficiencyThreshold">
-                  <set_value name="$shouldQuery" exact="true"/>
-                </do_if>
-              </do_if>
-              <do_else>
-                <!-- We don't have trades for this ware yet - query based on profitability only (not efficiency vs other wares) -->
-                <!-- Efficiency can't be compared across different wares, so just check if trade is profitable -->
-                <do_if value="$cacheEntry.$Profit? and $cacheEntry.$Profit ge $minAbsoluteProfit">
-                  <do_if value="$cacheEntry.$ROI? and $cacheEntry.$ROI ge $cacheThreshold">
-                    <set_value name="$shouldQuery" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_else>
-            </do_elseif>
             
-            <!-- Track entries that are skipped due to efficiency threshold -->
+            <!-- Track entries that don't meet profit/ROI thresholds -->
             <do_if value="not $shouldQuery">
               <set_value name="$ware" exact="@$cacheEntry.$BuyOffer.ware"/>
               <!-- ✅ FIX: Check both existence AND non-null (ware? only checks existence, not null) -->
@@ -2279,10 +2295,16 @@
                 </do_if>
                 <set_value name="$wareStats" exact="$tradesByWareBeforeFiltering.{$ware}"/>
                 <set_value name="$wareStats.$filtered" exact="$wareStats.$filtered + 1"/>
-                <set_value name="$wareStats.$efficiencyThreshold" exact="$wareStats.$efficiencyThreshold + 1"/>
+                <!-- Track why it was filtered (profit or ROI too low) -->
+                <do_if value="not $cacheEntry.$Profit? or $cacheEntry.$Profit lt $minAbsoluteProfit">
+                  <set_value name="$wareStats.$profitTooLow" exact="$wareStats.$profitTooLow + 1"/>
+                </do_if>
+                <do_if value="not $cacheEntry.$ROI? or $cacheEntry.$ROI lt $cacheThreshold">
+                  <set_value name="$wareStats.$roiBelowThreshold" exact="$wareStats.$roiBelowThreshold + 1"/>
+                </do_if>
                 <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
               </do_if>
-              <!-- Skip to next entry (efficiency too low to query) -->
+              <!-- Skip to next entry (doesn't meet profit/ROI thresholds) -->
               <continue/>
             </do_if>
             
