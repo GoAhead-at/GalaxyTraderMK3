@@ -206,18 +206,6 @@
             <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
           </do_else>
           
-          <!-- ✅ OPTIMIZATION: If default order is Assist, schedule delayed verification -->
-          <!-- Assist order takes time to process commander removal, so schedule a check -->
-          <set_value name="$currentDefaultOrder" exact="@$ship.defaultorder.id"/>
-          <do_if value="$currentDefaultOrder == 'Assist' and $hasCommander">
-            <!-- Ship has Assist order and commander - schedule delayed verification -->
-            <!-- This catches cases where commander is removed after Assist script processes -->
-            <set_value name="$state.$DelayedVerificationTime" exact="player.age + 5s"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - GT order cancelled with Assist order, scheduled delayed verification in 5s (commander still present)'" chance="100"/>
-            </do_if>
-          </do_if>
-          
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - GT order cancelled, state updated (has commander: ' + $hasCommander + ', subordinate state: ' + $state.$SubordinateState + ')'" chance="100"/>
           </do_if>
@@ -384,87 +372,389 @@
     <!-- COMMENTED OUT: Event-driven detection handles all cases, no need for constant polling -->
     <!-- Note: VerifyGTOrders cue was removed due to XML comment nesting issues -->
     
-    <!-- ✅ OPTIMIZATION: Delayed verification for Assist order scenarios -->
-    <!-- When GT order is cancelled with Assist order, schedule a one-time check -->
-    <!-- This catches cases where commander removal happens after Assist script processes -->
-    <cue name="DelayedVerification" instantiate="true" checkinterval="5s">
+    <!-- ✅ EVENT-DRIVEN: Detect when GalaxyTraderMK3 order is cancelled (catches "remove all commands and orders" on direct GT orders) -->
+    <!-- CRITICAL: Only processes GalaxyTraderMK3 order cancellations (scoped like vanilla story_yaki.xml pattern) -->
+    <!-- FALLBACK: Only used when AI script doesn't emit signal (e.g., script wasn't running) -->
+    <cue name="DetectOrderCancellation" instantiate="true">
       <conditions>
-        <check_value value="global.$GT_Ship_State? and global.$GT_Ship_State.keys.count gt 0"/>
+        <event_object_order_cancelled object="player.galaxy"/>
+        <check_value value="event.object.isclass.ship"/>
+        <check_value value="event.object.owner == faction.player"/>
+        <!-- ✅ CRITICAL GATE: Only process GalaxyTraderMK3 order cancellations (matches vanilla scoped event pattern) -->
+        <check_value value="event.param? and event.param.id? and @event.param.id == 'GalaxyTraderMK3'"/>
       </conditions>
+      <!-- Small delay to let order cancellation complete -->
+      <delay exact="100ms"/>
       <actions>
-        <set_value name="$shipKeys" exact="global.$GT_Ship_State.keys.list"/>
+        <set_value name="$ship" exact="event.object"/>
+        <debug_text text="'[GT-State] Phase 7: DetectOrderCancellation triggered - GalaxyTraderMK3 order cancelled for ship: ' + $ship.idcode" chance="100"/>
         
-        <do_all exact="$shipKeys.count" counter="$i">
-          <set_value name="$ship" exact="$shipKeys.{$i}"/>
+        <!-- FAST PATH: Process event.object directly (not scanning all ships) -->
+        <!-- Check if ship was GT-controlled -->
+        <set_value name="$wasGTControlled" exact="false"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+          <set_value name="$wasGTControlled" exact="true"/>
+        </do_if>
+        <do_elseif value="global.$GT_Ship_State? and global.$GT_Ship_State.{$ship}?">
+          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+          <do_if value="$state.$HasGTOrder? and $state.$HasGTOrder">
+            <set_value name="$wasGTControlled" exact="true"/>
+          </do_if>
+        </do_elseif>
+        
+        <!-- Only process if ship was GT-controlled -->
+        <do_if value="$wasGTControlled">
+          <!-- Check if ship still has GT order (direct or via commander) -->
+          <set_value name="$hasGTOrderNow" exact="false"/>
           
-          <!-- Skip if ship no longer exists -->
-          <do_if value="not $ship.exists">
-            <continue/>
+          <!-- Check 1: Direct GT order -->
+          <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasGTOrderNow" exact="true"/>
           </do_if>
           
-          <!-- Get ship state -->
-          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
-          
-          <!-- Check if delayed verification is scheduled -->
-          <do_if value="$state.$DelayedVerificationTime? and player.age ge $state.$DelayedVerificationTime">
-            <!-- Time for delayed verification - check if commander was removed -->
+          <!-- Check 2: Subordinate to GT commander -->
+          <do_if value="not $hasGTOrderNow">
             <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckCommanderStatus" result="$commanderStatus">
               <param name="ship" value="$ship"/>
             </run_actions>
-            <set_value name="$hasCommanderActual" exact="$commanderStatus.$HasCommander"/>
-            <set_value name="$commanderHasGTActual" exact="$commanderStatus.$CommanderHasGT"/>
+            <do_if value="$commanderStatus.$HasCommander and $commanderStatus.$CommanderHasGT">
+              <set_value name="$hasGTOrderNow" exact="true"/>
+            </do_if>
+          </do_if>
+          
+          <!-- If ship no longer has GT order, trigger cleanup (only if AI script didn't already handle it) -->
+          <do_if value="not $hasGTOrderNow">
+            <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - GalaxyTraderMK3 order cancelled and GT order lost - triggering cleanup (FALLBACK: AI script may not have handled it)'" chance="100"/>
             
-            <!-- Check if state is stale (state says subordinate but ship is not) -->
-            <do_if value="$state.$SubordinateState == 'subordinate' and (not $hasCommanderActual or not $commanderHasGTActual)">
-              <!-- Stale state detected - fix it -->
-              <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - Delayed verification: Stale subordinate state detected (commander removed), fixing state...' +
-                '\n  Has commander (actual): ' + $hasCommanderActual +
-                '\n  Commander has GT (actual): ' + $commanderHasGTActual +
-                '\n  State.CommanderHasGT: ' + (if $state.$CommanderHasGT? then $state.$CommanderHasGT else 'unknown')" 
-                chance="100"/>
-              
-              <!-- Update state to reflect actual subordinate status -->
-              <set_value name="$state.$OperationalState" exact="'orphaned'"/>
-              <set_value name="$state.$ActiveTradeOrders" exact="0"/>
-              
-              <!-- Update commander state -->
-              <do_if value="$hasCommanderActual">
-                <set_value name="$state.$Commander" exact="$ship.commander"/>
-                <set_value name="$state.$CommanderHasGT" exact="$commanderHasGTActual"/>
-                <do_if value="$commanderHasGTActual">
-                  <set_value name="$state.$SubordinateState" exact="'subordinate'"/>
-                </do_if>
-                <do_else>
-                  <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
-                </do_else>
-              </do_if>
-              <do_else>
-                <set_value name="$state.$Commander" exact="null"/>
-                <set_value name="$state.$CommanderHasGT" exact="false"/>
-                <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
-              </do_else>
-              
-              <set_value name="$state.$LastStateUpdate" exact="player.age"/>
-              
-              <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled -->
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_RestoreShipName" result="$nameRestored">
-                <param name="ship" value="$ship"/>
-                <param name="reason" value="'Subordinate removed from GT commander - restoring original name (delayed verification)'"/>
-                <param name="checkSubordinate" value="false"/>
-                <param name="state" value="$state"/>
-                <param name="checkDirectGTOrder" value="true"/>
-              </run_actions>
-              <do_if value="$nameRestored">
-                <debug_text text="'[GT-State] Phase 7: Name restoration signal sent for ' + $ship.idcode + ' (delayed verification)'" chance="100"/>
-              </do_if>
+            <!-- Initialize state if missing -->
+            <do_if value="not global.$GT_Ship_State?">
+              <set_value name="global.$GT_Ship_State" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_Ship_State.{$ship}?">
+              <set_value name="global.$GT_Ship_State.{$ship}" exact="table[
+                $OperationalState = 'orphaned',
+                $SubordinateState = 'orphaned',
+                $Commander = null,
+                $CommanderHasGT = false,
+                $HasGTOrder = false,
+                $HasAssistOrder = false,
+                $ActiveTradeOrders = 0,
+                $LastStateUpdate = player.age
+              ]"/>
             </do_if>
             
-            <!-- Clear delayed verification flag -->
-            <remove_value name="$state.$DelayedVerificationTime"/>
+            <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+            
+            <!-- Update state -->
+            <set_value name="$state.$HasGTOrder" exact="false"/>
+            <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+            <set_value name="$state.$ActiveTradeOrders" exact="0"/>
+            <set_value name="$state.$Commander" exact="null"/>
+            <set_value name="$state.$CommanderHasGT" exact="false"/>
+            <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+            <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+            
+            <!-- Send cleanup signals -->
+            <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+              $Ship = $ship,
+              $UpdateType = 'GT_Order_Cancelled'
+            ]"/>
+            
+            <set_value name="$pilot" exact="@$ship.pilot"/>
+            <set_value name="$originalName" exact="null"/>
+            <do_if value="$pilot? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+            </do_if>
+            <do_elseif value="$state.$OriginalShipName?">
+              <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$originalName" exact="@$ship.macro.name"/>
+            </do_else>
+            
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $pilot,
+              $Reason = 'GT order removed (MD fallback) - restoring original name',
+              $OriginalName = $originalName
+            ]"/>
+            
+            <debug_text text="'[GT-State] Phase 7: Cleanup signals sent for ' + $ship.idcode + ' (MD fallback handler)'" chance="100"/>
           </do_if>
-        </do_all>
+        </do_if>
       </actions>
     </cue>
+    
+    <!-- ✅ EVENT-DRIVEN: Detect when subordinate is removed from commander (catches "remove all commands and orders" on subordinates) -->
+    <!-- This is the PRIMARY event for detecting subordinate removal -->
+    <!-- event.object = old commander, event.param = subordinate that was removed -->
+    <cue name="DetectSubordinateRemoval" instantiate="true">
+      <conditions>
+        <event_object_subordinate_removed object="player.galaxy"/>
+        <check_value value="event.param.isclass.ship"/>
+        <check_value value="event.param.owner == faction.player"/>
+      </conditions>
+      <delay exact="100ms"/>
+      <actions>
+        <set_value name="$subordinate" exact="event.param"/>
+        <set_value name="$commander" exact="event.object"/>
+        
+        <!-- ✅ DEBUG: Log event firing -->
+        <debug_text text="'[GT-State] 🔔 DetectSubordinateRemoval EVENT FIRED - Subordinate: ' + $subordinate.idcode + ', Commander: ' + (if $commander.exists then $commander.idcode else 'NONE')" chance="100"/>
+        
+        <!-- Check if subordinate was GT-controlled -->
+        <set_value name="$wasGTControlled" exact="false"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$subordinate}?">
+          <set_value name="$wasGTControlled" exact="true"/>
+        </do_if>
+        
+        <!-- ✅ CRITICAL: Only check if commander had GT order (subordinate was inheriting GT order) -->
+        <!-- Don't check subordinates that don't inherit GT order at all -->
+        <set_value name="$commanderHadGT" exact="false"/>
+        <set_value name="$commanderOrder" exact="'NONE'"/>
+        <do_if value="$commander.exists">
+          <set_value name="$commanderOrder" exact="@$commander.defaultorder.id"/>
+          <do_if value="$commander.defaultorder? and @$commander.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$commanderHadGT" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ✅ DEBUG: Log check results -->
+        <debug_text text="'[GT-State] DetectSubordinateRemoval CHECK: ' + $subordinate.idcode + ' - wasGTControlled: ' + $wasGTControlled + ', commanderHadGT: ' + $commanderHadGT + ', commanderOrder: ' + $commanderOrder" chance="100"/>
+        
+        <!-- Only trigger delayed verification if subordinate was GT-controlled AND commander had GT order -->
+        <do_if value="$wasGTControlled and $commanderHadGT">
+          <debug_text text="'[GT-State] Subordinate removed: ' + $subordinate.idcode + ' from GT commander ' + $commander.idcode + ' - starting Assist order check'" chance="100"/>
+          
+          <!-- Initialize delayed verification registry -->
+          <do_if value="not global.$GT_DelayedVerification?">
+            <set_value name="global.$GT_DelayedVerification" exact="table[]"/>
+          </do_if>
+          
+          <!-- Signal to start checking -->
+          <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
+            $Ship = $subordinate,
+            $CheckTime = player.age
+          ]"/>
+        </do_if>
+        <do_else>
+          <!-- Subordinate removed but commander didn't have GT order - no delayed check needed -->
+          <debug_text text="'[GT-State] Subordinate removed: ' + $subordinate.idcode + ' from commander ' + (if $commander.exists then $commander.idcode else 'NONE') + ' - commander had GT: ' + $commanderHadGT + ' (order: ' + $commanderOrder + ') - skipping delayed check'" chance="100"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- ✅ EVENT-DRIVEN: Detect when commander is set/changed (catches "remove all commands and orders" on subordinates) -->
+    <!-- FAST PATH: Process event.object directly (the ship whose commander changed) -->
+    <!-- FALLBACK: Only used when AI script doesn't emit signal -->
+    <cue name="DetectCommanderRemoval" instantiate="true">
+      <conditions>
+        <event_object_commander_set object="player.galaxy"/>
+        <check_value value="event.object.isclass.ship"/>
+        <check_value value="event.object.owner == faction.player"/>
+      </conditions>
+      <!-- Small delay to let commander change complete -->
+      <delay exact="100ms"/>
+      <actions>
+        <set_value name="$ship" exact="event.object"/>
+        <debug_text text="'[GT-State] Phase 7: DetectCommanderRemoval triggered - Commander changed for ship: ' + $ship.idcode" chance="100"/>
+        
+        <!-- FAST PATH: Process event.object directly (not scanning all ships) -->
+        <!-- Check if ship was tracked as subordinate to GT commander -->
+        <set_value name="$wasSubordinate" exact="false"/>
+        <do_if value="global.$GT_Ship_State? and global.$GT_Ship_State.{$ship}?">
+          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+          <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+            <set_value name="$wasSubordinate" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_elseif value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+          <!-- Ship is in GT_Ships registry - check if it was subordinate -->
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <!-- Was subordinate before - check if commander had GT order -->
+            <set_value name="$wasSubordinate" exact="true"/>
+          </do_if>
+        </do_elseif>
+        
+        <!-- Only process if ship was tracked as subordinate to GT commander -->
+        <do_if value="$wasSubordinate">
+          <!-- Check if ship still has GT commander -->
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckCommanderStatus" result="$commanderStatus">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <set_value name="$hasCommander" exact="$commanderStatus.$HasCommander"/>
+          <set_value name="$commanderHasGT" exact="$commanderStatus.$CommanderHasGT"/>
+          <set_value name="$hasGTCommanderNow" exact="$hasCommander and $commanderHasGT"/>
+          
+          <!-- If ship no longer has GT commander, trigger cleanup (only if AI script didn't already handle it) -->
+          <do_if value="not $hasGTCommanderNow">
+            <debug_text text="'[GT-State] Phase 7: ' + $ship.idcode + ' - Commander removed and GT commander lost - triggering cleanup (FALLBACK: AI script may not have handled it)'" chance="100"/>
+            
+            <!-- Initialize state if missing -->
+            <do_if value="not global.$GT_Ship_State?">
+              <set_value name="global.$GT_Ship_State" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_Ship_State.{$ship}?">
+              <set_value name="global.$GT_Ship_State.{$ship}" exact="table[
+                $OperationalState = 'orphaned',
+                $SubordinateState = 'orphaned',
+                $Commander = null,
+                $CommanderHasGT = false,
+                $HasGTOrder = false,
+                $HasAssistOrder = false,
+                $ActiveTradeOrders = 0,
+                $LastStateUpdate = player.age
+              ]"/>
+            </do_if>
+            
+            <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+            
+            <!-- Update state -->
+            <set_value name="$state.$HasGTOrder" exact="false"/>
+              <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+              <set_value name="$state.$ActiveTradeOrders" exact="0"/>
+            <set_value name="$state.$Commander" exact="null"/>
+            <set_value name="$state.$CommanderHasGT" exact="false"/>
+            <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+            <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+            
+            <!-- Send cleanup signals -->
+            <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+              $Ship = $ship,
+              $UpdateType = 'GT_Order_Cancelled'
+            ]"/>
+            
+            <set_value name="$pilot" exact="@$ship.pilot"/>
+            <set_value name="$originalName" exact="null"/>
+            <do_if value="$pilot? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+            </do_if>
+            <do_elseif value="$state.$OriginalShipName?">
+              <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$originalName" exact="@$ship.macro.name"/>
+            </do_else>
+            
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $pilot,
+              $Reason = 'Commander removed (MD fallback) - restoring original name',
+              $OriginalName = $originalName
+            ]"/>
+            
+            <debug_text text="'[GT-State] Phase 7: Cleanup signals sent for ' + $ship.idcode + ' (MD fallback handler)'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- ✅ DELAYED VERIFICATION: Event-driven delayed check (NO POLLING) -->
+    <!-- Handles cases where "remove all commands and orders" is used but default order hasn't changed immediately -->
+    <!-- Scheduled by Assist order's on_abort handler when default order is still "Assist" but commander lost GT order -->
+    <!-- Checks every 1 second for up to 20 seconds -->
+    <cue name="DelayedVerification" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Delayed_Verification'"/>
+      </conditions>
+      <!-- Check every 1 second -->
+      <delay exact="1s"/>
+      <actions>
+        <set_value name="$params" exact="event.param2"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        
+        <!-- Initialize state tracking if first run -->
+        <do_if value="not global.$GT_DelayedVerificationState?">
+          <set_value name="global.$GT_DelayedVerificationState" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_DelayedVerificationState.{$ship}?">
+          <set_value name="global.$GT_DelayedVerificationState.{$ship}" exact="table[
+            $CheckCount = 0,
+            $StartTime = player.age,
+            $CleanupSent = false
+          ]"/>
+        </do_if>
+        
+        <set_value name="$state" exact="global.$GT_DelayedVerificationState.{$ship}"/>
+        <set_value name="$state.$CheckCount" exact="$state.$CheckCount + 1"/>
+        <set_value name="$elapsedTime" exact="player.age - $state.$StartTime"/>
+        
+        <!-- Check: Is default order still "Assist"? -->
+        <set_value name="$defaultOrder" exact="@$ship.defaultorder.id"/>
+        
+        <!-- Check if ship has direct GT order (not via commander - commander check is unreliable due to stale state) -->
+        <set_value name="$hasDirectGT" exact="false"/>
+        <do_if value="$defaultOrder == 'GalaxyTraderMK3'">
+          <set_value name="$hasDirectGT" exact="true"/>
+        </do_if>
+        
+        <!-- Check commander for logging only (don't use for cancellation - can be stale) -->
+        <set_value name="$hasGTCommander" exact="false"/>
+        <set_value name="$currentCommander" exact="@$ship.commander"/>
+        <do_if value="$currentCommander? and $currentCommander.exists and $currentCommander != $ship">
+          <do_if value="$currentCommander.defaultorder? and @$currentCommander.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasGTCommander" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <debug_text text="'[GT-State] CHECK #' + $state.$CheckCount + ' (' + $elapsedTime + 's): ' + $ship.idcode + ' - Default Order: ' + (if $defaultOrder then $defaultOrder else 'NONE') + ', HasDirectGT: ' + $hasDirectGT + ', Commander: ' + (if $currentCommander? and $currentCommander.exists then $currentCommander.idcode else 'NONE') + ' (GT: ' + $hasGTCommander + ')'" chance="100"/>
+        
+        <!-- Stop after 20 seconds -->
+        <do_if value="$state.$CheckCount ge 20">
+          <debug_text text="'[GT-State] Timeout after 20s - stopping checks for ' + $ship.idcode" chance="100"/>
+          <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
+        </do_if>
+        <do_elseif value="$hasDirectGT">
+          <!-- Ship has DIRECT GT order - cancel early (not a subordinate) -->
+          <debug_text text="'[GT-State] DelayedVerification cancelled for ' + $ship.idcode + ' - Ship has direct GT order (check #' + $state.$CheckCount + ', ' + $elapsedTime + 's)'" chance="100"/>
+          <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
+        </do_elseif>
+        <do_else>
+          <!-- Check: Is Assist order gone? -->
+          <do_if value="$defaultOrder != 'Assist'">
+            <!-- Assist order is gone - trigger cleanup -->
+            <do_if value="not $state.$CleanupSent">
+              <set_value name="$state.$CleanupSent" exact="true"/>
+              <debug_text text="'[GT-State] ✅ Assist order REMOVED for ' + $ship.idcode + ' (check #' + $state.$CheckCount + ', ' + $elapsedTime + 's) - triggering cleanup'" chance="100"/>
+              
+              <!-- Trigger cleanup signals -->
+              <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+                $Ship = $ship,
+                $UpdateType = 'GT_Order_Cancelled'
+              ]"/>
+              
+              <!-- Get original name and restore -->
+              <set_value name="$pilot" exact="@$ship.pilot"/>
+              <set_value name="$originalName" exact="null"/>
+              <do_if value="$pilot? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+                <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+              </do_if>
+              <do_else>
+                <set_value name="$originalName" exact="@$ship.macro.name"/>
+              </do_else>
+              
+              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                $Ship = $ship,
+                $Pilot = $pilot,
+                $Reason = 'Assist order removed - restoring original name',
+                $OriginalName = $originalName
+              ]"/>
+              
+              <!-- Clean up state -->
+              <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Assist order still active - continue checking -->
+            <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
+              $Ship = $ship,
+              $CheckTime = player.age + 1s
+            ]"/>
+          </do_else>
+        </do_else>
+      </actions>
+    </cue>
+    
     
   </cues>
 </mdscript>

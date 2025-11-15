@@ -1,6 +1,140 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.2 - 2025-11-15
+---------------------------
+
+FIX: Trade Order Validation - Prevent "Trade Not Allowed" Errors
+  - Issue: Ships were receiving "trade not allowed" errors when attempting to create trade orders
+  - Root Cause: Trade offers were being validated earlier in the process, but not checked immediately before `create_trade_order` was called. Between validation and order creation, offers could be consumed or reserved by other ships, causing vanilla's `create_trade_order` to reject the order.
+  - Problem Scenario:
+    1. Ship validates trade offer (available=true, amount=1000)
+    2. Another ship reserves/consumes part of the offer (now only 500 available)
+    3. Ship calls `create_trade_order` with amount=1000
+    4. Vanilla rejects: "trade not allowed" (insufficient amount)
+  - Solution: Added final validation check immediately before `create_trade_order` following vanilla pattern
+    * Checks `offer.available` (offer still exists)
+    * Checks `offer.offeramount.{this.assignedcontrolled}` (ship-specific available amount after reservations)
+    * Validates both buy and sell offers have sufficient amount for requested trade
+    * If validation fails: Restart search (offers may have changed, need fresh search)
+    * If validation passes: Proceed with order creation
+  - Implementation:
+    * Added final validation block in `order.trade.galaxytrader.xml` before `create_trade_order` calls
+    * Uses vanilla pattern: `offer.available AND offer.offeramount.{this.assignedcontrolled} ge requestedAmount`
+    * `offeramount.{this.assignedcontrolled}` returns ship-specific available amount (accounts for reservations by other ships)
+    * If offer becomes invalid, signals `GT_No_Trade_Found` to restart search
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (added final validation check before order creation)
+  - Benefits:
+    * Prevents "trade not allowed" errors from race conditions
+    * Follows vanilla's proven validation pattern
+    * Handles multi-ship competition for same offers gracefully
+    * Restarts search when offers are consumed (ensures fresh trade data)
+  - Technical Details:
+    * Vanilla pattern from `order.trade.routine.xml` lines 643, 666, 838, 844
+    * `offeramount.{this.assignedcontrolled}` is ship-specific (different from total `amount`)
+    * Validation happens as late as possible (right before order creation) to minimize race window
+    * Debug logging shows which offer failed and why (available status and amounts)
+
+FIX: Missing GT_Order_Assigned Signal Emission - State Initialization
+  - Issue: Ships receiving GalaxyTrader orders never had their state properly initialized
+  - Root Cause: Handlers existed for `GT_Order_Assigned` events in both `gt_ship_state_manager` and `gt_ship_modifications`, but no code ever sent this signal when a ship was assigned a GT order. As a result, state tracking fields (`$HasGTOrder`, `$OriginalShipName`, `$DefaultOrder`) were never initialized, leaving downstream systems to rely on stale or default state.
+  - Problem Scenario:
+    1. Ship gets GalaxyTraderMK3 order assigned
+    2. State manager handler exists but never receives `GT_Order_Assigned` signal
+    3. `$HasGTOrder` remains false (or stale value)
+    4. `$OriginalShipName` never captured (name restoration fails)
+    5. Modifications may not install correctly
+  - Solution: Added `GT_Order_Assigned` signal emission when GT order is first assigned
+    * Signal sent in `init` label when `trackedDefaultOrder` is initialized for first time
+    * Includes `MacroShipName` parameter for proper state initialization
+    * Only sent when order is actually `GalaxyTraderMK3` (not for other orders)
+  - Implementation:
+    * Added signal emission in `order.trade.galaxytrader.xml` init label (lines 655-663)
+    * Checks if `trackedDefaultOrder` is being initialized for first time
+    * If order is `GalaxyTraderMK3`, sends `GT_Ship_State_Update` with `UpdateType='GT_Order_Assigned'`
+    * Includes `MacroShipName` from ship's macro for state tracking
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (added GT_Order_Assigned signal emission)
+  - Benefits:
+    * State now initializes correctly for all new GT order assignments
+    * `$HasGTOrder` properly set to true
+    * `$OriginalShipName` captured for name restoration
+    * Modifications install correctly on new assignments
+    * Downstream systems can rely on accurate state data
+  - Technical Details:
+    * Signal sent only once per ship (when order first assigned)
+    * Uses existing `GT_Ship_State_Update` signal infrastructure
+    * State manager handler already existed, just needed signal emission
+    * Modifications handler also listens for this signal (already implemented)
+
+FIX: State-Dependent Subordinate Cleanup - Memory Leaks
+  - Issue: Subordinates removed from GT commanders didn't trigger cleanup if they never had state initialized
+  - Root Cause: The Assist order patch only checked for subordinate removal if `global.$GT_Ship_State.{ship}` already existed. Subordinates that were assigned before state tracking existed, or that never had state initialized (e.g., they were just mirroring a commander), wouldn't trigger the cleanup block, leaving stale registry entries and preventing `GT_Order_Cancelled` signals.
+  - Problem Scenario:
+    1. Subordinate assigned to GT commander (before state tracking existed)
+    2. Subordinate removed from commander
+    3. Assist order detects no commander
+    4. Cleanup code checks: `global.$GT_Ship_State.{ship}?` → false (never initialized)
+    5. Cleanup block skipped → stale entries remain, mods not removed
+  - Solution: Made subordinate cleanup state-independent with lazy initialization
+    * Always initialize state registry and ship state if missing (lazy initialization)
+    * Dual-check approach: Check state first, then check commander directly as fallback
+    * Handles both cases: state-tracked subordinates and subordinates without prior state
+  - Implementation:
+    * Modified `order.assist.xml` patch (lines 66-112)
+    * Removed dependency on existing state - now initializes state lazily if missing
+    * Added dual-check: checks `$state.$SubordinateState` and `$state.$CommanderHasGT` first
+    * Fallback: checks commander directly if state wasn't tracked
+    * Ensures cleanup always runs, even if state was never initialized
+  - Files Modified:
+    * `aiscripts/order.assist.xml` (made subordinate cleanup state-independent)
+  - Benefits:
+    * All subordinates trigger cleanup correctly, regardless of state initialization
+    * Prevents memory leaks from stale registry entries
+    * Ensures `GT_Order_Cancelled` signal is sent for all subordinates
+    * Mods are removed correctly for all subordinates (not just state-tracked ones)
+    * Handles edge cases: ships assigned before state tracking existed
+  - Technical Details:
+    * Lazy initialization pattern: creates state entry only when needed
+    * Dual-check ensures robustness: state OR direct commander check
+    * Commander may still exist briefly during removal, so checks both
+    * Maintains backward compatibility with existing state-tracked ships
+
+FIX: Incomplete Queue Awareness - Maintenance Orders
+  - Issue: Trading queue could schedule trade searches while ships were busy with maintenance orders
+  - Root Cause: The trading queue only checked for trade orders (`tradeorders.count gt 0`) and training orders (`DockAndTrain`), but ignored maintenance orders (`Repair`, `Resupply`, `order.build.equip`, `DockAndWait`). This caused unnecessary trade searches to be scheduled while ships were still performing maintenance.
+  - Problem Scenario:
+    1. Ship receives Repair order (hull damage)
+    2. Trading queue checks: no trade orders, no DockAndTrain → ship not busy
+    3. Queue schedules trade search
+    4. Ship is still repairing → wasted CPU cycles, potential race conditions
+  - Solution: Added maintenance order checks to queue awareness
+    * Checks for `Repair` order (hull repairs)
+    * Checks for `Resupply` order (ammunition/missiles)
+    * Checks for `order.build.equip` (equipment installation)
+    * Checks for `DockAndWait` (waiting at station)
+    * Ships marked as "busy" when any maintenance order is active
+  - Implementation:
+    * Added maintenance order check in `gt_trading_queue.xml` (lines 251-260)
+    * Checks `$ship.order.id` against maintenance order IDs
+    * Sets `$isBusy = true` if maintenance order detected
+    * Includes debug logging for maintenance order detection
+  - Files Modified:
+    * `md/gt_trading_queue.xml` (added maintenance order checks)
+  - Benefits:
+    * Reduces wasted CPU cycles from unnecessary trade searches
+    * Prevents race conditions during maintenance
+    * Ships complete maintenance before searching for new trades
+    * Better performance and more predictable behavior
+    * More accurate "busy" detection
+  - Technical Details:
+    * Checks performed after trade orders and training checks (efficient ordering)
+    * Uses same `$isBusy` flag pattern as existing checks
+    * Debug logging follows existing pattern for consistency
+    * Order ID comparison uses exact match (no wildcards needed)
+
+
 Version 0.6.1 - 2025-11-15
 ---------------------------
 

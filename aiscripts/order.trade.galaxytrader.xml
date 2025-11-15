@@ -651,6 +651,16 @@
       <do_if value="not this.$trackedDefaultOrder?">
         <!-- First time - initialize tracked order -->
         <set_value name="this.$trackedDefaultOrder" exact="$currentDefaultOrder"/>
+        
+        <!-- ✅ FIX 1: Send GT_Order_Assigned signal when GT order is first assigned -->
+        <do_if value="$currentDefaultOrder == 'GalaxyTraderMK3'">
+          <debug_text text="'[GT-AI] ✅ GT order assigned to ' + this.ship.idcode + ' - sending GT_Order_Assigned signal'" chance="100"/>
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.ship,
+            $UpdateType = 'GT_Order_Assigned',
+            $MacroShipName = @this.ship.macro.name
+          ]"/>
+        </do_if>
       </do_if>
       <do_if value="this.$trackedDefaultOrder == 'GalaxyTraderMK3' and $currentDefaultOrder != 'GalaxyTraderMK3'">
         <!-- GT order was removed → send Phase 7 signal -->
@@ -2997,8 +3007,46 @@
       <set_value name="$isMaintenanceTransition" exact="true"/>
     </do_if>
     
+    <!-- ✅ COMPREHENSIVE DEBUG LOGGING: Ship state and orders at removal detection -->
     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Order terminating (actively trading: ' + $isActivelyTrading + ', training transition: ' + $isTrainingTransition + ', maintenance transition: ' + $isMaintenanceTransition + ')'" chance="100"/>
+      <set_value name="$debugShip" exact="this.ship"/>
+      <set_value name="$debugDefaultOrder" exact="@$debugShip.defaultorder.id"/>
+      <set_value name="$debugCommander" exact="@$debugShip.commander"/>
+      <set_value name="$debugCommanderId" exact="if $debugCommander? and $debugCommander.exists then $debugCommander.idcode else 'NONE'"/>
+      <set_value name="$debugCommanderOrder" exact="if $debugCommander? and $debugCommander.exists and $debugCommander.defaultorder? then @$debugCommander.defaultorder.id else 'NONE'"/>
+      <set_value name="$debugPilot" exact="@$debugShip.pilot"/>
+      <set_value name="$debugPilotName" exact="if $debugPilot? then $debugPilot.knownname else 'NONE'"/>
+      
+      <!-- Build orders list -->
+      <set_value name="$debugOrdersList" exact="[]"/>
+      <set_value name="$debugOrdersCount" exact="$debugShip.orders.count"/>
+      <do_all exact="$debugOrdersCount" counter="$i">
+        <set_value name="$orderId" exact="@$debugShip.orders.{$i}.id"/>
+        <append_to_list name="$debugOrdersList" exact="if $orderId then $orderId else 'UNKNOWN'"/>
+      </do_all>
+      <set_value name="$debugOrdersStr" exact="if $debugOrdersList.count gt 0 then $debugOrdersList.{1} + (if $debugOrdersList.count gt 1 then ', ' + $debugOrdersList.{2} else '') + (if $debugOrdersList.count gt 2 then ', ' + $debugOrdersList.{3} else '') + (if $debugOrdersList.count gt 3 then ', ' + $debugOrdersList.{4} else '') + (if $debugOrdersList.count gt 4 then ', ...' else '') else 'NONE'"/>
+      
+      <!-- Check GT order status -->
+      <set_value name="$debugHasDirectGT" exact="false"/>
+      <do_if value="$debugDefaultOrder == 'GalaxyTraderMK3'">
+        <set_value name="$debugHasDirectGT" exact="true"/>
+      </do_if>
+      <set_value name="$debugHasGTCommander" exact="false"/>
+      <do_if value="$debugCommander? and $debugCommander.exists and $debugCommanderOrder == 'GalaxyTraderMK3'">
+        <set_value name="$debugHasGTCommander" exact="true"/>
+      </do_if>
+      
+      <!-- Check if in GT_Ships registry -->
+      <set_value name="$debugInRegistry" exact="global.$GT_Ships? and global.$GT_Ships.{$debugShip}?"/>
+      
+      <debug_text text="'[GT-AI] 🔍 REMOVAL DETECTION DEBUG: ' + $debugShip.idcode + ' - COMPREHENSIVE STATE'" chance="100"/>
+      <debug_text text="'[GT-AI]   Ship: ' + $debugShip.idcode + ' (' + (if $debugShip.knownname then $debugShip.knownname else 'UNNAMED') + ')'" chance="100"/>
+      <debug_text text="'[GT-AI]   Pilot: ' + $debugPilotName + (if $debugPilot? then ' (exists)' else ' (NONE)')" chance="100"/>
+      <debug_text text="'[GT-AI]   Default Order: ' + (if $debugDefaultOrder then $debugDefaultOrder else 'NONE')" chance="100"/>
+      <debug_text text="'[GT-AI]   Active Orders (' + $debugOrdersCount + '): ' + $debugOrdersStr" chance="100"/>
+      <debug_text text="'[GT-AI]   Commander: ' + $debugCommanderId + ' (Order: ' + $debugCommanderOrder + ')'" chance="100"/>
+      <debug_text text="'[GT-AI]   GT Status: Direct=' + $debugHasDirectGT + ', ViaCommander=' + $debugHasGTCommander + ', InRegistry=' + $debugInRegistry" chance="100"/>
+      <debug_text text="'[GT-AI]   Flags: ActivelyTrading=' + $isActivelyTrading + ', TrainingTransition=' + $isTrainingTransition + ', MaintenanceTransition=' + $isMaintenanceTransition" chance="100"/>
     </do_if>
     
     <!-- ✅ PHASE 7: Order cancellation detection -->
@@ -3008,8 +3056,25 @@
     <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
     <set_value name="$isGTOrderCancelled" exact="false"/>
     
-    <!-- Only send Phase 7 if GT order is actually cancelled (not just trade orders) -->
-    <do_if value="not $isTrainingTransition and not $isMaintenanceTransition">
+    <!-- ✅ FIRST: Check if GT order is still active (direct or via commander) -->
+    <!-- CRITICAL: Check GT order status FIRST, regardless of training/maintenance transitions -->
+    <!-- If GT order is gone, we MUST clean up even if training/maintenance/disposal orders exist -->
+    <set_value name="$phase7HasDirectGT" exact="false"/>
+    <do_if value="$currentDefaultOrder == 'GalaxyTraderMK3'">
+      <set_value name="$phase7HasDirectGT" exact="true"/>
+    </do_if>
+    
+    <set_value name="$phase7HasGTCommander" exact="false"/>
+    <do_if value="not $phase7HasDirectGT and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+      <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+        <set_value name="$phase7HasGTCommander" exact="true"/>
+      </do_if>
+    </do_if>
+    
+    <!-- ✅ CRITICAL: If GT order is gone, process cleanup REGARDLESS of training/maintenance transitions -->
+    <!-- Only skip Phase 7 if GT order is STILL ACTIVE AND there's a training/maintenance transition -->
+    <do_if value="not $phase7HasDirectGT and not $phase7HasGTCommander">
+      <!-- GT order is gone - process cleanup even if training/maintenance/disposal orders exist -->
       <!-- Check if GT default order is still active -->
       <!-- CRITICAL: If defaultorder.id is null, different, or not GalaxyTraderMK3, GT order was cancelled -->
       <do_if value="not $currentDefaultOrder">
@@ -3080,29 +3145,38 @@
       </do_if>
       <do_elseif value="$currentDefaultOrder != 'GalaxyTraderMK3'">
         <!-- Different default order → Check if GT order was actually cancelled -->
-        <!-- CRITICAL: Only send GT_Order_Cancelled if ship NO LONGER has GT as default order -->
-        <!-- For subordinates, default order is Assist, but GT order is still active via commander -->
-        <!-- Check if ship has direct GT order OR is subordinate to GT commander -->
-        <set_value name="$hasGTOrder" exact="false"/>
-        
-        <!-- Check for direct GT order (re-check defaultorder.id directly) -->
+        <!-- CRITICAL: For subordinates with Assist order, trade order termination is NORMAL -->
+        <!-- Only emit cleanup if ship NO LONGER has GT order (direct or via commander) -->
         <set_value name="$actualDefaultOrder" exact="@this.ship.defaultorder.id"/>
+        
+        <!-- Check if ship has direct GT order -->
+        <set_value name="$hasDirectGTOrder" exact="false"/>
         <do_if value="$actualDefaultOrder == 'GalaxyTraderMK3'">
-          <set_value name="$hasGTOrder" exact="true"/>
+          <set_value name="$hasDirectGTOrder" exact="true"/>
         </do_if>
         
-        <!-- Check if subordinate to GT commander -->
-        <do_if value="not $hasGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+        <!-- Check if ship is subordinate to GT commander (current commander, not old) -->
+        <set_value name="$hasGTCommander" exact="false"/>
+        <do_if value="not $hasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
           <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
-            <set_value name="$hasGTOrder" exact="true"/>
+            <set_value name="$hasGTCommander" exact="true"/>
           </do_if>
         </do_if>
         
-        <!-- Only send GT_Order_Cancelled if GT order is actually gone -->
-        <do_if value="not $hasGTOrder">
+        <!-- Only emit cleanup if ship NO LONGER has GT order (direct or via commander) -->
+        <!-- CRITICAL: For subordinates, Assist order termination is handled by Assist order's on_abort -->
+        <!-- Trade order termination is NORMAL and should NOT trigger cleanup -->
+        <set_value name="$shouldEmitCleanup" exact="false"/>
+        <do_if value="not $hasDirectGTOrder and not $hasGTCommander">
+          <!-- No direct GT order and no GT commander = GT order truly gone -->
+          <set_value name="$shouldEmitCleanup" exact="true"/>
+        </do_if>
+        
+        <!-- Emit cleanup signal if GT order is gone -->
+        <do_if value="$shouldEmitCleanup">
           <set_value name="$isGTOrderCancelled" exact="true"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ', no GT order found)'" chance="100"/>
+            <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ', has direct GT: ' + $hasDirectGTOrder + ', has GT commander: ' + $hasGTCommander + ')'" chance="100"/>
           </do_if>
           <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
             $Ship = this.ship,
@@ -3111,7 +3185,7 @@
         </do_if>
         <do_else>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ⚠️ PHASE 7: Trade order aborted but GT order still active for ' + this.ship.idcode + ' (default order: ' + $currentDefaultOrder + ', actual default: ' + (if $actualDefaultOrder then $actualDefaultOrder else 'NONE') + ', has GT: ' + $hasGTOrder + ') - NOT sending GT_Order_Cancelled'" chance="100"/>
+            <debug_text text="'[GT-AI] ⚠️ PHASE 7: Trade order aborted but GT order still active for ' + this.ship.idcode + ' (default order: ' + $currentDefaultOrder + ', has direct GT: ' + $hasDirectGTOrder + ', has GT commander: ' + $hasGTCommander + ') - NOT sending GT_Order_Cancelled'" chance="100"/>
           </do_if>
         </do_else>
         
@@ -3170,11 +3244,192 @@
           </do_if>
         </do_if>
       </do_elseif>
-      <do_else>
-        <!-- GT order still active - this is just trade order cancellation, not GT order cancellation -->
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': on_abort fired but GT order still active (default order: ' + $currentDefaultOrder + ') - skipping Phase 7 (trade order cancellation, not GT order cancellation)'" chance="100"/>
-      </do_else>
     </do_if>
+    <do_elseif value="$phase7HasDirectGT or $phase7HasGTCommander">
+      <!-- GT order still active - only skip Phase 7 if there's a training/maintenance transition -->
+      <!-- This prevents cleanup when GT order creates training/maintenance orders (normal behavior) -->
+      <do_if value="not $isTrainingTransition and not $isMaintenanceTransition">
+        <!-- GT order active, no transitions - check if default order changed -->
+        <!-- (This is the original Phase 7 logic for when GT order is still active) -->
+        <!-- Check if GT default order is still active -->
+        <!-- CRITICAL: If defaultorder.id is null, different, or not GalaxyTraderMK3, GT order was cancelled -->
+        <do_if value="not $currentDefaultOrder">
+          <!-- No default order → GT order was cancelled -->
+          <set_value name="$isGTOrderCancelled" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: NONE)'" chance="100"/>
+          </do_if>
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.ship,
+            $UpdateType = 'GT_Order_Cancelled'
+          ]"/>
+          
+          <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled (direct or subordinate) -->
+          <!-- CRITICAL: Check if ship WAS a subordinate BEFORE GT order was cancelled -->
+          <!-- Use this.$was_subordinate flag or check state manager state -->
+          <set_value name="$wasSubordinateBeforeCancellation" exact="false"/>
+          <do_if value="this.$was_subordinate?">
+            <set_value name="$wasSubordinateBeforeCancellation" exact="true"/>
+          </do_if>
+          <do_elseif value="global.$GT_Ship_State? and global.$GT_Ship_State.{this.ship}?">
+            <!-- Check state manager to see if ship was a subordinate -->
+            <set_value name="$state" exact="global.$GT_Ship_State.{this.ship}"/>
+            <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+              <set_value name="$wasSubordinateBeforeCancellation" exact="true"/>
+            </do_if>
+          </do_elseif>
+          
+          <!-- Check if ship is CURRENTLY subordinate to GT commander -->
+          <set_value name="$isSubordinateOfGTCommander" exact="false"/>
+          <do_if value="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+            <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$isSubordinateOfGTCommander" exact="true"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Restore name if:
+               1. Ship was NOT a subordinate before cancellation, OR
+               2. Ship was a subordinate but is NO LONGER subordinate to GT commander -->
+          <set_value name="$shouldRestoreName" exact="false"/>
+          <do_if value="not $wasSubordinateBeforeCancellation">
+            <!-- Ship was not a subordinate - restore name if not currently subordinate to GT commander -->
+            <do_if value="not $isSubordinateOfGTCommander">
+              <set_value name="$shouldRestoreName" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$wasSubordinateBeforeCancellation and not $isSubordinateOfGTCommander">
+            <!-- Ship WAS a subordinate but is NO LONGER subordinate to GT commander - restore name -->
+            <set_value name="$shouldRestoreName" exact="true"/>
+          </do_elseif>
+          
+          <do_if value="$shouldRestoreName and this.ship.pilot?">
+            <set_value name="$originalName" exact="null"/>
+            <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName"/>
+            </do_if>
+            
+            <do_if value="$originalName">
+              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                $Ship = this.ship,
+                $Pilot = this.ship.pilot,
+                $Reason = 'GT order cancelled - restoring original name',
+                $OriginalName = $originalName
+              ]"/>
+              <debug_text text="'[GT-AI] ✅ PHASE 7: Name restoration signal sent for ' + this.ship.idcode + ' (was subordinate: ' + $wasSubordinateBeforeCancellation + ', currently subordinate: ' + $isSubordinateOfGTCommander + ', original name: ' + $originalName + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_elseif value="$currentDefaultOrder != 'GalaxyTraderMK3'">
+          <!-- Different default order → Check if GT order was actually cancelled -->
+          <!-- CRITICAL: For subordinates with Assist order, trade order termination is NORMAL -->
+          <!-- Only emit cleanup if ship NO LONGER has GT order (direct or via commander) -->
+          <set_value name="$actualDefaultOrder" exact="@this.ship.defaultorder.id"/>
+          
+          <!-- Check if ship has direct GT order -->
+          <set_value name="$hasDirectGTOrder" exact="false"/>
+          <do_if value="$actualDefaultOrder == 'GalaxyTraderMK3'">
+            <set_value name="$hasDirectGTOrder" exact="true"/>
+          </do_if>
+          
+          <!-- Check if ship is subordinate to GT commander (current commander, not old) -->
+          <set_value name="$hasGTCommander" exact="false"/>
+          <do_if value="not $hasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+            <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$hasGTCommander" exact="true"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Only emit cleanup if ship NO LONGER has GT order (direct or via commander) -->
+          <!-- CRITICAL: For subordinates, Assist order termination is handled by Assist order's on_abort -->
+          <!-- Trade order termination is NORMAL and should NOT trigger cleanup -->
+          <set_value name="$shouldEmitCleanup" exact="false"/>
+          <do_if value="not $hasDirectGTOrder and not $hasGTCommander">
+            <!-- No direct GT order and no GT commander = GT order truly gone -->
+            <set_value name="$shouldEmitCleanup" exact="true"/>
+          </do_if>
+          
+          <!-- Emit cleanup signal if GT order is gone -->
+          <do_if value="$shouldEmitCleanup">
+            <set_value name="$isGTOrderCancelled" exact="true"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ✅ PHASE 7: GT order cancelled for ' + this.ship.idcode + ' (detected in on_abort, default order: ' + $currentDefaultOrder + ', has direct GT: ' + $hasDirectGTOrder + ', has GT commander: ' + $hasGTCommander + ')'" chance="100"/>
+            </do_if>
+            <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+              $Ship = this.ship,
+              $UpdateType = 'GT_Order_Cancelled'
+            ]"/>
+          </do_if>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ⚠️ PHASE 7: Trade order aborted but GT order still active for ' + this.ship.idcode + ' (default order: ' + $currentDefaultOrder + ', has direct GT: ' + $hasDirectGTOrder + ', has GT commander: ' + $hasGTCommander + ') - NOT sending GT_Order_Cancelled'" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <!-- ✅ NAME RESTORATION: Restore ship name if not GT-controlled (direct or subordinate) -->
+          <!-- CRITICAL: Check if ship WAS a subordinate BEFORE GT order was cancelled -->
+          <!-- Use this.$was_subordinate flag or check state manager state -->
+          <set_value name="$wasSubordinateBeforeCancellation" exact="false"/>
+          <do_if value="this.$was_subordinate?">
+            <set_value name="$wasSubordinateBeforeCancellation" exact="true"/>
+          </do_if>
+          <do_elseif value="global.$GT_Ship_State? and global.$GT_Ship_State.{this.ship}?">
+            <!-- Check state manager to see if ship was a subordinate -->
+            <set_value name="$state" exact="global.$GT_Ship_State.{this.ship}"/>
+            <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+              <set_value name="$wasSubordinateBeforeCancellation" exact="true"/>
+            </do_if>
+          </do_elseif>
+          
+          <!-- Check if ship is CURRENTLY subordinate to GT commander -->
+          <set_value name="$isSubordinateOfGTCommander" exact="false"/>
+          <do_if value="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+            <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$isSubordinateOfGTCommander" exact="true"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Restore name if:
+               1. Ship was NOT a subordinate before cancellation, OR
+               2. Ship was a subordinate but is NO LONGER subordinate to GT commander -->
+          <set_value name="$shouldRestoreName" exact="false"/>
+          <do_if value="not $wasSubordinateBeforeCancellation">
+            <!-- Ship was not a subordinate - restore name if not currently subordinate to GT commander -->
+            <do_if value="not $isSubordinateOfGTCommander">
+              <set_value name="$shouldRestoreName" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$wasSubordinateBeforeCancellation and not $isSubordinateOfGTCommander">
+            <!-- Ship WAS a subordinate but is NO LONGER subordinate to GT commander - restore name -->
+            <set_value name="$shouldRestoreName" exact="true"/>
+          </do_elseif>
+          
+          <do_if value="$shouldRestoreName and this.ship.pilot?">
+            <set_value name="$originalName" exact="null"/>
+            <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName?">
+              <set_value name="$originalName" exact="global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName"/>
+            </do_if>
+            
+            <do_if value="$originalName">
+              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                $Ship = this.ship,
+                $Pilot = this.ship.pilot,
+                $Reason = 'GT order cancelled - restoring original name',
+                $OriginalName = $originalName
+              ]"/>
+              <debug_text text="'[GT-AI] ✅ PHASE 7: Name restoration signal sent for ' + this.ship.idcode + ' (was subordinate: ' + $wasSubordinateBeforeCancellation + ', currently subordinate: ' + $isSubordinateOfGTCommander + ', original name: ' + $originalName + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_elseif>
+        <do_else>
+          <!-- GT order still active - this is just trade order cancellation, not GT order cancellation -->
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': on_abort fired but GT order still active (default order: ' + $currentDefaultOrder + ') - skipping Phase 7 (trade order cancellation, not GT order cancellation)'" chance="100"/>
+        </do_else>
+      </do_if>
+      <do_else>
+        <!-- GT order still active AND training/maintenance transition - skip Phase 7 (normal behavior) -->
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT order still active with training/maintenance transition - skipping Phase 7 (normal transition, not removal)'" chance="100"/>
+      </do_else>
+    </do_elseif>
     
     <!-- Check if subordinate cleanup already sent signal (to avoid duplicate) -->
     <do_if value="this.$subordinate_cleanup_sent?">
@@ -3183,50 +3438,53 @@
     <do_else>
       <!-- ✅ CRITICAL FIX: Check for permanent removal FIRST, regardless of trading state -->
       <!-- When player stops order, we MUST restore name even if TradePerform orders are still active -->
+      <!-- KEY INSIGHT: Check if GT order is still active BEFORE checking trading state -->
       <set_value name="$isPermanentRemoval" exact="false"/>
       
-      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Current default order when GT order aborted: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE')" chance="100"/>
+      <!-- ✅ FIRST: Check if GT order is still active (direct or via commander) -->
+      <set_value name="$hasDirectGTOrder" exact="false"/>
+      <do_if value="$currentDefaultOrder == 'GalaxyTraderMK3'">
+        <set_value name="$hasDirectGTOrder" exact="true"/>
       </do_if>
       
-      <do_if value="not $currentDefaultOrder">
-        <!-- No default order at all → PERMANENT REMOVAL -->
-        <set_value name="$isPermanentRemoval" exact="true"/>
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No default order detected → PERMANENT REMOVAL'" chance="100"/>
-      </do_if>
-      <do_elseif value="$currentDefaultOrder and $currentDefaultOrder != 'GalaxyTraderMK3' and $currentDefaultOrder != 'Assist'">
-        <!-- Ship has a DIFFERENT permanent default order → PERMANENT REMOVAL -->
-        <set_value name="$isPermanentRemoval" exact="true"/>
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Different default order (' + $currentDefaultOrder + ') detected → PERMANENT REMOVAL'" chance="100"/>
-      </do_elseif>
-      
-      <!-- ✅ CRITICAL FIX: If ship is actively trading but GT order is being aborted, also check if ship is still registered -->
-      <!-- If ship was removed from GT (unregistered), definitely restore name -->
-      <set_value name="$isStillRegistered" exact="global.$GT_Ships? and global.$GT_Ships.{this.ship}?"/>
-      <do_if value="not $isStillRegistered">
-        <set_value name="$isPermanentRemoval" exact="true"/>
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship no longer registered in GT_Ships → PERMANENT REMOVAL (even if actively trading)'" chance="100"/>
-      </do_if>
-      
-      <!-- ✅ CRITICAL FIX: Check if ship is a subordinate (subordinates use "Assist" order, which is normal) -->
-      <set_value name="$isSubordinate" exact="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship"/>
-      
-      <!-- ✅ ADDITIONAL CHECK: If GT order is being aborted and ship is actively trading, check if current order is still GT -->
-      <!-- IMPORTANT: Subordinates use "Assist" order - this is NORMAL and should NOT trigger permanent removal -->
-      <!-- Only trigger permanent removal if ship is NOT a subordinate AND has a different order -->
-      <do_if value="not $isPermanentRemoval and $isActivelyTrading">
-        <do_if value="$currentDefaultOrder != 'GalaxyTraderMK3'">
-          <!-- If ship is a subordinate and order is "Assist", this is normal - don't treat as permanent removal -->
-          <do_if value="$isSubordinate and $currentDefaultOrder == 'Assist'">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Subordinate ship with Assist order (normal) - NOT treating as permanent removal (actively trading)'" chance="100"/>
-          </do_if>
-          <do_else>
-            <!-- Not a subordinate OR different order than Assist → PERMANENT REMOVAL -->
-            <set_value name="$isPermanentRemoval" exact="true"/>
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT order aborted but current order is ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ' → PERMANENT REMOVAL (actively trading, subordinate: ' + $isSubordinate + ')'" chance="100"/>
-          </do_else>
+      <set_value name="$hasGTCommander" exact="false"/>
+      <do_if value="not $hasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+        <do_if value="this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+          <set_value name="$hasGTCommander" exact="true"/>
         </do_if>
       </do_if>
+      
+      <!-- ✅ CRITICAL: If GT order is gone (no direct, no commander), it's permanent removal REGARDLESS of trading state -->
+      <do_if value="not $hasDirectGTOrder and not $hasGTCommander">
+        <set_value name="$isPermanentRemoval" exact="true"/>
+        <set_value name="$debugOrdersCount" exact="this.ship.orders.count"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT order removed (no direct GT, no GT commander) → PERMANENT REMOVAL (actively trading: ' + $isActivelyTrading + ', orders count: ' + $debugOrdersCount + ')'" chance="100"/>
+      </do_if>
+      <do_else>
+        <!-- GT order still active - check other conditions -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT order still active (direct: ' + $hasDirectGTOrder + ', commander: ' + $hasGTCommander + ') - checking other removal conditions'" chance="100"/>
+        </do_if>
+        
+        <do_if value="not $currentDefaultOrder">
+          <!-- No default order at all → PERMANENT REMOVAL -->
+          <set_value name="$isPermanentRemoval" exact="true"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No default order detected → PERMANENT REMOVAL'" chance="100"/>
+        </do_if>
+        <do_elseif value="$currentDefaultOrder and $currentDefaultOrder != 'GalaxyTraderMK3' and $currentDefaultOrder != 'Assist'">
+          <!-- Ship has a DIFFERENT permanent default order → PERMANENT REMOVAL -->
+          <set_value name="$isPermanentRemoval" exact="true"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Different default order (' + $currentDefaultOrder + ') detected → PERMANENT REMOVAL'" chance="100"/>
+        </do_elseif>
+        
+        <!-- ✅ CRITICAL FIX: If ship is actively trading but GT order is being aborted, also check if ship is still registered -->
+        <!-- If ship was removed from GT (unregistered), definitely restore name -->
+        <set_value name="$isStillRegistered" exact="global.$GT_Ships? and global.$GT_Ships.{this.ship}?"/>
+        <do_if value="not $isStillRegistered">
+          <set_value name="$isPermanentRemoval" exact="true"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship no longer registered in GT_Ships → PERMANENT REMOVAL (even if actively trading)'" chance="100"/>
+        </do_if>
+      </do_else>
       
       <!-- ✅ FIXED: Always restore name on permanent removal, even if actively trading -->
       <do_if value="$isPermanentRemoval">
