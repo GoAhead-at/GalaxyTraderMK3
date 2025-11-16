@@ -1,7 +1,7 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.6.4 - 2025-01-XX
+Version 0.6.4 - 2025-01-15
 ---------------------------
 
 FEATURE: MK3 Rename - Custom Ship Renaming via Context Menu
@@ -344,6 +344,87 @@ FIX: Cache Lookups Clobber In-Flight Live Searches - Prevent Race Condition
     * In-flight live searches no longer lose their state
     * Locks properly released when searches complete
     * Concurrent searches work correctly without interfering
+
+FIX: Cache Hit Execution - Send $Trade Parameter
+  - Issue: CheckTradeCache sent only $TradeList to ExecuteTrade, but ExecuteTrade's validation guard checked $Trade first and aborted before extraction could occur
+  - Root Cause: CheckTradeCache extracted first trade but didn't send it as $Trade parameter, relying on ExecuteTrade's extraction logic
+  - Problem Scenario:
+    1. Cache hit found → CheckTradeCache signals ExecuteTrade with only $TradeList
+    2. ExecuteTrade checks $Trade → null → validation guard aborts immediately (line 29)
+    3. Extraction code (lines 20-26) never executes because guard aborts first
+    4. Ship receives GT_No_Trade_Found → cache hit treated as miss
+    5. Ship queues for live search → wastes cycles, negates cache performance benefit
+  - Solution: Extract first trade in CheckTradeCache and send both $Trade and $TradeList
+    * Extract first trade: $firstTrade = $cacheTradeList.{1}
+    * Send both parameters: $Trade = $firstTrade, $TradeList = $cacheTradeList
+    * ExecuteTrade receives $Trade directly, validation passes, execution proceeds
+  - Implementation:
+    * Modified `CheckTradeCache` (gt_trading_queue.xml:555-565)
+      - Extract first trade from cacheTradeList before signaling ExecuteTrade
+      - Send both $Trade and $TradeList parameters for compatibility
+      - Ensures ExecuteTrade validation guard passes immediately
+  - Files Modified:
+    * `md/gt_trading_queue.xml` (extract and send $Trade parameter)
+  - Benefits:
+    * Cache hits execute correctly (validation guard passes)
+    * Cache performance benefit realized (instant trade execution)
+    * No wasted cycles queuing live searches for cached trades
+    * Consistent with live search path (both send $Trade parameter)
+
+FIX: Cache Checks Preserve In-Progress Live Search State
+  - Issue: SearchCachedTrades overwrote global.$GT_SearchResult with empty defaults when another ship was waiting, wiping $WaitingForBatch, $Ship, and $TradeList needed for live search continuation
+  - Root Cause: When another ship was waiting, the else branch replaced entire global.$GT_SearchResult structure, destroying waiting ship's state
+  - Problem Scenario:
+    1. Ship A starts live search → SearchLiveTrades sets WaitingForBatch=true, Ship=A, TradeList=[...] in global.$GT_SearchResult
+    2. Ship B requests cache check → SearchCachedTrades runs
+    3. SearchCachedTrades detects Ship A waiting → enters else branch
+    4. Else branch overwrites global.$GT_SearchResult with empty table → Ship A's state lost
+    5. Ship A's batch completes → SearchLiveTrades_Resume fires
+    6. global.$GT_SearchResult.$Ship != Ship A or WaitingForBatch missing → continuation check fails
+    7. Search never resumes → lock held indefinitely
+  - Solution: Preserve waiting ship's state when another ship requests cache check
+    * When another ship waiting: Set only $Found=false and clear $TradeList (indicate cache miss)
+    * Preserve $WaitingForBatch and $Ship (needed for waiting ship's continuation)
+    * Don't overwrite entire structure - only modify fields needed for current ship
+  - Implementation:
+    * Modified `SearchCachedTrades` (gt_search_methods.xml:1169-1174)
+      - When another ship waiting: Set $Found=false, clear $TradeList
+      - Preserve $WaitingForBatch and $Ship for waiting ship
+      - CheckTradeCache reads $Found=false and queues for live search (correct behavior)
+      - Waiting ship's state remains intact for continuation
+  - Files Modified:
+    * `md/gt_search_methods.xml` (preserve waiting ship state when cache check occurs)
+  - Benefits:
+    * In-progress live searches no longer lose their state
+    * Locks properly released when searches complete
+    * Concurrent cache checks don't interfere with live searches
+    * Both ships proceed correctly (current ship queues, waiting ship continues)
+
+FIX: Zero-Trade Live Searches - Remove $Ship from Global State
+  - Issue: When live search returned zero trades, $Ship was never removed from global.$GT_SearchResult, causing all future requests to be treated as continuations hitting cooldown path
+  - Root Cause: Zero-trade cleanup removed $WaitingForBatch and $TradeList but not $Ship, leaving stale continuation state
+  - Problem Scenario:
+    1. Ship requests trade search → live search returns 0 trades
+    2. Code clears continuation state → removes $WaitingForBatch, $TradeList, etc. but NOT $Ship
+    3. Next request → SearchTradeRoutes checks global.$GT_SearchResult.$Ship == $ship (line 111)
+    4. $Ship still set → $isLiveSearchContinuation = true
+    5. Continuation block checks $liveTradeList.count == 0 → hits cooldown path
+    6. Ship never performs another real search → permanently throttled
+  - Solution: Remove $Ship from global.$GT_SearchResult when clearing continuation state
+    * When zero-trade live search completes, remove $Ship along with other continuation fields
+    * Prevents future requests from being incorrectly treated as continuations
+    * Allows ship to perform fresh searches on next request
+  - Implementation:
+    * Modified `SearchTradeRoutes` (gt_trading_search.xml:640-641)
+      - Added removal of global.$GT_SearchResult.$Ship when clearing continuation state
+      - Ensures no stale continuation state remains after zero-trade searches
+  - Files Modified:
+    * `md/gt_trading_search.xml` (remove $Ship when clearing zero-trade continuation state)
+  - Benefits:
+    * Ships no longer permanently throttled after zero-trade searches
+    * Future requests perform fresh searches instead of hitting cooldown
+    * Continuation state properly cleared when searches complete
+    * Ships can recover from stuck states (blacklisted sectors, etc.)
 
 Version 0.6.3 - 2025-11-15
 ---------------------------
