@@ -1,6 +1,350 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.4 - 2025-01-XX
+---------------------------
+
+FEATURE: MK3 Rename - Custom Ship Renaming via Context Menu
+  - Added "MK3 Rename" context menu entry for player-owned ships
+  - Opens floating text input dialog with Cancel/OK buttons
+  - Stores custom original ship name in GT_Pilots registry ($OriginalShipName)
+  - Integrates with GT ship naming system (triggers Update_Pilot_Ship_Name)
+  - Features:
+    * Event-driven communication (Lua ↔ MD via SignalObject/NPCBlackboard)
+    * Displays current GT original name when opening dialog
+    * Persists name across game sessions
+    * Automatically registers pilots if not yet in GT_Pilots registry
+    * Works for multiple ships independently
+  - Implementation:
+    * MD script: `md/gt_context_rename.xml`
+      - Listens for Interact_Menu_API.Get_Actions to add context menu entry
+      - Handles rename confirmation via event_object_signalled
+      - Registers pilots if needed before storing original name
+    * Lua script: `ui/gt_context_rename.lua`
+      - Creates floating context menu with text input field
+      - Hooks into vanilla menu system (createContextFrame, refreshContextFrame)
+      - Stores newName in NPCBlackboard and signals MD via SignalObject
+      - Reads originalName from NPCBlackboard when opening dialog
+  - Files Added:
+    * `md/gt_context_rename.xml` (MD script for context menu integration)
+    * `ui/gt_context_rename.lua` (Lua script for UI dialog)
+  - Files Modified:
+    * `ui.xml` (added gt_context_rename.lua to UI addons)
+    * `t/0001-L001.xml` (added localization string for "MK3 Rename")
+  - Benefits:
+    * Allows players to set custom original ship names
+    * Integrates seamlessly with GT naming system
+    * Non-intrusive (separate from vanilla rename, doesn't interfere)
+    * Event-driven architecture (no polling, efficient)
+
+IMPROVEMENT: Original Ship Name Protection
+  - Original ship name ($OriginalShipName) is now protected from automatic overwriting
+  - Once set (via rename feature or initial registration), it is preserved across:
+    * Ship reassignments (pilot moved to different ship)
+    * Pilot reactivations (after being paused)
+    * Default order restarts
+  - Only the "MK3 Rename" feature can overwrite the stored original name
+  - Implementation:
+    * Modified `Register_Pilot` library (gt_ship_management.xml)
+      - Added checks before setting $OriginalShipName when pilot reassigned to new ship
+      - Added checks before setting $OriginalShipName when pilot reactivated
+      - First-time registration still sets original name (unchanged behavior)
+  - Files Modified:
+    * `md/gt_ship_management.xml` (added protection checks in Register_Pilot)
+  - Benefits:
+    * Custom ship names set via rename feature are preserved permanently
+    * No accidental overwriting when ships are reassigned or pilots reactivate
+    * User has full control over ship names via rename feature
+
+IMPROVEMENT: Rename Dialog - Start Empty When No Original Name
+  - Rename dialog now starts empty if no GT original name is stored
+  - Removed fallback to current ship name (was showing ship's current name instead of empty)
+  - If GT original name exists: Dialog displays the stored original name
+  - If no GT original name: Dialog starts empty (user can enter new name)
+  - Implementation:
+    * Modified `GT_RenameAction` cue (gt_context_rename.xml)
+      - Changed fallback from `$component.knownname` to empty string `''`
+    * Modified `createGTRenameContext` function (gt_context_rename.lua)
+      - Removed fallback to `GetComponentName(component)`
+      - Only uses GT original name from NPCBlackboard
+  - Files Modified:
+    * `md/gt_context_rename.xml` (removed fallback to current ship name)
+    * `ui/gt_context_rename.lua` (removed fallback to GetComponentName)
+  - Benefits:
+    * Clear distinction between "no name set" (empty) and "name set" (shows stored name)
+    * Better UX: User knows when they're setting a name for the first time
+
+FEATURE: Basename Option for Ship Renaming
+  - Added new "basename" option to Default Name Source setting
+  - When selected, ship renaming uses stored GT original ship name directly
+  - No stripping or special handling applied - uses $OriginalShipName as-is
+  - Cycle order: Model Name → Type Name → Base Name → Basename → Model Name
+  - Implementation:
+    * Added 'basename' option to cycle handler (gt_global_settings.xml)
+    * Added 'basename' handling in UpdateShipName (gt_xp_training.xml)
+      - Uses `global.$GT_Pilots.{$pilot}.$OriginalShipName` directly
+      - Fallback to `macro.name` if no stored original name exists
+    * Added UI text display for "Basename" option
+  - Files Modified:
+    * `md/gt_global_settings.xml` (added basename to cycle, updated UI text logic)
+    * `md/gt_xp_training.xml` (added basename handling in UpdateShipName)
+    * `t/0001-L001.xml` (added translation text ID 9083: "Basename")
+  - Benefits:
+    * Allows players to use custom names set via rename feature as base for ship naming
+    * Works with all naming options (prefixes, suffixes, rank, level, XP, etc.)
+    * Provides full control over ship name base while maintaining GT naming features
+
+FIX: Search Lock Management - Prevent Duplicate Search Requests
+  - Issue: Search locks were being released immediately after queueing, before the search actually started, allowing duplicate search requests to slip through
+  - Root Cause: `ProcessDelayedTradeRequest` was removing the search lock inline immediately after adding the ship to the queue, long before `SearchTradeRoutes` ran
+  - Problem Scenario:
+    1. Ship sends GT_Find_Trade signal → lock set, ship queued
+    2. Lock immediately removed in ProcessDelayedTradeRequest
+    3. Ship sends another GT_Find_Trade signal (before first search starts)
+    4. No lock found → second request slips through → duplicate queue entries
+    5. Results: redundant searches, wasted AI parameter tables, extra GT_No_Trade_Found churn
+  - Solution: Keep lock set until search actually completes or request is rejected
+    * Lock only released when request is rejected (busy ship, duplicate in queue)
+    * Lock released by SearchTradeRoutes when search completes (existing behavior)
+    * Lock released by queue cleanup handlers when search aborted (existing behavior)
+  - Implementation:
+    * Removed premature lock cleanup from `ProcessDelayedTradeRequest` (gt_trading_ai.xml:335-341)
+    * Added lock release when request rejected (busy ship or duplicate)
+    * Added cleanup of AI parameters when request rejected (prevents stale data)
+  - Files Modified:
+    * `md/gt_trading_ai.xml` (removed premature lock cleanup, added cleanup on rejection)
+  - Benefits:
+    * Prevents duplicate search requests from slipping through
+    * Eliminates redundant queue entries and wasted CPU cycles
+    * Reduces GT_No_Trade_Found signal churn
+    * Proper cleanup of AI parameters on rejection
+
+FIX: Cache Check Performance - Implement Actual Cache Checking
+  - Issue: `CheckTradeCache` cue was skipping cache check entirely, always queuing for live search even when valid cached trades existed
+  - Root Cause: Cache check was implemented as TODO placeholder - just logged "skip cache" and queued for live search
+  - Problem Scenario:
+    1. Ship requests trade search → CheckTradeCache called
+    2. Cache check skipped → ship queued for live search
+    3. Ship waits in queue (25-35s skill delay)
+    4. Live search runs → finds same trades that were already in cache
+    5. Result: Artificial delays even when cache has valid trades
+  - Solution: Implement actual synchronous cache checking
+    * Call `SearchCachedTrades` synchronously with proper parameters
+    * If cache hit: Send directly to execution pipeline (bypass queue, instant)
+    * If cache miss: Queue for live search (existing behavior)
+    * Respect ForceLiveSearch flag (skip cache if set)
+  - Implementation:
+    * Modified `CheckTradeCache` cue (gt_trading_queue.xml:440-605)
+      - Extract search parameters from event
+      - Calculate derived parameters (distance penalty, skill level, ROI multiplier)
+      - Call `SearchCachedTrades` synchronously
+      - Check cache results (foundCachedTrade, cacheTradeList)
+      - Cache hit: Signal ExecuteTrade directly (bypass queue)
+      - Cache miss: Queue for live search (existing behavior)
+  - Files Modified:
+    * `md/gt_trading_queue.xml` (implemented actual cache checking logic)
+  - Benefits:
+    * Removes artificial 25-35s skill delays for cached trades
+    * Dramatically reduces CPU load (no queueing/batch processing for cache hits)
+    * Cache now provides intended performance benefit
+    * Instant trade execution when cache has valid trades
+
+FIX: Forced Sell Pipeline - Use Normal Execution Pipeline
+  - Issue: Forced sell orders (when ship has cargo) were bypassing the normal execution pipeline, creating orders directly in MD script
+  - Root Cause: `SearchSellOpportunities` was calling `create_trade_order` directly instead of using the normal pipeline
+  - Problem Scenario:
+    1. Ship has cargo → SearchSellOpportunities finds buyer
+    2. MD script creates order directly → violates "MD finds, AI executes" rule
+    3. Order created while AI waits → X4 terminates wait context instead of suspending
+    4. Trade never stored in GT_PendingTrades → failure handler can't track sector pairs
+    5. Pathing failures during cargo-dump runs invisible to blacklist system → infinite loops
+  - Solution: Use normal pipeline for forced sell trades
+    * Create trade structure compatible with ExecuteTrade
+    * Store in GT_PendingTrades (enables failure tracking)
+    * Send to ExecuteTrade cue (stores pending trade, signals AI)
+    * AI script creates orders (maintains wait state safety)
+    * Modified ExecuteTrade to handle sell-only trades ($IsSellOnly flag)
+  - Implementation:
+    * Modified `SearchSellOpportunities` (gt_trading_search.xml:2732-2789)
+      - Create sell-only trade structure (BuyOffer=null, IsSellOnly=true)
+      - Store BuyStation (ship's sector), SellStation (target station), Ware, SellOffer
+      - Signal ExecuteTrade with trade structure
+    * Modified `ExecuteTrade` (gt_trading_execution.xml:27-116)
+      - Added support for sell-only trades ($IsSellOnly flag)
+      - Validate: Sell-only trades only require SellOffer (BuyOffer can be null)
+      - Handle logging for sell-only trades (no buy station)
+      - Validate only SellOffer for sell-only trades (BuyOffer always valid)
+  - Files Modified:
+    * `md/gt_trading_search.xml` (use normal pipeline for forced sell)
+    * `md/gt_trading_execution.xml` (support sell-only trades)
+  - Benefits:
+    * Maintains wait state safety (AI creates orders, not MD)
+    * Enables failure tracking (GT_PendingTrades populated)
+    * Failure handler can track sector pairs for forced sell trades
+    * Consistent behavior with normal trades (reservations, statistics, telemetry)
+
+FIX: Busy Ship Rejection - Clean Up AI Parameters
+  - Issue: When trade requests were rejected (busy ship, duplicate), AI parameters were set but never cleaned up, causing stale data to persist
+  - Root Cause: AI parameters were set before checking if ship was busy, and busy/duplicate rejection paths didn't clean up the parameters
+  - Problem Scenario:
+    1. Ship sends GT_Find_Trade → AI parameters set (ForceLiveSearch=true, WareBasket=[...], AllowIllegal=false)
+    2. Ship is busy → request rejected, GT_No_Trade_Found signaled
+    3. AI parameters NOT cleaned up → stale data persists
+    4. Next request inherits stale ForceLiveSearch=true → cache bypassed unnecessarily
+    5. Next request inherits stale WareBasket → wrong wares searched
+    6. Next request inherits stale AllowIllegal → incorrect illegal ware handling
+  - Solution: Clean up AI parameters when request is rejected
+    * Remove global.$GT_AIParameters.{ship} when busy ship rejected
+    * Remove global.$GT_AIParameters.{ship} when duplicate request rejected
+    * Also release search lock when request rejected (proper cleanup)
+  - Implementation:
+    * Modified `ProcessDelayedTradeRequest` (gt_trading_ai.xml:320-358)
+      - Added cleanup of AI parameters when busy ship rejected
+      - Added cleanup of AI parameters when duplicate request rejected
+      - Added search lock release when request rejected
+  - Files Modified:
+    * `md/gt_trading_ai.xml` (added parameter cleanup on rejection)
+  - Benefits:
+    * Prevents stale ForceLiveSearch flag from bypassing cache unnecessarily
+    * Prevents stale WareBasket from affecting future searches
+    * Prevents stale AllowIllegal from incorrectly blocking/allowing illegal wares
+    * Proper cleanup ensures each request starts with fresh parameters
+
+FIX: Cache Hit Lock Cleanup - Release Search Lock After Cache Hit
+  - Issue: When CheckTradeCache found a valid cached trade, it sent the trade to ExecuteTrade but never released the search lock or cleaned up AI parameters
+  - Root Cause: Cache hits bypass SearchTradeRoutes (which normally releases locks), so the cleanup code in SearchTradeRoutes never ran
+  - Problem Scenario:
+    1. Ship requests trade search → lock set, cache checked
+    2. Cache hit found → trade sent to ExecuteTrade, cue exits
+    3. Search lock never released → ship idles for ~60s until maintenance cue purges old locks
+    4. Ship cannot request next trade until lock expires
+    5. Result: Every cache-served trader sits idle for about a minute between trades
+  - Solution: Explicitly release search lock and clean up AI parameters after cache hit
+    * Mirror the cleanup done in SearchTradeRoutes (lines 1584-1606)
+    * Release global.$GT_SearchLocks.{ship} after successful cache hit
+    * Remove global.$GT_AIParameters.{ship} after successful cache hit
+  - Implementation:
+    * Modified `CheckTradeCache` cue (gt_trading_queue.xml:561-573)
+      - Added lock release after cache hit (before sending to ExecuteTrade)
+      - Added AI parameter cleanup after cache hit
+      - Added debug logging for lock release
+  - Files Modified:
+    * `md/gt_trading_queue.xml` (added lock and parameter cleanup after cache hit)
+  - Benefits:
+    * Ships can request next trade immediately after cache hit (no 60s wait)
+    * Proper cleanup prevents resource leaks
+    * Consistent behavior with live search completion
+
+FIX: Forced Sell BuyStation - Use Station Object Instead of Sector
+  - Issue: Forced sell trades stored ship's sector object in $BuyStation, but downstream code expects a station object with .sector and .knownname properties
+  - Root Cause: SearchSellOpportunities was storing `$ship.sector` (a sector object) in $BuyStation field
+  - Problem Scenario:
+    1. Ship has cargo → forced sell trade created
+    2. $BuyStation = $ship.sector (sector object, not station)
+    3. Failure handler tries to access $buyStation.sector → null (sectors don't have .sector)
+    4. Failure handler logs "Pending trade entry MISSING" instead of recording blocked route
+    5. ExecuteTrade gatedistance checks receive null sectors → may misreport unreachable routes
+  - Solution: Use actual station object (or ship) for $BuyStation
+    * If ship is docked: Use $ship.dock.container (docked station)
+    * If ship is parked: Use $ship.parkedat (parked station)
+    * Otherwise: Use $ship itself (ships have .sector and .knownname properties)
+  - Implementation:
+    * Modified `SearchSellOpportunities` (gt_trading_search.xml:2746-2756)
+      - Check if ship is docked → use dock.container
+      - Check if ship is parked → use parkedat
+      - Fallback to ship object itself (has required properties)
+  - Files Modified:
+    * `md/gt_trading_search.xml` (use station/ship object instead of sector)
+  - Benefits:
+    * Failure handler can properly extract sector pairs for blacklisting
+    * ExecuteTrade pathfinding checks work correctly
+    * Proper telemetry and failure tracking for forced sell trades
+
+FIX: Forced Sell Cargo Rotation - Avoid Getting Stuck on Unsellable Wares
+  - Issue: Forced sell routine only examined the first cargo entry (cargo.list.{1}), so if that ware was banned, blacklisted, or mission-tied, the ship would retry the same ware forever
+  - Root Cause: Code always selected `$currentCargo.{1}` without rotating through cargo list
+  - Problem Scenario:
+    1. Ship has cargo: [Energy Cells, Food Rations, Illegal Ware]
+    2. First ware (Energy Cells) is mission-tied or blacklisted → GT_No_Trade_Found
+    3. Ship requests forced sell again → selects Energy Cells again (always first)
+    4. Same failure → retry → stuck forever
+    5. Other wares (Food Rations, Illegal Ware) never attempted
+  - Solution: Rotate through cargo entries on each request
+    * Track last attempted ware index in global.$GT_ForcedSellLastWare.{ship}
+    * On next request, start from next ware (wrap around)
+    * If one ware can't be sold, next request tries different ware
+  - Implementation:
+    * Modified `SearchSellOpportunities` (gt_trading_search.xml:2591-2614)
+      - Track last attempted ware index per ship
+      - Rotate to next ware on each request: (lastIndex mod count) + 1
+      - Store attempted index for next rotation
+      - Added debug logging showing rotation
+  - Files Modified:
+    * `md/gt_trading_search.xml` (implemented cargo rotation system)
+  - Benefits:
+    * Ships don't get stuck retrying same unsellable ware
+    * All cargo entries eventually attempted
+    * Better cargo disposal for ships with mixed cargo types
+    * Prevents infinite retry loops on mission-tied or blacklisted wares
+
+FIX: Cache Hit Execution - Extract Trade from TradeList
+  - Issue: CheckTradeCache sent only $TradeList to ExecuteTrade, but ExecuteTrade requires $Trade parameter, causing cache hits to fail immediately
+  - Root Cause: ExecuteTrade validated $Trade was not null and aborted if missing, but CheckTradeCache only sent $TradeList
+  - Problem Scenario:
+    1. Cache hit found → CheckTradeCache signals ExecuteTrade with only $TradeList
+    2. ExecuteTrade checks $Trade → null → logs error and aborts
+    3. Ship receives GT_No_Trade_Found → cache hit behaves like miss
+    4. Queue restarts whole search → negates cache performance benefit
+  - Solution: Extract $Trade from $TradeList if $Trade is null
+    * Check if $Trade is null but $TradeList exists and has trades
+    * Extract first trade: $Trade = $TradeList.{1}
+    * Proceed with normal execution using extracted trade
+  - Implementation:
+    * Modified `ExecuteTrade` (gt_trading_execution.xml:20-26)
+      - Added check: if $Trade is null and $TradeList has trades, extract first trade
+      - Added debug logging when trade extracted from list
+      - Enhanced error message to show TradeList count for debugging
+  - Files Modified:
+    * `md/gt_trading_execution.xml` (extract trade from TradeList if missing)
+  - Benefits:
+    * Cache hits now execute correctly (no false negatives)
+    * Cache performance benefit realized (instant trade execution)
+    * Consistent behavior with live search results (both use TradeList)
+
+FIX: Cache Hit Lock Cleanup - Already Fixed
+  - Status: This issue was already fixed in previous changes
+  - Fix Location: CheckTradeCache now releases search lock and cleans up AI parameters after cache hit (gt_trading_queue.xml:561-573)
+  - Note: Lock cleanup happens after ExecuteTrade is signaled, which is correct timing
+
+FIX: Cache Lookups Clobber In-Flight Live Searches - Prevent Race Condition
+  - Issue: SearchCachedTrades unconditionally overwrote global.$GT_SearchResult, clobbering in-flight live search results when another ship was waiting for batch processing
+  - Root Cause: SearchCachedTrades always replaced global.$GT_SearchResult without checking if another ship had WaitingForBatch=true
+  - Problem Scenario:
+    1. Ship A starts live search → SearchLiveTrades sets WaitingForBatch=true, Ship=A in global.$GT_SearchResult
+    2. Ship B requests cache check → SearchCachedTrades runs
+    3. SearchCachedTrades overwrites global.$GT_SearchResult → Ship A's state lost
+    4. Ship A's batch completes → SearchLiveTrades_Resume fires
+    5. global.$GT_SearchResult.$Ship != Ship A → continuation check fails
+    6. Search never resumes → lock held indefinitely
+  - Solution: Check for waiting ships before overwriting global.$GT_SearchResult
+    * Before overwriting, check if WaitingForBatch=true and Ship != current ship
+    * If another ship is waiting, skip overwrite (preserve their state)
+    * If no other ship waiting, proceed with overwrite
+    * Applied to both early exit (cache disabled) and successful cache results
+  - Implementation:
+    * Modified `SearchCachedTrades` (gt_search_methods.xml:77-118, 1124-1186)
+      - Early exit path: Check WaitingForBatch before overwriting empty results
+      - Success path: Check WaitingForBatch before overwriting cache results
+      - If another ship waiting: Skip overwrite, log debug message, return empty results (triggers live search)
+      - If no other ship waiting: Proceed with overwrite as normal
+  - Files Modified:
+    * `md/gt_search_methods.xml` (added WaitingForBatch check before overwriting results)
+  - Benefits:
+    * Prevents race condition between concurrent cache checks and live searches
+    * In-flight live searches no longer lose their state
+    * Locks properly released when searches complete
+    * Concurrent searches work correctly without interfering
+
 Version 0.6.3 - 2025-11-15
 ---------------------------
 
