@@ -1,5 +1,61 @@
-GalaxyTrader MK3 - Changelog
+﻿GalaxyTrader MK3 - Changelog
 ========================================
+
+Version 0.6.6 - 2025-01-15
+---------------------------
+
+FIX: Search Queue Deadlock - Config Reload Recovery
+  - Issue: Search queue permanently deadlocked after configuration reloads or other resets
+  - Root Cause: When SearchLiveTrades_Resume couldn't find original parameters ($originalParams? is false) because config reload cleared global.$GT_SearchQueue.$Params and global.$GT_BatchDataList, it only logged a warning and didn't signal SearchTradeRoutes
+  - Problem:
+    * SearchTradeRoutes cleanup never runs (where locks are released and counter is decremented)
+    * global.$GT_SearchLocks.{ship} stays set forever, preventing ship from requesting new trades
+    * global.$GT_SearchQueue.$ActiveSearches never decrements, blocking all subsequent ships
+    * All GT traders stop finding trades immediately after any config reload
+  - Solution: Added emergency cleanup in the $originalParams? false branch:
+    * Release search lock (global.$GT_SearchLocks.{ship})
+    * Clean up AI parameters (global.$GT_AIParameters.{ship})
+    * Clean up queue params (global.$GT_SearchQueue.$Params.{ship})
+    * Decrement active search counter (global.$GT_SearchQueue.$ActiveSearches)
+    * Try to reconstruct params from batch data (if still available) and requeue ship
+    * If no params available, signal AI with GT_No_Trade_Found to restart
+  - Implementation:
+    * Modified SearchLiveTrades_Resume (gt_trading_search.xml)
+      - Added emergency cleanup code in $originalParams? false branch (lines 2701-2778)
+      - Reconstructs params from batch data if available, otherwise signals AI to restart
+  - Files Modified:
+    * `md/gt_trading_search.xml` (lines 2701-2778)
+  - Benefits:
+    * Prevents queue deadlock when config reload clears params mid-search
+    * Ships can request new trades even after config reload
+    * Queue continues processing other ships instead of blocking permanently
+    * Eliminates "all traders stuck after config change" scenario
+    * Proper resource cleanup prevents memory leaks
+
+FIX: Search Queue Deadlock - Missing Batch Results Cleanup
+  - Issue: Search queue permanently deadlocked when batch results were missing
+  - Root Cause: When SearchLiveTrades_Resume couldn't fetch batch results ($results? is false), it cleaned up batch data and requeued the ship but didn't release search locks or decrement active search counter
+  - Problem: 
+    * global.$GT_SearchQueue.$ActiveSearches never decremented, blocking all subsequent ships from being processed
+    * global.$GT_SearchLocks.{$ship} never cleared, preventing ship from requesting new trades
+    * global.$GT_SearchQueue.$Params.{$ship} and global.$GT_AIParameters.{$ship} left as stale data
+  - Solution: Added proper cleanup in the not $results? branch before requeueing:
+    * Release search lock (global.$GT_SearchLocks.{$ship})
+    * Clean up AI parameters (global.$GT_AIParameters.{$ship})
+    * Clean up queue params (global.$GT_SearchQueue.$Params.{$ship})
+    * Decrement active search counter (global.$GT_SearchQueue.$ActiveSearches)
+  - Implementation:
+    * Modified SearchLiveTrades_Resume (gt_trading_search.xml)
+      - Added cleanup code in not $results? branch (lines 1715-1741)
+      - Matches cleanup pattern from normal SearchTradeRoutes completion path
+  - Files Modified:
+    * `md/gt_trading_search.xml` (lines 1715-1741)
+  - Benefits:
+    * Prevents queue deadlock when batch results are missing (race conditions, save/load timing)
+    * Ships can request new trades even after batch failure
+    * Queue continues processing other ships instead of blocking permanently
+    * Eliminates "all traders stuck" scenario
+    * Proper resource cleanup prevents memory leaks
 
 Version 0.6.5 - 2025-01-15
 ---------------------------
@@ -887,12 +943,12 @@ CODE REFACTORING: Search Methods Extraction
       - `SearchCachedTrades` (~1115 lines) - Searches cached trade entries
       - `SearchLiveTrades` (~710 lines) - Performs live trade searches with batch processing
       - `SearchFallbackTrades` (~76 lines) - Fallback search with relaxed parameters
-    * **Updated References**: All signal calls in `gt_trading_search.xml` updated to use `md.GT_Search_Methods.CueName`
+    * **Updated References**: All signal calls in `gt_trading_search.xml` updated to use `md.gt_cuename`
     * **Signal Updates**: 
-      - `SearchCachedTrades` → `md.GT_Search_Methods.SearchCachedTrades`
-      - `SearchLiveTrades` → `md.GT_Search_Methods.SearchLiveTrades`
-      - `SearchFallbackTrades` → `md.GT_Search_Methods.SearchFallbackTrades`
-    * **Internal Signal**: `SearchFallbackTrades` signals `md.GT_Search_Methods.SearchLiveTrades` internally
+      - `SearchCachedTrades` → `md.gt_searchcachedtrades`
+      - `SearchLiveTrades` → `md.gt_searchlivetrades`
+      - `SearchFallbackTrades` → `md.gt_searchfallbacktrades`
+    * **Internal Signal**: `SearchFallbackTrades` signals `md.gt_searchlivetrades` internally
   - Benefits:
     * **Code Organization**: Reduced `gt_trading_search.xml` from 4676 lines to 2779 lines (~40% reduction)
     * **Maintainability**: Search methods now isolated in dedicated file, easier to locate and modify
@@ -3157,7 +3213,7 @@ ENHANCEMENT: Path-Aware Threat Detection for Mid-Trade Sector Blacklisting
 CRITICAL FIX: Total Profit and Trades Completed Statistics Always Zero
   - Fixed: Periodic fleet report notifications always showed 0 Cr profit and 0 trades completed
   - Root cause: UpdateShipStats library existed but was never called when trades completed
-  - Solution: Added call to md.GT_Fleet_Coordination.UpdateShipStats in gt_trading_signals.xml
+  - Solution: Added call to md.gt_updateshipstats in gt_trading_signals.xml
   - Statistics now updated immediately after each successful trade completion
   - Updates both $TotalProfit and $TradesCompleted for individual ships
   - Fleet reports now show accurate cumulative statistics

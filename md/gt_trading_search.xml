@@ -1695,6 +1695,32 @@
               <debug_text text="'[GT-Resume] âš ï¸ Batch results not found for ship ' + $ship.idcode" chance="100"/>
             </do_if>
             
+            <!-- ✅ CRITICAL FIX: Extract params BEFORE cleanup (needed for requeue) -->
+            <!-- Try to get params from queue first, then reconstruct from batch data if needed -->
+            <set_value name="$savedParams" exact="null"/>
+            <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+              <!-- Params still in queue - extract before cleanup -->
+              <set_value name="$savedParams" exact="global.$GT_SearchQueue.$Params.{$ship}"/>
+            </do_if>
+            <do_else>
+              <!-- Try to reconstruct from batch data (before cleanup) -->
+              <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$ship}"/>
+              <do_if value="$batchData?">
+                <set_value name="$allowIllegalDefault" exact="false"/>
+                <set_value name="$savedParams" exact="table[
+                  $Ship = $ship,
+                  $MaxDistance = @$batchData.$maxDistance,
+                  $MinROI = @$batchData.$minROI,
+                  $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+                  $FactionPriority = @$batchData.$factionPriority,
+                  $AllowIllegal = $allowIllegalDefault
+                ]"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Resume] Reconstructed params from batch data for ' + $ship.idcode" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_else>
+            
             <!-- ✅ FIX: Clean up batch data and re-queue ship for new search -->
             <!-- Clear batch data entries for this ship -->
             <do_if value="global.$GT_BatchDataList.{$ship}?">
@@ -1711,6 +1737,52 @@
             <set_value name="global.$GT_SearchResult.$TradeList" exact="[]"/>
             <remove_value name="global.$GT_SearchResult.$WaitingForBatch"/>
             <remove_value name="global.$GT_SearchResult.$Ship"/>
+            
+            <!-- ✅ CRITICAL FIX: Release search lock and decrement active search counter -->
+            <!-- This prevents deadlock when batch results are missing -->
+            <!-- Without this cleanup, the queue gets permanently blocked and ships can't request new trades -->
+            <do_if value="global.$GT_SearchLocks.{$ship}?">
+              <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] 🔓 Search lock released (batch results missing): ' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Clean up AI parameters -->
+            <do_if value="global.$GT_AIParameters.{$ship}?">
+              <remove_value name="global.$GT_AIParameters.{$ship}"/>
+            </do_if>
+            
+            <!-- Clean up search queue params -->
+            <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+              <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+            </do_if>
+            
+            <!-- Decrement active search counter (critical: prevents queue deadlock) -->
+            <do_if value="global.$GT_SearchQueue.$ActiveSearches?">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] 🔢 Active searches decremented (batch results missing): ' + global.$GT_SearchQueue.$ActiveSearches + '/' + (if global.$GT_SearchQueue.$MaxConcurrent? then global.$GT_SearchQueue.$MaxConcurrent else 1)" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- ✅ CRITICAL FIX: Restore params to queue BEFORE requeueing -->
+            <!-- Without params, ProcessSearchQueue will skip the ship with "Missing search parameters" -->
+            <do_if value="$savedParams?">
+              <do_if value="not global.$GT_SearchQueue.$Params?">
+                <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$savedParams"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] 💾 Restored params to queue for ' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- No params available - log warning but still requeue (ship will need to request new search) -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] ⚠️ No params available for requeue - ship ' + $ship.idcode + ' will need to request new search'" chance="100"/>
+              </do_if>
+            </do_else>
             
             <!-- Re-queue ship for new live search (don't leave it waiting forever) -->
             <do_if value="global.$GT_SearchQueue.$Ships?">
@@ -2619,11 +2691,91 @@
           </do_if>
         </do_if>
         <do_else>
-          <!-- Fallback: Could not find original parameters, but results are already in global.$GT_SearchResult -->
-          <!-- SearchTradeRoutes will be signaled by another mechanism or will read results on next check -->
+          <!-- ✅ CRITICAL FIX: Original parameters missing (config reload/reset cleared them) -->
+          <!-- Must release locks and decrement counter, otherwise queue deadlocks permanently -->
+          <!-- Without this cleanup, SearchTradeRoutes cleanup never runs, locks stay set forever -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Resume] (' + $ship.idcode + ') âš ï¸ Could not find original parameters to signal SearchTradeRoutes - results stored in global.$GT_SearchResult'" chance="100"/>
           </do_if>
+          
+          <!-- ✅ CRITICAL FIX: Release locks and decrement counter to prevent queue deadlock -->
+          <!-- Release search lock (prevents ship from being permanently locked) -->
+          <do_if value="global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] Emergency: Search lock released for ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Clean up AI parameters -->
+          <do_if value="global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          
+          <!-- Clean up search queue params (if any) -->
+          <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+          </do_if>
+          
+          <!-- Decrement active search counter (critical: prevents queue deadlock) -->
+          <do_if value="global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] Emergency: Active searches decremented: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + (if global.$GT_SearchQueue.$MaxConcurrent? then global.$GT_SearchQueue.$MaxConcurrent else 1)" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Try to reconstruct minimal params from available data for requeue -->
+          <set_value name="$reconstructedParams" exact="null"/>
+          <do_if value="$batchData?">
+            <!-- Reconstruct from batch data if still available -->
+            <set_value name="$allowIllegalDefault" exact="false"/>
+            <set_value name="$reconstructedParams" exact="table[
+              $Ship = $ship,
+              $MaxDistance = @$batchData.$maxDistance,
+              $MinROI = @$batchData.$minROI,
+              $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+              $FactionPriority = @$batchData.$factionPriority,
+              $AllowIllegal = $allowIllegalDefault
+            ]"/>
+          </do_if>
+          
+          <!-- Requeue ship with reconstructed params (if available) or let AI request new search -->
+          <do_if value="$reconstructedParams?">
+            <!-- Store reconstructed params in queue -->
+            <do_if value="not global.$GT_SearchQueue.$Params?">
+              <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$reconstructedParams"/>
+            
+            <!-- Requeue ship -->
+            <do_if value="global.$GT_SearchQueue.$Ships?">
+              <set_value name="$shipInQueue" exact="false"/>
+              <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
+                <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
+                  <set_value name="$shipInQueue" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $shipInQueue">
+                <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Resume] Emergency: Re-queued ship ' + $ship.idcode + ' with reconstructed params'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
+            <!-- Trigger queue processing -->
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+          </do_if>
+          <do_else>
+            <!-- No params available - ship will need to request new search from AI -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] Emergency: No params available - ship ' + $ship.idcode + ' will need to request new search'" chance="100"/>
+            </do_if>
+            <!-- Signal AI to restart (clear any waiting state) -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'config_reload'"/>
+          </do_else>
         </do_else>
       </actions>
     </cue>
