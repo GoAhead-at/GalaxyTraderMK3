@@ -36,18 +36,13 @@ function menu.createGTRenameContext(frame)
     local title = "MK3 Rename"
     local component = menu.contextMenuData.component
     
-    -- Get original name to display (prefer GT original name from blackboard, fallback to current ship name)
+    -- Get original name to display (only use GT original name from blackboard, no fallback)
     local startname = ""
     if menu.contextMenuData.originalName and menu.contextMenuData.originalName ~= "" then
         -- Use GT original name if provided (from NPCBlackboard)
         startname = menu.contextMenuData.originalName
-    elseif component and component ~= 0 then
-        -- Fallback to current ship name
-        local namePtr = C.GetComponentName(component)
-        if namePtr and namePtr ~= 0 then
-            startname = ffi.string(namePtr)
-        end
     end
+    -- If no GT original name, startname remains empty (let user enter new name)
     
     local shiptable = frame:addTable(2, { 
         tabOrder = 2, 
