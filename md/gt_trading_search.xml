@@ -2588,15 +2588,30 @@
         <set_value name="$currentCargo" exact="$ship.cargo.list"/>
         
         <do_if value="$currentCargo.count gt 0">
-          <!-- âœ… CRITICAL FIX: Sell ONE ware at a time (first ware in list) -->
-          <!-- After this trade completes, ship will loop back and sell next ware -->
-          <!-- This prevents multiple concurrent trade orders for the same ship -->
+          <!-- ✅ FIX: Rotate through cargo entries to avoid getting stuck on unsellable wares -->
+          <!-- Track last attempted ware index to rotate through cargo list -->
+          <!-- If one ware can't be sold (banned, blacklisted, mission-tied), next request tries next ware -->
+          <set_value name="$selectedIndex" exact="1"/>
+          <do_if value="global.$GT_ForcedSellLastWare? and global.$GT_ForcedSellLastWare.{$ship}?">
+            <!-- Get last attempted ware index -->
+            <set_value name="$lastWareIndex" exact="global.$GT_ForcedSellLastWare.{$ship}"/>
+            <!-- Rotate to next ware (wrap around if needed) -->
+            <!-- Use % operator for modulo (X4 MD syntax) -->
+            <set_value name="$selectedIndex" exact="(($lastWareIndex % $currentCargo.count) + 1)"/>
+          </do_if>
           
-          <set_value name="$selectedWare" exact="$currentCargo.{1}"/>
+          <!-- Select ware at rotated index -->
+          <set_value name="$selectedWare" exact="$currentCargo.{$selectedIndex}"/>
           <set_value name="$selectedAmount" exact="$ship.cargo.{$selectedWare}.count"/>
           
+          <!-- Store attempted ware index for next rotation -->
+          <do_if value="not global.$GT_ForcedSellLastWare?">
+            <set_value name="global.$GT_ForcedSellLastWare" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_ForcedSellLastWare.{$ship}" exact="$selectedIndex"/>
+          
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Cargo contains ' + $currentCargo.count + ' ware types, selling first: ' + @$selectedWare.name + ' x' + $selectedAmount + ' (after sale, will retry for remaining wares)'" chance="100"/>
+            <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Cargo contains ' + $currentCargo.count + ' ware types, attempting to sell ware ' + $selectedIndex + '/' + $currentCargo.count + ': ' + @$selectedWare.name + ' x' + $selectedAmount + ' (rotating through cargo to avoid stuck on unsellable wares)'" chance="100"/>
           </do_if>
           
           <!-- Find buy offers for the selected ware -->
@@ -2729,21 +2744,61 @@
             </do_if>
           </do_all>
           
-          <!-- Execute best sell if found -->
+          <!-- ✅ FIX: Execute best sell if found - use normal pipeline (store in GT_PendingTrades, let AI create orders) -->
           <do_if value="$bestOffer and $bestPrice gt $minProfit">
-            <!-- âœ… CRITICAL: Validate offer is STILL valid before creating order -->
+            <!-- ✅ CRITICAL: Validate offer is STILL valid before proceeding -->
             <!-- Offers can become invalid between search and order creation -->
             <set_value name="$offerStillValid" exact="$bestOffer.available and $bestOffer.amount gt 0"/>
             
             <do_if value="$offerStillValid">
               <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' found sell opportunity'" chance="100"/>
               
-              <!-- Create trade order with blacklist routing enabled -->
-              <!-- internal="true" ensures pathfinding routes around blacklisted sectors -->
-              <create_trade_order object="$ship" tradeoffer="$bestOffer" amount="$bestAmount" immediate="false" internal="true"/>
+              <!-- ✅ FIX: Create trade structure compatible with normal pipeline -->
+              <!-- For forced sell: ship already has cargo, so we create a sell-only trade structure -->
+              <!-- BuyStation = ship's docked station (if docked) or ship itself (if in space) -->
+              <!-- This ensures failure handler can access .sector and .knownname properties -->
+              <!-- SellStation = target station buying the cargo -->
+              <set_value name="$buyStation" exact="$ship"/>
+              <do_if value="$ship.dock? and $ship.dock.container?">
+                <!-- Ship is docked - use docked station for better tracking -->
+                <set_value name="$buyStation" exact="$ship.dock.container"/>
+              </do_if>
+              <do_elseif value="$ship.parkedat?">
+                <!-- Ship is parked at station -->
+                <set_value name="$buyStation" exact="$ship.parkedat"/>
+              </do_elseif>
+              <!-- If not docked, use ship object itself (has .sector and .knownname) -->
+              <set_value name="$sellStation" exact="$bestOffer.owner"/>
               
-              <!-- Signal back to AI script: Trade Found -->
-              <signal_objects object="$ship" param="'GT_Trade_Found'"/>
+              <!-- ✅ FIX: Create trade structure matching normal pipeline format -->
+              <!-- For sell-only trades, BuyOffer is null (ship already has cargo) -->
+              <!-- ExecuteTrade will handle this via $IsSellOnly flag -->
+              <set_value name="$sellTrade" exact="table[
+                $BuyStation = $buyStation,
+                $SellStation = $sellStation,
+                $Ware = $selectedWare,
+                $BuyOffer = null,
+                $SellOffer = $bestOffer,
+                $Amount = $bestAmount,
+                $BuyPrice = 0,
+                $SellPrice = $bestOffer.unitprice,
+                $Profit = $bestPrice,
+                $ROI = 0,
+                $Score = $bestPrice,
+                $Distance = 0,
+                $IsSellOnly = true
+              ]"/>
+              
+              <!-- ✅ FIX: Store in GT_PendingTrades and send to execution pipeline -->
+              <!-- This ensures failure tracking, telemetry, and proper order creation by AI -->
+              <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
+                $Ship = $ship,
+                $Trade = $sellTrade,
+                $TradeList = [$sellTrade],
+                $SearchMethod = 'forced_sell'
+              ]"/>
+              
+              <!-- Note: GT_Trade_Found signal now sent FROM ExecuteTrade after storing pending trade -->
             </do_if>
             <do_else>
               <!-- Offer became invalid - don't create order -->

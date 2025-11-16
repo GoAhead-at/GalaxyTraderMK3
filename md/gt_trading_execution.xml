@@ -17,21 +17,42 @@
         <set_value name="$trade" exact="$params.$Trade"/>
         <set_value name="$tradeList" exact="@$params.$TradeList"/> <!-- Trade list for fallback -->
         
+        <!-- ✅ FIX: Extract trade from TradeList if Trade is null (cache hits send only TradeList) -->
+        <do_if value="not $trade? and $tradeList? and $tradeList.count gt 0">
+          <set_value name="$trade" exact="$tradeList.{1}"/>
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Execution] (' + $ship.idcode + ') Extracted trade from TradeList (cache hit path)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
         <!-- ✅ FIX: Validate trade is not null before accessing properties -->
         <do_if value="not $trade?">
-          <debug_text text="'[GT-Execution] ⚠️ ERROR: ExecuteTrade called with null trade for ' + $ship.idcode" chance="100"/>
+          <debug_text text="'[GT-Execution] ⚠️ ERROR: ExecuteTrade called with null trade for ' + $ship.idcode + ' (TradeList count: ' + (if $tradeList? then $tradeList.count else 0) + ')'" chance="100"/>
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
           <cancel_cue cue="this"/>
         </do_if>
         
         <!-- ✅ FIX: Validate trade has required properties -->
+        <!-- ✅ FIX: Support sell-only trades (forced sell) where BuyOffer is null -->
         <set_value name="$tradeValid" exact="false"/>
+        <set_value name="$isSellOnly" exact="false"/>
         <do_if value="$trade?">
           <set_value name="$testBuyOffer" exact="@$trade.$BuyOffer"/>
           <set_value name="$testSellOffer" exact="@$trade.$SellOffer"/>
-          <do_if value="$testBuyOffer? and $testSellOffer?">
-            <set_value name="$tradeValid" exact="true"/>
+          <set_value name="$testIsSellOnly" exact="@$trade.$IsSellOnly"/>
+          <do_if value="$testIsSellOnly">
+            <!-- Sell-only trade: only SellOffer required -->
+            <do_if value="$testSellOffer?">
+              <set_value name="$tradeValid" exact="true"/>
+              <set_value name="$isSellOnly" exact="true"/>
+            </do_if>
           </do_if>
+          <do_else>
+            <!-- Normal trade: both offers required -->
+            <do_if value="$testBuyOffer? and $testSellOffer?">
+              <set_value name="$tradeValid" exact="true"/>
+            </do_if>
+          </do_else>
         </do_if>
         
         <do_if value="not $tradeValid">
@@ -48,9 +69,21 @@
           <set_value name="$buyPrice" exact="@$trade.$BuyPrice"/>
           <set_value name="$sellPrice" exact="@$trade.$SellPrice"/>
           <set_value name="$distance" exact="@$trade.$Distance"/>
-          <set_value name="$wareName" exact="@$trade.$BuyOffer.ware.name"/>
-          <set_value name="$buyStationName" exact="@$trade.$BuyOffer.owner.knownname"/>
-          <set_value name="$sellStationName" exact="@$trade.$SellOffer.owner.knownname"/>
+          <!-- ✅ FIX: Handle sell-only trades (BuyOffer may be null) -->
+          <set_value name="$wareName" exact="'Unknown'"/>
+          <set_value name="$buyStationName" exact="'N/A (sell-only)'"/>
+          <set_value name="$sellStationName" exact="'Unknown'"/>
+          <do_if value="not $isSellOnly and $trade.$BuyOffer?">
+            <set_value name="$wareName" exact="@$trade.$BuyOffer.ware.name"/>
+            <set_value name="$buyStationName" exact="@$trade.$BuyOffer.owner.knownname"/>
+          </do_if>
+          <do_elseif value="$isSellOnly and $trade.$SellOffer?">
+            <set_value name="$wareName" exact="@$trade.$Ware.name"/>
+            <set_value name="$buyStationName" exact="'Ship cargo (sell-only)'"/>
+          </do_elseif>
+          <do_if value="$trade.$SellOffer?">
+            <set_value name="$sellStationName" exact="@$trade.$SellOffer.owner.knownname"/>
+          </do_if>
           <!-- Note: This log will be skipped if trade becomes invalid and fallback is used -->
           <!-- Fallback trade logging happens in the fallback block -->
         </do_if>
@@ -59,19 +92,35 @@
         <do_if value="$tradeValid">
           <!-- CRITICAL FIX: Validate offers are still available -->
           <!-- ✅ FIX: Use safe operators to access trade properties -->
+          <!-- ✅ FIX: Handle sell-only trades (BuyOffer may be null) -->
           <set_value name="$buyOffer" exact="@$trade.$BuyOffer"/>
           <set_value name="$sellOffer" exact="@$trade.$SellOffer"/>
           <set_value name="$buyOfferValid" exact="false"/>
           <set_value name="$sellOfferValid" exact="false"/>
-          <do_if value="$buyOffer? and $sellOffer?">
-            <set_value name="$buyOfferValid" exact="$buyOffer.available and $buyOffer.amount gt 0"/>
-            <set_value name="$sellOfferValid" exact="$sellOffer.available and $sellOffer.amount gt 0"/>
+          <do_if value="$isSellOnly">
+            <!-- Sell-only trade: only validate SellOffer -->
+            <do_if value="$sellOffer?">
+              <set_value name="$sellOfferValid" exact="$sellOffer.available and $sellOffer.amount gt 0"/>
+            </do_if>
+            <set_value name="$buyOfferValid" exact="true"/>  <!-- Always valid for sell-only -->
           </do_if>
+          <do_else>
+            <!-- Normal trade: validate both offers -->
+            <do_if value="$buyOffer? and $sellOffer?">
+              <set_value name="$buyOfferValid" exact="$buyOffer.available and $buyOffer.amount gt 0"/>
+              <set_value name="$sellOfferValid" exact="$sellOffer.available and $sellOffer.amount gt 0"/>
+            </do_if>
+          </do_else>
           <set_value name="$canExecute" exact="true"/>
           
           <!-- Log original trade execution (only if trade is still valid) -->
           <do_if value="$buyOfferValid and $sellOfferValid">
-            <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+            <do_if value="$isSellOnly">
+              <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing SELL-ONLY trade for ' + ($profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  📦 Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  📍 BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  📍 SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  🚀 Distance: ' + $distance + ' jumps' + '\n  💰 Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+            </do_else>
           </do_if>
           
           <!-- ✅ RACE CONDITION FIX: If selected trade is invalid, try fallback trades from list -->
@@ -129,18 +178,31 @@
           </do_if>
           
           <!-- CRITICAL FIX: Verify ship can carry the ware -->
+          <!-- ✅ FIX: Handle sell-only trades (ware comes from $trade.$Ware, not $buyOffer.ware) -->
           <do_if value="$canExecute">
-            <set_value name="$ware" exact="@$buyOffer.ware"/>
+            <set_value name="$ware" exact="null"/>
+            <do_if value="$isSellOnly">
+              <!-- Sell-only trade: extract ware from trade structure -->
+              <set_value name="$ware" exact="@$trade.$Ware"/>
+            </do_if>
+            <do_else>
+              <!-- Normal trade: extract ware from buy offer -->
+              <set_value name="$ware" exact="@$buyOffer.ware"/>
+            </do_else>
+            
             <do_if value="not $ware?">
-              <debug_text text="'[GalaxyTrader MK3] ⚠ Trade missing BuyOffer.ware for ' + $ship.knownname" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3] ⚠ Trade missing ware information for ' + $ship.knownname + ' (IsSellOnly: ' + $isSellOnly + ')'" chance="100"/>
               <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
               <set_value name="$canExecute" exact="false"/>
             </do_if>
             <do_if value="$canExecute and $ware?">
-              <do_if value="$ship.cargo.{$ware}.max le 0">
-                <debug_text text="'[GalaxyTrader MK3] ⚠ Ship ' + $ship.knownname + ' cannot carry ware ' + $ware.name + ' - aborting trade'" chance="100"/>
-                <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-                <set_value name="$canExecute" exact="false"/>
+              <!-- ✅ FIX: Skip cargo capacity check for sell-only trades (ship already has cargo) -->
+              <do_if value="not $isSellOnly">
+                <do_if value="$ship.cargo.{$ware}.max le 0">
+                  <debug_text text="'[GalaxyTrader MK3] ⚠ Ship ' + $ship.knownname + ' cannot carry ware ' + $ware.name + ' - aborting trade'" chance="100"/>
+                  <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+                  <set_value name="$canExecute" exact="false"/>
+                </do_if>
               </do_if>
             </do_if>
           </do_if>
@@ -175,78 +237,148 @@
           <!-- CRITICAL: Check path reachability FIRST (faster to fail on unreachable) -->
           <!-- Extract stations from trade structure (handle both formats) -->
           <!-- ✅ FIX: Use pre-extracted $buyOffer and $sellOffer -->
+          <!-- ✅ FIX: Handle sell-only trades (BuyStation may be ship object or null) -->
           <set_value name="$buyStation" exact="null"/>
           <set_value name="$sellStation" exact="null"/>
-          <do_if value="$trade.$BuyStation?">
-            <set_value name="$buyStation" exact="$trade.$BuyStation"/>
+          <do_if value="$isSellOnly">
+            <!-- Sell-only trade: BuyStation is ship's docked station or ship itself -->
+            <set_value name="$buyStation" exact="@$trade.$BuyStation"/>
+            <set_value name="$sellStation" exact="@$trade.$SellStation"/>
           </do_if>
           <do_else>
-            <set_value name="$buyStation" exact="@$buyOffer.owner"/>
-          </do_else>
-          <do_if value="$trade.$SellStation?">
-            <set_value name="$sellStation" exact="$trade.$SellStation"/>
-          </do_if>
-          <do_else>
-            <set_value name="$sellStation" exact="@$sellOffer.owner"/>
+            <!-- Normal trade: Extract from trade structure or offers -->
+            <do_if value="$trade.$BuyStation?">
+              <set_value name="$buyStation" exact="$trade.$BuyStation"/>
+            </do_if>
+            <do_else>
+              <set_value name="$buyStation" exact="@$buyOffer.owner"/>
+            </do_else>
+            <do_if value="$trade.$SellStation?">
+              <set_value name="$sellStation" exact="$trade.$SellStation"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellStation" exact="@$sellOffer.owner"/>
+            </do_else>
           </do_else>
           
           <!-- Use BLACKLIST-AWARE gatedistance so it respects blocked paths from threat system -->
           <!-- Correct syntax: $ship.gatedistance.{$targetSector}.{$blacklistgroup}.{$ship} (NO blacklisttype!) -->
-          <set_value name="$buySector" exact="$buyStation.sector"/>
-          <set_value name="$sellSector" exact="$sellStation.sector"/>
+          <!-- ✅ FIX: Handle sell-only trades (BuyStation may be ship object, extract sector safely) -->
           <set_value name="$currentSector" exact="$ship.sector"/>
+          <set_value name="$buySector" exact="null"/>
+          <set_value name="$sellSector" exact="null"/>
           
-          <!-- ✅ ESCAPE LOGIC: Calculate path distances with escape support -->
-          <!-- Check if current sector is blacklisted for escape logic -->
-          <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklistedForEscape">
-            <param name="sector" value="$currentSector"/>
-            <param name="ship" value="$ship"/>
-            <param name="blacklistgroup" value="$blacklistgroup"/>
-          </run_actions>
-          
-          <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
-          <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$buyDistance">
-            <param name="ship" value="$ship"/>
-            <param name="fromSector" value="$currentSector"/>
-            <param name="toSector" value="$buySector"/>
-            <param name="blacklistgroup" value="$blacklistgroup"/>
-            <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
-          </run_actions>
-          
-          <!-- Sell path: Calculate based on buy location -->
-          <do_if value="$sellSector == $buySector">
-            <!-- Buy and sell in same sector -->
-            <set_value name="$sellDistance" exact="0"/>
+          <do_if value="$isSellOnly">
+            <!-- Sell-only trade: Ship already has cargo, no buy path needed -->
+            <!-- BuySector = ship's current sector (cargo already on board) -->
+            <set_value name="$buySector" exact="$currentSector"/>
+            <!-- Extract sell sector from sell station -->
+            <do_if value="$sellStation?">
+              <set_value name="$sellSector" exact="@$sellStation.sector"/>
+            </do_if>
           </do_if>
-          <do_elseif value="$buySector == $currentSector">
-            <!-- ✅ ESCAPE CASE: Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
-            <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$sellDistance">
-              <param name="ship" value="$ship"/>
-              <param name="fromSector" value="$currentSector"/>
-              <param name="toSector" value="$sellSector"/>
-              <param name="blacklistgroup" value="$blacklistgroup"/>
-              <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
-            </run_actions>
-          </do_elseif>
           <do_else>
-            <!-- Normal case: Need to travel from buy to sell sector -->
-            <do_if value="$buySector == $sellSector">
-              <set_value name="$sellDistance" exact="0"/>
+            <!-- Normal trade: Extract sectors from stations -->
+            <do_if value="$buyStation?">
+              <set_value name="$buySector" exact="@$buyStation.sector"/>
+            </do_if>
+            <do_if value="$sellStation?">
+              <set_value name="$sellSector" exact="@$sellStation.sector"/>
+            </do_if>
+          </do_else>
+          
+          <!-- ✅ FIX: Validate sectors extracted before pathfinding -->
+          <do_if value="not $buySector? or not $sellSector?">
+            <debug_text text="'[GT-Execution] ⚠️ ERROR: Failed to extract sectors for ' + $ship.idcode + ' (IsSellOnly: ' + $isSellOnly + ', BuyStation: ' + (if $buyStation? then 'exists' else 'null') + ', SellStation: ' + (if $sellStation? then 'exists' else 'null') + ')'" chance="100"/>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <set_value name="$canExecute" exact="false"/>
+          </do_if>
+          
+          <do_if value="$canExecute">
+            <!-- ✅ ESCAPE LOGIC: Calculate path distances with escape support -->
+            <!-- Check if current sector is blacklisted for escape logic -->
+            <run_actions ref="md.GT_Blacklist_Utilities.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklistedForEscape">
+              <param name="sector" value="$currentSector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            
+            <!-- ✅ FIX: Handle sell-only trades (no buy path needed, only sell path) -->
+            <do_if value="$isSellOnly">
+              <!-- Sell-only trade: Only calculate sell path (from current sector to sell sector) -->
+              <set_value name="$buyDistance" exact="0"/>  <!-- No buy path - cargo already on board -->
+              <do_if value="$sellSector == $currentSector">
+                <!-- Ship and sell station in same sector -->
+                <set_value name="$sellDistance" exact="0"/>
+              </do_if>
+              <do_else>
+                <!-- Calculate path from ship's current location to sell station -->
+                <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$sellDistance">
+                  <param name="ship" value="$ship"/>
+                  <param name="fromSector" value="$currentSector"/>
+                  <param name="toSector" value="$sellSector"/>
+                  <param name="blacklistgroup" value="$blacklistgroup"/>
+                  <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+                </run_actions>
+              </do_else>
             </do_if>
             <do_else>
-              <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+              <!-- Normal trade: Calculate both buy and sell paths -->
+              <!-- ✅ ESCAPE LOGIC: Buy path calculation with escape support -->
+              <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$buyDistance">
+                <param name="ship" value="$ship"/>
+                <param name="fromSector" value="$currentSector"/>
+                <param name="toSector" value="$buySector"/>
+                <param name="blacklistgroup" value="$blacklistgroup"/>
+                <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+              </run_actions>
+              
+              <!-- Sell path: Calculate based on buy location -->
+              <do_if value="$sellSector == $buySector">
+                <!-- Buy and sell in same sector -->
+                <set_value name="$sellDistance" exact="0"/>
+              </do_if>
+              <do_elseif value="$buySector == $currentSector">
+                <!-- ✅ ESCAPE CASE: Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
+                <run_actions ref="md.GT_Pathfinding_Utilities.GT_CalculatePathDistance" result="$sellDistance">
+                  <param name="ship" value="$ship"/>
+                  <param name="fromSector" value="$currentSector"/>
+                  <param name="toSector" value="$sellSector"/>
+                  <param name="blacklistgroup" value="$blacklistgroup"/>
+                  <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+                </run_actions>
+              </do_elseif>
+              <do_else>
+                <!-- Normal case: Need to travel from buy to sell sector -->
+                <do_if value="$buySector == $sellSector">
+                  <set_value name="$sellDistance" exact="0"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+                </do_else>
+              </do_else>
             </do_else>
-          </do_else>
+          </do_if>
           
           <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
             <!-- ✅ FIX: Use pre-extracted $ware and safe operators -->
+            <!-- ✅ FIX: Handle sell-only trades (BuyStation may be null or ship object) -->
             <set_value name="$wareNameForLog" exact="@$ware.name"/>
-            <set_value name="$buyStationNameForLog" exact="@$buyStation.knownname"/>
-            <set_value name="$buySectorNameForLog" exact="@$buyStation.sector.knownname"/>
-            <set_value name="$sellStationNameForLog" exact="@$sellStation.knownname"/>
-            <set_value name="$sellSectorNameForLog" exact="@$sellStation.sector.knownname"/>
+            <set_value name="$buyStationNameForLog" exact="'N/A (sell-only)'"/>
+            <set_value name="$buySectorNameForLog" exact="'N/A (sell-only)'"/>
+            <do_if value="not $isSellOnly and $buyStation?">
+              <set_value name="$buyStationNameForLog" exact="@$buyStation.knownname"/>
+              <set_value name="$buySectorNameForLog" exact="@$buyStation.sector.knownname"/>
+            </do_if>
+            <set_value name="$sellStationNameForLog" exact="'Unknown'"/>
+            <set_value name="$sellSectorNameForLog" exact="'Unknown'"/>
+            <do_if value="$sellStation?">
+              <set_value name="$sellStationNameForLog" exact="@$sellStation.knownname"/>
+              <set_value name="$sellSectorNameForLog" exact="@$sellStation.sector.knownname"/>
+            </do_if>
             <debug_text text="'[GT-Execution] 🚫 PATH BLOCKED: Trade became unreachable - restarting' +
               '\n  Ware: ' + $wareNameForLog +
+              '\n  Trade Type: ' + (if $isSellOnly then 'Sell-Only' else 'Normal') +
               '\n  BUY: ' + $buyStationNameForLog + ' (Sector: ' + $buySectorNameForLog + ', Distance: ' + $buyDistance + ')' +
               '\n  SELL: ' + $sellStationNameForLog + ' (Sector: ' + $sellSectorNameForLog + ', Distance: ' + $sellDistance + ')' +
               '\n  Reason: No path exists (disconnected sectors, war, or gates destroyed)' +
