@@ -1,6 +1,82 @@
 GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.5 - 2025-01-15
+---------------------------
+
+FIX: Cache Hit Detection - Trade List Execution
+  - Issue: Cache hits never executed trades when tradeList had entries but bestTrade was null
+  - Root Cause: $Found flag required both tradeList.count > 0 AND bestTrade? to be true
+  - Problem: When tradeList had valid entries but none passed GT_IsTradeValid validation, bestTrade stayed null, causing $Found to be false
+  - Solution: Changed $Found logic to only require tradeList.count > 0 (bestTrade is for backward compatibility, ExecuteTrade uses TradeList anyway)
+  - Implementation:
+    * Modified SearchCachedTrades (gt_search_methods.xml)
+      - Changed: $Found = ($foundCachedTrade and $tradeList.count gt 0 and $bestTrade?)
+      - To: $Found = ($foundCachedTrade and $tradeList.count gt 0)
+  - Files Modified:
+    * `md/gt_search_methods.xml` (line 1147)
+  - Benefits:
+    * More cache hits result in trade execution
+    * Ships with valid trade lists that don't pass validation can still execute trades
+    * Reduces unnecessary live searches when cache has valid entries
+
+FIX: Search Result State Preservation - Waiting Ships
+  - Issue: Search result state was overwritten for ships waiting on live/batch searches
+  - Root Cause: When batch results were missing, SearchLiveTrades_Resume reset entire global.$GT_SearchResult structure without preserving waiting ship state
+  - Problem: Waiting ship's $WaitingForBatch, $Ship, and trade list were wiped, causing search lock to remain set and live results to never resume
+  - Solution: Preserve $WaitingForBatch and $Ship when batch results are missing (another ship might be waiting)
+  - Implementation:
+    * Modified SearchLiveTrades_Resume (gt_trading_search.xml)
+      - Added preservation of $WaitingForBatch and $Ship before resetting structure
+      - Only sets empty results, preserves waiting state for other ships
+  - Files Modified:
+    * `md/gt_trading_search.xml` (lines 1654-1684)
+  - Benefits:
+    * Ships waiting for batch results don't lose their state
+    * Live search continuations can resume properly
+    * Prevents search locks from becoming stale
+
+FIX: Continuation Cleanup - Prevent Permanent Blocking
+  - Issue: Zero-trade continuations permanently blocked ships from searching again
+  - Root Cause: When live search continuation completed with trades, $Ship was never removed from global.$GT_SearchResult
+  - Problem: Next SearchTradeRoutes run detected continuation (Ship == current ship) but no waiting flag, assumed previous search just finished, hit cooldown path and exited without searching
+  - Solution: Remove $Ship from global.$GT_SearchResult after successful trade execution when continuation detected
+  - Implementation:
+    * Modified SearchTradeRoutes (gt_trading_search.xml)
+      - Added cleanup code after ExecuteTrade signal when $isLiveSearchContinuation is true
+      - Removes $WaitingForBatch and $Ship to prevent future requests from being treated as continuations
+  - Files Modified:
+    * `md/gt_trading_search.xml` (lines 1189-1198)
+  - Benefits:
+    * Ships are no longer permanently blocked after successful continuation completion
+    * Future search requests proceed normally instead of hitting cooldown shortcut
+    * Prevents infinite cooldown loops
+
+FIX: TradeList Preservation - Waiting Ship State Protection
+  - Issue: When another ship was mid-live search, SearchCachedTrades wiped that ship's stored trade list
+  - Root Cause: "Another ship waiting" branch cleared global.$GT_SearchResult.$TradeList = [], destroying waiting ship's live results
+  - Problem: Waiting ship's $TradeList contained their live search results - clearing it destroyed them, kept search lock set, causing stall
+  - Solution: Do NOT modify global.$GT_SearchResult at all when another ship is waiting - preserve ALL state including TradeList
+  - Implementation:
+    * Modified SearchCachedTrades (gt_search_methods.xml)
+      - Removed line that cleared $TradeList when another ship waiting
+      - Now preserves all waiting ship state (Found, TradeList, WaitingForBatch, Ship)
+    * Modified CheckTradeCache (gt_trading_queue.xml)
+      - Added verification that results belong to current ship
+      - Checks if global.$GT_SearchResult.$Ship matches current ship
+      - If results belong to another ship, treats as cache miss and proceeds to live search
+    * Modified SearchTradeRoutes (gt_trading_search.xml)
+      - Added same verification logic to ensure doesn't use another ship's cache results
+  - Files Modified:
+    * `md/gt_search_methods.xml` (lines 1160-1182)
+    * `md/gt_trading_queue.xml` (lines 537-563)
+    * `md/gt_trading_search.xml` (lines 351-363)
+  - Benefits:
+    * Waiting ship's TradeList (live results) is preserved intact
+    * Current ship correctly detects results don't belong to them
+    * No state is lost or overwritten
+    * Waiting ship's continuation can find TradeList intact when SearchLiveTrades_Resume completes
+
 Version 0.6.4 - 2025-01-15
 ---------------------------
 
