@@ -110,9 +110,14 @@ function menu.buttonGTRenameConfirm(isconfirmed)
             end
             
             if newname ~= currentName then
-                -- Raise MD event to set GT original name (MD handles global variable updates)
-                SignalObject(component, "gt_set_original_name", newname)
-                DebugError(string.format("[GT Context Rename] Set original name to: %s", newname))
+                -- Store rename data in NPCBlackboard for MD to read
+                -- Store newName separately to avoid table access issues
+                local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+                SetNPCBlackboard(playerId, "$GT_ContextRename_NewName", newname)
+                
+                -- Signal MD to process the rename (event-driven, not polling)
+                SignalObject(playerId, "gt_context_rename_confirmed", ConvertStringToLuaID(tostring(component)))
+                DebugError(string.format("[GT Context Rename] Signaled MD with component=%s, newName=%s", tostring(component), newname))
             end
         end
     end
