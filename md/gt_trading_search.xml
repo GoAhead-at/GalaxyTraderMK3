@@ -120,12 +120,16 @@
         <!-- Fallback search receives already-multiplied values, relaxes them, then SearchLiveTrades_Resume signals SearchTradeRoutes -->
         <!-- When SearchTradeRoutes runs as continuation, params already have relaxed values that shouldn't be multiplied again -->
         <set_value name="$isFallbackContinuation" exact="false"/>
-        <do_if value="$isLiveSearchContinuation and $maxDistance == 2">
-          <set_value name="$isFallbackContinuation" exact="true"/>
-          <!-- âœ… CRITICAL FIX: For fallback continuation, params already have relaxed profit thresholds from SearchFallbackTrades -->
-          <!-- These were calculated from already-multiplied values, so don't apply multiplier again -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ”„ Fallback continuation detected - skipping skill multiplier (params already relaxed)'" chance="100"/>
+        <!-- ✅ FIX: Detect fallback via OriginalMaxDistance parameter instead of assuming maxDistance == 2 -->
+        <do_if value="$isLiveSearchContinuation">
+          <!-- Check if OriginalMaxDistance exists and differs from current maxDistance (indicates fallback) -->
+          <do_if value="$params.$OriginalMaxDistance? and $params.$OriginalMaxDistance != $maxDistance">
+            <set_value name="$isFallbackContinuation" exact="true"/>
+            <!-- âœ… CRITICAL FIX: For fallback continuation, params already have relaxed profit thresholds from SearchFallbackTrades -->
+            <!-- These were calculated from already-multiplied values, so don't apply multiplier again -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback continuation detected (OriginalMaxDistance=' + $params.$OriginalMaxDistance + ', CurrentMaxDistance=' + $maxDistance + ') - skipping skill multiplier (params already relaxed)'" chance="100"/>
+            </do_if>
           </do_if>
         </do_if>
         
@@ -1691,38 +1695,45 @@
               <debug_text text="'[GT-Resume] âš ï¸ Batch results not found for ship ' + $ship.idcode" chance="100"/>
             </do_if>
             
-            <!-- ✅ FIX: Preserve WaitingForBatch and Ship when batch results are missing -->
-            <!-- Another ship might be waiting for batch results - don't wipe their state -->
-            <set_value name="$preservedWaitingForBatch" exact="false"/>
-            <set_value name="$preservedShip" exact="null"/>
-            <set_value name="$preservedLastRejectionStats" exact="null"/>
-            <do_if value="global.$GT_SearchResult.$WaitingForBatch? and global.$GT_SearchResult.$WaitingForBatch">
-              <set_value name="$preservedWaitingForBatch" exact="true"/>
-              <do_if value="global.$GT_SearchResult.$Ship?">
-                <set_value name="$preservedShip" exact="global.$GT_SearchResult.$Ship"/>
-              </do_if>
+            <!-- ✅ FIX: Clean up batch data and re-queue ship for new search -->
+            <!-- Clear batch data entries for this ship -->
+            <do_if value="global.$GT_BatchDataList.{$ship}?">
+              <remove_value name="global.$GT_BatchDataList.{$ship}"/>
             </do_if>
-            <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
-              <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
+            <do_if value="global.$GT_BatchResultsList.{$ship}?">
+              <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
             </do_if>
             
-            <!-- Set empty results but preserve waiting state -->
+            <!-- Clear search result state for this ship -->
             <set_value name="global.$GT_SearchResult.$Found" exact="false"/>
             <set_value name="global.$GT_SearchResult.$BestTrade" exact="null"/>
             <set_value name="global.$GT_SearchResult.$BestScore" exact="0"/>
             <set_value name="global.$GT_SearchResult.$TradeList" exact="[]"/>
+            <remove_value name="global.$GT_SearchResult.$WaitingForBatch"/>
+            <remove_value name="global.$GT_SearchResult.$Ship"/>
             
-            <!-- Restore preserved state -->
-            <do_if value="$preservedWaitingForBatch">
-              <set_value name="global.$GT_SearchResult.$WaitingForBatch" exact="true"/>
-              <do_if value="$preservedShip?">
-                <set_value name="global.$GT_SearchResult.$Ship" exact="$preservedShip"/>
+            <!-- Re-queue ship for new live search (don't leave it waiting forever) -->
+            <do_if value="global.$GT_SearchQueue.$Ships?">
+              <!-- Check if ship is already in queue -->
+              <set_value name="$shipInQueue" exact="false"/>
+              <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
+                <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
+                  <set_value name="$shipInQueue" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $shipInQueue">
+                <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Resume] ✅ Re-queued ship ' + $ship.idcode + ' for new search after batch failure'" chance="100"/>
+                </do_if>
               </do_if>
             </do_if>
-            <do_if value="$preservedLastRejectionStats?">
-              <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
-            </do_if>
             
+            <!-- Trigger queue processing -->
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            
+            <!-- Exit - ship will be processed in next queue cycle -->
             <cancel_cue cue="this"/>
           </do_if>
         
@@ -2923,6 +2934,13 @@
           <!-- No cargo -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ⚠️ NO CARGO: Ship has no cargo to dispose - signaling GT_No_Trade_Found'" chance="100"/>
+          </do_if>
+          <!-- ✅ FIX: Clear rotation state when cargo is emptied -->
+          <do_if value="global.$GT_ForcedSellLastWare? and global.$GT_ForcedSellLastWare.{$ship}?">
+            <remove_value name="global.$GT_ForcedSellLastWare.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ✅ Cleared rotation state (cargo emptied)'" chance="100"/>
+            </do_if>
           </do_if>
           <!-- Signal back to AI script: No Trade Found (no cargo) -->
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
