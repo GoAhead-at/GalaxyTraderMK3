@@ -348,13 +348,42 @@
           <set_value name="$cacheBlacklistRejections" exact="@global.$GT_SearchResult.$BlacklistRejections"/>
           <set_value name="$cacheTradeList" exact="@global.$GT_SearchResult.$TradeList"/>
           
+          <!-- ✅ CRITICAL FIX: Verify results belong to THIS ship, not another waiting ship -->
+          <!-- If another ship is waiting, global.$GT_SearchResult contains THEIR results, not ours -->
+          <!-- If $Ship doesn't exist, state might be stale/cleared - don't trust results -->
+          <set_value name="$resultsBelongToThisShip" exact="false"/>
+          <do_if value="global.$GT_SearchResult.$Ship?">
+            <set_value name="$resultShip" exact="global.$GT_SearchResult.$Ship"/>
+            <do_if value="$resultShip == $ship">
+              <!-- Results belong to THIS ship - safe to use -->
+              <set_value name="$resultsBelongToThisShip" exact="true"/>
+            </do_if>
+            <do_else>
+              <!-- Results belong to ANOTHER ship - don't use them -->
+              <set_value name="$resultsBelongToThisShip" exact="false"/>
+              <set_value name="$foundCachedTrade" exact="false"/>
+              <set_value name="$cacheBestTrade" exact="null"/>
+              <set_value name="$cacheBestScore" exact="0"/>
+              <set_value name="$cacheTradeList" exact="[]"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <!-- $Ship doesn't exist - state might be stale/cleared, don't trust results -->
+            <set_value name="$resultsBelongToThisShip" exact="false"/>
+            <set_value name="$foundCachedTrade" exact="false"/>
+            <set_value name="$cacheBestTrade" exact="null"/>
+            <set_value name="$cacheBestScore" exact="0"/>
+            <set_value name="$cacheTradeList" exact="[]"/>
+          </do_else>
+          
           <!-- âœ… ENHANCED: Log cache check results (debug mode only) -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <set_value name="$cacheTradeCount" exact="0"/>
             <do_if value="$cacheTradeList?">
               <set_value name="$cacheTradeCount" exact="@$cacheTradeList.count"/>
             </do_if>
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ“‹ Cache check complete: Found=' + $foundCachedTrade + ', Trades=' + $cacheTradeCount + ', BestScore=' + $cacheBestScore" chance="100"/>
+            <set_value name="$belongsToShipText" exact="if $resultsBelongToThisShip then 'YES' else 'NO (another ship waiting)'"/>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') 📋 Cache check complete: Found=' + $foundCachedTrade + ', Trades=' + $cacheTradeCount + ', BestScore=' + $cacheBestScore + ', BelongsToThisShip=' + $belongsToShipText" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
@@ -1186,6 +1215,17 @@
               $SearchMethod = $searchMethod
             ]"/>
             
+            <!-- ✅ FIX: Clear continuation state after successful trade execution -->
+            <!-- Remove $Ship from global.$GT_SearchResult to prevent future requests from being treated as continuations -->
+            <!-- This prevents ships from being permanently blocked after successful continuation -->
+            <do_if value="$isLiveSearchContinuation">
+              <remove_value name="global.$GT_SearchResult.$WaitingForBatch"/>
+              <remove_value name="global.$GT_SearchResult.$Ship"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ') ✅ Continuation cleanup: Removed $Ship after successful trade execution'" chance="100"/>
+              </do_if>
+            </do_if>
+            
             <!-- GT_Trade_Found signal now sent FROM ExecuteTrade cue after storing pending trade -->
           </do_if>
         </do_if>
@@ -1651,21 +1691,34 @@
               <debug_text text="'[GT-Resume] âš ï¸ Batch results not found for ship ' + $ship.idcode" chance="100"/>
             </do_if>
             
-            <!-- âœ… CRITICAL FIX: Preserve LastRejectionStats when updating global.$GT_SearchResult -->
+            <!-- ✅ FIX: Preserve WaitingForBatch and Ship when batch results are missing -->
+            <!-- Another ship might be waiting for batch results - don't wipe their state -->
+            <set_value name="$preservedWaitingForBatch" exact="false"/>
+            <set_value name="$preservedShip" exact="null"/>
             <set_value name="$preservedLastRejectionStats" exact="null"/>
-            <!-- âœ… SIMPLIFIED: Initialization guarantees global.$GT_SearchResult exists -->
-          <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
+            <do_if value="global.$GT_SearchResult.$WaitingForBatch? and global.$GT_SearchResult.$WaitingForBatch">
+              <set_value name="$preservedWaitingForBatch" exact="true"/>
+              <do_if value="global.$GT_SearchResult.$Ship?">
+                <set_value name="$preservedShip" exact="global.$GT_SearchResult.$Ship"/>
+              </do_if>
+            </do_if>
+            <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
               <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
             </do_if>
             
-            <set_value name="global.$GT_SearchResult" exact="table[
-              $Found = false,
-              $BestTrade = null,
-              $BestScore = 0,
-              $TradeList = []
-            ]"/>
+            <!-- Set empty results but preserve waiting state -->
+            <set_value name="global.$GT_SearchResult.$Found" exact="false"/>
+            <set_value name="global.$GT_SearchResult.$BestTrade" exact="null"/>
+            <set_value name="global.$GT_SearchResult.$BestScore" exact="0"/>
+            <set_value name="global.$GT_SearchResult.$TradeList" exact="[]"/>
             
-            <!-- âœ… CRITICAL FIX: Restore LastRejectionStats after updating global.$GT_SearchResult -->
+            <!-- Restore preserved state -->
+            <do_if value="$preservedWaitingForBatch">
+              <set_value name="global.$GT_SearchResult.$WaitingForBatch" exact="true"/>
+              <do_if value="$preservedShip?">
+                <set_value name="global.$GT_SearchResult.$Ship" exact="$preservedShip"/>
+              </do_if>
+            </do_if>
             <do_if value="$preservedLastRejectionStats?">
               <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
             </do_if>
@@ -2578,7 +2631,19 @@
         
         <!-- DEBUG: Sell search start -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === SELL SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin Profit: ' + $minProfit + ' Cr'" chance="100"/>
+          <set_value name="$hasCargo" exact="false"/>
+          <set_value name="$cargoCount" exact="0"/>
+          <do_if value="$ship.cargo.list?">
+            <set_value name="$cargoCount" exact="$ship.cargo.list.count"/>
+            <do_if value="$cargoCount gt 0">
+              <set_value name="$hasCargo" exact="true"/>
+            </do_if>
+          </do_if>
+          <set_value name="$stateShip" exact="'none'"/>
+          <do_if value="global.$GT_SearchResult.$Ship?">
+            <set_value name="$stateShip" exact="'exists (ship: ' + global.$GT_SearchResult.$Ship.idcode + ')'"/>
+          </do_if>
+          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === SELL SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin Profit: ' + $minProfit + ' Cr' + '\nHas Cargo: ' + $hasCargo + ' (' + $cargoCount + ' types)' + '\nGlobal State Ship: ' + $stateShip" chance="100"/>
         </do_if>
         
         <!-- Find best sell location for current cargo -->
@@ -2616,6 +2681,10 @@
             <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Cargo contains ' + $currentCargo.count + ' ware types, attempting to sell ware ' + $selectedIndex + '/' + $currentCargo.count + ': ' + @$selectedWare.name + ' x' + $selectedAmount + ' (rotating through cargo to avoid stuck on unsellable wares)'" chance="100"/>
           </do_if>
           
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') 🔍 Searching for buy offers: Ware=' + @$selectedWare.name + ', Amount=' + $selectedAmount + ', MaxDistance=' + $maxDistance + ' jumps'" chance="100"/>
+          </do_if>
+          
           <!-- Find buy offers for the selected ware -->
           <!-- âœ… CRITICAL: tradepartner="$ship" ensures only executable offers (relations, permissions, F6 limitations) -->
           <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$buyOffers" multiple="true" wares="$selectedWare">
@@ -2625,11 +2694,17 @@
           </find_buy_offer>
           
           <!-- âœ… FIX: Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') 📊 find_buy_offer returned ' + $buyOffers.count + ' offers for ' + @$selectedWare.name" chance="100"/>
+          </do_if>
+          
           <run_actions ref="md.GT_Blacklist_Utilities.GT_GetBlacklistGroup" result="$blacklistgroup">
             <param name="ship" value="$ship"/>
           </run_actions>
           
           <!-- Find best price -->
+          <set_value name="$validOffersCount" exact="0"/>
+          <set_value name="$rejectedCount" exact="0"/>
           <do_all exact="$buyOffers.count" counter="$j">
             <set_value name="$offer" exact="$buyOffers.{$j}"/>
             <set_value name="$station" exact="$offer.owner"/>
@@ -2731,6 +2806,7 @@
             
             <!-- Only consider valid, non-blacklisted, operational, dockable offers -->
             <do_if value="not $isBlacklisted and $isOperational and $canDock and $offer.available">
+              <set_value name="$validOffersCount" exact="$validOffersCount + 1"/>
               <set_value name="$tradeAmount" exact="[$selectedAmount, $offer.amount].min"/>
               <set_value name="$profit" exact="$offer.unitprice * $tradeAmount"/>
               
@@ -2744,13 +2820,31 @@
                 </do_if>
               </do_if>
             </do_if>
+            <do_else>
+              <set_value name="$rejectedCount" exact="$rejectedCount + 1"/>
+            </do_else>
           </do_all>
           
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') 📊 Offer filtering complete: Total=' + $buyOffers.count + ', Valid=' + $validOffersCount + ', Rejected=' + $rejectedCount + ', BestPrice=' + $bestPrice + ' Cr'" chance="100"/>
+          </do_if>
+          
           <!-- ✅ FIX: Execute best sell if found - use normal pipeline (store in GT_PendingTrades, let AI create orders) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$hasBestOffer" exact="false"/>
+            <do_if value="$bestOffer?">
+              <set_value name="$hasBestOffer" exact="true"/>
+            </do_if>
+            <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ✅ DECISION: hasBestOffer=' + $hasBestOffer + ', bestPrice=' + $bestPrice + ' Cr, minProfit=' + $minProfit + ' Cr, bestPrice gt minProfit=' + ($bestPrice gt $minProfit)" chance="100"/>
+          </do_if>
           <do_if value="$bestOffer and $bestPrice gt $minProfit">
             <!-- ✅ CRITICAL: Validate offer is STILL valid before proceeding -->
             <!-- Offers can become invalid between search and order creation -->
             <set_value name="$offerStillValid" exact="$bestOffer.available and $bestOffer.amount gt 0"/>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ✅ Offer validation: offerStillValid=' + $offerStillValid + ', available=' + $bestOffer.available + ', amount=' + $bestOffer.amount" chance="100"/>
+            </do_if>
             
             <do_if value="$offerStillValid">
               <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' found sell opportunity'" chance="100"/>
@@ -2804,18 +2898,32 @@
             </do_if>
             <do_else>
               <!-- Offer became invalid - don't create order -->
-              <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Best offer became invalid before order creation - retrying'" chance="100"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ⚠️ Best offer became invalid before order creation - available=' + $bestOffer.available + ', amount=' + $bestOffer.amount + ' - signaling GT_No_Trade_Found (will retry)'" chance="100"/>
+              </do_if>
               
               <!-- Signal back to AI script: No Trade Found (will retry) -->
               <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             </do_else>
           </do_if>
           <do_else>
+            <!-- No valid offer found -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$reason" exact="'no offer'"/>
+              <do_if value="$bestOffer?">
+                <set_value name="$reason" exact="'profit too low (bestPrice=' + $bestPrice + ' Cr, minProfit=' + $minProfit + ' Cr)'"/>
+              </do_if>
+              <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ❌ NO SELL OPPORTUNITY FOUND: Reason=' + $reason + ', TotalOffers=' + $buyOffers.count + ', ValidOffers=' + $validOffersCount + ', Rejected=' + $rejectedCount + ' - signaling GT_No_Trade_Found'" chance="100"/>
+            </do_if>
             <!-- Signal back to AI script: No Trade Found -->
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
           </do_else>
         </do_if>
         <do_else>
+          <!-- No cargo -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') ⚠️ NO CARGO: Ship has no cargo to dispose - signaling GT_No_Trade_Found'" chance="100"/>
+          </do_if>
           <!-- Signal back to AI script: No Trade Found (no cargo) -->
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
         </do_else>
