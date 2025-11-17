@@ -32,18 +32,60 @@
             </do_if>
             <do_else>
               <!-- Reconstruct params from batch data (if still available) -->
+              <!-- ✅ CRITICAL: Validate batchData is a valid table (not null) before using it -->
+              <!-- X4 MD quirk: $batchData? returns true even when value is null -->
               <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$shipFromQueue}"/>
+              <set_value name="$batchDataValid" exact="false"/>
               <do_if value="$batchData?">
-                <set_value name="$allowIllegalDefault" exact="false"/>
-                <set_value name="$params" exact="table[
-                  $Ship = $shipFromQueue,
-                  $MaxDistance = @$batchData.$maxDistance,
-                  $MinROI = @$batchData.$minROI,
-                  $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
-                  $FactionPriority = @$batchData.$factionPriority,
-                  $AllowIllegal = $allowIllegalDefault
-                ]"/>
+                <!-- Variable exists - verify it's actually a valid table (not null) -->
+                <set_value name="$batchDataKeysTest" exact="@$batchData.keys"/>
+                <do_if value="$batchDataKeysTest?">
+                  <!-- Keys property exists - check if count is valid -->
+                  <set_value name="$batchDataKeysCountTest" exact="@$batchDataKeysTest.count"/>
+                  <do_if value="$batchDataKeysCountTest? and $batchDataKeysCountTest ge 0">
+                    <!-- Also verify batchData has expected property ($maxDistance) to confirm it's batch state -->
+                    <set_value name="$batchDataMaxDistanceTest" exact="@$batchData.$maxDistance"/>
+                    <!-- Note: We check property exists, but will validate value is non-null later -->
+                    <!-- Property exists (even if null) - it's valid batch state structure -->
+                    <set_value name="$batchDataValid" exact="true"/>
+                  </do_if>
+                </do_if>
               </do_if>
+              <do_if value="$batchDataValid">
+                <set_value name="$batchMaxDistance" exact="@$batchData.$maxDistance"/>
+                <!-- ✅ CRITICAL: maxDistance MUST be a valid number >= 0 - null is FATAL -->
+                <!-- We do NOT have unlimited distance - null means the batch data is corrupted -->
+                <set_value name="$batchMaxDistanceValid" exact="false"/>
+                <do_if value="$batchMaxDistance? and $batchMaxDistance ge 0">
+                  <!-- Valid number >= 0 -->
+                  <set_value name="$batchMaxDistanceValid" exact="true"/>
+                </do_if>
+                <do_if value="$batchMaxDistanceValid">
+                  <set_value name="$allowIllegalDefault" exact="false"/>
+                  <set_value name="$params" exact="table[
+                    $Ship = $shipFromQueue,
+                    $MaxDistance = $batchMaxDistance,
+                    $MinROI = @$batchData.$minROI,
+                    $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+                    $FactionPriority = @$batchData.$factionPriority,
+                    $AllowIllegal = $allowIllegalDefault
+                  ]"/>
+                </do_if>
+                <do_else>
+                  <!-- ✅ CRITICAL: maxDistance is null or invalid - FATAL, cannot proceed -->
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GT-Search] ⚠️ ERROR: Cannot reconstruct params from batch data for ship ' + $ship.idcode + ' - maxDistance is null or invalid (value: ' + $batchMaxDistance + ', exists: ' + $batchMaxDistance? + ') - batch data corrupted, aborting'" chance="100"/>
+                  </do_if>
+                  <!-- Don't set $params - validation will fail and cue will cancel -->
+                </do_else>
+              </do_if>
+              <do_else>
+                <!-- ✅ CRITICAL: Batch data missing or null - fail loudly -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Search] ⚠️ ERROR: Cannot reconstruct params from batch data for ship ' + $shipFromQueue.idcode + ' - batchData is null or invalid (exists check: ' + $batchData? + ', keysCount: ' + $batchDataKeysCountTest + ')'" chance="100"/>
+                </do_if>
+                <!-- Don't set $params - validation will fail and cue will cancel -->
+              </do_else>
             </do_else>
           </do_if>
         </do_if>
@@ -94,10 +136,29 @@
         
         <do_if value="$shouldProceed">
         <set_value name="$ship" exact="$params.$Ship"/>
-        <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
-        <set_value name="$minROI" exact="$params.$MinROI"/>
-        <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
-        <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
+        <!-- ✅ CRITICAL FIX: Use safe operator @ and handle null properly -->
+        <set_value name="$maxDistance" exact="@$params.$MaxDistance"/>
+        <set_value name="$minROI" exact="@$params.$MinROI"/>
+        <do_if value="not $minROI?">
+          <set_value name="$minROI" exact="0"/>
+        </do_if>
+        <set_value name="$minAbsoluteProfit" exact="@$params.$MinAbsoluteProfit"/>
+        <do_if value="not $minAbsoluteProfit?">
+          <set_value name="$minAbsoluteProfit" exact="0"/>
+        </do_if>
+        <set_value name="$factionPriority" exact="@$params.$FactionPriority"/>
+        <do_if value="not $factionPriority?">
+          <set_value name="$factionPriority" exact="0"/>
+        </do_if>
+        
+        <!-- ✅ CRITICAL: maxDistance must be a valid number -->
+        <set_value name="$maxDistanceValid" exact="false"/>
+        <do_if value="$maxDistance != null">
+          <do_if value="$maxDistance ge 0">
+            <set_value name="$maxDistanceValid" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$maxDistanceValid">
         
         <!-- âœ… DEBUG: Log profit threshold from params -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -204,11 +265,18 @@
             </do_elseif>
             <set_value name="$pilotInfo" exact="$ship.pilot.name + ' (Skill: ' + $shownSkill + ')'"/>
           </do_if>
+          <!-- ✅ CRITICAL: maxDistance MUST be set - null is a BUG, not "unlimited" -->
+          <!-- If maxDistance is null, validation should have caught it and cancelled the cue -->
+          <!-- But if we get here with null, log it as an error so we can see the problem -->
+          <set_value name="$maxDistanceText" exact="'ERROR: NULL'"/>
+          <do_if value="$maxDistance? and $maxDistance ge 0">
+            <set_value name="$maxDistanceText" exact="$maxDistance"/>
+          </do_if>
           <debug_text text="'[GT-Search] (' + $ship.idcode + ') === TRADE SEARCH START ===' + 
             '\nShip: ' + $ship.knownname + 
             '\nPilot: ' + $pilotInfo + 
             '\nCurrent Sector: ' + $ship.sector.knownname + 
-            '\nMax Distance: ' + $maxDistance + ' jumps' + 
+            '\nMax Distance: ' + $maxDistanceText + ' jumps' + 
             '\nMin ROI: ' + $minROI + '%' + 
             '\nMin Absolute Profit: ' + ($minAbsoluteProfit / 100) + ' Cr' + 
             '\nShip Cargo: ' + ($ship.cargo.capacity.all - $ship.cargo.free.all) + '/' + $ship.cargo.capacity.all +
@@ -1210,13 +1278,22 @@
               <debug_text text="$logTradeList" chance="100"/>
             </do_if> -->
             
+            <!-- ✅ CRITICAL FIX: Extract $AllowIllegal BEFORE cleanup (needed for ExecuteTrade) -->
+            <!-- ExecuteTrade reads this from global.$GT_AIParameters, but cleanup deletes it before ExecuteTrade runs -->
+            <set_value name="$allowIllegal" exact="false"/>
+            <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AllowIllegal?">
+              <set_value name="$allowIllegal" exact="global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+            </do_if>
+            
             <!-- Signal execution module (which will signal AI after storing trade LIST) -->
             <!-- âœ… NEW: Pass searchMethod so AI knows if trades came from cache or live search -->
+            <!-- ✅ CRITICAL FIX: Pass $AllowIllegal in params (ExecuteTrade needs it but cleanup deletes global.$GT_AIParameters) -->
             <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
               $Ship = $ship,
               $Trade = $bestTrade,
               $TradeList = $tradeList,
-              $SearchMethod = $searchMethod
+              $SearchMethod = $searchMethod,
+              $AllowIllegal = $allowIllegal
             ]"/>
             
             <!-- ✅ FIX: Clear continuation state after successful trade execution -->
@@ -1606,8 +1683,40 @@
             <!-- Better UX: Don't escalate to 60s timeout when ship might just need blacklist adjustment -->
             <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
           </do_else>
-          </do_else>  <!-- âœ… FIX: Close do_else for batch check (batch NOT in progress) -->
+        </do_else>  <!-- âœ… FIX: Close do_else for batch check (batch NOT in progress) -->
         </do_else>  <!-- âœ… FIX: Close do_else for bestTradeIsValidForExecution -->
+        </do_if>  <!-- ✅ Close maxDistanceValid guard -->
+        <do_else>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] ⚠️ ERROR: Invalid MaxDistance (' + (if $maxDistance? then $maxDistance else 'NULL') + ') for ship ' + $ship.idcode + ' - aborting search and forcing retry'" chance="100"/>
+          </do_if>
+          <!-- Release search lock -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+          </do_if>
+          <!-- Decrement active search counter -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+          </do_if>
+          <!-- Clean up queue params -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+          </do_if>
+          <!-- Clean up AI parameters -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          <!-- Clean up batch data -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+          <!-- Notify AI so it can request a fresh search -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          <cancel_cue cue="this"/>
+        </do_else>
         </do_if>  <!-- âœ… FIX: Close do_if for $shouldProceed -->
         
         <!-- CRITICAL: Release search lock ONLY if NOT waiting for batch processing FOR THIS SHIP -->
@@ -1704,26 +1813,72 @@
             </do_if>
             <do_else>
               <!-- Try to reconstruct from batch data (before cleanup) -->
+              <!-- ✅ CRITICAL: Validate batchData is a valid table (not null) before using it -->
+              <!-- X4 MD quirk: $batchData? returns true even when value is null -->
               <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$ship}"/>
+              <set_value name="$batchDataValid" exact="false"/>
               <do_if value="$batchData?">
-                <set_value name="$allowIllegalDefault" exact="false"/>
-                <set_value name="$savedParams" exact="table[
-                  $Ship = $ship,
-                  $MaxDistance = @$batchData.$maxDistance,
-                  $MinROI = @$batchData.$minROI,
-                  $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
-                  $FactionPriority = @$batchData.$factionPriority,
-                  $AllowIllegal = $allowIllegalDefault
-                ]"/>
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                  <debug_text text="'[GT-Resume] Reconstructed params from batch data for ' + $ship.idcode" chance="100"/>
+                <!-- Variable exists - verify it's actually a valid table (not null) -->
+                <set_value name="$batchDataKeysTest" exact="@$batchData.keys"/>
+                <do_if value="$batchDataKeysTest?">
+                  <!-- Keys property exists - check if count is valid -->
+                  <set_value name="$batchDataKeysCountTest" exact="@$batchDataKeysTest.count"/>
+                  <do_if value="$batchDataKeysCountTest? and $batchDataKeysCountTest ge 0">
+                    <!-- Also verify batchData has expected property ($maxDistance) to confirm it's batch state -->
+                    <set_value name="$batchDataMaxDistanceTest" exact="@$batchData.$maxDistance"/>
+                    <!-- Note: We check property exists, but will validate value is non-null later -->
+                    <!-- Property exists (even if null) - it's valid batch state structure -->
+                    <set_value name="$batchDataValid" exact="true"/>
+                  </do_if>
                 </do_if>
               </do_if>
+              <do_if value="$batchDataValid">
+                <set_value name="$batchMaxDistance" exact="@$batchData.$maxDistance"/>
+                <!-- ✅ CRITICAL: maxDistance MUST be a valid number >= 0 - null is FATAL -->
+                <!-- We do NOT have unlimited distance - null means the batch data is corrupted -->
+                <set_value name="$batchMaxDistanceValid" exact="false"/>
+                <do_if value="$batchMaxDistance? and $batchMaxDistance ge 0">
+                  <!-- Valid number >= 0 -->
+                  <set_value name="$batchMaxDistanceValid" exact="true"/>
+                </do_if>
+                <do_if value="$batchMaxDistanceValid">
+                  <set_value name="$allowIllegalDefault" exact="false"/>
+                  <set_value name="$savedParams" exact="table[
+                    $Ship = $ship,
+                    $MaxDistance = $batchMaxDistance,
+                    $MinROI = @$batchData.$minROI,
+                    $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+                    $FactionPriority = @$batchData.$factionPriority,
+                    $AllowIllegal = $allowIllegalDefault
+                  ]"/>
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GT-Resume] Reconstructed params from batch data for ' + $ship.idcode" chance="100"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <!-- ✅ CRITICAL: maxDistance is null or invalid - FATAL, cannot proceed -->
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot reconstruct params from batch data for ship ' + $ship.idcode + ' - maxDistance is null or invalid (value: ' + $batchMaxDistance + ', exists: ' + $batchMaxDistance? + ') - batch data corrupted, aborting'" chance="100"/>
+                  </do_if>
+                  <!-- Don't set $savedParams - will be null, and requeue will fail validation -->
+                </do_else>
+              </do_if>
+              <do_else>
+                <!-- ✅ CRITICAL: Batch data missing or null - fail loudly -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot reconstruct params from batch data for ship ' + $ship.idcode + ' - batchData is null or invalid (exists check: ' + $batchData? + ', keysCount: ' + $batchDataKeysCountTest + ')'" chance="100"/>
+                </do_if>
+                <!-- Don't set $savedParams - will be null, and requeue will fail validation -->
+              </do_else>
             </do_else>
             
             <!-- ✅ FIX: Clean up batch data and re-queue ship for new search -->
             <!-- Clear batch data entries for this ship -->
+            <!-- ✅ CRITICAL: Log when batch data is cleared to track why params might be missing later -->
             <do_if value="global.$GT_BatchDataList.{$ship}?">
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] 🗑️ Cleaning up batch data for ship ' + $ship.idcode + ' (missing batch results cleanup)'" chance="100"/>
+              </do_if>
               <remove_value name="global.$GT_BatchDataList.{$ship}"/>
             </do_if>
             <do_if value="global.$GT_BatchResultsList.{$ship}?">
@@ -1768,6 +1923,7 @@
             
             <!-- ✅ CRITICAL FIX: Restore params to queue BEFORE requeueing -->
             <!-- Without params, ProcessSearchQueue will skip the ship with "Missing search parameters" -->
+            <!-- ✅ FIX: Only requeue if params are available, otherwise signal AI to restart -->
             <do_if value="$savedParams?">
               <do_if value="not global.$GT_SearchQueue.$Params?">
                 <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
@@ -1776,34 +1932,37 @@
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
                 <debug_text text="'[GT-Resume] 💾 Restored params to queue for ' + $ship.idcode" chance="100"/>
               </do_if>
+              
+              <!-- Re-queue ship for new live search (only if params available) -->
+              <do_if value="global.$GT_SearchQueue.$Ships?">
+                <!-- Check if ship is already in queue -->
+                <set_value name="$shipInQueue" exact="false"/>
+                <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
+                  <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
+                    <set_value name="$shipInQueue" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="not $shipInQueue">
+                  <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                    <debug_text text="'[GT-Resume] ✅ Re-queued ship ' + $ship.idcode + ' for new search after batch failure'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              
+              <!-- Trigger queue processing -->
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
             </do_if>
             <do_else>
-              <!-- No params available - log warning but still requeue (ship will need to request new search) -->
+              <!-- ✅ CRITICAL FIX: No params available - don't requeue (would be skipped anyway) -->
+              <!-- Signal AI to restart instead (prevents 90s timeout and wasted queue cycles) -->
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GT-Resume] ⚠️ No params available for requeue - ship ' + $ship.idcode + ' will need to request new search'" chance="100"/>
+                <debug_text text="'[GT-Resume] ⚠️ No params available for requeue - signaling AI to restart (ship ' + $ship.idcode + ')'" chance="100"/>
               </do_if>
+              <!-- Signal AI to restart (clear any waiting state) -->
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             </do_else>
-            
-            <!-- Re-queue ship for new live search (don't leave it waiting forever) -->
-            <do_if value="global.$GT_SearchQueue.$Ships?">
-              <!-- Check if ship is already in queue -->
-              <set_value name="$shipInQueue" exact="false"/>
-              <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-                <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                  <set_value name="$shipInQueue" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
-              <do_if value="not $shipInQueue">
-                <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                  <debug_text text="'[GT-Resume] ✅ Re-queued ship ' + $ship.idcode + ' for new search after batch failure'" chance="100"/>
-                </do_if>
-              </do_if>
-            </do_if>
-            
-            <!-- Trigger queue processing -->
-            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
             
             <!-- Exit - ship will be processed in next queue cycle -->
             <cancel_cue cue="this"/>
@@ -1973,20 +2132,88 @@
         
         <!-- Retrieve state from global table -->
         <set_value name="$filterState" exact="@global.$GT_FilterState.{$ship}"/>
-        <!-- âœ… FIX: Proper null check - extract property first, then check if result exists and is valid -->
-        <set_value name="$filterStateValid" exact="false"/>
+        <!-- ✅ CRITICAL FIX: Proper validation - check if filterState is actually a valid table (not just if variable exists) -->
+        <!-- In X4 MD, $filterState? can be true even if value is null, so we need to validate it's actually a table -->
+        <!-- Without this check, all property assignments fail with "Failed to set null.$property" -->
+        <set_value name="$filterStateIsValid" exact="false"/>
         <do_if value="$filterState?">
-          <set_value name="$filterStateKeysCount" exact="@$filterState.keys.count"/>
-          <do_if value="$filterStateKeysCount? and $filterStateKeysCount ge 0">
-            <set_value name="$filterStateValid" exact="true"/>
+          <!-- Check if $filterState is actually a valid table by trying to access .keys property -->
+          <set_value name="$filterStateKeysTest" exact="@$filterState.keys"/>
+          <do_if value="$filterStateKeysTest?">
+            <set_value name="$filterStateIsValid" exact="true"/>
           </do_if>
         </do_if>
-        <do_if value="not $filterStateValid">
+        <do_if value="not $filterStateIsValid">
+          <!-- ✅ CRITICAL: FilterState is null/invalid - abort batch processing and clean up properly -->
+          <!-- Must prevent FilterTradeList_Resume from running with null state -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Batch] ⚠️ FilterState is null/invalid for ship ' + $ship.idcode + ' - aborting batch processing and cleaning up'" chance="100"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up filter state to prevent FilterTradeList_Resume from running -->
+          <do_if value="global.$GT_FilterState? and global.$GT_FilterState.{$ship}?">
+            <remove_value name="global.$GT_FilterState.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Release search lock so ship can request new search -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🔓 Search lock released for ship ' + $ship.idcode + ' (FilterState abort)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up batch data (prevents reconstruction attempts with corrupted data) -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🗑️ Batch data cleaned up for ship ' + $ship.idcode + ' (FilterState abort)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Decrement active search counter -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🔢 Active searches decremented for ship ' + $ship.idcode + ' (FilterState abort): ' + global.$GT_SearchQueue.$ActiveSearches" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up AI parameters -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up queue params -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Signal AI to restart (prevents 90s timeout) -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          
+          <!-- Abort batch processing -->
           <cancel_cue cue="this"/>
         </do_if>
         
         <!-- Extract state variables -->
+        <!-- ✅ CRITICAL FIX: Initialize to safe defaults if null (prevents property lookup errors) -->
+        <!-- In X4 MD, @$filterState.$tradeList can return null even if variable exists, so we need explicit null check -->
         <set_value name="$tradeList" exact="@$filterState.$tradeList"/>
+        <set_value name="$tradeListValid" exact="false"/>
+        <do_if value="$tradeList?">
+          <!-- Variable exists - check if it's actually a valid list (not null) -->
+          <set_value name="$tradeListTestCount" exact="@$tradeList.count"/>
+          <do_if value="$tradeListTestCount?">
+            <set_value name="$tradeListValid" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $tradeListValid">
+          <set_value name="$tradeList" exact="[]"/>
+        </do_if>
         <set_value name="$wareBasket" exact="@$filterState.$wareBasket"/>
         <set_value name="$allowIllegal" exact="@$filterState.$allowIllegal"/>
         <set_value name="$blacklistgroup" exact="@$filterState.$blacklistgroup"/>
@@ -1996,8 +2223,16 @@
         <set_value name="$filterBatchSize" exact="@$filterState.$filterBatchSize"/>
         
         <!-- Get mutable lists/stats from state (or initialize if first batch) -->
+        <!-- ✅ CRITICAL FIX: Explicit null check for filteredTradeList -->
         <set_value name="$filteredTradeList" exact="@$filterState.$filteredTradeList"/>
-        <do_if value="not $filteredTradeList?">
+        <set_value name="$filteredTradeListValid" exact="false"/>
+        <do_if value="$filteredTradeList?">
+          <set_value name="$filteredTradeListTestCount" exact="@$filteredTradeList.count"/>
+          <do_if value="$filteredTradeListTestCount?">
+            <set_value name="$filteredTradeListValid" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $filteredTradeListValid">
           <set_value name="$filteredTradeList" exact="[]"/>
         </do_if>
         <set_value name="$filteredByWareBasket" exact="@$filterState.$filteredByWareBasket"/>
@@ -2013,12 +2248,20 @@
         <set_value name="$intraSectorTradesValid" exact="@$filterState.$intraSectorTradesValid"/>
         
         <!-- Process one batch of trades -->
-        <set_value name="$filterTotalTrades" exact="$tradeList.count"/>
+        <!-- ✅ CRITICAL FIX: Use safe operator to check if list is valid before accessing .count -->
+        <!-- In X4 MD, $tradeList? can be true even if value is null, so we need to check .count with @ operator -->
+        <set_value name="$filterTotalTrades" exact="0"/>
+        <set_value name="$tradeListCount" exact="@$tradeList.count"/>
+        <do_if value="$tradeListCount?">
+          <set_value name="$filterTotalTrades" exact="$tradeListCount"/>
+        </do_if>
         <set_value name="$batchEnd" exact="[$filterIndex + $filterBatchSize, $filterTotalTrades].min"/>
-        <do_all exact="$batchEnd - $filterIndex" counter="$batchOffset">
-          <set_value name="$i" exact="$filterIndex + $batchOffset"/>
-          <set_value name="$trade" exact="$tradeList.{$i}"/>
-          <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
+        <!-- ✅ CRITICAL FIX: Only iterate if tradeList is valid and has items to process -->
+        <do_if value="$filterTotalTrades gt 0">
+          <do_all exact="$batchEnd - $filterIndex" counter="$batchOffset">
+            <set_value name="$i" exact="$filterIndex + $batchOffset"/>
+            <set_value name="$trade" exact="$tradeList.{$i}"/>
+            <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
           
           <!-- Initialize ware stats if needed -->
           <do_if value="not $tradesByWareStats.{$ware}?">
@@ -2093,21 +2336,93 @@
           
           <!-- Update ware stats -->
           <set_value name="$tradesByWareStats.{$ware}" exact="$wareStats"/>
-        </do_all>
+          </do_all>
+        </do_if>
         
         <!-- Update state for next batch or completion -->
-        <set_value name="$filterIndex" exact="$batchEnd"/>
-        <set_value name="$filterState.$filterIndex" exact="$filterIndex"/>
-        <set_value name="$filterState.$filteredTradeList" exact="$filteredTradeList"/>
-        <set_value name="$filterState.$filteredByWareBasket" exact="$filteredByWareBasket"/>
-        <set_value name="$filterState.$filteredByIllegal" exact="$filteredByIllegal"/>
-        <set_value name="$filterState.$filteredByBlacklist" exact="$filteredByBlacklist"/>
-        <set_value name="$filterState.$filteredByPathBlocked" exact="$filteredByPathBlocked"/>
-        <set_value name="$filterState.$tradesByWareStats" exact="$tradesByWareStats"/>
-        <set_value name="$filterState.$intraSectorTradesTotal" exact="$intraSectorTradesTotal"/>
-        <set_value name="$filterState.$intraSectorTradesFiltered" exact="$intraSectorTradesFiltered"/>
-        <set_value name="$filterState.$intraSectorTradesValid" exact="$intraSectorTradesValid"/>
-        <set_value name="global.$GT_FilterState.{$ship}" exact="$filterState"/>
+        <!-- ✅ CRITICAL FIX: Check if global entry exists before reading and updating -->
+        <!-- $filterState might have become null if global entry was cleared (race condition, config reload, etc.) -->
+        <!-- Check if the entry exists in the global table first -->
+        <set_value name="$filterStateValidForUpdate" exact="false"/>
+        <do_if value="global.$GT_FilterState? and global.$GT_FilterState.{$ship}?">
+          <!-- Entry exists - read it and validate it's a valid table -->
+          <set_value name="$filterState" exact="@global.$GT_FilterState.{$ship}"/>
+          <!-- Validate by checking if .keys property exists (tables always have .keys) -->
+          <set_value name="$filterStateKeysTest" exact="@$filterState.keys"/>
+          <do_if value="$filterStateKeysTest?">
+            <!-- .keys exists - this confirms $filterState is a valid table (not null) -->
+            <set_value name="$filterStateValidForUpdate" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$filterStateValidForUpdate">
+          <set_value name="$filterIndex" exact="$batchEnd"/>
+          <set_value name="$filterState.$filterIndex" exact="$filterIndex"/>
+          <set_value name="$filterState.$filteredTradeList" exact="$filteredTradeList"/>
+          <set_value name="$filterState.$filteredByWareBasket" exact="$filteredByWareBasket"/>
+          <set_value name="$filterState.$filteredByIllegal" exact="$filteredByIllegal"/>
+          <set_value name="$filterState.$filteredByBlacklist" exact="$filteredByBlacklist"/>
+          <set_value name="$filterState.$filteredByPathBlocked" exact="$filteredByPathBlocked"/>
+          <set_value name="$filterState.$tradesByWareStats" exact="$tradesByWareStats"/>
+          <set_value name="$filterState.$intraSectorTradesTotal" exact="$intraSectorTradesTotal"/>
+          <set_value name="$filterState.$intraSectorTradesFiltered" exact="$intraSectorTradesFiltered"/>
+          <set_value name="$filterState.$intraSectorTradesValid" exact="$intraSectorTradesValid"/>
+          <set_value name="global.$GT_FilterState.{$ship}" exact="$filterState"/>
+        </do_if>
+        <do_else>
+          <!-- ✅ CRITICAL: FilterState is null/invalid - abort batch processing and clean up properly -->
+          <!-- Continuing with null state will cause all filtered results to be null, leading to null maxDistance -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Batch] ⚠️ FilterState entry missing or invalid when trying to update state for ship ' + $ship.idcode + ' - aborting batch processing and cleaning up'" chance="100"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up filter state to prevent FilterTradeList_Resume from running -->
+          <do_if value="global.$GT_FilterState? and global.$GT_FilterState.{$ship}?">
+            <remove_value name="global.$GT_FilterState.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Release search lock so ship can request new search -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🔓 Search lock released for ship ' + $ship.idcode + ' (FilterState update abort)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up batch data (prevents reconstruction attempts with corrupted data) -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🗑️ Batch data cleaned up for ship ' + $ship.idcode + ' (FilterState update abort)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Decrement active search counter -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Batch] 🔢 Active searches decremented for ship ' + $ship.idcode + ' (FilterState update abort): ' + global.$GT_SearchQueue.$ActiveSearches" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up AI parameters -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up queue params -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Signal AI to restart (prevents 90s timeout) -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          
+          <!-- Abort batch processing - state is corrupted, cannot continue -->
+          <cancel_cue cue="this"/>
+        </do_else>
         
         <!-- Check if more batches needed -->
         <do_if value="$filterIndex lt $filterTotalTrades">
@@ -2145,20 +2460,77 @@
           </do_if>
         </do_if>
         <do_if value="not $filterStateValid">
+          <!-- ✅ CRITICAL: FilterState is null/invalid - abort IMMEDIATELY and clean up properly -->
+          <!-- This happens when FilterTradeList_Batch aborted but resume cue still ran -->
+          <!-- MUST exit before accessing any $filterState properties (which would be null) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Resume] ⚠️ FilterState is null/invalid for ship ' + $ship.idcode + ' - aborting immediately (batch filter aborted earlier, cannot continue)'" chance="100"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Release search lock so ship can request new search -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] 🔓 Search lock released for ship ' + $ship.idcode + ' (FilterState abort)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up batch data -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Decrement active search counter -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] 🔢 Active searches decremented for ship ' + $ship.idcode + ' (FilterState abort): ' + global.$GT_SearchQueue.$ActiveSearches" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up AI parameters -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Clean up queue params -->
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+          </do_if>
+          
+          <!-- ✅ CRITICAL: Signal AI to restart (prevents 90s timeout) -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          
+          <!-- ✅ CRITICAL: Exit immediately - do NOT continue processing with null FilterState -->
+          <!-- cancel_cue should stop execution, but wrap entire rest of cue in do_else to be safe -->
           <cancel_cue cue="this"/>
         </do_if>
-        
-        <!-- Extract all filtered results and statistics -->
+        <do_else>
+          <!-- ✅ CRITICAL: Only process if FilterState is valid -->
+          <!-- Extract all filtered results and statistics -->
+        <!-- ✅ FIX: Initialize to safe defaults if null (prevents property lookup errors) -->
         <set_value name="$filteredTradeList" exact="@$filterState.$filteredTradeList"/>
+        <do_if value="not $filteredTradeList?">
+          <set_value name="$filteredTradeList" exact="[]"/>
+        </do_if>
         <set_value name="$filteredByWareBasket" exact="@$filterState.$filteredByWareBasket"/>
         <set_value name="$filteredByIllegal" exact="@$filterState.$filteredByIllegal"/>
         <set_value name="$filteredByBlacklist" exact="@$filterState.$filteredByBlacklist"/>
         <set_value name="$filteredByPathBlocked" exact="@$filterState.$filteredByPathBlocked"/>
         <set_value name="$tradesByWareStats" exact="@$filterState.$tradesByWareStats"/>
+        <do_if value="not $tradesByWareStats?">
+          <set_value name="$tradesByWareStats" exact="table[]"/>
+        </do_if>
         <set_value name="$intraSectorTradesTotal" exact="@$filterState.$intraSectorTradesTotal"/>
         <set_value name="$intraSectorTradesFiltered" exact="@$filterState.$intraSectorTradesFiltered"/>
         <set_value name="$intraSectorTradesValid" exact="@$filterState.$intraSectorTradesValid"/>
         <set_value name="$tradeList" exact="@$filterState.$tradeList"/>
+        <do_if value="not $tradeList?">
+          <set_value name="$tradeList" exact="[]"/>
+        </do_if>
         <set_value name="$maxDistance" exact="@$filterState.$maxDistance"/>
         
         <!-- âœ… FALLBACK SEARCH: Get originalMaxDistance from batch data (if available) -->
@@ -2210,20 +2582,48 @@
         
         <!-- DEBUG: Log filtering statistics -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <!-- ✅ CRITICAL FIX: Use safe operator to check if lists are valid before accessing .count -->
+          <set_value name="$tradeListCountForStats" exact="0"/>
+          <set_value name="$tradeListCountForStatsTemp" exact="@$tradeList.count"/>
+          <do_if value="$tradeListCountForStatsTemp?">
+            <set_value name="$tradeListCountForStats" exact="$tradeListCountForStatsTemp"/>
+          </do_if>
+          <set_value name="$filteredTradeListCountForStats" exact="0"/>
+          <set_value name="$filteredTradeListCountForStatsTemp" exact="@$filteredTradeList.count"/>
+          <do_if value="$filteredTradeListCountForStatsTemp?">
+            <set_value name="$filteredTradeListCountForStats" exact="$filteredTradeListCountForStatsTemp"/>
+          </do_if>
           <set_value name="$filteringStats" exact="'[GT-Resume] (' + $ship.idcode + ') Filtering statistics:' +
-            '\n  Total trades: ' + $tradeList.count +
-            '\n  ðŸ  TRUE intra-sector trades: ' + $intraSectorTradesTotal + ' (filtered: ' + $intraSectorTradesFiltered + ', valid: ' + $intraSectorTradesValid + ')' +
+            '\n  Total trades: ' + $tradeListCountForStats +
+            '\n  ðŸ  TRUE intra-sector trades: ' + $intraSectorTradesTotal + ' (filtered: ' + $intraSectorTradesFiltered + ', valid: ' + $intraSectorTradesValid + ')' +
             '\n  Filtered by ware basket: ' + $filteredByWareBasket +
             '\n  Filtered by illegal: ' + $filteredByIllegal +
             '\n  Filtered by blacklist: ' + $filteredByBlacklist +
             '\n  Filtered by path blocked: ' + $filteredByPathBlocked +
-            '\n  Valid trades: ' + $filteredTradeList.count"/>
+            '\n  Valid trades: ' + $filteredTradeListCountForStats"/>
           <debug_text text="$filteringStats" chance="100"/>
           
           <!-- Log per-ware statistics -->
-          <do_if value="$tradesByWareStats.keys.count gt 0">
+          <!-- ✅ FIX: Check if $tradesByWareStats exists and has keys before accessing -->
+          <!-- Use separate check to avoid evaluating .keys.count on null (X4 evaluates both branches) -->
+          <!-- ✅ CRITICAL FIX: Use safe operator to check if tradesByWareStats is valid before accessing .keys -->
+          <!-- ✅ CRITICAL FIX: Use safe operator to check if tradesByWareStats.keys is valid before accessing .count -->
+          <set_value name="$hasWareStats" exact="false"/>
+          <do_if value="$tradesByWareStats?">
+            <set_value name="$wareStatsKeys" exact="@$tradesByWareStats.keys"/>
+            <do_if value="$wareStatsKeys?">
+              <!-- Use safe operator to check if .count exists before accessing it -->
+              <set_value name="$wareStatsKeysCountTemp" exact="@$wareStatsKeys.count"/>
+              <do_if value="$wareStatsKeysCountTemp? and $wareStatsKeysCountTemp gt 0">
+                <set_value name="$wareStatsKeysCount" exact="$wareStatsKeysCountTemp"/>
+                <set_value name="$hasWareStats" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_if value="$hasWareStats">
             <set_value name="$wareStatsLog" exact="'[GT-Resume] (' + $ship.idcode + ') Per-ware filtering:'"/>
-            <do_all exact="$tradesByWareStats.keys.count" counter="$wareIdx">
+            <!-- ✅ CRITICAL FIX: Use the validated count variable instead of accessing .count directly -->
+            <do_all exact="$wareStatsKeysCount" counter="$wareIdx">
               <set_value name="$ware" exact="$tradesByWareStats.keys.{$wareIdx}"/>
               <set_value name="$stats" exact="$tradesByWareStats.{$ware}"/>
               <set_value name="$wareStatsLog" exact="$wareStatsLog + 
@@ -2239,24 +2639,52 @@
         </do_if>
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GT-Resume] (' + $ship.idcode + ') After ship-specific filtering: ' + $filteredTradeList.count + ' trades (from ' + $tradeList.count + ')'" chance="100"/>
+          <!-- ✅ FIX: Use separate variables to avoid evaluating .count on null (X4 evaluates both branches of conditional) -->
+          <!-- ✅ CRITICAL FIX: Use safe operator to check if lists are valid before accessing .count -->
+          <set_value name="$filteredCount" exact="0"/>
+          <set_value name="$filteredCountTemp" exact="@$filteredTradeList.count"/>
+          <do_if value="$filteredCountTemp?">
+            <set_value name="$filteredCount" exact="$filteredCountTemp"/>
+          </do_if>
+          <set_value name="$totalCount" exact="0"/>
+          <set_value name="$totalCountTemp" exact="@$tradeList.count"/>
+          <do_if value="$totalCountTemp?">
+            <set_value name="$totalCount" exact="$totalCountTemp"/>
+          </do_if>
+          <debug_text text="'[GT-Resume] (' + $ship.idcode + ') After ship-specific filtering: ' + $filteredCount + ' trades (from ' + $totalCount + ')'" chance="100"/>
         </do_if>
         
         <!-- 4. Build diverse list: Top 5 per ware (minimum-maximum) with early exit -->
         <!-- DEBUG: Log trades before diverse list building -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Building diverse list from ' + $filteredTradeList.count + ' filtered trades'" chance="100"/>
+          <!-- ✅ FIX: Use separate variable to avoid evaluating .count on null -->
+          <!-- ✅ CRITICAL FIX: Use safe operator to check if filteredTradeList is valid before accessing .count -->
+          <set_value name="$filteredCountForLog" exact="0"/>
+          <set_value name="$filteredCountForLogTemp" exact="@$filteredTradeList.count"/>
+          <do_if value="$filteredCountForLogTemp?">
+            <set_value name="$filteredCountForLog" exact="$filteredCountForLogTemp"/>
+          </do_if>
+          <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Building diverse list from ' + $filteredCountForLog + ' filtered trades'" chance="100"/>
         </do_if>
         
         <set_value name="$tradesByWare" exact="table[]"/>
-        <do_all exact="$filteredTradeList.count" counter="$i">
+        <!-- ✅ FIX: Check if $filteredTradeList exists before iterating -->
+        <!-- ✅ CRITICAL FIX: Use safe operator to check if filteredTradeList is valid before accessing .count -->
+        <set_value name="$filteredCountForIter" exact="0"/>
+        <set_value name="$filteredCountForIterTemp" exact="@$filteredTradeList.count"/>
+        <do_if value="$filteredCountForIterTemp?">
+          <set_value name="$filteredCountForIter" exact="$filteredCountForIterTemp"/>
+        </do_if>
+        <do_if value="$filteredCountForIter gt 0">
+          <do_all exact="$filteredTradeList.count" counter="$i">
           <set_value name="$trade" exact="$filteredTradeList.{$i}"/>
           <set_value name="$ware" exact="$trade.$BuyOffer.ware"/>
           <do_if value="not $tradesByWare.{$ware}?">
             <set_value name="$tradesByWare.{$ware}" exact="[]"/>
           </do_if>
           <append_to_list name="$tradesByWare.{$ware}" exact="$trade"/>
-        </do_all>
+          </do_all>
+        </do_if>
         
         <!-- DEBUG: Log wares found -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -2597,21 +3025,56 @@
         <set_value name="$originalParams" exact="null"/>
         <set_value name="$batchData" exact="@global.$GT_BatchDataList.{$ship}"/>
         <set_value name="$isFallbackFromBatch" exact="false"/>
-        <do_if value="$batchData? and $batchData.$maxDistance == 2">
-          <!-- This is a fallback search - batch data has relaxed profit thresholds, use those instead of queue -->
-          <set_value name="$isFallbackFromBatch" exact="true"/>
-          <set_value name="$allowIllegalDefault" exact="false"/>
-          <set_value name="$originalParams" exact="table[
-            $Ship = $ship,
-            $MaxDistance = @$batchData.$maxDistance,
-            $MinROI = @$batchData.$minROI,
-            $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
-            $FactionPriority = @$batchData.$factionPriority,
-            $AllowIllegal = $allowIllegalDefault
-          ]"/>
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') âœ… Using batch data params for fallback search (relaxed profit: ' + (@$batchData.$minAbsoluteProfit / 100) + ' Cr)'" chance="100"/>
+        <!-- ✅ CRITICAL: Validate batchData is a valid table (not null) before using it -->
+        <!-- X4 MD quirk: $batchData? returns true even when value is null -->
+        <set_value name="$batchDataValid" exact="false"/>
+        <do_if value="$batchData?">
+          <!-- Variable exists - verify it's actually a valid table (not null) -->
+          <set_value name="$batchDataKeysTest" exact="@$batchData.keys"/>
+          <do_if value="$batchDataKeysTest?">
+            <!-- Keys property exists - check if count is valid -->
+            <set_value name="$batchDataKeysCountTest" exact="@$batchDataKeysTest.count"/>
+            <do_if value="$batchDataKeysCountTest? and $batchDataKeysCountTest ge 0">
+              <!-- Also verify batchData has expected property ($maxDistance) to confirm it's batch state -->
+              <!-- Note: We check property exists, but will validate value is non-null later -->
+              <set_value name="$batchDataMaxDistanceTest" exact="@$batchData.$maxDistance"/>
+              <!-- Property exists (even if null) - it's valid batch state structure -->
+              <set_value name="$batchDataValid" exact="true"/>
+            </do_if>
           </do_if>
+        </do_if>
+        <!-- ✅ FIX: Check if $batchData is valid table and has $maxDistance == 2 before accessing -->
+        <!-- ✅ CRITICAL: Also validate maxDistance is not null (must be valid number) -->
+        <do_if value="$batchDataValid and $batchData.$maxDistance? and $batchData.$maxDistance == 2">
+          <!-- This is a fallback search - batch data has relaxed profit thresholds, use those instead of queue -->
+          <set_value name="$batchMaxDistance" exact="@$batchData.$maxDistance"/>
+          <!-- ✅ CRITICAL: maxDistance MUST be a valid number - null is FATAL -->
+          <set_value name="$fallbackMaxDistanceValid" exact="false"/>
+          <do_if value="$batchMaxDistance? and $batchMaxDistance ge 0">
+            <set_value name="$fallbackMaxDistanceValid" exact="true"/>
+          </do_if>
+          <do_if value="$fallbackMaxDistanceValid">
+            <set_value name="$isFallbackFromBatch" exact="true"/>
+            <set_value name="$allowIllegalDefault" exact="false"/>
+            <set_value name="$originalParams" exact="table[
+              $Ship = $ship,
+              $MaxDistance = $batchMaxDistance,
+              $MinROI = @$batchData.$minROI,
+              $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+              $FactionPriority = @$batchData.$factionPriority,
+              $AllowIllegal = $allowIllegalDefault
+            ]"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] (' + $ship.idcode + ') âœ… Using batch data params for fallback search (relaxed profit: ' + (@$batchData.$minAbsoluteProfit / 100) + ' Cr)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- ✅ CRITICAL: maxDistance is null or invalid in fallback batch data - FATAL -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot use batch data for fallback search for ship ' + $ship.idcode + ' - maxDistance is null or invalid (value: ' + $batchMaxDistance + ', exists: ' + $batchMaxDistance? + ') - batch data corrupted'" chance="100"/>
+            </do_if>
+            <!-- Don't set $originalParams - will be null, and SearchTradeRoutes will fail validation -->
+          </do_else>
         </do_if>
         <do_else>
           <!-- Normal search - try queue first, then batch data -->
@@ -2621,17 +3084,60 @@
           </do_if>
           <do_else>
             <!-- Fallback: Reconstruct parameters from batch data (before cleanup) -->
+            <!-- ✅ CRITICAL: Validate batchData is a valid table (not null) before using it -->
+            <!-- X4 MD quirk: $batchData? returns true even when value is null -->
+            <!-- Note: $batchDataValid already set above if fallback check ran, but re-validate here -->
+            <set_value name="$batchDataValidForNormal" exact="false"/>
             <do_if value="$batchData?">
-              <set_value name="$allowIllegalDefault" exact="false"/>
-              <set_value name="$originalParams" exact="table[
-                $Ship = $ship,
-                $MaxDistance = @$batchData.$maxDistance,
-                $MinROI = @$batchData.$minROI,
-                $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
-                $FactionPriority = @$batchData.$factionPriority,
-                $AllowIllegal = $allowIllegalDefault
-              ]"/>
+              <!-- Variable exists - verify it's actually a valid table (not null) -->
+              <set_value name="$batchDataKeysTest2" exact="@$batchData.keys"/>
+              <do_if value="$batchDataKeysTest2?">
+                <!-- Keys property exists - check if count is valid -->
+                <set_value name="$batchDataKeysCountTest2" exact="@$batchDataKeysTest2.count"/>
+                <do_if value="$batchDataKeysCountTest2? and $batchDataKeysCountTest2 ge 0">
+                  <!-- Also verify batchData has expected property ($maxDistance) to confirm it's batch state -->
+                  <!-- Note: We check property exists, but will validate value is non-null later -->
+                  <set_value name="$batchDataMaxDistanceTest2" exact="@$batchData.$maxDistance"/>
+                  <!-- Property exists (even if null) - it's valid batch state structure -->
+                  <set_value name="$batchDataValidForNormal" exact="true"/>
+                </do_if>
+              </do_if>
             </do_if>
+            <do_if value="$batchDataValidForNormal">
+              <set_value name="$batchMaxDistance" exact="@$batchData.$maxDistance"/>
+              <!-- ✅ CRITICAL: maxDistance MUST be a valid number >= 0 - null is FATAL -->
+              <!-- We do NOT have unlimited distance - null means the batch data is corrupted -->
+              <set_value name="$batchMaxDistanceValid" exact="false"/>
+              <do_if value="$batchMaxDistance? and $batchMaxDistance ge 0">
+                <!-- Valid number >= 0 -->
+                <set_value name="$batchMaxDistanceValid" exact="true"/>
+              </do_if>
+              <do_if value="$batchMaxDistanceValid">
+                <set_value name="$allowIllegalDefault" exact="false"/>
+                <set_value name="$originalParams" exact="table[
+                  $Ship = $ship,
+                  $MaxDistance = $batchMaxDistance,
+                  $MinROI = @$batchData.$minROI,
+                  $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
+                  $FactionPriority = @$batchData.$factionPriority,
+                  $AllowIllegal = $allowIllegalDefault
+                ]"/>
+              </do_if>
+              <do_else>
+                <!-- ✅ CRITICAL: maxDistance is null or invalid - FATAL, cannot proceed -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                  <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot reconstruct originalParams from batch data for ship ' + $ship.idcode + ' - maxDistance is null or invalid (value: ' + $batchMaxDistance + ', exists: ' + $batchMaxDistance? + ') - batch data corrupted, aborting'" chance="100"/>
+                </do_if>
+                <!-- Don't set $originalParams - will be null, and SearchTradeRoutes will fail validation -->
+              </do_else>
+            </do_if>
+            <do_else>
+              <!-- ✅ CRITICAL: Batch data missing or null - fail loudly -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot reconstruct originalParams from batch data for ship ' + $ship.idcode + ' - batchData is null or invalid (exists check: ' + $batchData? + ', keysCount: ' + $batchDataKeysCountTest2 + ')'" chance="100"/>
+              </do_if>
+              <!-- Don't set $originalParams - will be null, and SearchTradeRoutes will fail validation -->
+            </do_else>
           </do_else>
         </do_else>
         
@@ -2676,19 +3182,54 @@
         </do_if>
         
         <!-- 9. Cleanup batch data (using ship object as key) -->
-        <remove_value name="global.$GT_BatchDataList.{$ship}"/>
-        <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+        <!-- ✅ CRITICAL: Log when batch data is cleared to track why params might be missing later -->
+        <do_if value="global.$GT_BatchDataList.{$ship}?">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Resume] 🗑️ Cleaning up batch data for ship ' + $ship.idcode + ' (completion cleanup)'" chance="100"/>
+          </do_if>
+          <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+        </do_if>
+        <do_if value="global.$GT_BatchResultsList.{$ship}?">
+          <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+        </do_if>
         
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
           <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Complete. Returning ' + $diverseList.count + ' diverse trades. Best score: ' + $bestScore" chance="100"/>
         </do_if>
         
         <!-- 10. Signal SearchTradeRoutes again with original parameters so it can read the live search results -->
+        <!-- ✅ CRITICAL: Only signal if $originalParams is valid (not null) -->
         <do_if value="$originalParams?">
-          <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$originalParams"/>
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades)'" chance="100"/>
+          <!-- ✅ CRITICAL: Validate params have required $MaxDistance before signaling -->
+          <set_value name="$originalParamsMaxDistance" exact="@$originalParams.$MaxDistance"/>
+          <set_value name="$originalParamsValid" exact="false"/>
+          <do_if value="$originalParamsMaxDistance? and $originalParamsMaxDistance ge 0">
+            <set_value name="$originalParamsValid" exact="true"/>
           </do_if>
+          <do_if value="$originalParamsValid">
+            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$originalParams"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- ✅ CRITICAL: $originalParams exists but $MaxDistance is null/invalid - FATAL, abort -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Resume] ⚠️ ERROR: Cannot signal SearchTradeRoutes for ship ' + $ship.idcode + ' - $originalParams exists but $MaxDistance is null/invalid (value: ' + $originalParamsMaxDistance + ', exists: ' + $originalParamsMaxDistance? + ') - aborting'" chance="100"/>
+            </do_if>
+            
+            <!-- ✅ CRITICAL: Clean up and signal AI to restart -->
+            <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+              <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+              <remove_value name="global.$GT_AIParameters.{$ship}"/>
+            </do_if>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          </do_else>
         </do_if>
         <do_else>
           <!-- ✅ CRITICAL FIX: Original parameters missing (config reload/reset cleared them) -->
@@ -2777,6 +3318,7 @@
             <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'config_reload'"/>
           </do_else>
         </do_else>
+        </do_else>  <!-- ✅ CRITICAL: Close do_else for FilterState validation - only process if FilterState is valid -->
       </actions>
     </cue>
     
@@ -3048,13 +3590,22 @@
                 $IsSellOnly = true
               ]"/>
               
+              <!-- ✅ CRITICAL FIX: Extract $AllowIllegal BEFORE cleanup (needed for ExecuteTrade) -->
+              <!-- ExecuteTrade reads this from global.$GT_AIParameters, but cleanup deletes it before ExecuteTrade runs -->
+              <set_value name="$allowIllegal" exact="false"/>
+              <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AllowIllegal?">
+                <set_value name="$allowIllegal" exact="global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+              </do_if>
+              
               <!-- ✅ FIX: Store in GT_PendingTrades and send to execution pipeline -->
               <!-- This ensures failure tracking, telemetry, and proper order creation by AI -->
+              <!-- ✅ CRITICAL FIX: Pass $AllowIllegal in params (ExecuteTrade needs it but cleanup deletes global.$GT_AIParameters) -->
               <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
                 $Ship = $ship,
                 $Trade = $sellTrade,
                 $TradeList = [$sellTrade],
-                $SearchMethod = 'forced_sell'
+                $SearchMethod = 'forced_sell',
+                $AllowIllegal = $allowIllegal
               ]"/>
               
               <!-- Note: GT_Trade_Found signal now sent FROM ExecuteTrade after storing pending trade -->

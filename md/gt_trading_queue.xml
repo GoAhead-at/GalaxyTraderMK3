@@ -159,11 +159,22 @@
           </do_if>
         </do_if>
         
-        <!-- Check 2: Has training order -->
+        <!-- Check 2: Has training order OR pilot needs advancement (XPBlocked) -->
         <do_if value="not $isBusy and this.$ship.order? and this.$ship.order.id == 'DockAndTrain'">
           <set_value name="$isBusy" exact="true"/>
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + this.$shipID + ') Ship busy: in training'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ✅ CRITICAL FIX: Check if pilot needs advancement (XPBlocked) - ship should go to training, not search for trades -->
+        <!-- When pilot has XPBlocked set (ADVANCE status), they need to complete advancement exam before trading -->
+        <do_if value="not $isBusy and this.$ship.pilot?">
+          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.$ship.pilot}? and global.$GT_Pilots.{this.$ship.pilot}.$XPBlocked?">
+            <set_value name="$isBusy" exact="true"/>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + this.$shipID + ') Ship busy: pilot needs advancement (XPBlocked, ADVANCE status) - should go to training'" chance="100"/>
+            </do_if>
           </do_if>
         </do_if>
         
@@ -229,6 +240,36 @@
           <param name="ship" value="$ship"/>
         </run_actions>
         
+        <!-- ✅ CRITICAL FIX: Clean up immediately if ship validation fails (before checking busy status) -->
+        <!-- Without this cleanup, ships that lose pilot/destroyed while search pending get permanently stuck -->
+        <do_if value="not $shipValid">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Invalid ship for trading (validation failed) - cleaning up locks and params'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL: Release search lock for invalid ships -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search lock released (ship validation failed)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- CRITICAL: Clean up AI parameters for invalid ships -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI parameters cleaned up (ship validation failed)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Signal AI to restart (clear any waiting state) -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          
+          <!-- Exit immediately - don't process invalid ships -->
+          <cancel_cue cue="this"/>
+        </do_if>
+        
         <!-- ✅ SIMPLIFIED: Check if ship is currently busy with orders -->
         <set_value name="$isBusy" exact="false"/>
         
@@ -240,11 +281,22 @@
           </do_if>
         </do_if>
         
-        <!-- Check 2: Has training order -->
+        <!-- Check 2: Has training order OR pilot needs advancement (XPBlocked) -->
         <do_if value="not $isBusy and $ship.order? and $ship.order.id == 'DockAndTrain'">
           <set_value name="$isBusy" exact="true"/>
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship busy: in training'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- ✅ CRITICAL FIX: Check if pilot needs advancement (XPBlocked) - ship should go to training, not search for trades -->
+        <!-- When pilot has XPBlocked set (ADVANCE status), they need to complete advancement exam before trading -->
+        <do_if value="not $isBusy and $ship.pilot?">
+          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$XPBlocked?">
+            <set_value name="$isBusy" exact="true"/>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Ship busy: pilot needs advancement (XPBlocked, ADVANCE status) - should go to training'" chance="100"/>
+            </do_if>
           </do_if>
         </do_if>
         
@@ -306,16 +358,35 @@
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Search parameters: MinROI=' + $minROI + '%, MinAbsoluteProfit=' + ($minAbsoluteProfit / 100) + ' Cr (Level ' + $skillLevel + ' based)'" chance="100"/>
           </do_if>
           
-          <!-- CRITICAL FIX: Use AI script parameters if available, otherwise use pilot skill-based limits -->
-          <set_value name="$maxDistance" exact="15"/> <!-- Default fallback -->
-          
-          <!-- Check if we have stored AI parameters for this ship -->
+          <!-- CRITICAL FIX: Use AI script parameters - REQUIRED, no fallbacks -->
+          <!-- ✅ CRITICAL: MaxBuy/MaxSell are REQUIRED parameters - signal must always include them -->
+          <!-- No fallbacks - fail loudly if missing to prevent hiding issues -->
           <set_value name="$allowIllegal" exact="false"/> <!-- Default: illegal trades not allowed -->
           <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
             <set_value name="$aiParams" exact="global.$GT_AIParameters.{$ship}"/>
             
-            <!-- Use the maximum of MaxBuy and MaxSell from AI script -->
-            <set_value name="$maxDistance" exact="[$aiParams.$MaxBuy, $aiParams.$MaxSell].max"/>
+            <!-- ✅ CRITICAL: Extract MaxBuy and MaxSell - these MUST exist (validated when signal received) -->
+            <set_value name="$maxBuy" exact="@$aiParams.$MaxBuy"/>
+            <set_value name="$maxSell" exact="@$aiParams.$MaxSell"/>
+            
+            <!-- ✅ CRITICAL: Fail loudly if MaxBuy/MaxSell are missing (should never happen if signal validation works) -->
+            <set_value name="$maxBuyValid" exact="false"/>
+            <set_value name="$maxSellValid" exact="false"/>
+            <do_if value="$maxBuy? and $maxBuy ge 0">
+              <set_value name="$maxBuyValid" exact="true"/>
+            </do_if>
+            <do_if value="$maxSell? and $maxSell ge 0">
+              <set_value name="$maxSellValid" exact="true"/>
+            </do_if>
+            
+            <do_if value="not $maxBuyValid or not $maxSellValid">
+              <debug_text text="'[GT-TradingQueue] ⚠️ ERROR: AI parameters missing required MaxBuy/MaxSell for ship ' + $ship.idcode + ' (MaxBuy: ' + $maxBuy + ', MaxSell: ' + $maxSell + ') - this should never happen if signal validation works!'" chance="100"/>
+              <!-- Cancel - cannot proceed without valid distance parameters -->
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- Use the maximum of MaxBuy and MaxSell -->
+            <set_value name="$maxDistance" exact="[$maxBuy, $maxSell].max"/>
             
             <!-- Get AllowIllegal setting from AI parameters -->
             <do_if value="$aiParams.$AllowIllegal?">
@@ -324,7 +395,7 @@
             
             <!-- DEBUG: Using AI script parameters -->
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using AI script distance limits: MaxBuy=' + $aiParams.$MaxBuy + ', MaxSell=' + $aiParams.$MaxSell + ', using max=' + $maxDistance + ' jumps'" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using AI script distance limits: MaxBuy=' + $maxBuy + ', MaxSell=' + $maxSell + ', using max=' + $maxDistance + ' jumps'" chance="100"/>
             </do_if>
             
             <!-- Clean up old parameters (older than 5 minutes) -->
@@ -336,39 +407,10 @@
             </do_if>
           </do_if>
           <do_else>
-            <!-- Fallback to pilot skill-based limits -->
-            <do_if value="$ship.pilot">
-              <!-- Get pilot's actual max jump capability -->
-              <set_value name="$pilotMaxJumps" exact="$ship.pilot.skill.piloting"/>
-              
-              <!-- Apply skill-based maximum distance with reasonable limits -->
-              <set_value name="$skillBasedMax" exact="[$pilotMaxJumps, 1].max"/> <!-- Minimum 1 jump -->
-              <set_value name="$configMax" exact="15"/> <!-- Default config maximum -->
-              
-              <!-- Check if config override exists -->
-              <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$MaxTradeDistance?">
-                <set_value name="$configMax" exact="@global.$GT_Config.$Trading.$MaxTradeDistance"/>
-              </do_if>
-              
-              <!-- Use the minimum of skill-based limit and config limit -->
-              <set_value name="$maxDistance" exact="[$skillBasedMax, $configMax].min"/>
-              
-              <!-- DEBUG: Pilot skill-based distance -->
-              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No AI params, using pilot ' + $ship.pilot.name + ' max jumps: ' + $pilotMaxJumps + ', trade distance: ' + $maxDistance + ' (config max: ' + $configMax + ')'" chance="100"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <!-- No pilot - use config or default -->
-              <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$MaxTradeDistance?">
-                <set_value name="$maxDistance" exact="@global.$GT_Config.$Trading.$MaxTradeDistance"/>
-              </do_if>
-              
-              <!-- DEBUG: No pilot fallback -->
-              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') No pilot found, using fallback distance: ' + $maxDistance + ' jumps'" chance="100"/>
-              </do_if>
-            </do_else>
+            <!-- ✅ CRITICAL: AI parameters missing - this should never happen if signal validation works -->
+            <debug_text text="'[GT-TradingQueue] ⚠️ ERROR: AI parameters missing for ship ' + $ship.idcode + ' - this should never happen if signal validation works!'" chance="100"/>
+            <!-- Cancel - cannot proceed without AI parameters -->
+            <cancel_cue cue="this"/>
           </do_else>
           
           <do_if value="global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$FactionPriority?">
@@ -420,19 +462,7 @@
               <remove_value name="global.$GT_AIParameters.{$ship}"/>
             </do_if>
           </do_if>
-          <do_else>
-            <debug_text text="'[GalaxyTrader MK3] Invalid ship for trading: ' + $ship.knownname" chance="100"/>
-            
-            <!-- CRITICAL: Release search lock for invalid ships too -->
-            <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
-              <remove_value name="global.$GT_SearchLocks.{$ship}"/>
-            </do_if>
-            
-            <!-- CRITICAL: Clean up AI parameters -->
-            <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
-              <remove_value name="global.$GT_AIParameters.{$ship}"/>
-            </do_if>
-          </do_else>
+          <!-- Note: Invalid ship cleanup now happens immediately after validation (above), so this else only handles busy ships -->
         </do_else>
       </actions>
     </cue>
@@ -583,11 +613,20 @@
             <do_if value="$cacheTradeList? and $cacheTradeList.count gt 0">
               <set_value name="$firstTrade" exact="$cacheTradeList.{1}"/>
             </do_if>
+            
+            <!-- ✅ CRITICAL FIX: Extract $AllowIllegal BEFORE cleanup (needed for ExecuteTrade) -->
+            <!-- ExecuteTrade reads this from global.$GT_AIParameters, but cleanup deletes it before ExecuteTrade runs -->
+            <set_value name="$allowIllegal" exact="false"/>
+            <do_if value="global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AllowIllegal?">
+              <set_value name="$allowIllegal" exact="global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+            </do_if>
+            
             <signal_cue_instantly cue="md.GT_Trading_Execution.ExecuteTrade" param="table[
               $Ship = $ship,
               $Trade = $firstTrade,
               $TradeList = $cacheTradeList,
-              $SearchMethod = 'cache'
+              $SearchMethod = 'cache',
+              $AllowIllegal = $allowIllegal
             ]"/>
             
             <!-- ✅ FIX: Release search lock and clean up AI parameters after cache hit -->
