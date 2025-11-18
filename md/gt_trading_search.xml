@@ -91,10 +91,18 @@
         
         <do_if value="$shouldProceed">
         <set_value name="$ship" exact="$params.$Ship"/>
-        <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
-        <set_value name="$minROI" exact="$params.$MinROI"/>
-        <set_value name="$minAbsoluteProfit" exact="$params.$MinAbsoluteProfit"/>
-        <set_value name="$factionPriority" exact="$params.$FactionPriority"/>
+        <set_value name="$maxDistance" exact="@$params.$MaxDistance"/>
+        <set_value name="$minROI" exact="@$params.$MinROI"/>
+        <set_value name="$minAbsoluteProfit" exact="@$params.$MinAbsoluteProfit"/>
+        <set_value name="$factionPriority" exact="@$params.$FactionPriority"/>
+        
+        <!-- Validate maxDistance - must not be null (fail loudly, no fallback) -->
+        <do_if value="not $maxDistance? or $maxDistance lt 0">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] ERROR: (' + $ship.idcode + ') MaxDistance is null or invalid (' + $maxDistance + ') - cannot proceed without valid distance parameter!'" chance="100"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
         
         <!-- Log profit threshold from params -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -117,23 +125,48 @@
         <!-- Check if this is a fallback search continuation - if so, params already have skill multiplier applied -->
         <!-- Fallback search receives already-multiplied values, relaxes them, then SearchLiveTrades_Resume signals SearchTradeRoutes -->
         <!-- When SearchTradeRoutes runs as continuation, params already have relaxed values that shouldn't be multiplied again -->
+        <!-- Detect fallback search: originalMaxDistance exists and differs from maxDistance -->
         <set_value name="$isFallbackContinuation" exact="false"/>
-        <do_if value="$isLiveSearchContinuation and $maxDistance == 2">
+        <set_value name="$originalMaxDistance" exact="$maxDistance"/>  <!-- Default: same as maxDistance -->
+        <do_if value="$params.$OriginalMaxDistance?">
+          <set_value name="$originalMaxDistance" exact="$params.$OriginalMaxDistance"/>
+        </do_if>
+        <do_if value="$isLiveSearchContinuation and $originalMaxDistance? and $originalMaxDistance != $maxDistance">
           <set_value name="$isFallbackContinuation" exact="true"/>
           <!-- For fallback continuation, params already have relaxed profit thresholds from SearchFallbackTrades -->
           <!-- These were calculated from already-multiplied values, so don't apply multiplier again -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ”„ Fallback continuation detected - skipping skill multiplier (params already relaxed)'" chance="100"/>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback continuation detected (fallback distance: ' + $maxDistance + ', original: ' + $originalMaxDistance + ') - skipping skill multiplier (params already relaxed)'" chance="100"/>
           </do_if>
         </do_if>
         
         <!-- Clear fallback flag at start of new search cycle -->
         <!-- This allows fallback to be attempted again if cache and live search both fail -->
         <!-- Initialization guarantees global.$GT_FallbackAttempted exists -->
-        <do_if value="global.$GT_FallbackAttempted.{$ship}?">
+        <!-- BUT: Don't clear if this is a fallback continuation (detected above) -->
+        <do_if value="global.$GT_FallbackAttempted.{$ship}? and not $isFallbackContinuation">
           <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ”„ Starting new search cycle - cleared fallback flag'" chance="100"/>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting new search cycle - cleared fallback flag'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clear logbook flag ONLY when starting a completely new search (not from queue continuation) -->
+        <!-- This prevents clearing the flag during fallback continuations -->
+        <!-- Check if this is a new search request (not a continuation from live search or fallback) -->
+        <set_value name="$isNewSearchRequest" exact="false"/>
+        <do_if value="not $isLiveSearchContinuation">
+          <!-- Check if this is coming from search queue (new request) vs continuation -->
+          <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <set_value name="$isNewSearchRequest" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only clear logbook flag for truly new search requests -->
+        <do_if value="global.$GT_FallbackLogbookWritten.{$ship}? and $isNewSearchRequest">
+          <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Cleared logbook flag - new search request detected'" chance="100"/>
           </do_if>
         </do_if>
         
@@ -221,8 +254,15 @@
         <do_if value="global.$GT_FallbackAttempted.{$ship}?">
           <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') âœ… New search cycle started - fallback flag cleared'" chance="100"/>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') New search cycle started - fallback flag cleared'" chance="100"/>
           </do_if>
+        </do_if>
+        
+        <!-- Clear logbook flag when new normal search cycle starts -->
+        <!-- This allows logbook message to be written again for new fallback attempts -->
+        <!-- BUT: Don't clear if this is a continuation (fallback or live search) -->
+        <do_if value="global.$GT_FallbackLogbookWritten.{$ship}? and not $isLiveSearchContinuation">
+          <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
         </do_if>
         
         <!-- Extract live search results if continuation (already detected earlier) -->
@@ -1037,48 +1077,104 @@
                 
                 <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted -->
                 <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted">
-                  <!-- Write logbook message BEFORE triggering fallback search -->
-                  <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
-                  <do_if value="not $currentSectorName?">
-                    <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
-                  </do_if>
-                  
-                  <!-- Construct logbook message using TextDB syntax -->
-                  <set_value name="$logbookMessage" exact="{77000,3221}.[$ship.knownname, $currentSectorName, $maxDistance, 2]"/>
-                  
-                  <!-- Write logbook entry using centralized library -->
-                  <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-                    <param name="Message" value="$logbookMessage"/>
-                    <param name="Category" value="'alerts'"/>
-                    <param name="Title" value="'Fallback Search: ' + $ship.knownname"/>
-                    <param name="Object" value="$ship"/>
-                    <param name="Interaction" value="'showonmap'"/>
-                    <param name="CheckGlobalSettings" value="true"/>
-                  </run_actions>
-                  
-                  <!-- Mark that fallback search was triggered -->
-                  <set_value name="$fallbackSearchTriggered" exact="true"/>
-                  
                   <!-- Ensure table exists before accessing -->
                   <do_if value="not global.$GT_FallbackAttempted?">
                     <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
                   </do_if>
+                  
+                  <!-- Check if logbook message was already written for this fallback attempt -->
+                  <!-- Use a separate flag to prevent logbook spam -->
+                  <!-- Ensure table exists before checking -->
+                  <do_if value="not global.$GT_FallbackLogbookWritten?">
+                    <set_value name="global.$GT_FallbackLogbookWritten" exact="table[]"/>
+                  </do_if>
+                  
+                  <!-- Check if logbook already written - if so, skip writing -->
+                  <set_value name="$logbookAlreadyWritten" exact="false"/>
+                  <do_if value="global.$GT_FallbackLogbookWritten.{$ship}?">
+                    <set_value name="$logbookAlreadyWritten" exact="true"/>
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook message already written - skipping (flag exists, isLiveContinuation=' + $isLiveSearchContinuation + ')'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  <do_else>
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook flag NOT set - will write message (isLiveContinuation=' + $isLiveSearchContinuation + ', isFallbackContinuation=' + $isFallbackContinuation + ')'" chance="100"/>
+                    </do_if>
+                  </do_else>
+                  
+                  <!-- Set flag IMMEDIATELY when fallback is triggered (before any other processing) -->
+                  <!-- This ensures flag persists across cue instances and prevents logbook spam -->
+                  <do_if value="not $logbookAlreadyWritten">
+                    <set_value name="global.$GT_FallbackLogbookWritten.{$ship}" exact="true"/>
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Set logbook flag - fallback triggered'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Calculate skill level for fallback distance calculation -->
+                  <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
+                    <param name="ship" value="$ship"/>
+                  </run_actions>
+                  <set_value name="$fallbackSkillLevel" exact="if $skillInfo? and $skillInfo.$Level? then $skillInfo.$Level else 1"/>
+                  
+                  <!-- Use originalMaxDistance for fallback calculation if available (prevents decreasing distance) -->
+                  <!-- If this is already a fallback continuation, $maxDistance is already reduced, so use originalMaxDistance -->
+                  <set_value name="$distanceForFallbackCalc" exact="$maxDistance"/>
+                  <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+                    <set_value name="$distanceForFallbackCalc" exact="$originalMaxDistance"/>
+                  </do_if>
+                  
+                  <!-- Calculate fallback distance: max(1, min(pilotMaxJumps, maxDistance / 3)) -->
+                  <set_value name="$fallbackMaxDistance" exact="1"/>  <!-- Default fallback to 1 -->
+                  <run_actions ref="md.GT_Libraries_General.GT_CalculateFallbackDistance" result="$fallbackMaxDistance">
+                    <param name="maxDistance" value="$distanceForFallbackCalc"/>
+                    <param name="skillLevel" value="$fallbackSkillLevel"/>
+                  </run_actions>
+                  
+                  <!-- Write logbook message ONLY if not already written for this fallback attempt -->
+                  <do_if value="not $logbookAlreadyWritten">
+                    
+                    <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
+                    <do_if value="not $currentSectorName?">
+                      <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
+                    </do_if>
+                    
+                    <!-- Use originalMaxDistance in logbook message if available (shows original search range) -->
+                    <set_value name="$originalSearchRange" exact="$maxDistance"/>
+                    <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+                      <set_value name="$originalSearchRange" exact="$originalMaxDistance"/>
+                    </do_if>
+                    
+                    <!-- Construct logbook message using TextDB syntax with calculated fallback distance -->
+                    <set_value name="$logbookMessage" exact="{77000,3221}.[$ship.knownname, $currentSectorName, $originalSearchRange, $fallbackMaxDistance]"/>
+                    
+                    <!-- Write logbook entry using centralized library -->
+                    <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                      <param name="Message" value="$logbookMessage"/>
+                      <param name="Category" value="'alerts'"/>
+                      <param name="Title" value="'Fallback Search: ' + $ship.knownname"/>
+                      <param name="Object" value="$ship"/>
+                      <param name="Interaction" value="'showonmap'"/>
+                      <param name="CheckGlobalSettings" value="true"/>
+                    </run_actions>
+                  </do_if>
+                  
+                  <!-- Mark that fallback search was triggered -->
+                  <set_value name="$fallbackSearchTriggered" exact="true"/>
+                  
                   <!-- Mark fallback as attempted globally (persists across cue instances) -->
                   <set_value name="global.$GT_FallbackAttempted.{$ship}" exact="true"/>
                   
                   <!-- Trigger fallback search -->
                   <!-- Fallback uses lower profit thresholds, so we compensate by restricting travel distance -->
-                  <!-- Use maxJumps / 3 to balance: closer trades (less travel time) but still within reasonable range -->
-                  <!-- Minimum: 2 jumps, Maximum: pilot's maxDistance / 3 -->
+                  <!-- Formula: max(1, min(pilotMaxJumps, maxDistance / 3)) -->
                   <!-- OriginalMaxDistance used for filtering stations from home sector -->
-                  <!-- Use library function for fallback distance calculation -->
-                  <run_actions ref="md.GT_Libraries_General.GT_CalculateFallbackDistance" result="$fallbackMaxDistance">
-                    <param name="maxDistance" value="$maxDistance"/>
-                  </run_actions>
+                  <!-- CRITICAL: Pass $originalMaxDistance (not $maxDistance) to preserve original search range -->
                   <set_value name="$fallbackParams" exact="table[
                     $Ship = $ship,
                     $MaxDistance = $fallbackMaxDistance,
-                    $OriginalMaxDistance = $maxDistance,
+                    $OriginalMaxDistance = $originalMaxDistance,
                     $MinROI = $minROI,
                     $MinAbsoluteProfit = $minAbsoluteProfit,
                     $FactionPriority = $factionPriority,
@@ -1178,6 +1274,11 @@
               </do_all>
               <debug_text text="$logTradeList" chance="100"/>
             </do_if> -->
+            
+            <!-- Clear fallback logbook flag when trade is found (allows new message for next search cycle) -->
+            <do_if value="global.$GT_FallbackLogbookWritten.{$ship}?">
+              <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
+            </do_if>
             
             <!-- Signal execution module (which will signal AI after storing trade LIST) -->
             <!-- Pass searchMethod so AI knows if trades came from cache or live search -->
@@ -1486,47 +1587,89 @@
             
             <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted -->
             <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted">
-              <!-- Write logbook message BEFORE triggering fallback search -->
-              <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
-              <do_if value="not $currentSectorName?">
-                <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
+              <!-- Ensure table exists before accessing -->
+              <do_if value="not global.$GT_FallbackAttempted?">
+                <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
               </do_if>
               
-              <!-- Construct logbook message using TextDB syntax -->
-              <set_value name="$logbookMessage" exact="{77000,3221}.[$ship.knownname, $currentSectorName, $maxDistance, 2]"/>
+              <!-- Check if logbook message was already written for this fallback attempt -->
+              <!-- Use a separate flag to prevent logbook spam -->
+              <!-- Ensure table exists before checking -->
+              <do_if value="not global.$GT_FallbackLogbookWritten?">
+                <set_value name="global.$GT_FallbackLogbookWritten" exact="table[]"/>
+              </do_if>
               
-              <!-- Write logbook entry using centralized library -->
-              <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-                <param name="Message" value="$logbookMessage"/>
-                <param name="Category" value="'alerts'"/>
-                <param name="Title" value="'Fallback Search: ' + $ship.knownname"/>
-                <param name="Object" value="$ship"/>
-                <param name="Interaction" value="'showonmap'"/>
-                <param name="CheckGlobalSettings" value="true"/>
+              <!-- Check if logbook already written - if so, skip writing -->
+              <set_value name="$logbookAlreadyWritten" exact="false"/>
+              <do_if value="global.$GT_FallbackLogbookWritten.{$ship}?">
+                <set_value name="$logbookAlreadyWritten" exact="true"/>
+              </do_if>
+              
+              <!-- Calculate skill level for fallback distance calculation -->
+              <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
+                <param name="ship" value="$ship"/>
               </run_actions>
+              <set_value name="$fallbackSkillLevel" exact="if $skillInfo? and $skillInfo.$Level? then $skillInfo.$Level else 1"/>
+              
+              <!-- Use originalMaxDistance for fallback calculation if available (prevents decreasing distance) -->
+              <!-- If this is already a fallback continuation, $maxDistance is already reduced, so use originalMaxDistance -->
+              <set_value name="$distanceForFallbackCalc" exact="$maxDistance"/>
+              <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+                <set_value name="$distanceForFallbackCalc" exact="$originalMaxDistance"/>
+              </do_if>
+              
+              <!-- Calculate fallback distance: max(1, min(pilotMaxJumps, maxDistance / 3)) -->
+              <set_value name="$fallbackMaxDistance" exact="1"/>  <!-- Default fallback to 1 -->
+              <run_actions ref="md.GT_Libraries_General.GT_CalculateFallbackDistance" result="$fallbackMaxDistance">
+                <param name="maxDistance" value="$distanceForFallbackCalc"/>
+                <param name="skillLevel" value="$fallbackSkillLevel"/>
+              </run_actions>
+              
+              <!-- Write logbook message ONLY if not already written for this fallback attempt -->
+              <do_if value="not $logbookAlreadyWritten">
+                <!-- Set flag IMMEDIATELY before writing to prevent race conditions -->
+                <set_value name="global.$GT_FallbackLogbookWritten.{$ship}" exact="true"/>
+                
+                <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
+                <do_if value="not $currentSectorName?">
+                  <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
+                </do_if>
+                
+                <!-- Use originalMaxDistance in logbook message if available (shows original search range) -->
+                <set_value name="$originalSearchRange" exact="$maxDistance"/>
+                <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+                  <set_value name="$originalSearchRange" exact="$originalMaxDistance"/>
+                </do_if>
+                
+                <!-- Construct logbook message using TextDB syntax with calculated fallback distance -->
+                <set_value name="$logbookMessage" exact="{77000,3221}.[$ship.knownname, $currentSectorName, $originalSearchRange, $fallbackMaxDistance]"/>
+                
+                <!-- Write logbook entry using centralized library -->
+                <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                  <param name="Message" value="$logbookMessage"/>
+                  <param name="Category" value="'alerts'"/>
+                  <param name="Title" value="'Fallback Search: ' + $ship.knownname"/>
+                  <param name="Object" value="$ship"/>
+                  <param name="Interaction" value="'showonmap'"/>
+                  <param name="CheckGlobalSettings" value="true"/>
+                </run_actions>
+              </do_if>
               
               <!-- Mark that fallback search was triggered -->
               <set_value name="$fallbackSearchTriggered" exact="true"/>
               
               <!-- Mark fallback as attempted globally (persists across cue instances) -->
-              <do_if value="not global.$GT_FallbackAttempted?">
-                <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
-              </do_if>
               <set_value name="global.$GT_FallbackAttempted.{$ship}" exact="true"/>
               
               <!-- Trigger fallback search -->
               <!-- Fallback uses lower profit thresholds, so we compensate by restricting travel distance -->
-              <!-- Use maxJumps / 3 to balance: closer trades (less travel time) but still within reasonable range -->
-              <!-- Minimum: 2 jumps, Maximum: pilot's maxDistance / 3 -->
+              <!-- Formula: max(1, min(pilotMaxJumps, maxDistance / 3)) -->
               <!-- OriginalMaxDistance used for filtering stations from home sector -->
-              <!-- Use library function for fallback distance calculation -->
-              <run_actions ref="md.GT_Libraries_General.GT_CalculateFallbackDistance" result="$fallbackMaxDistance">
-                <param name="maxDistance" value="$maxDistance"/>
-              </run_actions>
+              <!-- CRITICAL: Pass $originalMaxDistance (not $maxDistance) to preserve original search range -->
               <set_value name="$fallbackParams" exact="table[
                 $Ship = $ship,
                 $MaxDistance = $fallbackMaxDistance,
-                $OriginalMaxDistance = $maxDistance,
+                $OriginalMaxDistance = $originalMaxDistance,
                 $MinROI = $minROI,
                 $MinAbsoluteProfit = $minAbsoluteProfit,
                 $FactionPriority = $factionPriority,
@@ -1583,14 +1726,16 @@
           <set_value name="$isWaitingForThisShipBatch" exact="true"/>
         </do_if>
         
+        <!-- Release lock and parameters using Request Registry -->
+        <!-- Only release if NOT waiting for batch processing FOR THIS SHIP -->
+        <!-- If waiting for batch, we'll need these parameters when processing live search results -->
+        <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
         <do_if value="not $isWaitingForThisShipBatch or $isLiveSearchContinuation">
-          <do_if value="global.$GT_SearchLocks.{$shipForCleanup}?">
-            <remove_value name="global.$GT_SearchLocks.{$shipForCleanup}"/>
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$lockReason" exact="if $isLiveSearchContinuation then 'live search continuation complete' else 'search complete'"/>
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock released (' + $lockReason + ')'" chance="100"/>
-            </do_if>
-          </do_if>
+          <set_value name="$releaseReason" exact="if $isLiveSearchContinuation then 'live search continuation complete' else 'search complete'"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+            <param name="ship" value="$shipForCleanup"/>
+            <param name="reason" value="$releaseReason"/>
+          </run_actions>
         </do_if>
         <do_else>
           <!-- Batch processing in progress FOR THIS SHIP - keep lock until live search completes -->
@@ -1598,15 +1743,6 @@
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock retained (waiting for live search batch to complete)'" chance="100"/>
           </do_if>
         </do_else>
-        
-        <!-- Clean up AI parameters ONLY if NOT waiting for batch processing FOR THIS SHIP -->
-        <!-- If waiting for batch, we'll need these parameters when processing live search results -->
-        <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
-        <do_if value="not $isWaitingForThisShipBatch or $isLiveSearchContinuation">
-          <do_if value="global.$GT_AIParameters.{$shipForCleanup}?">
-            <remove_value name="global.$GT_AIParameters.{$shipForCleanup}"/>
-          </do_if>
-        </do_if>
         
         <!-- Mark search complete and process next ship in queue -->
         <!-- Use $shipForCleanup instead of $ship (available even if $shouldProceed was false) -->
@@ -2574,20 +2710,27 @@
         <set_value name="$isFallbackFromBatch" exact="false"/>
         <!-- Proper null check for batchData and its properties -->
         <set_value name="$batchDataMaxDistance" exact="@$batchData.$maxDistance"/>
-        <do_if value="$batchData? and $batchDataMaxDistance? and $batchDataMaxDistance == 2">
+        <set_value name="$batchDataOriginalMaxDistance" exact="@$batchData.$originalMaxDistance"/>
+        <!-- Detect fallback search: OriginalMaxDistance exists and differs from MaxDistance -->
+        <set_value name="$isFallbackSearchFromBatch" exact="false"/>
+        <do_if value="$batchData? and $batchDataMaxDistance? and $batchDataOriginalMaxDistance? and $batchDataOriginalMaxDistance != $batchDataMaxDistance">
+          <set_value name="$isFallbackSearchFromBatch" exact="true"/>
+        </do_if>
+        <do_if value="$batchData? and $batchDataMaxDistance? and $isFallbackSearchFromBatch">
           <!-- This is a fallback search - batch data has relaxed profit thresholds, use those instead of queue -->
           <set_value name="$isFallbackFromBatch" exact="true"/>
           <set_value name="$allowIllegalDefault" exact="false"/>
           <set_value name="$originalParams" exact="table[
             $Ship = $ship,
             $MaxDistance = @$batchData.$maxDistance,
+            $OriginalMaxDistance = $batchDataOriginalMaxDistance,
             $MinROI = @$batchData.$minROI,
             $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
             $FactionPriority = @$batchData.$factionPriority,
             $AllowIllegal = $allowIllegalDefault
           ]"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') âœ… Using batch data params for fallback search (relaxed profit: ' + (@$batchData.$minAbsoluteProfit / 100) + ' Cr)'" chance="100"/>
+            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Using batch data params for fallback search (relaxed profit: ' + (@$batchData.$minAbsoluteProfit / 100) + ' Cr, OriginalMaxDistance: ' + $batchDataOriginalMaxDistance + ')'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
@@ -2595,6 +2738,10 @@
           <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
             <!-- Parameters are stored in search queue when search was initiated -->
             <set_value name="$originalParams" exact="global.$GT_SearchQueue.$Params.{$ship}"/>
+            <!-- Ensure OriginalMaxDistance is included if it exists in queue params -->
+            <do_if value="not $originalParams.$OriginalMaxDistance? and $batchDataOriginalMaxDistance?">
+              <set_value name="$originalParams.$OriginalMaxDistance" exact="$batchDataOriginalMaxDistance"/>
+            </do_if>
           </do_if>
           <do_else>
             <!-- Fallback: Reconstruct parameters from batch data (before cleanup) -->
@@ -2603,6 +2750,7 @@
               <set_value name="$originalParams" exact="table[
                 $Ship = $ship,
                 $MaxDistance = @$batchData.$maxDistance,
+                $OriginalMaxDistance = $batchDataOriginalMaxDistance,
                 $MinROI = @$batchData.$minROI,
                 $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
                 $FactionPriority = @$batchData.$factionPriority,
@@ -2922,10 +3070,11 @@
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
         </do_else>
         
-        <!-- Clean up AI parameters -->
-        <do_if value="global.$GT_AIParameters.{$ship}?">
-          <remove_value name="global.$GT_AIParameters.{$ship}"/>
-        </do_if>
+        <!-- Release lock and parameters using Request Registry -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+          <param name="ship" value="$ship"/>
+          <param name="reason" value="'search_aborted'"/>
+        </run_actions>
       </actions>
     </cue>
   </cues>

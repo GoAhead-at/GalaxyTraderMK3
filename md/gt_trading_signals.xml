@@ -117,8 +117,13 @@
               <remove_value name="global.$GT_ActiveTradeReservations.{$ship}"/>
             </do_if>
             
-            <!-- 3. Categorize failure type and notify AI accordingly -->
-            <set_value name="$isPathingFailure" exact="false"/>
+            <!-- 3. Categorize failure type and build structured payload -->
+            <!-- Determine failure category and build structured payload for unified signal -->
+            <set_value name="$failureCategory" exact="'MARKET'"/> <!-- Default: market failure -->
+            <set_value name="$shouldTryNext" exact="false"/>
+            <set_value name="$pathBlocked" exact="false"/>
+            
+            <!-- Check if this is a pathing failure -->
             <set_value name="$pathingFailureReasons" exact="[
               'ERR_NO_PATH_TO_DESTINATION',
               'ERR_DESTINATION_BLACKLISTED', 
@@ -127,15 +132,18 @@
               'ERR_CANNOT_DOCK'
             ]"/>
             
-            <!-- Check if reason is in pathing failure list using explicit loop (indexof unreliable for lists) -->
             <set_value name="$isPathingFailure" exact="false"/>
             <do_all exact="$pathingFailureReasons.count" counter="$i">
               <do_if value="$pathingFailureReasons.{$i} == $data.$reason">
                 <set_value name="$isPathingFailure" exact="true"/>
+                <set_value name="$failureCategory" exact="'PATHING'"/>
+                <set_value name="$shouldTryNext" exact="true"/>
+                <set_value name="$pathBlocked" exact="true"/>
                 <break/>
               </do_if>
             </do_all>
             
+            <!-- Handle pathing failures: track failed routes -->
             <do_if value="$isPathingFailure">
               <!-- PATHFINDING/BLACKLIST FAILURE: Trade route not accessible -->
               <!-- This means the trade is theoretically good, but ship can't reach it -->
@@ -206,13 +214,9 @@
               <do_if value="global.$GT_FailedTrades.{$ship}?">
                 <debug_text text="'[GT-Failure] 🚫 PATHFINDING FAILURE: ' + $ship.idcode + ' | Failed trades tracked: ' + global.$GT_FailedTrades.{$ship}.count" chance="100"/>
               </do_if>
-              
-              <debug_text text="'[GT-Signals] 📡 Sending GT_Try_Next_Trade signal to ' + $ship.idcode" chance="100"/>
-              <signal_objects object="$ship" param="'GT_Try_Next_Trade'" param2="$data.$reason"/>
-              <debug_text text="'[GT-Signals] ✅ GT_Try_Next_Trade signal sent successfully to ' + $ship.idcode" chance="100"/>
             </do_if>
             <do_else>
-              <!-- OTHER FAILURE: Market conditions changed (destroyed, no stock, etc.) -->
+              <!-- MARKET FAILURE: Market conditions changed (destroyed, no stock, etc.) -->
               <!-- Solution: Start NEW SEARCH to find current market opportunities -->
               
               <!-- Clean up pending trade entry -->
@@ -220,10 +224,31 @@
               <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
                 <param name="ship" value="$ship"/>
               </run_actions>
-              
-              <debug_text text="'[GT-Failure] ❌ MARKET FAILURE: ' + $ship.idcode + ' - market conditions changed - will search for new trade'" chance="100"/>
-              <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="$data.$reason"/>
             </do_else>
+            
+            <!-- Build structured failure payload for unified signal -->
+            <set_value name="$failurePayload" exact="table[
+              $Ship = $ship,
+              $Reason = $data.$reason,
+              $FailureText = $data.$failureText,
+              $Partner = $data.$partner,
+              $IsBuying = $data.$isBuying,
+              $ReasonType = $failureCategory,
+              $PathBlocked = $pathBlocked,
+              $ShouldTryNext = $shouldTryNext,
+              $Timestamp = player.age
+            ]"/>
+            
+            <!-- Send unified GT_Trade_Failed signal with structured payload -->
+            <do_if value="$isPathingFailure">
+              <debug_text text="'[GT-Signals] 📡 Sending GT_Trade_Failed (PATHING) signal to ' + $ship.idcode + ' - will try next cached trade'" chance="100"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Failure] ❌ MARKET FAILURE: ' + $ship.idcode + ' - market conditions changed - will search for new trade'" chance="100"/>
+            </do_else>
+            
+            <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="$failurePayload"/>
+            <debug_text text="'[GT-Signals] ✅ GT_Trade_Failed signal sent successfully to ' + $ship.idcode + ' (ReasonType: ' + $failureCategory + ', ShouldTryNext: ' + $shouldTryNext + ')'" chance="100"/>
             
             <!-- 4. Cargo Safety: Handle destroyed sell station -->
             <do_if value="$data.$reason == 'ERR_TRADEPARTNER_DESTROYED' and not $data.$isBuying">

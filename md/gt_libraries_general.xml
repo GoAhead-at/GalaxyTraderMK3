@@ -272,6 +272,68 @@
       </actions>
     </library>
     
+    <!-- Request Registry: Acquire Search Lock and Parameters -->
+    <!-- Centralizes lock and parameter management to prevent cleanup leaks -->
+    <library name="GT_RequestRegistry_Acquire" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship requesting trade search"/>
+        <param name="parameters" comment="AI parameters table (must match structure from gt_trading_ai.xml)"/>
+      </params>
+      <actions>
+        <!-- Initialize tables if needed -->
+        <do_if value="not global.$GT_SearchLocks?">
+          <set_value name="global.$GT_SearchLocks" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_AIParameters?">
+          <set_value name="global.$GT_AIParameters" exact="table[]"/>
+        </do_if>
+        
+        <!-- Check if already locked -->
+        <set_value name="this.$alreadyLocked" exact="false"/>
+        <do_if value="global.$GT_SearchLocks.{$ship}?">
+          <set_value name="this.$alreadyLocked" exact="true"/>
+        </do_if>
+        
+        <!-- Acquire lock and store parameters -->
+        <do_if value="not this.$alreadyLocked">
+          <set_value name="global.$GT_SearchLocks.{$ship}" exact="player.age"/>
+          <set_value name="global.$GT_AIParameters.{$ship}" exact="$parameters"/>
+          <set_value name="this.$acquired" exact="true"/>
+        </do_if>
+        <do_else>
+          <set_value name="this.$acquired" exact="false"/>
+        </do_else>
+      </actions>
+    </library>
+    
+    <!-- Request Registry: Release Search Lock and Parameters -->
+    <!-- Centralizes cleanup to prevent leaks and ensure consistent behavior -->
+    <library name="GT_RequestRegistry_Release" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to release"/>
+        <param name="reason" default="'search_complete'" comment="Reason for release (for debugging)"/>
+      </params>
+      <actions>
+        <!-- Release lock -->
+        <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+          <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+          <do_if value="global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Registry] Search lock released for ' + $ship.idcode + ' (' + $reason + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clean up parameters -->
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+          <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          <do_if value="global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Registry] AI parameters cleaned up for ' + $ship.idcode + ' (' + $reason + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <set_value name="this.$released" exact="true"/>
+      </actions>
+    </library>
+    
     <!-- Get Skill-Based Multiplier -->
     <library name="GT_GetSkillMultiplier" purpose="run_actions">
       <params>
@@ -1215,14 +1277,41 @@
     <library name="GT_CalculateFallbackDistance" purpose="run_actions">
       <params>
         <param name="maxDistance" comment="Maximum distance (pilot's maxJumps)"/>
+        <param name="skillLevel" comment="Pilot skill level (for capping fallback distance)"/>
       </params>
       <actions>
-        <!-- Calculates fallback search distance: max(maxJumps / 3, 2) -->
-        <!-- Minimum: 2 jumps, Maximum: pilot's maxDistance / 3 -->
+        <!-- Calculates fallback search distance: max(1, min(pilotMaxJumps, maxDistance / 3)) -->
+        <!-- Formula: 1/3 of maxDistance, capped by pilot level capability, minimum 1 jump -->
         <!-- This compensates for lower profit thresholds in fallback search -->
-        <set_value name="$calculatedDistance" exact="($maxDistance / 3)"/>  <!-- Calculate as maxJumps / 3 -->
-        <!-- Use maximum of (calculated distance, 2) to ensure minimum of 2 jumps -->
-        <set_value name="$fallbackDistance" exact="[$calculatedDistance, 2].max"/>
+        
+        <!-- Calculate pilot's max jump capability based on skill level -->
+        <set_value name="$pilotMaxJumps" exact="1"/>
+        <do_if value="$skillLevel le 2">
+          <set_value name="$pilotMaxJumps" exact="1"/>
+        </do_if>
+        <do_elseif value="$skillLevel le 5">
+          <set_value name="$pilotMaxJumps" exact="3"/>
+        </do_elseif>
+        <do_elseif value="$skillLevel le 8">
+          <set_value name="$pilotMaxJumps" exact="5"/>
+        </do_elseif>
+        <do_elseif value="$skillLevel le 11">
+          <set_value name="$pilotMaxJumps" exact="10"/>
+        </do_elseif>
+        <do_elseif value="$skillLevel le 13">
+          <set_value name="$pilotMaxJumps" exact="15"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="$pilotMaxJumps" exact="25"/>
+        </do_else>
+        
+        <!-- Calculate 1/3 of maxDistance -->
+        <set_value name="$calculatedDistance" exact="($maxDistance / 3)"/>
+        
+        <!-- Cap by pilot capability, then ensure minimum of 1 -->
+        <set_value name="$fallbackDistance" exact="[$calculatedDistance, $pilotMaxJumps].min"/>
+        <set_value name="$fallbackDistance" exact="[$fallbackDistance, 1].max"/>  <!-- Minimum: 1 jump -->
+        
         <return value="$fallbackDistance"/>
       </actions>
     </library>
@@ -1412,7 +1501,8 @@
       </params>
       <actions>
         <!-- Calculates distances for fallback search trades -->
-        <!-- Filters by home sector distance, calculates current distance for sorting -->
+        <!-- For fallback search: Filters by CURRENT LOCATION distance (2 jumps max), calculates home distance for reference -->
+        <!-- For normal search: Filters by HOME SECTOR distance, calculates current distance for sorting -->
         <!-- Returns: $tradesWithDistance list, $rejectionStats -->
         <set_value name="$tradesWithDistance" exact="[]"/>
         <set_value name="$rejectedByUnreachable" exact="0"/>
@@ -1422,7 +1512,7 @@
         <!-- Get filterMaxDistance (home sector distance limit) -->
         <set_value name="$filterMaxDistance" exact="$maxDistance"/>  <!-- Default: use maxDistance -->
         <do_if value="$isFallbackSearch and $originalMaxDistance?">
-          <set_value name="$filterMaxDistance" exact="$originalMaxDistance"/>  <!-- Fallback: use original pilot maxDistance -->
+          <set_value name="$filterMaxDistance" exact="$originalMaxDistance"/>  <!-- Fallback: use original pilot maxDistance (respects trading range) -->
         </do_if>
         
         <do_all exact="$wareTrades.count" counter="$i">
@@ -1433,44 +1523,43 @@
           <set_value name="$sellStation" exact="@$trade.$SellStation"/>
           <set_value name="$ware" exact="@$trade.$BuyOffer.ware"/>
           
-          <!-- Calculate distance from HOME SECTOR FIRST (primary filter) -->
-          <set_value name="$buyDistance" exact="-1"/>
-          <set_value name="$sellDistance" exact="-1"/>
-          
-          <do_if value="$buySector == $homeSector">
-            <set_value name="$buyDistance" exact="0"/>
-          </do_if>
-          <do_else>
-            <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
-          </do_else>
-          
-          <do_if value="$sellSector == $homeSector">
-            <set_value name="$sellDistance" exact="0"/>
-          </do_if>
-          <do_else>
-            <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
-          </do_else>
-          
-          <!-- Use max distance (farthest station from home) for filtering -->
-          <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
-          
-          <!-- Filter by home distance FIRST (primary filter) -->
-          <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
-            <!-- Unreachable from home sector - skip -->
-            <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
-            <continue/>
-          </do_if>
-          <do_if value="$maxStationDistance gt $filterMaxDistance">
-            <!-- Too far from home sector - skip -->
-            <set_value name="$rejectedByHomeDistance" exact="$rejectedByHomeDistance + 1"/>
-            <continue/>
-          </do_if>
-          
-          <!-- Trade passed home distance filter - calculate distance from current for SCORING/SORTING -->
-          <set_value name="$currentToBuyDistance" exact="-1"/>
-          <set_value name="$currentToSellDistance" exact="-1"/>
-          <set_value name="$maxDistanceFromCurrent" exact="-1"/>
           <do_if value="$isFallbackSearch">
+            <!-- FALLBACK SEARCH: Filter by HOME SECTOR distance (respects pilot's trading range) -->
+            <!-- Sector list was built from current location, but trades must still respect home sector range -->
+            <set_value name="$buyDistance" exact="-1"/>
+            <set_value name="$sellDistance" exact="-1"/>
+            
+            <do_if value="$buySector == $homeSector">
+              <set_value name="$buyDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+            </do_else>
+            
+            <do_if value="$sellSector == $homeSector">
+              <set_value name="$sellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+            </do_else>
+            
+            <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
+            
+            <!-- Filter by home sector distance (using originalMaxDistance to respect pilot's trading range) -->
+            <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+              <!-- Unreachable from home sector - skip -->
+              <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
+              <continue/>
+            </do_if>
+            <do_if value="$maxStationDistance gt $filterMaxDistance">
+              <!-- Too far from home sector - skip (respects pilot's trading range) -->
+              <set_value name="$rejectedByHomeDistance" exact="$rejectedByHomeDistance + 1"/>
+              <continue/>
+            </do_if>
+            
+            <!-- Calculate current location distance for SORTING (prioritize nearby trades) -->
+            <set_value name="$currentToBuyDistance" exact="-1"/>
+            <set_value name="$currentToSellDistance" exact="-1"/>
             <do_if value="$buySector == $currentSector">
               <set_value name="$currentToBuyDistance" exact="0"/>
             </do_if>
@@ -1484,16 +1573,72 @@
               <set_value name="$currentToSellDistance" exact="$currentSector.gatedistance.{$sellSector}"/>
             </do_else>
             <set_value name="$maxDistanceFromCurrent" exact="[$currentToBuyDistance, $currentToSellDistance].max"/>
+            
+            <!-- Count trade as evaluated (passed home sector filter) -->
+            <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
+            
+            <!-- Sort by distance from current position (prioritize nearby trades) -->
+            <set_value name="$sortDistance" exact="$maxDistanceFromCurrent"/>
           </do_if>
+          <do_else>
+            <!-- NORMAL SEARCH: Filter by HOME SECTOR distance -->
+            <set_value name="$buyDistance" exact="-1"/>
+            <set_value name="$sellDistance" exact="-1"/>
+            
+            <do_if value="$buySector == $homeSector">
+              <set_value name="$buyDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+            </do_else>
+            
+            <do_if value="$sellSector == $homeSector">
+              <set_value name="$sellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+            </do_else>
+            
+            <!-- Use max distance (farthest station from home) for filtering -->
+            <set_value name="$maxStationDistance" exact="[$buyDistance, $sellDistance].max"/>
+            
+            <!-- Filter by home distance -->
+            <do_if value="$buyDistance lt 0 or $sellDistance lt 0">
+              <!-- Unreachable from home sector - skip -->
+              <set_value name="$rejectedByUnreachable" exact="$rejectedByUnreachable + 1"/>
+              <continue/>
+            </do_if>
+            <do_if value="$maxStationDistance gt $filterMaxDistance">
+              <!-- Too far from home sector - skip -->
+              <set_value name="$rejectedByHomeDistance" exact="$rejectedByHomeDistance + 1"/>
+              <continue/>
+            </do_if>
+            
+            <!-- Trade passed home distance filter - calculate distance from current for SCORING/SORTING -->
+            <set_value name="$currentToBuyDistance" exact="-1"/>
+            <set_value name="$currentToSellDistance" exact="-1"/>
+            <set_value name="$maxDistanceFromCurrent" exact="-1"/>
+            <do_if value="$buySector == $currentSector">
+              <set_value name="$currentToBuyDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$currentToBuyDistance" exact="$currentSector.gatedistance.{$buySector}"/>
+            </do_else>
+            <do_if value="$sellSector == $currentSector">
+              <set_value name="$currentToSellDistance" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$currentToSellDistance" exact="$currentSector.gatedistance.{$sellSector}"/>
+            </do_else>
+            <set_value name="$maxDistanceFromCurrent" exact="[$currentToBuyDistance, $currentToSellDistance].max"/>
+            
+            <!-- Count trade as evaluated (passed home distance filter) -->
+            <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
+            
+            <!-- Sort by distance from home -->
+            <set_value name="$sortDistance" exact="$maxStationDistance"/>
+          </do_else>
           
-          <!-- Count trade as evaluated (passed home distance filter) -->
-          <set_value name="$evaluatedCount" exact="$evaluatedCount + 1"/>
-          
-          <!-- For fallback search, sort by distance from current position; otherwise sort by distance from home -->
-          <set_value name="$sortDistance" exact="$maxStationDistance"/>  <!-- Default: sort by home distance -->
-          <do_if value="$isFallbackSearch">
-            <set_value name="$sortDistance" exact="$maxDistanceFromCurrent"/>  <!-- Fallback: sort by current position distance -->
-          </do_if>
           <append_to_list name="$tradesWithDistance" exact="table[
             $Trade = $trade,
             $Distance = $sortDistance,
@@ -2798,6 +2943,15 @@
           <set_value name="$hasInteraction" exact="false"/>
           <do_if value="$Interaction? and $Interaction != null and $Interaction == 'showonmap'">
             <set_value name="$hasInteraction" exact="true"/>
+          </do_if>
+          
+          <!-- Debug: Log before writing logbook -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$msgExists" exact="if $Message? then 'true' else 'false'"/>
+            <set_value name="$msgNull" exact="if $Message == null then 'true' else 'false'"/>
+            <set_value name="$msgEmpty" exact="if $Message == '' then 'true' else 'false'"/>
+            <debug_text text="'[GT-Logbook] WriteLogbookMessage: Category=' + $Category + ', Title=' + $Title" chance="100"/>
+            <debug_text text="'[GT-Logbook] Message exists=' + $msgExists + ', null=' + $msgNull + ', empty=' + $msgEmpty" chance="100"/>
           </do_if>
           
           <!-- Write logbook entry with conditional blocks for interaction, category, and money/bonus -->

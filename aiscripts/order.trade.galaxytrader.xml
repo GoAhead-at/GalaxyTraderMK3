@@ -645,6 +645,43 @@
       <!-- Subordinate reinitialization: Jump here to restart and re-inherit commander settings -->
       <label name="init"/>
       
+      <!-- Restore XPBlocked if BlockedLevel still exists (ship restart/reinit) -->
+      <!-- Also update ship name to show ADVANCE label when XPBlocked is restored -->
+      <do_if value="this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}?">
+        <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel? and not global.$GT_Pilots.{this.ship.pilot}.$XPBlocked?">
+          <set_value name="global.$GT_Pilots.{this.ship.pilot}.$XPBlocked" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] Restored XPBlocked for pilot ' + this.ship.pilot.name + ' on ship restart (BlockedLevel: ' + global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Update ship name to show ADVANCE label when XPBlocked is restored -->
+          <!-- This ensures the ship name reflects the blocked state after restart -->
+          <!-- Calculate rank title based on blocked level -->
+          <set_value name="$blockedLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
+          <set_value name="$rankTitle" exact="'Lehrling'"/>
+          <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
+            <set_value name="$rankIndex" exact="($blockedLevel / 3)i + 1"/>
+            <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+              <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+            </do_if>
+            <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+              <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+            </do_if>
+          </do_if>
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $ship = this.ship,
+            $pilot = this.ship.pilot,
+            $xp = @global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level = $blockedLevel,
+            $rank = $rankTitle,
+            $nameType = 'blocked'
+          ]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] Updated ship name to show ADVANCE label after XPBlocked restoration: ' + this.ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+      </do_if>
+      
       <!-- Initialize default order tracking -->
       <!-- Track the current default order to detect when GT order is removed -->
       <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
@@ -1514,33 +1551,54 @@
         </do_elseif>
         
         <do_if value="$shouldStartTraining">
-          <!-- Get blocked level with safety check -->
-          <set_value name="$blockedLevel" exact="1"/>
-          <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel?">
-            <set_value name="$blockedLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
+          <!-- CRITICAL: Only trigger training if XPBlocked is true -->
+          <!-- If XPBlocked is false but BlockedLevel exists, it means training stations were not found previously -->
+          <!-- In that case, don't trigger another search - ship should continue trading -->
+          <set_value name="$xpBlocked" exact="false"/>
+          <do_if value="global.$GT_Pilots.{this.ship.pilot}.$XPBlocked?">
+            <set_value name="$xpBlocked" exact="true"/>
+          </do_if>
+          
+          <do_if value="$xpBlocked">
+            <!-- Get blocked level with safety check -->
+            <set_value name="$blockedLevel" exact="1"/>
+            <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel?">
+              <set_value name="$blockedLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
+            </do_if>
+            <do_else>
+              <!-- Calculate current skill level as fallback -->
+              <do_if value="global.$GT_Pilots.{this.ship.pilot}.$XP?">
+                <set_value name="$currentXP" exact="global.$GT_Pilots.{this.ship.pilot}.$XP"/>
+                <do_all exact="15" counter="$skillLevel">
+                  <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevel}">
+                    <set_value name="$blockedLevel" exact="$skillLevel"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_else>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🎓 Initiating mandatory training for pilot ' + $pilotNameForDebug + ' (Level ' + $blockedLevel + ')'" chance="$debugchance"/>
+            
+            <!-- Signal MD system to handle training -->
+            <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
+              $Ship = this.ship,
+              $Pilot = this.ship.pilot,
+              $RequiredLevel = $blockedLevel
+            ]"/>
+            
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📡 Training signal sent to MD system for pilot ' + $pilotNameForDebug" chance="$debugchance"/>
           </do_if>
           <do_else>
-            <!-- Calculate current skill level as fallback -->
-            <do_if value="global.$GT_Pilots.{this.ship.pilot}.$XP?">
-              <set_value name="$currentXP" exact="global.$GT_Pilots.{this.ship.pilot}.$XP"/>
-              <do_all exact="15" counter="$skillLevel">
-                <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevel}">
-                  <set_value name="$blockedLevel" exact="$skillLevel"/>
-                </do_if>
-              </do_all>
+            <!-- XPBlocked is false but BlockedLevel exists - training stations were not found previously -->
+            <!-- Don't trigger another search - ship should continue trading -->
+            <set_value name="$blockedLevelForDebug" exact="'none'"/>
+            <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel?">
+              <set_value name="$blockedLevelForDebug" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
             </do_if>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏸️ Training needed but XPBlocked=false (no training stations found previously) - continuing with trading. BlockedLevel=' + $blockedLevelForDebug" chance="$debugchance"/>
+            <!-- Break out of training handler and continue to trading -->
+            <resume label="check_maintenance"/>
           </do_else>
-          
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🎓 Initiating mandatory training for pilot ' + $pilotNameForDebug + ' (Level ' + $blockedLevel + ')'" chance="$debugchance"/>
-          
-          <!-- Signal MD system to handle training -->
-          <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
-            $Ship = this.ship,
-            $Pilot = this.ship.pilot,
-            $RequiredLevel = $blockedLevel
-          ]"/>
-          
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📡 Training signal sent to MD system for pilot ' + $pilotNameForDebug" chance="$debugchance"/>
         </do_if>
         <do_else>
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏳ Training already in progress (active order: ' + $hasActiveTrainingOrder + ') - waiting'" chance="$debugchance"/>
@@ -2892,7 +2950,6 @@
             <check_any>
               <event_object_signalled object="this.ship" param="'GT_Trade_Completed'"/>
               <event_object_signalled object="this.ship" param="'GT_Trade_Failed'"/>
-              <event_object_signalled object="this.ship" param="'GT_Try_Next_Trade'"/>
             </check_any>
           </conditions>
           <actions>
@@ -2900,18 +2957,49 @@
             <do_if value="event.param == 'GT_Trade_Completed'">
               <debug_text text="'[GT-AI] ✅ Trade completed signal received for ' + this.ship.idcode" chance="$debugchance"/>
               <set_value name="this.$tradeComplete" exact="true"/>
+              
+              <!-- Restore XPBlocked if BlockedLevel still exists (training stations may have become available) -->
+              <do_if value="this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}?">
+                <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel? and not global.$GT_Pilots.{this.ship.pilot}.$XPBlocked?">
+                  <set_value name="global.$GT_Pilots.{this.ship.pilot}.$XPBlocked" exact="true"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-AI] 🔒 Restored XPBlocked for pilot ' + this.ship.pilot.name + ' after trade completion (BlockedLevel: ' + global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel + ')'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
             </do_if>
             <do_elseif value="event.param == 'GT_Trade_Failed'">
-              <set_value name="this.$failureReason" exact="event.param2"/>
-              <debug_text text="'[GT-AI] ❌ Trade failed for ' + this.ship.idcode + ': ' + this.$failureReason" chance="100"/>
-              <set_value name="this.$tradeFailed" exact="true"/>
-            </do_elseif>
-            <do_elseif value="event.param == 'GT_Try_Next_Trade'">
-              <set_value name="this.$failureReason" exact="event.param2"/>
-              <debug_text text="'[GT-AI] 🔄 Pathfinding failed for ' + this.ship.idcode + ': ' + this.$failureReason + ' - trying next cached alternative'" chance="100"/>
-              <!-- Mark as failed but with special retry flag -->
-              <set_value name="this.$tradeFailed" exact="true"/>
-              <set_value name="this.$tryNextTrade" exact="true"/>
+              <!-- Read structured payload (with legacy guard for backward compatibility) -->
+              <set_value name="$failurePayload" exact="event.param2"/>
+              
+              <!-- Handle legacy payloads (string) vs new structured payloads (table) -->
+              <set_value name="$isLegacyPayload" exact="false"/>
+              <do_if value="typeof $failurePayload == datatype.string">
+                <set_value name="$isLegacyPayload" exact="true"/>
+                <set_value name="this.$failureReason" exact="$failurePayload"/>
+                <set_value name="this.$tradeFailed" exact="true"/>
+                <set_value name="this.$tryNextTrade" exact="false"/>
+                <debug_text text="'[GT-AI] ❌ Trade failed (legacy payload) for ' + this.ship.idcode + ': ' + this.$failureReason" chance="100"/>
+              </do_if>
+              <do_else>
+                <!-- New structured payload -->
+                <!-- Extract properties with safe access, then check if they exist -->
+                <set_value name="$reasonTypeValue" exact="@$failurePayload.$ReasonType"/>
+                <set_value name="$shouldTryNextValue" exact="@$failurePayload.$ShouldTryNext"/>
+                <set_value name="$reasonType" exact="if $reasonTypeValue? then $reasonTypeValue else 'MARKET'"/>
+                <set_value name="$shouldTryNext" exact="if $shouldTryNextValue? then $shouldTryNextValue else false"/>
+                
+                <set_value name="this.$failureReason" exact="$failurePayload.$Reason"/>
+                <set_value name="this.$tradeFailed" exact="true"/>
+                <set_value name="this.$tryNextTrade" exact="$shouldTryNext"/>
+                
+                <do_if value="$shouldTryNext">
+                  <debug_text text="'[GT-AI] 🔄 Pathfinding failed for ' + this.ship.idcode + ': ' + this.$failureReason + ' - trying next cached alternative'" chance="100"/>
+                </do_if>
+                <do_else>
+                  <debug_text text="'[GT-AI] ❌ Trade failed for ' + this.ship.idcode + ': ' + this.$failureReason + ' - will search for new trade'" chance="100"/>
+                </do_else>
+              </do_else>
             </do_elseif>
             <resume label="trade_completed"/>
           </actions>
