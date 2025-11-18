@@ -1,10 +1,185 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.6.6 - 2025-01-15
+Version 0.6.7 - 2025-01-15
 ---------------------------
 
-FIX: Search Queue Deadlock - Config Reload Recovery
+FIX: Race Condition in Search Results - Per-Ship Global Table
+  - Issue: Critical race condition in global.$GT_SearchResult causing ships to receive wrong trade results
+  - Root Cause: Single shared global.$GT_SearchResult table accessed by multiple ships simultaneously during parallel searches
+  - Problem:
+    * Ship A starts search → writes results to global.$GT_SearchResult
+    * Ship B starts search → overwrites Ship A's results with its own
+    * Ship A reads results → gets Ship B's trades instead of its own
+    * Ship B reads results → gets its own trades (correct)
+    * Result: Ships execute trades for wrong destinations, wrong wares, wrong stations
+    * Multiple ships searching simultaneously caused frequent cross-contamination
+  - Solution: Changed from single shared table to per-ship indexed global table:
+    * Old: global.$GT_SearchResult.$Found, global.$GT_SearchResult.$BestTrade, etc.
+    * New: global.$GT_SearchResult.{$ship}.$Found, global.$GT_SearchResult.{$ship}.$BestTrade, etc.
+    * Each ship now has isolated storage: global.$GT_SearchResult.{$ship}
+    * Shared data (LastRejectionStats) remains at top level: global.$GT_SearchResult.$LastRejectionStats
+  - Implementation:
+    * Modified GT_InitializeGlobalTables (gt_configuration.xml)
+      - Initialize global.$GT_SearchResult as container table with $LastRejectionStats
+      - Per-ship entries created on-demand when searches complete
+    * Modified SearchCachedTrades (gt_search_methods.xml)
+      - Write results to global.$GT_SearchResult.{$ship} instead of shared table
+      - Removed defensive checks for other waiting ships (no longer needed)
+    * Modified CheckTradeCache (gt_trading_queue.xml)
+      - Read results from global.$GT_SearchResult.{$ship}
+      - Removed verification block that checked if results belong to THIS ship
+    * Modified SearchTradeRoutes (gt_trading_search.xml)
+      - Parameter reconstruction: Removed reliance on global.$GT_SearchResult for ship identification
+      - Continuation detection: Read from global.$GT_SearchResult.{$ship}
+      - Cache results extraction: Read from global.$GT_SearchResult.{$ship}
+      - Final results storage: Write to global.$GT_SearchResult.{$ship}
+      - Cleanup: Remove entire global.$GT_SearchResult.{$ship} entry when done
+    * Modified SearchLiveTrades_Resume (gt_trading_search.xml)
+      - Write final results to global.$GT_SearchResult.{$ship}
+    * Modified GT_CheckBatchStatus (gt_libraries_general.xml)
+      - Read from global.$GT_SearchResult.{$ship}
+    * Confirmed GT_UpdateLastRejectionStats (gt_libraries_general.xml)
+      - Correctly handles shared global.$GT_SearchResult.$LastRejectionStats at top level
+  - Files Modified:
+    * `md/gt_configuration.xml` (GT_InitializeGlobalTables)
+    * `md/gt_search_methods.xml` (SearchCachedTrades)
+    * `md/gt_trading_queue.xml` (CheckTradeCache)
+    * `md/gt_trading_search.xml` (SearchTradeRoutes, SearchLiveTrades_Resume)
+    * `md/gt_libraries_general.xml` (GT_CheckBatchStatus)
+  - Benefits:
+    * Eliminates race condition completely - each ship has isolated storage
+    * Ships can search simultaneously without cross-contamination
+    * No more wrong trades executed due to shared state corruption
+    * Proper cleanup prevents memory leaks (per-ship entries removed when done)
+    * Shared LastRejectionStats still works correctly for rejection tracking
+
+FIX: Rerouting Logic Flaw - Unreachable Destination Detection
+  - Issue: Ships didn't reroute when destination became unreachable via normal path (disconnected sectors, destroyed gates)
+  - Root Cause: Reroute check only executed when $normalDistance ge 0, skipping case where normal path doesn't exist
+  - Problem:
+    * Ship enters new sector → checks destination reachability
+    * Normal path doesn't exist ($normalDistance lt 0) → reroute check skipped entirely
+    * Ship continues trying to reach unreachable destination
+    * Ship gets stuck or wastes time attempting impossible route
+    * Only blacklist-aware path changes triggered rerouting, not complete path failures
+  - Solution: Split reroute logic into two cases:
+    * Case 1: Normal path doesn't exist ($normalDistance lt 0) → Always reroute immediately
+    * Case 2: Normal path exists but blacklist-aware path blocked/longer → Reroute if needed
+  - Implementation:
+    * Modified GT Sector-Change Rerouting handler (aiscripts/move.generic.xml)
+      - Changed from nested do_if to do_if/do_elseif structure
+      - Case 1: Handle $normalDistance lt 0 (unreachable destination)
+        * Set reroute flag
+        * Update ship name to show [REROUTE] state
+        * Send logbook notification with "UNREACHABLE" status
+        * Signal dock failure to parent order
+        * Abort move.generic to return control
+      - Case 2: Handle $normalDistance ge 0 with path changes (existing logic)
+        * Check if blacklist-aware path blocked or longer
+        * Same reroute logic as before
+  - Files Modified:
+    * `aiscripts/move.generic.xml` (lines 59-165)
+  - Benefits:
+    * Ships now detect unreachable destinations when entering new sectors
+    * Ships reroute immediately when sectors disconnect or gates destroyed
+    * Proper logbook notifications for both unreachable and blocked paths
+    * Prevents ships from wasting time on impossible routes
+    * Complete coverage: handles both path failures and path changes
+
+FIX: Fallback Search Logbook Spam
+  - Issue: Fallback search logbook messages were being written repeatedly, spamming the logbook
+  - Root Cause: Flag to prevent duplicate messages was being cleared during fallback continuations
+  - Solution: Added per-ship flag (global.$GT_FallbackLogbookWritten.{$ship}) that persists across cue instances
+    * Flag is set immediately when fallback is triggered (before writing message)
+    * Flag is only cleared for truly new search requests (not continuations)
+    * Flag is cleared when trade is successfully found (allows new message for next search cycle)
+  - Files Modified:
+    * `md/gt_trading_search.xml` (SearchTradeRoutes, FilterTradeList_Resume)
+  - Benefits:
+    * Fallback logbook message appears only once per fallback attempt
+    * No more logbook spam during fallback continuations
+    * Message can still appear for new fallback scenarios
+
+FIX: Decreasing Fallback Distance
+  - Issue: Fallback search distance was decreasing with each attempt (e.g., 3 → 1 jumps)
+  - Root Cause: Fallback distance calculation was using already-reduced $maxDistance instead of original $originalMaxDistance
+  - Solution: Use $originalMaxDistance for fallback calculation if available
+    * Preserves original search range for fallback distance calculation
+    * Ensures fallback distance remains consistent across attempts
+  - Files Modified:
+    * `md/gt_trading_search.xml` (SearchTradeRoutes, FilterTradeList_Resume)
+  - Benefits:
+    * Fallback distance remains consistent (doesn't decrease)
+    * Better fallback search coverage
+    * More accurate logbook messages showing original search range
+
+FIX: Ship Name Labeling After Trade Order Restart
+  - Issue: Ships with "ADVANCE" label (XP blocked, no training stations found) lost label after deleting trade orders
+  - Root Cause: XPBlocked flag was temporarily cleared when no training stations found, but wasn't restored on new trade searches
+  - Solution:
+    * Modified training initiation logic to only trigger training search if XPBlocked is true
+    * If XPBlocked is false but BlockedLevel exists (no training stations found previously), skip training search and continue trading
+    * Restore XPBlocked flag after every trade completion and on ship restart/reinitialization
+    * Update ship name to show "ADVANCE" label when XPBlocked is restored on restart
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (init label, GT_Trade_Completed handler, training initiation)
+  - Benefits:
+    * "ADVANCE" label persists correctly after trade order restarts
+    * XPBlocked flag properly restored to prevent XP gain without training
+    * Ship name correctly reflects blocked state
+
+FIX: Temporary XP Block Release Clearing
+  - Issue: Temporary XPBlocked release (when no training stations found) wasn't being cleared after trades
+  - Root Cause: XPBlocked was cleared to allow trading, but wasn't restored after trade completion
+  - Solution: Restore XPBlocked flag after every trade completion and on ship restart/reinitialization
+    * Ensures pilots cannot gain XP without training while still allowing ships to trade
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (GT_Trade_Completed handler, init label)
+  - Benefits:
+    * Temporary XP block release properly cleared after trades
+    * Pilots cannot bypass training requirement
+    * Ships can still trade when training stations unavailable
+
+FIX: Missing MaxBuy/MaxSell Parameters in GT_Find_Trade Signal
+  - Issue: "null jumps" appearing in logs when triggering live search after cached trades rejected
+  - Root Cause: GT_Find_Trade signal sent without MaxBuy/MaxSell parameters when forcing live search
+  - Solution: Include MaxBuy/MaxSell parameters in all GT_Find_Trade signals
+    * Use effectiveMaxBuy/effectiveMaxSell if available (for subordinates)
+    * Fall back to maxbuy/maxsell from order parameters
+    * Also include HomeBase parameter
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (GT_Trade_Found interrupt handler)
+    * `md/gt_trading_search.xml` (added validation to fail loudly if maxDistance is null)
+    * `md/gt_trading_queue.xml` (added validation to fail loudly if maxDistance is null)
+  - Benefits:
+    * No more "null jumps" in logs
+    * Proper distance parameters always included
+    * System fails loudly if parameters are missing (no silent fallbacks)
+
+FIX: Parsing Error in Training Station Search Failure Logbook Message
+  - Issue: Parsing error when constructing logbook message for training station search failure
+  - Root Cause: Used ternary operator (? :) which is not supported in X4 MD scripts
+  - Solution: Replaced ternary operators with proper X4 MD conditional logic using separate variables
+  - Files Modified:
+    * `md/gt_xp_training.xml` (HandleTrainingNeeded cue)
+  - Benefits:
+    * No more parsing errors
+    * Proper error logging for debugging
+
+CLEANUP: Removed Emojis from Debug Messages
+  - Removed emojis from debug messages across codebase
+  - Files Modified:
+    * `md/gt_trading_search.xml`
+    * `aiscripts/order.trade.galaxytrader.xml`
+  - Benefits:
+    * Cleaner log output
+    * Better compatibility
+
+Version 0.6.6 - 2025-01-15 => reverted
+---------------------------
+
+FIX: Search Queue Deadlock - Config Reload Recovery => reverted
   - Issue: Search queue permanently deadlocked after configuration reloads or other resets
   - Root Cause: When SearchLiveTrades_Resume couldn't find original parameters ($originalParams? is false) because config reload cleared global.$GT_SearchQueue.$Params and global.$GT_BatchDataList, it only logged a warning and didn't signal SearchTradeRoutes
   - Problem:
@@ -32,7 +207,7 @@ FIX: Search Queue Deadlock - Config Reload Recovery
     * Eliminates "all traders stuck after config change" scenario
     * Proper resource cleanup prevents memory leaks
 
-FIX: Search Queue Deadlock - Missing Batch Results Cleanup
+FIX: Search Queue Deadlock - Missing Batch Results Cleanup => reverted
   - Issue: Search queue permanently deadlocked when batch results were missing
   - Root Cause: When SearchLiveTrades_Resume couldn't fetch batch results ($results? is false), it cleaned up batch data and requeued the ship but didn't release search locks or decrement active search counter
   - Problem: 
@@ -57,7 +232,7 @@ FIX: Search Queue Deadlock - Missing Batch Results Cleanup
     * Eliminates "all traders stuck" scenario
     * Proper resource cleanup prevents memory leaks
 
-FIX: Training Station Search Failed - Ship Continues Trading
+FIX: Training Station Search Failed - Ship Continues Trading => reverted
   - Issue: Ships with ADVANCE status (XPBlocked) got stuck in infinite loop when no training stations were accessible
   - Root Cause: When HandleTrainingNeeded couldn't find any reachable training stations, it didn't signal the AI, causing the AI's 10-second wait loop to timeout and retry indefinitely
   - Problem:
@@ -113,7 +288,7 @@ FEATURE: Logbook Message for Training Station Search Failure
 Version 0.6.5 - 2025-01-15
 ---------------------------
 
-FIX: Cache Hit Detection - Trade List Execution
+FIX: Cache Hit Detection - Trade List Execution => reverted
   - Issue: Cache hits never executed trades when tradeList had entries but bestTrade was null
   - Root Cause: $Found flag required both tradeList.count > 0 AND bestTrade? to be true
   - Problem: When tradeList had valid entries but none passed GT_IsTradeValid validation, bestTrade stayed null, causing $Found to be false
@@ -129,7 +304,7 @@ FIX: Cache Hit Detection - Trade List Execution
     * Ships with valid trade lists that don't pass validation can still execute trades
     * Reduces unnecessary live searches when cache has valid entries
 
-FIX: Search Result State Preservation - Waiting Ships
+FIX: Search Result State Preservation - Waiting Ships => reverted
   - Issue: Search result state was overwritten for ships waiting on live/batch searches
   - Root Cause: When batch results were missing, SearchLiveTrades_Resume reset entire global.$GT_SearchResult structure without preserving waiting ship state
   - Problem: Waiting ship's $WaitingForBatch, $Ship, and trade list were wiped, causing search lock to remain set and live results to never resume
@@ -145,7 +320,7 @@ FIX: Search Result State Preservation - Waiting Ships
     * Live search continuations can resume properly
     * Prevents search locks from becoming stale
 
-FIX: Continuation Cleanup - Prevent Permanent Blocking
+FIX: Continuation Cleanup - Prevent Permanent Blocking => reverted
   - Issue: Zero-trade continuations permanently blocked ships from searching again
   - Root Cause: When live search continuation completed with trades, $Ship was never removed from global.$GT_SearchResult
   - Problem: Next SearchTradeRoutes run detected continuation (Ship == current ship) but no waiting flag, assumed previous search just finished, hit cooldown path and exited without searching
@@ -161,7 +336,7 @@ FIX: Continuation Cleanup - Prevent Permanent Blocking
     * Future search requests proceed normally instead of hitting cooldown shortcut
     * Prevents infinite cooldown loops
 
-FIX: TradeList Preservation - Waiting Ship State Protection
+FIX: TradeList Preservation - Waiting Ship State Protection => reverted
   - Issue: When another ship was mid-live search, SearchCachedTrades wiped that ship's stored trade list
   - Root Cause: "Another ship waiting" branch cleared global.$GT_SearchResult.$TradeList = [], destroying waiting ship's live results
   - Problem: Waiting ship's $TradeList contained their live search results - clearing it destroyed them, kept search lock set, causing stall
