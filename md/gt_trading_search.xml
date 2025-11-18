@@ -106,64 +106,67 @@
         
         <!-- Log profit threshold from params -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ’° Profit threshold from params: ' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') Profit threshold from params: ' + ($minAbsoluteProfit / 100) + ' Cr'" chance="100"/>
         </do_if>
         
-        <!-- Detect continuation EARLY (before skill multiplier) -->
-        <!-- Check if we're continuing from live search completion BEFORE applying skill multiplier -->
-        <!-- When SearchLiveTrades_Resume signals SearchTradeRoutes, live results are already in global.$GT_SearchResult.{$ship} -->
-        <set_value name="$isLiveSearchContinuation" exact="false"/>
-        <do_if value="global.$GT_SearchResult.{$ship}?">
-          <set_value name="$shipResults" exact="global.$GT_SearchResult.{$ship}"/>
-          <set_value name="$savedWaitingForBatch" exact="@$shipResults.$WaitingForBatch"/>
-          <do_if value="not $savedWaitingForBatch">
-            <!-- Live search just completed for this ship - this is a continuation -->
-            <set_value name="$isLiveSearchContinuation" exact="true"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Check if this is a fallback search continuation - if so, params already have skill multiplier applied -->
-        <!-- Fallback search receives already-multiplied values, relaxes them, then SearchLiveTrades_Resume signals SearchTradeRoutes -->
-        <!-- When SearchTradeRoutes runs as continuation, params already have relaxed values that shouldn't be multiplied again -->
-        <!-- Detect fallback search: originalMaxDistance exists and differs from maxDistance -->
-        <set_value name="$isFallbackContinuation" exact="false"/>
+        <!-- EXPLICIT STATE ENUM: Determine search state from params or infer from context -->
+        <!-- SearchState values: 'fresh' (new search), 'cache' (cache results), 'live' (live search continuation), 'fallback' (fallback continuation) -->
+        <set_value name="$searchState" exact="@$params.$SearchState"/>
         <set_value name="$originalMaxDistance" exact="$maxDistance"/>  <!-- Default: same as maxDistance -->
         <do_if value="$params.$OriginalMaxDistance?">
           <set_value name="$originalMaxDistance" exact="$params.$OriginalMaxDistance"/>
         </do_if>
-        <do_if value="$isLiveSearchContinuation and $originalMaxDistance? and $originalMaxDistance != $maxDistance">
-          <set_value name="$isFallbackContinuation" exact="true"/>
-          <!-- For fallback continuation, params already have relaxed profit thresholds from SearchFallbackTrades -->
-          <!-- These were calculated from already-multiplied values, so don't apply multiplier again -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback continuation detected (fallback distance: ' + $maxDistance + ', original: ' + $originalMaxDistance + ') - skipping skill multiplier (params already relaxed)'" chance="100"/>
+        
+        <!-- If SearchState not provided, infer from context (backward compatibility) -->
+        <do_if value="not $searchState?">
+          <!-- Check if we're continuing from live search completion -->
+          <set_value name="$savedWaitingForBatch" exact="true"/>
+          <do_if value="global.$GT_SearchResult.{$ship}?">
+            <set_value name="$shipResults" exact="global.$GT_SearchResult.{$ship}"/>
+            <set_value name="$savedWaitingForBatch" exact="@$shipResults.$WaitingForBatch"/>
+            <do_if value="not $savedWaitingForBatch">
+              <!-- Live search just completed - check if fallback -->
+              <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
+                <set_value name="$searchState" exact="'fallback'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$searchState" exact="'live'"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <!-- Still waiting for batch or cache search - check cache results -->
+              <set_value name="$cacheFound" exact="@$shipResults.$Found"/>
+              <do_if value="$cacheFound">
+                <set_value name="$searchState" exact="'cache'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$searchState" exact="'fresh'"/>
+              </do_else>
+            </do_else>
           </do_if>
+          <do_else>
+            <!-- No results yet - fresh search -->
+            <set_value name="$searchState" exact="'fresh'"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Debug state detection -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+          <debug_text text="'[GT-Search] (' + $ship.idcode + ') SearchState=' + $searchState + ' (originalMaxDistance=' + $originalMaxDistance + ', maxDistance=' + $maxDistance + ')'" chance="100"/>
         </do_if>
         
         <!-- Clear fallback flag at start of new search cycle -->
         <!-- This allows fallback to be attempted again if cache and live search both fail -->
-        <!-- Initialization guarantees global.$GT_FallbackAttempted exists -->
-        <!-- BUT: Don't clear if this is a fallback continuation (detected above) -->
-        <do_if value="global.$GT_FallbackAttempted.{$ship}? and not $isFallbackContinuation">
+        <!-- BUT: Don't clear if this is a fallback continuation -->
+        <do_if value="global.$GT_FallbackAttempted.{$ship}? and $searchState != 'fallback'">
           <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting new search cycle - cleared fallback flag'" chance="100"/>
           </do_if>
         </do_if>
         
-        <!-- Clear logbook flag ONLY when starting a completely new search (not from queue continuation) -->
-        <!-- This prevents clearing the flag during fallback continuations -->
-        <!-- Check if this is a new search request (not a continuation from live search or fallback) -->
-        <set_value name="$isNewSearchRequest" exact="false"/>
-        <do_if value="not $isLiveSearchContinuation">
-          <!-- Check if this is coming from search queue (new request) vs continuation -->
-          <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
-            <set_value name="$isNewSearchRequest" exact="true"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Only clear logbook flag for truly new search requests -->
-        <do_if value="global.$GT_FallbackLogbookWritten.{$ship}? and $isNewSearchRequest">
+        <!-- Clear logbook flag ONLY when starting a completely new search (not from continuation) -->
+        <do_if value="global.$GT_FallbackLogbookWritten.{$ship}? and $searchState == 'fresh'">
           <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') Cleared logbook flag - new search request detected'" chance="100"/>
@@ -198,7 +201,7 @@
         <!-- ROI multiplier still applies for ROI threshold (not profit threshold) -->
         <!-- Only apply ROI multiplier if NOT a fallback continuation -->
         <!-- Fallback continuation params come from SearchFallbackTrades which already relaxed the already-multiplied values -->
-        <do_if value="not $isFallbackContinuation">
+        <do_if value="$searchState != 'fallback'">
           <run_actions ref="md.GT_Libraries_General.GT_GetSkillMultiplier" result="$roiMultiplier">
             <param name="skillLevel" value="$skillLevel"/>
           </run_actions>
@@ -246,107 +249,49 @@
         <set_value name="$bestTrade" exact="null"/>
         <set_value name="$bestScore" exact="0"/>
         <set_value name="$foundCachedTrade" exact="false"/>
-        <set_value name="$fallbackSearchTriggered" exact="false"/>  <!-- Track if fallback search was triggered -->
-        
-        <!-- Clear fallback flag when new normal search cycle starts -->
-        <!-- This allows fallback to be tried again after normal search cooldown expires -->
-        <!-- Initialization guarantees global.$GT_FallbackAttempted exists -->
-        <do_if value="global.$GT_FallbackAttempted.{$ship}?">
-          <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ') New search cycle started - fallback flag cleared'" chance="100"/>
-          </do_if>
-        </do_if>
+        <!-- Note: $fallbackSearchTriggered is set earlier based on SearchState - don't reset it here! -->
         
         <!-- Clear logbook flag when new normal search cycle starts -->
         <!-- This allows logbook message to be written again for new fallback attempts -->
         <!-- BUT: Don't clear if this is a continuation (fallback or live search) -->
-        <do_if value="global.$GT_FallbackLogbookWritten.{$ship}? and not $isLiveSearchContinuation">
-          <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
-        </do_if>
+        <!-- Note: Already handled above in state detection section -->
         
         <!-- Extract live search results if continuation (already detected earlier) -->
         <!-- When SearchLiveTrades_Resume signals SearchTradeRoutes, live results are already in global.$GT_SearchResult -->
         <!-- We should use those results instead of running cache search again -->
         <!-- Extract and preserve live results IMMEDIATELY before cache search can overwrite them -->
-        <!-- Note: $isLiveSearchContinuation already set earlier (before skill multiplier) - don't reset it! -->
+        <!-- SearchState is already set earlier (before skill multiplier) - use it to determine continuation -->
         <set_value name="$liveTradeList" exact="[]"/>
         <set_value name="$liveBestTrade" exact="null"/>
         <set_value name="$liveBestScore" exact="0"/>
         
-        <!-- Check if we're already in a fallback search (MaxDistance == 2 from previous call) -->
-        <!-- If MaxDistance is 2 and we're being signaled from SearchLiveTrades_Resume, we're in fallback search -->
-        <!-- Note: $isLiveSearchContinuation already detected earlier (before skill multiplier) -->
-        <set_value name="$isFallbackSearch" exact="false"/>
-        <do_if value="$isLiveSearchContinuation">
-          <!-- If MaxDistance is 2, this is a fallback search continuation -->
-          <do_if value="$maxDistance == 2">
-            <set_value name="$isFallbackSearch" exact="true"/>
-            <set_value name="$fallbackSearchTriggered" exact="true"/>  <!-- Prevent triggering fallback again -->
-          </do_if>
+        <!-- Initialize fallback trigger flag - set to true if this IS a fallback continuation (prevents re-triggering) -->
+        <!-- This prevents infinite loops when SearchState='fallback' -->
+        <set_value name="$fallbackSearchTriggered" exact="false"/>
+        <do_if value="$searchState == 'fallback'">
+          <!-- This IS a fallback continuation - mark as triggered to prevent infinite loop -->
+          <set_value name="$fallbackSearchTriggered" exact="true"/>
         </do_if>
         
-        <!-- Check if live search just completed for this ship (per-ship storage - no race conditions) -->
-        <!-- With per-ship storage, cache search writes to global.$GT_SearchResult.{$ship}, same as live search -->
-        <set_value name="$savedWaitingForBatch" exact="true"/>
-        <set_value name="$savedTradeList" exact="[]"/>
-        <set_value name="$savedBestTrade" exact="null"/>
-        <set_value name="$savedBestScore" exact="0"/>
-        <do_if value="global.$GT_SearchResult.{$ship}?">
-          <set_value name="$shipResults" exact="global.$GT_SearchResult.{$ship}"/>
-          <set_value name="$savedWaitingForBatch" exact="@$shipResults.$WaitingForBatch"/>
-          <set_value name="$savedTradeList" exact="@$shipResults.$TradeList"/>
-          <set_value name="$savedBestTrade" exact="@$shipResults.$BestTrade"/>
-          <set_value name="$savedBestScore" exact="@$shipResults.$BestScore"/>
-        </do_if>
-        <do_if value="true">
-          <!-- Initialize to empty list first, then extract if global exists and is not null -->
-          <!-- The ? operator checks existence, not null - so initialize to safe default first -->
+        <!-- Extract live search results if this is a live or fallback continuation -->
+        <do_if value="$searchState == 'live' or $searchState == 'fallback'">
           <set_value name="$savedTradeList" exact="[]"/>
           <set_value name="$savedTradeListTemp" exact="@global.$GT_SearchResult.{$ship}.$TradeList"/>
           <do_if value="$savedTradeListTemp?">
-            <!-- Global value exists - check if it's actually a list (has .count property) -->
             <set_value name="$tempCount" exact="@$savedTradeListTemp.count"/>
             <do_if value="$tempCount?">
-              <!-- Valid list with count - use it -->
               <set_value name="$savedTradeList" exact="$savedTradeListTemp"/>
             </do_if>
           </do_if>
-          <!-- Ensure $savedTradeList is valid before accessing .count -->
-          <set_value name="$savedTradeListCount" exact="0"/>
-          <do_if value="$savedTradeList?">
-            <set_value name="$savedTradeListCountTemp" exact="@$savedTradeList.count"/>
-            <do_if value="$savedTradeListCountTemp?">
-              <set_value name="$savedTradeListCount" exact="$savedTradeListCountTemp"/>
-            </do_if>
-          </do_if>
-          <set_value name="$savedBestTrade" exact="@global.$GT_SearchResult.{$ship}.$BestTrade"/>
-          <set_value name="$savedBestScore" exact="@global.$GT_SearchResult.{$ship}.$BestScore"/>
-          
+          <set_value name="$liveTradeList" exact="$savedTradeList"/>
+          <set_value name="$liveBestTrade" exact="@global.$GT_SearchResult.{$ship}.$BestTrade"/>
+          <set_value name="$liveBestScore" exact="@global.$GT_SearchResult.{$ship}.$BestScore"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <set_value name="$savedShipId" exact="'null'"/>
-            <do_if value="$savedShip?">
-              <set_value name="$savedShipIdTemp" exact="@$savedShip.idcode"/>
-              <do_if value="$savedShipIdTemp?">
-                <set_value name="$savedShipId" exact="$savedShipIdTemp"/>
-              </do_if>
-            </do_if>
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ðŸ” Continuation check: waitingFlag=' + $savedWaitingForBatch + ', liveShip=' + $savedShipId + ', currentShip=' + $ship.idcode + ', tradeListCount=' + $savedTradeListCount" chance="100"/>
-          </do_if>
-          
-          <!-- Check if live search just completed (WaitingForBatch = false, TradeList exists or is empty, Ship matches) -->
-          <!-- Accept continuation even with 0 trades (all blacklisted) to prevent infinite loops -->
-          <do_if value="not $savedWaitingForBatch and $savedShip == $ship">
-            <!-- Live search just completed for this ship - use those results (even if 0 trades) -->
-            <set_value name="$isLiveSearchContinuation" exact="true"/>
-            <set_value name="$liveTradeList" exact="$savedTradeList"/>
-            <set_value name="$liveBestTrade" exact="$savedBestTrade"/>
-            <set_value name="$liveBestScore" exact="$savedBestScore"/>
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') âœ… Live search continuation detected - using live results (' + $liveTradeList.count + ' trades) instead of running cache search again'" chance="100"/>
-            </do_if>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using live search results (' + $liveTradeList.count + ' trades, state=' + $searchState + ', fallbackTriggered=' + $fallbackSearchTriggered + ')'" chance="100"/>
           </do_if>
         </do_if>
+        
+
         
         <!-- Check trade cache with age validation -->
         <!-- Only run cache search if NOT continuing from live search AND NOT forcing live search -->
@@ -359,7 +304,8 @@
         <!-- Check if ForceLiveSearch flag is set (AI rejected all cached trades) -->
         <set_value name="$forceLiveSearch" exact="@$params.$ForceLiveSearch"/>
         
-        <do_if value="not $isLiveSearchContinuation and not $forceLiveSearch">
+        <!-- Only check cache if this is a fresh search (not live/fallback continuation) -->
+        <do_if value="$searchState == 'fresh' and not $forceLiveSearch">
           <!-- Track search method for diagnostics -->
           <set_value name="$searchMethod" exact="'cache'"/>
           <set_value name="$cacheChecked" exact="true"/>
@@ -423,8 +369,8 @@
         </do_else>
         
         <!-- Compare cache vs live results and use the best -->
-        <!-- If we have both cache and live results, prefer live (they're fresher) -->
-        <do_if value="$isLiveSearchContinuation">
+        <!-- If we have live/fallback continuation, use live results (they're fresher) -->
+        <do_if value="$searchState == 'live' or $searchState == 'fallback'">
           <!-- Using live search results -->
           <set_value name="$bestTrade" exact="$liveBestTrade"/>
           <set_value name="$bestScore" exact="$liveBestScore"/>
@@ -464,7 +410,7 @@
         <set_value name="$bestRejectedTrade" exact="null"/>
         
         <!-- If using live search continuation, retrieve rejection stats from global (includes filtering stats) -->
-        <do_if value="$isLiveSearchContinuation">
+        <do_if value="$searchState == 'live' or $searchState == 'fallback'">
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') ðŸ” RETRIEVING STATS FROM CONTINUATION:' +
               '\n  TradesRejectedDocking exists: ' + (if global.$GT_SearchResult.{$ship}.$TradesRejectedDocking? then 'yes' else 'no') +
@@ -659,7 +605,7 @@
              3. Previous live search did NOT return 0 trades (to prevent infinite loops when all trades are blacklisted) -->
         <set_value name="$shouldDoLiveSearch" exact="false"/>
         <set_value name="$previousLiveSearchReturnedZeroTrades" exact="false"/>
-        <do_if value="$isLiveSearchContinuation and $liveTradeList.count == 0">
+        <do_if value="($searchState == 'live' or $searchState == 'fallback') and $liveTradeList.count == 0">
           <!-- Previous live search returned 0 trades -->
           <!-- Apply cooldown to prevent infinite loop when ship is stuck -->
           <!-- If ship is in blacklisted sector and all trades filtered, cooldown prevents immediate re-search -->
@@ -675,7 +621,6 @@
           </do_if>
           
           <!-- Clear continuation state -->
-          <set_value name="$isLiveSearchContinuation" exact="false"/>
           <set_value name="$liveTradeList" exact="[]"/>
           <set_value name="$liveBestTrade" exact="null"/>
           <set_value name="$liveBestScore" exact="0"/>
@@ -717,7 +662,8 @@
           </do_else>
         </do_if>
         
-        <do_if value="not $isLiveSearchContinuation">
+        <!-- Only trigger live search if this is a fresh search (not live/fallback continuation) -->
+        <do_if value="$searchState == 'fresh'">
           <!-- Low diversity check removed - only trigger live search on cache miss -->
           <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
         </do_if>
@@ -862,7 +808,7 @@
             <!-- Cooldown active - skip live search -->
             <!-- CRITICAL: Don't clear results if we're using live search continuation (results already set above) -->
             <!-- CRITICAL: Preserve cache tradeList even if bestTrade was invalid (fallback can find valid trade from list) -->
-            <do_if value="not $isLiveSearchContinuation">
+            <do_if value="$searchState == 'fresh'">
               <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
                 <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping live search due to cooldown - preserving cache results (bestTrade may be null, tradeList.count=' + (if $tradeList? and $tradeList.count? then $tradeList.count else 0) + ')'" chance="100"/>
               </do_if>
@@ -896,8 +842,8 @@
           
           <!-- Redundant batch check removed - already handled at the beginning of the cue -->
           <!-- Extract live search results from global return variable (batch processing completed) -->
-          <!-- Note: If $isLiveSearchContinuation is true, live results were already extracted above -->
-          <do_if value="not $isLiveSearchContinuation">
+          <!-- Note: If this is a live/fallback continuation, live results were already extracted above -->
+          <do_if value="$searchState == 'fresh'">
             <set_value name="$bestTrade" exact="@global.$GT_SearchResult.{$ship}.$BestTrade"/>
             <set_value name="$bestScore" exact="@global.$GT_SearchResult.{$ship}.$BestScore"/>
             
@@ -1004,7 +950,7 @@
             </do_if>
           </do_if>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Trade execution check: bestTrade=' + $bestTradeCheck + ', tradeList.count=' + $tradeListCount + ', isContinuation=' + $isLiveSearchContinuation" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Trade execution check: bestTrade=' + $bestTradeCheck + ', tradeList.count=' + $tradeListCount + ', searchState=' + $searchState" chance="100"/>
           </do_if>
         </do_if>
         
@@ -1094,12 +1040,12 @@
                   <do_if value="global.$GT_FallbackLogbookWritten.{$ship}?">
                     <set_value name="$logbookAlreadyWritten" exact="true"/>
                     <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook message already written - skipping (flag exists, isLiveContinuation=' + $isLiveSearchContinuation + ')'" chance="100"/>
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook message already written - skipping (flag exists, searchState=' + $searchState + ')'" chance="100"/>
                     </do_if>
                   </do_if>
                   <do_else>
                     <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook flag NOT set - will write message (isLiveContinuation=' + $isLiveSearchContinuation + ', isFallbackContinuation=' + $isFallbackContinuation + ')'" chance="100"/>
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Logbook flag NOT set - will write message (searchState=' + $searchState + ')'" chance="100"/>
                     </do_if>
                   </do_else>
                   
@@ -1214,8 +1160,8 @@
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') ENTERING bestTrade execution block'" chance="100"/>
             <!-- Log if this trade came from fallback search -->
-            <do_if value="$isFallbackSearch">
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ') âœ… Fallback search complete: Found ' + (if $tradeList? and $tradeList.count? then $tradeList.count else 0) + ' trades (MaxDistance=2)'" chance="100"/>
+            <do_if value="$searchState == 'fallback'">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback search complete: Found ' + (if $tradeList? and $tradeList.count? then $tradeList.count else 0) + ' trades'" chance="100"/>
             </do_if>
           </do_if>
           
@@ -1402,7 +1348,7 @@
           <!-- Combine blacklist stats: If using continuation, $tradesRejectedBlacklist already includes combined value -->
           <!-- Otherwise, combine evaluation-phase rejections + pre-filtering rejections -->
           <set_value name="$totalBlacklistFiltered" exact="$tradesRejectedBlacklist"/>
-          <do_if value="not $isLiveSearchContinuation">
+          <do_if value="$searchState == 'fresh'">
             <!-- Not a continuation: combine evaluation-phase + pre-filtering rejections -->
             <set_value name="$totalBlacklistFiltered" exact="$tradesRejectedBlacklist + $filteredByBlacklistFromResume + $filteredByPathBlockedFromResume"/>
           </do_if>
@@ -1692,9 +1638,9 @@
           </do_if>
           <do_else>
             <!-- Fallback search already triggered or cache search succeeded - signal no trade found -->
-            <!-- âœ… FALLBACK SEARCH: Log if fallback search completed with no trades -->
-            <do_if value="$isFallbackSearch and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ') âŒ Fallback search complete: No trades found (MaxDistance=2)'" chance="100"/>
+            <!-- Log if fallback search completed with no trades -->
+            <do_if value="$searchState == 'fallback' and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback search complete: No trades found'" chance="100"/>
             </do_if>
             <!-- âœ… ENHANCED: Log before signaling no trade found (debug mode only) -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1730,8 +1676,8 @@
         <!-- Only release if NOT waiting for batch processing FOR THIS SHIP -->
         <!-- If waiting for batch, we'll need these parameters when processing live search results -->
         <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
-        <do_if value="not $isWaitingForThisShipBatch or $isLiveSearchContinuation">
-          <set_value name="$releaseReason" exact="if $isLiveSearchContinuation then 'live search continuation complete' else 'search complete'"/>
+        <do_if value="not $isWaitingForThisShipBatch or $searchState == 'live' or $searchState == 'fallback'">
+          <set_value name="$releaseReason" exact="if ($searchState == 'live' or $searchState == 'fallback') then 'live search continuation complete' else 'search complete'"/>
           <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
             <param name="ship" value="$shipForCleanup"/>
             <param name="reason" value="$releaseReason"/>
@@ -1812,6 +1758,11 @@
         <!-- Extract results -->
         <set_value name="$ship" exact="$results.$ship"/>
         <set_value name="$tradeList" exact="$results.$tradeList"/>
+        <!-- Ensure $tradeList is never null - initialize to empty list if null or missing -->
+        <!-- Use same pattern as FilterTradeList_Batch check (line 1939) but inverted -->
+        <do_if value="not ($tradeList? and $tradeList != null)">
+          <set_value name="$tradeList" exact="[]"/>
+        </do_if>
         <set_value name="$crossStationBestTrade" exact="$results.$crossStationBestTrade"/>
         <set_value name="$crossStationBestScore" exact="$results.$crossStationBestScore"/>
         <set_value name="$nonConflictedBestTrade" exact="$results.$nonConflictedBestTrade"/>
@@ -1851,9 +1802,9 @@
           </do_if>
         </do_if>
         
-        <!-- Detect if this is a fallback search (MaxDistance == 2) -->
+        <!-- Detect if this is a fallback search (originalMaxDistance != maxDistance) -->
         <set_value name="$isFallbackSearch" exact="false"/>
-        <do_if value="$maxDistance == 2">
+        <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
           <set_value name="$isFallbackSearch" exact="true"/>
         </do_if>
         
@@ -2247,9 +2198,9 @@
           <set_value name="$originalMaxDistance" exact="$batchData.$originalMaxDistance"/>
         </do_if>
         
-        <!-- Detect if this is a fallback search (MaxDistance == 2) -->
+        <!-- Detect if this is a fallback search (originalMaxDistance != maxDistance) -->
         <set_value name="$isFallbackSearch" exact="false"/>
-        <do_if value="$maxDistance == 2">
+        <do_if value="$originalMaxDistance? and $originalMaxDistance != $maxDistance">
           <set_value name="$isFallbackSearch" exact="true"/>
         </do_if>
         
@@ -2809,9 +2760,15 @@
         
         <!-- 10. Signal SearchTradeRoutes again with original parameters so it can read the live search results -->
         <do_if value="$originalParams?">
+          <!-- Set explicit SearchState based on whether this is a fallback search -->
+          <set_value name="$searchState" exact="'live'"/>
+          <do_if value="$isFallbackSearchFromBatch">
+            <set_value name="$searchState" exact="'fallback'"/>
+          </do_if>
+          <set_value name="$originalParams.$SearchState" exact="$searchState"/>
           <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$originalParams"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades)'" chance="100"/>
+            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades, state=' + $searchState + ')'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
