@@ -131,6 +131,77 @@
       </actions>
     </handler>
     
+    <!-- Event-Driven Mobile Satellite Intelligence: Detect stations entering radar range -->
+    <!-- 
+    OPTIMIZED: Event-driven station detection (replaces polling-based MobileSatelliteIntelligence)
+    - Uses vanilla gravidar scan events (zero CPU when no stations detected)
+    - Only Level 9+ pilots can detect stations (skill gate maintained)
+    - Signals MD immediately when stations detected (no polling overhead)
+    - Same functionality as old polling system but much more efficient
+    -->
+    <handler comment="Detect stations entering radar range for mobile satellite intelligence">
+      <conditions>
+        <event_gravidar_has_scanned object="this.ship"/>
+        <check_value value="this.ship.pilot? and global.$GT_Pilots.{this.ship.pilot}?"/>
+        <check_value value="this.sector"/>
+      </conditions>
+      <actions>
+        <!-- DIAGNOSTIC: Log when gravidar scan event fires -->
+        <debug_text text="'[GT-AI-Intel] GRAVIDAR SCAN EVENT FIRED for ' + this.ship.idcode + ' (' + this.ship.knownname + ')'" chance="100"/>
+        
+        <!-- Get pilot level -->
+        <set_value name="$level" exact="@global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+        
+        <!-- DIAGNOSTIC: Log pilot level check -->
+        <debug_text text="'[GT-AI-Intel] Pilot level check: ' + this.ship.idcode + ' - Level ' + $level + ' (required: 9+), MobileIntel enabled: ' + (if (not global.$GT_GlobalSettings.$MobileIntel? or global.$GT_GlobalSettings.$MobileIntel.$Enable) then 'YES' else 'NO')" chance="100"/>
+        
+        <!-- Only Level 9+ pilots can do mobile satellite intel -->
+        <do_if value="$level ge 9 and (not global.$GT_GlobalSettings.$MobileIntel? or global.$GT_GlobalSettings.$MobileIntel.$Enable)">
+          <!-- Initialize detected stations list (prevents property lookup errors) -->
+          <set_value name="$detectedStations" exact="[]"/>
+          
+          <!-- Find stations in radar range using gravidar contacts -->
+          <!-- Note: find_gravidar_contact is used in actions blocks, count_gravidar_contacts is only for conditions -->
+          <find_gravidar_contact name="$detectedStations" object="this.ship" class="class.station" docked="false" checkoperational="true" multiple="true">
+            <match_distance object="this.ship" max="this.ship.maxradarrange"/>
+            <match_context macro="this.sector.macro"/>
+          </find_gravidar_contact>
+          
+          <!-- ✅ FIX: Ensure detectedStations is a valid list (find_gravidar_contact may fail) -->
+          <do_if value="not $detectedStations?">
+            <set_value name="$detectedStations" exact="[]"/>
+          </do_if>
+          
+          <!-- DIAGNOSTIC: Log when scan completes (even if no stations found) -->
+          <debug_text text="'[GT-AI-Intel] Scan complete for ' + this.ship.idcode + ': Found ' + $detectedStations.count + ' station(s) in radar range'" chance="100"/>
+          
+          <!-- DEBUG: Log detection event -->
+          <do_if value="$detectedStations.count gt 0">
+            <debug_text text="'[GT-AI-Intel] ' + this.ship.idcode + ' (' + this.ship.knownname + ') detected ' + $detectedStations.count + ' station(s) in radar range (Level ' + $level + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Signal MD for each detected station -->
+          <do_if value="$detectedStations.count gt 0">
+            <do_all exact="$detectedStations.count" counter="$i">
+              <set_value name="$station" exact="$detectedStations.{$i}"/>
+              <do_if value="$station.exists and $station.isoperational">
+                <!-- Signal MD to process this station -->
+                <signal_objects object="player.galaxy" param="'GT_Station_Detected'" param2="table[$ship=this.ship, $station=$station, $pilotLevel=$level]"/>
+                
+                <!-- DEBUG: Log individual station detection -->
+                <debug_text text="'[GT-AI-Intel] ' + this.ship.idcode + ' detected station: ' + $station.knownname + ' (signaling MD)'" chance="100"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- DIAGNOSTIC: Log why station detection was skipped -->
+          <set_value name="$skipReason" exact="if $level lt 9 then 'Pilot level too low (' + $level + ' less than 9)' else 'Mobile Intel disabled'"/>
+          <debug_text text="'[GT-AI-Intel] Station detection SKIPPED for ' + this.ship.idcode + ': ' + $skipReason" chance="100"/>
+        </do_else>
+      </actions>
+    </handler>
+    
     <!-- Subordinate Resync Handler: Listen for commander order changes (like vanilla order.assist) -->
     <handler comment="Subordinate resync on commander order change">
       <conditions>
@@ -1492,9 +1563,9 @@
       
       <!-- Wait for maintenance to complete -->
       <do_if value="(global.$GT_RepairOrders? and global.$GT_RepairOrders.{this.ship}?) or (global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{this.ship}?)">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏳ Waiting for maintenance orders to complete (max 600s)...'" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏳ Waiting for maintenance orders to complete (max 900s)...'" chance="100"/>
         
-        <wait max="600s">
+        <wait max="900s">
           <interrupt>
             <conditions>
               <event_object_signalled object="this.ship" param="'GT_Maintenance_Complete'"/>
@@ -1509,7 +1580,7 @@
         </wait>
         
         <!-- Timeout fallback -->
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏱️ Maintenance timeout after 600s, proceeding anyway'" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏱️ Maintenance timeout after 900s, proceeding anyway'" chance="100"/>
         
         <!-- Clear maintenance transition flag on timeout as well -->
         <remove_value name="this.$maintenance_transition"/>
