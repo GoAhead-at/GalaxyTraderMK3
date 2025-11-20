@@ -1690,7 +1690,12 @@
         
         <do_if value="$hasCargo">
           <!-- Ship has cargo - sell it first using our trade search -->
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship has cargo - finding best buyer using trade search...'" chance="100"/>
+          <!-- ✅ CARGO DISPOSAL: Only log initial message once (prevent spam) -->
+          <set_value name="$isFirstCargoDisposalAttempt" exact="false"/>
+          <do_if value="not this.$cargoDisposalFailed? or this.$cargoDisposalFailed == 0">
+            <set_value name="$isFirstCargoDisposalAttempt" exact="true"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship has cargo - finding best buyer using trade search...'" chance="100"/>
+          </do_if>
           
           <!-- Set cargo disposal flag for ship name -->
           <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
@@ -1709,8 +1714,8 @@
             ]"/>
           </do_if>
           
-          <!-- Write logbook entry about cargo safety -->
-          <do_if value="$gt_logbookentries">
+          <!-- Write logbook entry about cargo safety - ONLY ON FIRST ATTEMPT -->
+          <do_if value="$isFirstCargoDisposalAttempt and $gt_logbookentries">
             <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
             <set_value name="$logbookMessage" exact="{77000,3204}.[this.ship.knownname]"/>
             
@@ -1728,7 +1733,6 @@
             $Ship = this.ship,
             $HomeBase = this.$effectiveHome,
             $MaxSell = $effectiveMaxSell,
-            $RiskTolerance = $gt_risktolerance,
             $DistancePenalty = $effectiveDistancePenalty,
             $FleetCoordination = $effectiveFleetCoordination
           ]"/>
@@ -1740,6 +1744,11 @@
           <!-- Clear cargo disposal flag (cargo is now empty) -->
           <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
             <remove_value name="global.$GT_Ships.{this.ship}.$CargoDisposal"/>
+            
+            <!-- ✅ CARGO DISPOSAL: Reset cargo disposal failure counter when cargo is cleared -->
+            <do_if value="this.$cargoDisposalFailed?">
+              <set_value name="this.$cargoDisposalFailed" exact="0"/>
+            </do_if>
             
             <!-- Trigger ship rename to remove [CLEARANCE] state -->
             <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
@@ -1800,6 +1809,11 @@
               <!-- Reset retry counter on successful trade -->
               <set_value name="this.$searchFailed" exact="0"/>
               
+              <!-- ✅ CARGO DISPOSAL: Reset cargo disposal failure counter on successful trade -->
+              <do_if value="this.$cargoDisposalFailed?">
+                <set_value name="this.$cargoDisposalFailed" exact="0"/>
+              </do_if>
+              
               <!-- Clear reroute flag (new destination found) -->
               <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Rerouting?">
                 <remove_value name="global.$GT_Ships.{this.ship}.$Rerouting"/>
@@ -1821,7 +1835,12 @@
             </do_if>
             <do_elseif value="event.param == 'GT_No_Trade_Found'">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📥 INTERRUPT FIRED: GT_No_Trade_Found received at game time ' + player.age" chance="100"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📨 RECEIVED GT_No_Trade_Found signal - starting retry logic'" chance="100"/>
+              <!-- Check if this is a cargo disposal attempt -->
+              <set_value name="$isCargoDisposal" exact="false"/>
+              <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
+                <set_value name="$isCargoDisposal" exact="true"/>
+              </do_if>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 📨 RECEIVED GT_No_Trade_Found signal - starting retry logic (cargo disposal: ' + $isCargoDisposal + ')'" chance="100"/>
               <resume label="no_trade_retry"/>
             </do_elseif>
             <do_elseif value="event.param == 'GT_Destination_Threatened'">
@@ -3120,13 +3139,29 @@
       <!-- ========================================= -->
       <label name="no_trade_retry"/>
       
-      <!-- Increment failure counter -->
-      <set_value name="this.$searchFailed" exact="this.$searchFailed + 1"/>
+      <!-- ✅ CARGO DISPOSAL: Track cargo disposal failures separately -->
+      <set_value name="$isCargoDisposal" exact="false"/>
+      <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
+        <set_value name="$isCargoDisposal" exact="true"/>
+        <!-- Initialize cargo disposal failure counter if not exists -->
+        <do_if value="not this.$cargoDisposalFailed?">
+          <set_value name="this.$cargoDisposalFailed" exact="0"/>
+        </do_if>
+        <!-- Increment cargo disposal failure counter -->
+        <set_value name="this.$cargoDisposalFailed" exact="this.$cargoDisposalFailed + 1"/>
+      </do_if>
+      <do_else>
+        <!-- Normal trade search failure - increment normal counter -->
+        <!-- Increment failure counter -->
+        <set_value name="this.$searchFailed" exact="this.$searchFailed + 1"/>
+      </do_else>
       
       <!-- Calculate escalating wait time: 10s, 20s, 30s, 40s, 50s, 60s (max) -->
-      <set_value name="$waitTime" exact="[this.$searchFailed * 10s, 60s].min"/>
+      <!-- Use cargo disposal counter if this is cargo disposal, otherwise use normal counter -->
+      <set_value name="$failureCount" exact="if $isCargoDisposal then this.$cargoDisposalFailed else this.$searchFailed"/>
+      <set_value name="$waitTime" exact="[$failureCount * 10s, 60s].min"/>
       
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No profitable trades found (attempt ' + this.$searchFailed + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No ' + (if $isCargoDisposal then 'cargo buyer' else 'profitable trades') + ' found (attempt ' + $failureCount + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>
       
       <!-- Set ship to waiting state -->
       <set_command command="command.wait"/>
@@ -3158,7 +3193,24 @@
       <!-- Write logbook entry only if we've reached max wait (60s) AND wait completed naturally (not interrupted by trade found) -->
       <!-- Also check if we've already written a logbook entry recently to prevent duplicates -->
       <set_value name="$shouldWriteLogbook" exact="false"/>
-      <do_if value="$waitTime == 60s and not $tradeFoundDuringWait">
+      <set_value name="$shouldWriteCargoDisposalLogbook" exact="false"/>
+      
+      <!-- ✅ CARGO DISPOSAL: Separate logbook entry for cargo disposal failures -->
+      <do_if value="$isCargoDisposal and $waitTime == 60s and not $tradeFoundDuringWait">
+        <!-- Check if we've already written a cargo disposal failure logbook entry in the last 5 minutes (300s) -->
+        <set_value name="$lastCargoDisposalLogbookTime" exact="0"/>
+        <do_if value="this.$lastCargoDisposalLogbookEntryTime?">
+          <set_value name="$lastCargoDisposalLogbookTime" exact="this.$lastCargoDisposalLogbookEntryTime"/>
+        </do_if>
+        <set_value name="$timeSinceLastCargoDisposalLogbook" exact="player.age - $lastCargoDisposalLogbookTime"/>
+        <do_if value="$timeSinceLastCargoDisposalLogbook ge 300s or $lastCargoDisposalLogbookTime == 0">
+          <!-- Haven't written cargo disposal failure logbook recently (or never) - OK to write -->
+          <set_value name="$shouldWriteCargoDisposalLogbook" exact="true"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Normal trade search logbook entry -->
+      <do_if value="not $isCargoDisposal and $waitTime == 60s and not $tradeFoundDuringWait">
         <!-- Check if we've already written a logbook entry in the last 5 minutes (300s) -->
         <set_value name="$lastLogbookTime" exact="0"/>
         <do_if value="this.$lastLogbookEntryTime?">
@@ -3168,6 +3220,46 @@
         <do_if value="$timeSinceLastLogbook ge 300s or $lastLogbookTime == 0">
           <!-- Haven't written logbook recently (or never) - OK to write -->
           <set_value name="$shouldWriteLogbook" exact="true"/>
+        </do_if>
+      </do_if>
+      
+      <!-- ✅ CARGO DISPOSAL: Write separate failure message for cargo disposal -->
+      <do_if value="$shouldWriteCargoDisposalLogbook">
+        <!-- Check if logbook enabled -->
+        <set_value name="$logEnabled" exact="false"/>
+        <do_if value="@this.ship.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.defaultorder.$logbookentries">
+          <set_value name="$logEnabled" exact="true"/>
+        </do_if>
+        <!-- Subordinates inherit logbook setting from commander -->
+        <do_elseif value="@this.ship.defaultorder.id == 'Assist' and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.commander.defaultorder.$logbookentries">
+          <set_value name="$logEnabled" exact="true"/>
+        </do_elseif>
+        
+        <do_if value="$logEnabled">
+          <!-- Get cargo info for logbook message -->
+          <set_value name="$cargoList" exact="this.ship.cargo.list"/>
+          <set_value name="$cargoTypes" exact="[]"/>
+          <do_all exact="$cargoList.count" counter="$i">
+            <set_value name="$ware" exact="$cargoList.{$i}"/>
+            <set_value name="$amount" exact="this.ship.cargo.{$ware}.count"/>
+            <append_to_list name="$cargoTypes" exact="@$ware.name + ' x' + $amount"/>
+          </do_all>
+          <set_value name="$cargoDescription" exact="if $cargoTypes.count gt 0 then $cargoTypes.{1} + (if $cargoTypes.count gt 1 then ', ' + $cargoTypes.{2} else '') + (if $cargoTypes.count gt 2 then ', ...' else '') else 'Unknown'"/>
+          
+          <!-- Write cargo disposal failure logbook entry -->
+          <set_value name="$logbookMessage" exact="'Commander,\n\nI have been unable to find a buyer for my cargo after multiple attempts. My cargo hold contains: ' + $cargoDescription + '\n\nI have tried ' + $failureCount + ' times but cannot locate a suitable buyer within my trading range. This may be due to:\n- No stations buying these wares nearby\n- All potential buyers are blacklisted\n- Docking restrictions at available stations\n\nI will continue waiting and retrying periodically. You may want to manually assign a sell order or adjust my trading parameters.\n\nStatus: Waiting for buyer opportunity\n\nWith patience,\nAboard ' + this.ship.knownname"/>
+          
+          <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+            $Message = $logbookMessage,
+            $Category = 'alerts',
+            $Title = 'Cargo Disposal Failed: ' + this.ship.knownname,
+            $Object = this.ship,
+            $Interaction = 'showonmap',
+            $CheckGlobalSettings = false
+          ]"/>
+          
+          <!-- Update last cargo disposal logbook entry time -->
+          <set_value name="this.$lastCargoDisposalLogbookEntryTime" exact="player.age"/>
         </do_if>
       </do_if>
       
