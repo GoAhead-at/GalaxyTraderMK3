@@ -1900,14 +1900,19 @@
             <set_value name="global.$GT_Ships.{$ship}.$IsSubordinate" exact="true"/>
             <set_value name="global.$GT_Ships.{$ship}.$Commander" exact="$ship.commander"/>
             
-            <!-- Calculate fleet position -->
-            <set_value name="$fleetSubordinates" exact="$ship.commander.subordinates"/>
-            <do_all exact="$fleetSubordinates.count" counter="$i">
-              <do_if value="$fleetSubordinates.{$i} == $ship">
-                <set_value name="global.$GT_Ships.{$ship}.$FleetPosition" exact="$i"/>
-                <break/>
-              </do_if>
-            </do_all>
+            <!-- FleetPosition removed: Not used (Get_Fleet_Startup_Delay library not called) -->
+            <!-- Trade search queue already prevents simultaneous searches via MaxConcurrent -->
+            <!-- FleetPosition calculation caused stutter with many subordinates (O(n) loop) -->
+            <!-- FleetPosition remains initialized to 0 (default value) -->
+          </do_if>
+          
+          <!-- OPTIMIZATION: Update cached active trader count incrementally -->
+          <!-- Only increment if ship is operational (matches counting logic) -->
+          <do_if value="$ship.exists and $ship.isoperational">
+            <do_if value="not global.$GT_ActiveTraderCount?">
+              <set_value name="global.$GT_ActiveTraderCount" exact="0"/>
+            </do_if>
+            <set_value name="global.$GT_ActiveTraderCount" operation="add"/>
           </do_if>
           
           <do_if value="$debuglevel ge 1">
@@ -1998,6 +2003,12 @@
       </params>
       <actions>
         <do_if value="$ship? and global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+          <!-- OPTIMIZATION: Update cached active trader count incrementally -->
+          <!-- Only decrement if ship was operational (matches counting logic) -->
+          <do_if value="$ship.exists and $ship.isoperational and global.$GT_ActiveTraderCount? and global.$GT_ActiveTraderCount gt 0">
+            <set_value name="global.$GT_ActiveTraderCount" operation="subtract"/>
+          </do_if>
+          
           <remove_value name="global.$GT_Ships.{$ship}"/>
           
           <do_if value="$debuglevel ge 1">
@@ -2738,30 +2749,44 @@
           
           <!-- Only apply coordination delay if gate passed -->
           <do_if value="$fleetGatePassed">
-          <!-- Count active traders -->
+          <!-- OPTIMIZED: Use cached active trader count instead of expensive O(n) loop -->
+          <!-- Cache is maintained incrementally during ship registration/unregistration -->
           <set_value name="$activeTraders" exact="0"/>
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
-            <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
-            <do_all exact="$shipKeys.count" counter="$i">
-              <set_value name="$existingShip" exact="$shipKeys.{$i}"/>
-              <do_if value="$existingShip.exists and $existingShip.isoperational and $existingShip != $ship">
-                <set_value name="$activeTraders" exact="$activeTraders + 1"/>
-              </do_if>
-            </do_all>
+          <do_if value="global.$GT_ActiveTraderCount?">
+            <set_value name="$activeTraders" exact="global.$GT_ActiveTraderCount"/>
           </do_if>
+          <do_else>
+            <!-- Fallback: Cache not initialized - count manually (shouldn't happen, but safe) -->
+            <set_value name="$activeTraders" exact="0"/>
+            <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+              <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+              <do_all exact="$shipKeys.count" counter="$i">
+                <set_value name="$existingShip" exact="$shipKeys.{$i}"/>
+                <do_if value="$existingShip.exists and $existingShip.isoperational and $existingShip != $ship">
+                  <set_value name="$activeTraders" exact="$activeTraders + 1"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Initialize cache with counted value -->
+            <set_value name="global.$GT_ActiveTraderCount" exact="$activeTraders"/>
+          </do_else>
           
           <!-- Apply fleet coordination delay -->
           <do_if value="$activeTraders gt 0">
             <set_value name="$startupDelay" exact="[$activeTraders * 5, 30].min"/>
             <set_value name="$isSubordinate" exact="true"/>
             
-            <debug_text text="'[GT-AI] ' + $ship.idcode + ': Fleet coordination: delaying startup for ' + $startupDelay + 's (found ' + $activeTraders + ' active traders)'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + $ship.idcode + ': Fleet coordination: delaying startup for ' + $startupDelay + 's (found ' + $activeTraders + ' active traders, cached)'" chance="100"/>
           </do_if>
           </do_if>
           <do_if value="not $fleetGatePassed">
             <debug_text text="'[GT-AI] ' + $ship.idcode + ': Fleet coordination gated by level (requires 12), current=' + (if $skillInfo? then $skillInfo.$Level else 1)" chance="100"/>
           </do_if>
         </do_if>
+        <do_else>
+          <!-- Fleet coordination disabled - skip expensive count (Option 2: Skip if disabled) -->
+          <set_value name="$activeTraders" exact="0"/>
+        </do_else>
         
         <!-- Store results -->
         <set_value name="$fleetResult.$StartupDelay" exact="$startupDelay"/>
