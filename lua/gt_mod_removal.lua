@@ -84,15 +84,15 @@ local function GT_DismantleMod(_, params)
     local shipIdCode = tPackets[3] or shipIdStr  -- Use shipIdCode if provided, otherwise fall back to numeric ID
     local shipId = ConvertStringTo64Bit(shipIdStr)
     
-    -- ✅ FIX: Include readable ship ID code in log messages
+    -- FIX: Include readable ship ID code in log messages
     logDebug(string.format("Removing %s mod from ship ID string: %s (converted: %s) => %s", type, shipIdStr, tostring(shipId), shipIdCode))
     
     if type == "ship" then
         C.DismantleShipMod(shipId)
-        logDebug(string.format("✅ Removed ship mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
+        logDebug(string.format("Removed ship mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "engine" then
         C.DismantleEngineMod(shipId)
-        logDebug(string.format("✅ Removed engine mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
+        logDebug(string.format("Removed engine mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "shield" then
         -- For shield mods, we need context (ship) and group
         -- If group is "null" or not provided, we need to remove from all groups
@@ -103,12 +103,12 @@ local function GT_DismantleMod(_, params)
         
         if group then
             C.DismantleShieldMod(shipId, contextId, group)
-            logDebug(string.format("✅ Removed shield mod from ship ID: %s => %s, group: %s", tostring(shipId), shipIdCode, group))
+            logDebug(string.format("Removed shield mod from ship ID: %s => %s, group: %s", tostring(shipId), shipIdCode, group))
         else
             -- Try removing with nil group (may remove from all groups)
             -- Note: This might need iteration through actual shield groups
             C.DismantleShieldMod(shipId, contextId, nil)
-            logDebug(string.format("✅ Removed shield mod from ship ID: %s => %s (all groups)", tostring(shipId), shipIdCode))
+            logDebug(string.format("Removed shield mod from ship ID: %s => %s (all groups)", tostring(shipId), shipIdCode))
         end
     elseif type == "weapon" then
         -- For weapon mods, we need the component ID
@@ -118,15 +118,15 @@ local function GT_DismantleMod(_, params)
         
         if componentId then
             C.DismantleWeaponMod(componentId)
-            logDebug(string.format("✅ Removed weapon mod from component ID: %s (ship: %s)", tostring(componentId), shipIdCode))
+            logDebug(string.format("Removed weapon mod from component ID: %s (ship: %s)", tostring(componentId), shipIdCode))
         else
             logDebug(string.format("⚠ WARNING: No component ID provided for weapon mod - cannot remove individual weapon mods without component ID (ship: %s)", shipIdCode), "WARNING")
         end
     elseif type == "thruster" then
         C.DismantleThrusterMod(shipId)
-        logDebug(string.format("✅ Removed thruster mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
+        logDebug(string.format("Removed thruster mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     else
-        logDebug(string.format("❌ ERROR: Unknown mod type: %s", type), "ERROR")
+        logDebug(string.format("ERROR: Unknown mod type: %s", type), "ERROR")
     end
 end
 
@@ -145,12 +145,12 @@ local function GT_InstallMod(_, params)
         -- Thruster mods are installed via InstallEngineMod since they affect engine properties
         local success = C.InstallEngineMod(shipId, wareId)
         if success then
-            logDebug(string.format("✅ Installed thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)))
+            logDebug(string.format("Installed thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)))
         else
-            logDebug(string.format("❌ Failed to install thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)), "ERROR")
+            logDebug(string.format("Failed to install thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)), "ERROR")
         end
     else
-        logDebug(string.format("❌ ERROR: Unknown mod type for installation: %s", type), "ERROR")
+        logDebug(string.format("ERROR: Unknown mod type for installation: %s", type), "ERROR")
     end
 end
 
@@ -169,22 +169,22 @@ local function init()
     -- Register event handlers
     local success1 = pcall(RegisterEvent, "GT_DismantleMod", GT_DismantleMod)
     if success1 then
-        logDebug("✅ Registered event: GT_DismantleMod")
+        logDebug("Registered event: GT_DismantleMod")
     else
-        logDebug("❌ Failed to register event: GT_DismantleMod", "ERROR")
+        logDebug("Failed to register event: GT_DismantleMod", "ERROR")
         return false
     end
     
     local success2 = pcall(RegisterEvent, "GT_InstallMod", GT_InstallMod)
     if success2 then
-        logDebug("✅ Registered event: GT_InstallMod")
+        logDebug("Registered event: GT_InstallMod")
     else
-        logDebug("❌ Failed to register event: GT_InstallMod", "ERROR")
+        logDebug("Failed to register event: GT_InstallMod", "ERROR")
         return false
     end
     
     logDebug("================================================================================")
-    logDebug("✅ Mod Removal Lua Module loaded successfully!")
+    logDebug("Mod Removal Lua Module loaded successfully!")
     logDebug("================================================================================")
     
     return true

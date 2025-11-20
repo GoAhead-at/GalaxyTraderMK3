@@ -10,34 +10,34 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 
 ## 🌟 Features
 
-### Advanced Trading AI ✅ **WORKING**
+### Advanced Trading AI **WORKING**
 - **Intelligent Route Selection**: Multi-factor optimization considering profit margins, travel time, risk, and market saturation
 - **Advanced Trade Search**: 30+ validation layers with cross-station trade evaluation
 - **Risk Management**: Configurable risk tolerance with automatic threat avoidance
 - **Standard Cargo Handling**: Proper cargo space calculations and loading
 - **Anti-Stuck Protection**: Prevents ships from getting stuck with invalid orders
 
-### XP Progression System ✅ **WORKING**
+### XP Progression System **WORKING**
 - **15 Skill Levels**: From Apprentice (Level 1) to Long-Distance Merchant (Level 15)
 - **Experience-Based Growth**: Ships gain XP from successful trades using diff patch integration
 - **Distance & Risk Bonuses**: Extra XP for long-distance and dangerous trades
 - **Skill Benefits**: Higher levels unlock greater jump distances and efficiency
 - **Event-Driven XP**: Immediate XP award on trade completion (no polling delays)
 
-### Mandatory Training System ✅ **WORKING**
+### Mandatory Training System **WORKING**
 - **Training Requirements**: Certification needed at levels 3, 6, 9, and 12
 - **Station-Based Training**: Automatic docking at shipyards, wharfs, or trade stations
 - **XP Blocking**: Complete progression halt until training is completed
 - **Immersive Messages**: Professional logbook entries for training events
 - **Auto-Navigation**: Ships automatically find and travel to training stations
 
-### Ship Management ✅ **WORKING**
+### Ship Management **WORKING**
 - **Auto-Renaming**: Ships display pilot rank, level, and XP in their names
 - **Pilot Tracking**: Experience tied to individual pilots, not ships
 - **Training Status**: Visual indicators for training requirements and progress
 - **Full Localization**: English and German translations
 
-### Threat Intelligence System ✅ **WORKING**
+### Threat Intelligence System **WORKING**
 - **Real-Time Threat Detection**: Monitors attacks, missiles, and ship destruction
 - **Fleet-Wide Intelligence**: Ships share threat information across the fleet
 - **5-Level Threat Classification**: From minor threats to critical emergencies
@@ -48,21 +48,21 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Smart Notifications**: Fleet alerts for high-threat situations
 - **Automatic Cleanup**: Time-based database expiry and blacklist updates
 
-### Fleet Coordination System ✅ **WORKING**
+### Fleet Coordination System **WORKING**
 - **Multi-Ship Management**: Coordinate entire trading fleets
 - **Route Conflict Prevention**: Automatic detection and prevention of duplicate routes
 - **Trade Reservations**: Ships reserve routes to avoid fleet oversaturation
 - **Fleet Statistics**: Track total profit and trades across all ships
 - **Automatic Cleanup**: Stale reservations are automatically removed
 
-### Mobile Satellite Intelligence ✅ **WORKING**
+### Mobile Satellite Intelligence **WORKING**
 - **Mobile Market Data**: Ships act as advanced satellites (75km radar range)
 - **Skill-Gated**: Only Level 9+ pilots can gather intelligence
 - **Real-Time Updates**: Fresh market data during trading operations
 - **Station Scanning**: Automatic trade offer updates for nearby stations
 - **Smart Cooldowns**: Per-station cooldown prevents excessive scanning
 
-### Auto-Repair System ✅ **WORKING**
+### Auto-Repair System **WORKING**
 - **Automatic Hull Monitoring**: Ships check hull integrity after every trade
 - **Skill-Gated Access**: Only Level 12+ master traders can use auto-repair
 - **Configurable Threshold**: Default triggers at <95% hull (adjustable 50-99%)
@@ -71,7 +71,7 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Funds Management**: Full repair if affordable, partial repair if low on credits, notification if insufficient funds
 - **Automatic Resumption**: Ships automatically resume trading after repairs complete
 
-### Defensive Equipment Auto-Replenishment ✅ **WORKING**
+### Defensive Equipment Auto-Replenishment **WORKING**
 - **Skill-Gated Access**: Only Level 15 elite traders unlock this feature
 - **Countermeasures Restocking**: Flares and chaff automatically replenished
 - **Deployable Units**: Defense drones, cargo drones, repair drones, laser towers
@@ -82,14 +82,14 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 - **Initial Safety Check**: Ships verify equipment before entering dangerous sectors
 - **Failure Handling**: Monitors resupply completion, continues trading if items unavailable
 
-### Performance Features ✅ **WORKING**
+### Performance Features **WORKING**
 - **Event-Driven Architecture**: 3-5x faster than polling-based systems
 - **Comprehensive Logging**: Detailed debug output and trade tracking
 - **Professional Integration**: Compatible logbook message system
 - **Save Game Safe**: No save game corruption or compatibility issues
 - **Optimized Performance**: Minimal CPU and memory footprint
 
-## 📦 Installation
+## Installation
 
 ### **Prerequisites**
 - **Required**: SirNukes Mod Support APIs (Steam Workshop: ws_2042901274)
@@ -105,7 +105,7 @@ GalaxyTrader MK3 is a comprehensive trading automation mod that brings intellige
 4. **Enable** the mod in the X4 Extensions menu
 5. **Start/Load** your game
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Basic Setup
 1. Assign a ship to trading duty using the "GalaxyTrader MK3" order
@@ -168,7 +168,7 @@ All settings are centralized in the mod's configuration system:
 - **Repair Notifications**: Auto-repair status and fund warnings
 - **Debug Output**: Comprehensive logging levels (0-3)
 
-## 📊 Skill Progression System
+## Skill Progression System
 
 ### **Level Progression Table**
 
@@ -176,16 +176,16 @@ All settings are centralized in the mod's configuration system:
 |-------|-------------|-------|-------|-------------------|-------------------|---------------|
 | **1** | 0 XP | Apprentice | ⭐ | **1 jump** | No | • Starting level<br>• Local sector trading only<br>• Basic threat detection |
 | **2** | 100 XP | Apprentice | ⭐ | **1 jump** | No | • XP accumulation continues |
-| **3** | 250 XP | Apprentice | ⭐ | **1 jump** → **3 jumps** | **✅ TRAINING** | • **+200% jump range** (1→3 jumps)<br>• Training system unlocks<br>• Multi-sector trading begins |
+| **3** | 250 XP | Apprentice | ⭐ | **1 jump** → **3 jumps** | **TRAINING** | • **+200% jump range** (1→3 jumps)<br>• Training system unlocks<br>• Multi-sector trading begins |
 | **4** | 450 XP | Courier | ⭐⭐ | **3 jumps** | No | • 2-star rank title<br>• Extended trading range |
 | **5** | 700 XP | Courier | ⭐⭐ | **3 jumps** | No | • Continued progression |
-| **6** | 1,000 XP | Courier | ⭐⭐ | **3 jumps** → **5 jumps** | **✅ TRAINING** | • **+67% jump range** (3→5 jumps)<br>• Threat Intelligence access<br>• Regional trading unlocked |
+| **6** | 1,000 XP | Courier | ⭐⭐ | **3 jumps** → **5 jumps** | **TRAINING** | • **+67% jump range** (3→5 jumps)<br>• Threat Intelligence access<br>• Regional trading unlocked |
 | **7** | 1,350 XP | Supplier | ⭐⭐⭐ | **5 jumps** | No | • 3-star rank title<br>• Regional specialist |
 | **8** | 1,750 XP | Supplier | ⭐⭐⭐ | **5 jumps** | No | • Approaching advanced features |
-| **9** | 2,200 XP | Supplier | ⭐⭐⭐ | **5 jumps** → **10 jumps** | **✅ TRAINING** | • **+100% jump range** (5→10 jumps)<br>• **Mobile Satellite Intelligence** 📡<br>• 75km radar market scanning<br>• Long-distance trading unlocked |
+| **9** | 2,200 XP | Supplier | ⭐⭐⭐ | **5 jumps** → **10 jumps** | **TRAINING** | • **+100% jump range** (5→10 jumps)<br>• **Mobile Satellite Intelligence** 📡<br>• 75km radar market scanning<br>• Long-distance trading unlocked |
 | **10** | 2,700 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** | No | • 4-star rank title<br>• Cross-sector specialist |
 | **11** | 3,250 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** | No | • Approaching master level |
-| **12** | 3,850 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** → **15 jumps** | **✅ TRAINING** | • **+50% jump range** (10→15 jumps)<br>• **Advanced Fleet Coordination**<br>• **Auto-Repair System** 🔧<br>• Master trader certification<br>• Cross-galaxy trading |
+| **12** | 3,850 XP | Trader | ⭐⭐⭐⭐ | **10 jumps** → **15 jumps** | **TRAINING** | • **+50% jump range** (10→15 jumps)<br>• **Advanced Fleet Coordination**<br>• **Auto-Repair System** 🔧<br>• Master trader certification<br>• Cross-galaxy trading |
 | **13** | 4,500 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • 5-star rank title<br>• Elite trader status |
 | **14** | 5,200 XP | Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** | No | • Near maximum capabilities |
 | **15** | 6,000 XP | Long-Distance Merchant | ⭐⭐⭐⭐⭐ | **15 jumps** → **25 jumps** | No | • **+67% jump range** (15→25 jumps)<br>• **Defensive Equipment Auto-Replenishment** 🛡️<br>• Automatic countermeasure & unit restocking<br>• **Maximum capabilities**<br>• True galaxy-wide trading<br>• Ultimate trader rank |
@@ -272,7 +272,7 @@ Range: 10 - 1,000 XP per trade (clamped)
    - A 10-jump trade earns +50% bonus XP
    - Encourages long-distance trading as pilots level up
 
-4. **Risk Bonus** ⚠️ (Future)
+4. **Risk Bonus**  (Future)
    - Trading in dangerous sectors will earn extra XP
    - Currently under development
 
@@ -324,7 +324,7 @@ The system is balanced to require approximately **500 trades** to reach Level 15
   - Respects faction relation mods
   - Compatible with economy overhauls
 
-## 📝 Credits
+## Credits
 
 - **Author**: GoAhead
 - **Version**: 0.5.0

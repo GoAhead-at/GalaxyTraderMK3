@@ -293,7 +293,7 @@ function gtMenu.displayPilotTable(frame, instance, yOffset)
         return
     end
     
-    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    -- FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
     -- X4 automatically creates shield/hull bars for selectable rows, and has a global limit of 50
     -- Limit display to 50 rows to stay under the limit (header + 50 rows = 51 total, but header doesn't count)
     local maxRows = 50
@@ -579,7 +579,7 @@ function gtMenu.displayRenaming(frame, instance, yOffset)
         return
     end
     
-    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    -- FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
     local maxRows = 50
     local pilotsToDisplay = pilots
     if #pilots > maxRows then
@@ -785,7 +785,7 @@ function gtMenu.displayPilotControl(frame, instance, yOffset)
         return
     end
     
-    -- ✅ FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
+    -- FIX: Limit rows to prevent X4's 50 shield/hull bar limit from being exceeded
     local maxRows = 50
     local pilotsToDisplay = pilots
     if #pilots > maxRows then
