@@ -133,7 +133,7 @@ local function init()
     -- Register event listener for action confirmations from MD
     RegisterEvent("GT_PilotControl.Confirmation", onActionConfirmation)
     
-    debugLog("✅ Pilot Control Bridge initialized - listening for action confirmations")
+    debugLog("Pilot Control Bridge initialized - listening for action confirmations")
 end
 
 init()
