@@ -765,7 +765,7 @@
                 $LastLiveSearch = player.age,
                 $CooldownDuration = $newCooldown
               ]"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss   live search cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
               </do_if>
             </do_else>
@@ -2984,11 +2984,22 @@
           
           <!-- Find buy offers for the selected ware -->
           <!-- CRITICAL: tradepartner="$ship" ensures only executable offers (relations, permissions, F6 limitations) -->
+          <!-- CARGO DISPOSAL: Accept any amount ≥ 1 (ship must clear cargo, even if very small) -->
+          <!-- Without explicit filters, find_buy_offer may filter out offers where ship has less cargo than station wants -->
           <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$buyOffers" multiple="true" wares="$selectedWare">
             <match_buyer tradesknownto="$ship.owner">
               <match_gate_distance object="$ship" max="$maxDistance"/>
             </match_buyer>
+            <amount min="1"/>
+            <totalvolume min="1"/>
           </find_buy_offer>
+          
+          <!-- Debug: Log if no offers found -->
+          <do_if value="$buyOffers.count == 0">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Sell] ' + $ship.idcode + ': No buy offers found for ' + @$selectedWare.name + ' (ship cargo: ' + $selectedAmount + ' units)'" chance="100"/>
+            </do_if>
+          </do_if>
           
           <!-- Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
           <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
@@ -2998,15 +3009,27 @@
           <!-- Find best price -->
           <do_all exact="$buyOffers.count" counter="$j">
             <set_value name="$offer" exact="$buyOffers.{$j}"/>
-            <set_value name="$station" exact="$offer.owner"/>
-            <set_value name="$currentSector" exact="$ship.sector"/>
-            <set_value name="$stationSector" exact="$station.sector"/>
             
-            <!-- tradepartner="$ship" in find_buy_offer already filters by faction relations -->
-            <!-- No explicit check needed - C++ engine handles it -->
+            <!-- Validate offer is still valid (station may have been destroyed/removed) -->
+            <set_value name="$station" exact="@$offer.owner"/>
+            <set_value name="$offerValid" exact="false"/>
+            <do_if value="$station? and $station.exists">
+              <set_value name="$currentSector" exact="$ship.sector"/>
+              <set_value name="$stationSector" exact="@$station.sector"/>
+              
+              <!-- Validate station sector is valid -->
+              <do_if value="$stationSector?">
+                <set_value name="$offerValid" exact="true"/>
+              </do_if>
+            </do_if>
             
-            <!-- Check blacklists before considering offer -->
-            <set_value name="$isBlacklisted" exact="false"/>
+            <!-- Only process valid offers -->
+            <do_if value="$offerValid">
+              <!-- tradepartner="$ship" in find_buy_offer already filters by faction relations -->
+              <!-- No explicit check needed - C++ engine handles it -->
+              
+              <!-- Check blacklists before considering offer -->
+              <set_value name="$isBlacklisted" exact="false"/>
             
             <!-- Block intra-sector sales in blacklisted sectors (force escape) -->
             <!-- If ship is in blacklisted sector and trying to sell to station in same sector, block -->
@@ -3128,25 +3151,32 @@
               </do_if>
             </do_if>
             
-            <!-- Only consider valid, non-blacklisted, operational, dockable offers -->
-            <do_if value="not $isBlacklisted and $isOperational and $canDock and $offer.available">
-              <set_value name="$tradeAmount" exact="[$selectedAmount, $offer.amount].min"/>
-              <set_value name="$profit" exact="$offer.unitprice * $tradeAmount"/>
-              
-              <do_if value="$profit gt $bestPrice">
-                <set_value name="$bestOffer" exact="$offer"/>
-                <set_value name="$bestPrice" exact="$profit"/>
-                <set_value name="$bestAmount" exact="$tradeAmount"/>
+              <!-- Only consider valid, non-blacklisted, operational, dockable offers -->
+              <do_if value="not $isBlacklisted and $isOperational and $canDock and $offer.available">
+                <set_value name="$tradeAmount" exact="[$selectedAmount, $offer.amount].min"/>
                 
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Best offer now: ' + @$station.knownname + ' - ' + $offer.ware.name + ' x' + $tradeAmount + ' @ ' + $offer.unitprice + ' Cr/unit (profit: ' + $profit + ' Cr)'" chance="100"/>
+                <!-- CRITICAL: Skip if trade amount is zero or negative (ship has no cargo or offer has no amount) -->
+                <do_if value="$tradeAmount gt 0">
+                  <set_value name="$profit" exact="$offer.unitprice * $tradeAmount"/>
+                  
+                  <do_if value="$profit gt $bestPrice">
+                    <set_value name="$bestOffer" exact="$offer"/>
+                    <set_value name="$bestPrice" exact="$profit"/>
+                    <set_value name="$bestAmount" exact="$tradeAmount"/>
+                    
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Best offer now: ' + @$station.knownname + ' - ' + $offer.ware.name + ' x' + $tradeAmount + ' @ ' + $offer.unitprice + ' Cr/unit (profit: ' + $profit + ' Cr)'" chance="100"/>
+                    </do_if>
+                  </do_if>
                 </do_if>
               </do_if>
             </do_if>
+            <!-- End of $offerValid check -->
           </do_all>
           
           <!-- Execute best sell if found - use normal pipeline (store in GT_PendingTrades, let AI create orders) -->
-          <do_if value="$bestOffer and $bestPrice gt $minProfit">
+          <!-- For cargo disposal, accept even zero profit (ship must clear cargo) - use ge instead of gt to allow zero -->
+          <do_if value="$bestOffer and $bestPrice ge $minProfit">
             <!-- Validate offer is STILL valid before proceeding -->
             <!-- Offers can become invalid between search and order creation -->
             <set_value name="$offerStillValid" exact="$bestOffer.available and $bestOffer.amount gt 0"/>
