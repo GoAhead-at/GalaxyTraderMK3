@@ -1,6 +1,242 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.12 - 2025-01-21
+---------------------------
+
+FIX: RouteCacheCleanup Property Lookup Errors
+  - Fixed null property access errors in cache cleanup routines
+  - Problem: Property lookup failed when accessing `global.$GT_TradeCache.keys.count` and `$cacheKeys.count`
+    * Error: "Property lookup failed: global.$GT_TradeCache.count" in RouteCacheCleanup
+    * Error: "Property lookup failed: $cacheKeys.count" where `$cacheKeys == null`
+    * Cache structure changed in v5 to table indexed by home sector, so direct `.count` access was invalid
+  - Root Cause: Incorrect null/existence checks - `$cacheKeys?` only checks existence, not if value is null
+  - Solution: Implemented robust null/existence check pattern:
+    * Extract property with safe operator (`@`) first
+    * Extract count with safe operator (`@$cacheKeys.count`)
+    * Store count in separate variable (`$cacheKeysCount`)
+    * Check if count exists AND is greater than 0 before using in `<do_all>`
+  - Files Modified:
+    * `md/gt_trading_execution.xml` (fixed RouteCacheCleanup null checks, lines 691-694)
+    * `md/gt_fleet_coordination.xml` (fixed GetCacheStatistics null checks, lines 219-224)
+  - Benefits:
+    * No more property lookup errors during cache cleanup
+    * Robust handling of null/empty cache states
+    * Proper iteration through cache keys only when cache exists and has entries
+
+IMPROVEMENT: Hybrid Amount Clamping Implementation
+  - Implemented hybrid approach combining detailed validation with vanilla `clamp_trade_amount`
+  - Problem: Manual cargo space validation was redundant and could miss edge cases
+  - Solution: Leverage vanilla `clamp_trade_amount` for final amount adjustment while retaining detailed early validation
+    * Early validation: Blacklist, pathfinding, docking, cargo type, offer validity, cargo space, distance
+    * Final clamping: Use `clamp_trade_amount` before order creation to adjust amounts based on:
+      - Buyer cargo space
+      - Buyer money
+      - Seller cargo space
+      - Offer amount limits
+    * Store clamped amounts in `$pendingTrade.$FinalBuyAmount` and `$pendingTrade.$FinalSellAmount`
+    * Check if clamped amounts are zero and skip trade if so (with logging)
+  - Implementation:
+    * Added `clamp_trade_amount` calls within validation loop, before `create_trade_order`
+    * Clamps both buy and sell amounts separately
+    * Logs clamp reasons for debugging
+    * Continues to next trade if clamping results in zero amount
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (added clamping logic before order creation)
+  - Benefits:
+    * More accurate amount calculation (handles all edge cases vanilla handles)
+    * Detailed logging of clamp reasons
+    * Prevents creating orders with zero amounts
+    * Retains comprehensive early validation while leveraging vanilla clamping
+  - Vanilla Pattern Reference:
+    * `order.trade.routine.xml:773-797` (buy clamping)
+    * `order.trade.routine.xml:817-825` (sell clamping)
+
+IMPROVEMENT: Final Docking Verification with find_dockingbay
+  - Added accurate dock size verification right before creating trade orders
+  - Problem: `dockingallowed` property check is fast but may miss dock size mismatches
+    * L/XL ships could be sent to stations without L/XL docks
+    * S/M ships could be sent to stations without appropriate docks
+  - Solution: Two-stage docking verification:
+    * Stage 1 (loop): Fast `dockingallowed` check for early filtering
+    * Stage 2 (before orders): Accurate `find_dockingbay` check for final verification
+      - Uses `find_dockingbay` with `match_dock size="this.ship.docksize"`
+      - Checks both buy and sell stations (if applicable)
+      - Verifies trading permissions, dock size, and relation (not enemy)
+      - Only checks once per trade that passed all validation (efficient)
+  - Implementation:
+    * Added `find_dockingbay` check right before `create_trade_order` calls
+    * If check fails, sets `$validTradeFound = false` and resumes to `main_loop`
+    * Logs detailed debug messages explaining why docking failed
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml` (added final docking verification, lines 3064-3105)
+  - Benefits:
+    * More accurate: Verifies dock size right before creating orders
+    * More efficient: Only checks `find_dockingbay` once per trade that passed all validation
+    * Better error recovery: If docking fails, tries next trade instead of failing completely
+    * Catches edge cases: Dock size mismatches, dock availability issues
+  - Pattern Consistency:
+    * Matches pattern used in GalaxyTrader MD scripts (maintenance, training, trading search)
+    * Uses same `find_dockingbay` approach as vanilla `order.dock.xml:381-384`
+
+FIX: StateHistory List Slicing Property Lookup Error
+  - Fixed property lookup error when trimming StateHistory list
+  - Problem: Property lookup failed when slicing StateHistory list using `$historyList.[$startIdx, $endIdx]`
+    * Error: "Property lookup failed: $historyList.[1,51]" at line 364
+    * Issue: List slicing syntax `$list.[start, end]` was failing even with validated indices
+    * X4 list slicing may have edge cases or syntax requirements that caused failures
+  - Root Cause: List slicing syntax unreliable even with proper validation
+    * Indices were validated correctly (`$startIdx ge 0 and $endIdx gt $startIdx and $endIdx le $listCount`)
+    * But slice operation still failed, suggesting X4 slice syntax has limitations
+  - Solution: Replaced list slicing with explicit loop-based copying:
+    * Extract list count with safe operator (`@$state.$StateHistory.count`)
+    * Check if count exists and is greater than threshold (50)
+    * Extract list with safe operator (`@$state.$StateHistory`) into temporary variable
+    * Build new list by looping through last 50 entries (1-indexed: `$listCount - 50 + 1` to `$listCount`)
+    * Copy each item explicitly using `append_to_list` instead of slicing
+    * Replace StateHistory with the new trimmed list
+  - Files Modified:
+    * `md/gt_ship_state_manager.xml` (replaced slicing with loop-based copying, lines 354-374)
+  - Benefits:
+    * No more property lookup errors when trimming StateHistory
+    * More reliable: Explicit copying avoids slice syntax edge cases
+    * Robust handling of null/empty StateHistory lists
+    * Proper validation of indices before copying
+    * Prevents crashes when StateHistory is null or has insufficient entries
+
+FIX: SearchSellOpportunities Property Lookup Errors
+  - Fixed property lookup errors when processing sell-only trade offers
+  - Problem: Property lookup failed when accessing properties on invalid trade offers
+    * Error: "Property lookup failed: $offer.owner" - `$offer == trade.{0x7d36L} (invalid)`
+    * Error: "Property lookup failed: $station.sector" - `$station == null`
+    * Error: "Property lookup failed: $ship.gatedistance.{null}" - `$stationSector == null`
+    * Trade offers can become invalid between `find_buy_offer` and processing (stations destroyed/removed)
+  - Root Cause: Code accessed properties without validation
+    * Accessed `$offer.owner` without checking if offer is still valid
+    * Accessed `$station.sector` without checking if station exists
+    * Used `$stationSector` in `gatedistance` calculation without validating it's not null
+    * Stations can be destroyed/removed between search and processing, causing invalid trade objects
+  - Solution: Added comprehensive validation before processing offers:
+    * Use safe operator (`@`) when accessing `$offer.owner`
+    * Validate `$station` exists before accessing its properties
+    * Validate `$stationSector` is valid before using it in calculations
+    * Set `$offerValid` flag to track valid offers
+    * Wrap all offer processing logic inside `do_if value="$offerValid"` block
+    * Invalid offers are skipped gracefully without causing property lookup errors
+  - Files Modified:
+    * `md/gt_trading_search.xml` (added offer validation in SearchSellOpportunities, lines 3013-3027)
+  - Benefits:
+    * No more property lookup errors when processing sell-only trades
+    * Robust handling of invalid trade offers (stations destroyed/removed)
+    * Graceful skipping of invalid offers without crashing
+    * Prevents crashes when stations are destroyed between search and order creation
+    * Follows same safe property access pattern used elsewhere in codebase
+
+IMPROVEMENT: Research Requirement Check for Ship Modifications
+  - Added research requirement validation before installing ship modifications
+  - Problem: Modifications were installed based only on pilot level, ignoring research requirements
+    * Player must research modifications at HQ before they can be installed
+    * If only level 1 mods are researched, level 2/3 mods cannot be installed
+    * System was installing mods based on pilot level alone, ignoring research status
+  - Solution: Two-stage level determination:
+    * Stage 1: Calculate pilot-supported mod level (Level 9 = Level 1, Level 12 = Level 2, Level 15 = Level 3)
+    * Stage 2: Check research requirements from highest level down, find highest researched level that pilot supports
+      - Checks `ware.mod_ship_gt_levelX.research.unlocked` and `ware.mod_engine_gt_levelX.research.unlocked`
+      - Both ship and engine mods must be researched for a level to be available
+      - Falls back to lower levels if higher levels aren't researched
+      - Example: Pilot supports level 3, but only level 1 researched → installs level 1
+  - Implementation:
+    * Modified `Install_GT_Modifications` library (lines 40-95):
+      - Separated pilot-supported level (`$pilotModLevel`) from final mod level (`$modLevel`)
+      - Added research checks for each level (3 → 2 → 1)
+      - Only sets `$modLevel` if both ship and engine mods are researched for that level
+      - Enhanced debug messages to show pilot-supported level vs researched level
+    * Enhanced error messages (lines 175-195):
+      - Shows why mods weren't installed (pilot level too low vs research not completed)
+      - Indicates which level is missing research
+  - Files Modified:
+    * `md/gt_ship_modifications.xml` (added research requirement checks, lines 40-95)
+  - Benefits:
+    * Respects player research progress: Only installs mods that player has researched
+    * Prevents installation failures: Won't try to install unresearched mods
+    * Graceful fallback: Installs highest researched level that pilot supports
+    * Better debugging: Clear messages explaining why mods weren't installed
+    * Matches game mechanics: Research is required before mods can be installed
+  - Vanilla Pattern Reference:
+    * Uses `ware.research.unlocked` property (scriptproperties.xml:1910)
+    * Pattern matches vanilla research checks (diplomacy.xml, story_thefan.xml)
+
+IMPROVEMENT: Final Docking Verification for Repair and Resupply Orders
+  - Added accurate dock size verification right before creating repair and resupply orders
+  - Problem: `dockingallowed` property check is fast but may miss dock size mismatches
+    * L/XL ships could be sent to stations without L/XL docks for repair/resupply
+    * S/M ships could be sent to stations without appropriate docks
+    * MD scripts already use `find_dockingbay` in search loops, but no final verification before order creation
+  - Solution: Two-stage docking verification (consistent with trading):
+    * Stage 1 (MD script): Fast `dockingallowed` check and `find_dockingbay` in search loop for early filtering
+    * Stage 2 (AI script): Accurate `find_dockingbay` check right before creating orders
+      - Uses `find_dockingbay` with `match_dock size="this.ship.docksize"`
+      - Verifies dock size and operational status
+      - Only checks once per repair/resupply order that passed all validation (efficient)
+  - Implementation:
+    * Repair Orders:
+      - Added `find_dockingbay` check before `create_order` for Repair (lines 1547-1560)
+      - Skips docking check for capital ships docking at non-stations (matches MD script logic)
+      - If check fails, clears repair order data and continues trading
+      - Logs detailed debug messages explaining why docking failed
+    * Resupply Orders:
+      - Added `find_dockingbay` check before `add_build_to_modify_ship` (lines 1628-1649)
+      - If check fails, clears resupply order data and continues trading
+      - Logs detailed debug messages explaining why docking failed
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`:
+      - Added final docking verification for repair orders (lines 1547-1560)
+      - Added final docking verification for resupply orders (lines 1628-1649)
+  - Benefits:
+    * More accurate: Verifies dock size right before creating orders
+    * More efficient: Only checks `find_dockingbay` once per order that passed all validation
+    * Better error recovery: If docking fails, clears order data and continues trading instead of failing
+    * Catches edge cases: Dock size mismatches, dock availability issues
+    * Consistent pattern: Same approach as trading orders for maintainability
+  - Pattern Consistency:
+    * Matches pattern used for trading orders (same two-stage verification)
+    * Uses same `find_dockingbay` approach as vanilla `order.dock.xml:381-384`
+
+FIX: Sell-Only Trade Search Filtering for Small Cargo Amounts
+  - Fixed issue where ships with very small amounts of cheap cargo couldn't find trades
+  - Problem: `find_buy_offer` without explicit amount filters may filter out offers where ship has less cargo than station wants
+    * Example: Ship has 5 energy cells, station wants 100 → offer filtered out
+    * Ship couldn't find any buyers for small cargo amounts
+  - Root Cause: Missing explicit minimum amount filters in `find_buy_offer` for sell-only trades
+    * Normal trades use `<amount min="10"/>` and `<totalvolume min="100"/>`
+    * Sell-only trades had no filters, allowing implicit filtering based on tradepartner capacity
+  - Solution: Added explicit minimum filters that allow any amount ≥ 1 for sell-only trades
+    * Added `<amount min="1"/>` and `<totalvolume min="1"/>` to `find_buy_offer` in SearchSellOpportunities
+    * Added zero amount check to skip offers where tradeAmount is 0 or negative
+    * Changed profit comparison from `gt` to `ge` to allow zero profit (minProfit is 0Cr for cargo disposal)
+    * Added debug logging when no offers are found
+  - Files Modified:
+    * `md/gt_trading_search.xml`:
+      - Added explicit amount filters to find_buy_offer (lines 2993-2994)
+      - Added zero amount check before profit calculation (line 3138)
+      - Changed profit comparison to allow zero profit (line 3153)
+      - Added debug logging for no offers found (lines 2997-3001)
+  - Benefits:
+    * Ships can now find buyers for very small cargo amounts (even 1-10 units)
+    * Cargo disposal works correctly for cheap/low-value wares
+    * Better debugging with explicit logging when no offers found
+    * Proper handling of zero-profit trades (cargo disposal priority)
+
+FIX: Debug Message Gating
+  - Fixed debug message not properly gated behind full debug toggle
+  - Problem: Cache miss cooldown debug message was only gated by TradeSearch debug, not full debug toggle
+  - Solution: Added full debug toggle check to message condition
+  - Files Modified:
+    * `md/gt_trading_search.xml` (line 768): Added `@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging` check
+  - Benefits:
+    * Debug messages now properly respect full debug toggle setting
+    * Reduces log spam when full debug is disabled
+
 Version 0.6.11 - 2025-01-21
 ---------------------------
 

@@ -1544,19 +1544,55 @@
       <!-- Create Repair order if data prepared -->
       <do_if value="global.$GT_RepairOrders? and global.$GT_RepairOrders.{this.ship}?">
         <set_value name="$repairData" exact="global.$GT_RepairOrders.{this.ship}"/>
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Creating Repair order at ' + $repairData.$Station.knownname" chance="100"/>
+        <set_value name="$repairStation" exact="$repairData.$Station"/>
         
-        <!-- Set flag to indicate maintenance transition for on_abort handler -->
-        <set_value name="this.$maintenance_transition" exact="true"/>
+        <!-- FINAL DOCKING VERIFICATION: Use find_dockingbay for accurate dock size/permission check -->
+        <!-- This is more accurate than dockingallowed and catches dock size mismatches -->
+        <set_value name="$canDockRepair" exact="false"/>
+        <do_if value="$repairStation? and $repairStation.exists">
+          <!-- Skip docking check for capital ships unless station is a station (capital ships can dock at stations) -->
+          <set_value name="$checkDocking" exact="not this.ship.iscapitalship or ($repairStation.isclass.station)"/>
+          <do_if value="$checkDocking">
+            <find_dockingbay name="$testRepairDock" object="$repairStation" checkoperational="true" multiple="false">
+              <match_dock size="this.ship.docksize" storage="false"/>
+            </find_dockingbay>
+            <do_if value="$testRepairDock">
+              <set_value name="$canDockRepair" exact="true"/>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Repair docking check FAILED: ' + @$repairStation.knownname + 
+                  '\n  Sector: ' + @$repairStation.sector.knownname + 
+                  '\n  Reason: No dock available for ship size ' + this.ship.docksize + ' (station may not have L/XL docks)' +
+                  '\n  → Clearing repair order and continuing trading...'" 
+                  chance="100"/>
+              </do_if>
+              <!-- Clear repair order data so we don't try again -->
+              <remove_value name="global.$GT_RepairOrders.{this.ship}"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <!-- Capital ship docking at non-station - skip docking check -->
+            <set_value name="$canDockRepair" exact="true"/>
+          </do_else>
+        </do_if>
         
-        <create_order object="this.ship" id="'Repair'" immediate="false">
-          <param name="destination" value="$repairData.$Station"/>
-          <param name="hullpercent" value="100"/>
-          <param name="repairall" value="true"/>
-          <param name="acceptedcost" value="$repairData.$AcceptedCost"/>
-          <param name="urgent" value="false"/>
-          <param name="internalorder" value="true"/>
-        </create_order>
+        <!-- Only create repair order if docking check passed -->
+        <do_if value="$canDockRepair">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Creating Repair order at ' + $repairStation.knownname" chance="100"/>
+          
+          <!-- Set flag to indicate maintenance transition for on_abort handler -->
+          <set_value name="this.$maintenance_transition" exact="true"/>
+          
+          <create_order object="this.ship" id="'Repair'" immediate="false">
+            <param name="destination" value="$repairStation"/>
+            <param name="hullpercent" value="100"/>
+            <param name="repairall" value="true"/>
+            <param name="acceptedcost" value="$repairData.$AcceptedCost"/>
+            <param name="urgent" value="false"/>
+            <param name="internalorder" value="true"/>
+          </create_order>
+        </do_if>
       </do_if>
       
       <!-- Create Resupply order if data prepared -->
@@ -1587,58 +1623,88 @@
         
         <!-- Always call add_build_to_modify_ship if we have a resupply order (tables include existing + new equipment) -->
         <do_if value="$ammoTableCount? or $unitTableCount?">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Shopping list - Ammo types: ' + $ammoTableCount + ', Unit types: ' + $unitTableCount" chance="100"/>
+          <set_value name="$resupplyStation" exact="$resupplyData.$Station"/>
+          
+          <!-- FINAL DOCKING VERIFICATION: Use find_dockingbay for accurate dock size/permission check -->
+          <!-- This is more accurate than dockingallowed and catches dock size mismatches -->
+          <set_value name="$canDockResupply" exact="false"/>
+          <do_if value="$resupplyStation? and $resupplyStation.exists">
+            <find_dockingbay name="$testResupplyDock" object="$resupplyStation" checkoperational="true" multiple="false">
+              <match_dock size="this.ship.docksize" storage="false"/>
+            </find_dockingbay>
+            <do_if value="$testResupplyDock">
+              <set_value name="$canDockResupply" exact="true"/>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Resupply docking check FAILED: ' + @$resupplyStation.knownname + 
+                  '\n  Sector: ' + @$resupplyStation.sector.knownname + 
+                  '\n  Reason: No dock available for ship size ' + this.ship.docksize + ' (station may not have L/XL docks)' +
+                  '\n  → Clearing resupply order and continuing trading...'" 
+                  chance="100"/>
+              </do_if>
+              <!-- Clear resupply order data so we don't try again -->
+              <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
+            </do_else>
           </do_if>
           
-          <!-- Set flag to indicate maintenance transition for on_abort handler -->
-          <set_value name="this.$maintenance_transition" exact="true"/>
-          
-          <!-- Use vanilla's add_build_to_modify_ship action -->
-          <!-- Tables now include CURRENT equipment (preserves it) + NEW equipment (adds to it) -->
-          <!-- Use immediate="false" so GT order waits for build order to complete -->
-          <add_build_to_modify_ship 
-            object="$resupplyData.$Station" 
-            buildobject="this.ship" 
-            ammo="$resupplyData.$AmmoTable" 
-            units="$resupplyData.$UnitTable" 
-            immediate="false"
-            internal="true"
-            result="$buildSuccessful"/>
-          
-          <do_if value="$buildSuccessful">
+          <!-- Only create resupply order if docking check passed -->
+          <do_if value="$canDockResupply">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Build order created successfully - waiting for completion'" chance="100"/>
-              <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Shopping list - Ammo types: ' + $ammoTableCount + ', Unit types: ' + $unitTableCount" chance="100"/>
             </do_if>
-            <!-- Build order will complete and trigger our order.build.equip patch to signal completion -->
+            
+            <!-- Set flag to indicate maintenance transition for on_abort handler -->
+            <set_value name="this.$maintenance_transition" exact="true"/>
+            
+            <!-- Use vanilla's add_build_to_modify_ship action -->
+            <!-- Tables now include CURRENT equipment (preserves it) + NEW equipment (adds to it) -->
+            <!-- Use immediate="false" so GT order waits for build order to complete -->
+            <add_build_to_modify_ship 
+              object="$resupplyStation" 
+              buildobject="this.ship" 
+              ammo="$resupplyData.$AmmoTable" 
+              units="$resupplyData.$UnitTable" 
+              immediate="false"
+              internal="true"
+              result="$buildSuccessful"/>
+            
+            <do_if value="$buildSuccessful">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Build order created successfully - waiting for completion'" chance="100"/>
+                <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
+              </do_if>
+              <!-- Build order will complete and trigger our order.build.equip patch to signal completion -->
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAILED to create build order!'" chance="100"/>
+                <debug_text text="'[GT-AI]    This usually means the station cannot build the requested items'" chance="100"/>
+                <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  Build order creation failed - station cannot fulfill order'" chance="100"/>
+              </do_if>
+              
+              <!-- Clean up resupply data -->
+              <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
+              
+              <!-- Apply cooldown to prevent immediate retry -->
+              <do_if value="not global.$GT_MaintenanceFailedResupply?">
+                <set_value name="global.$GT_MaintenanceFailedResupply" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_MaintenanceFailedResupply.{this.ship}" exact="player.age + 300s"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🕒 Applied 5-minute cooldown due to failed build order'" chance="100"/>
+              
+              <!-- Remove maintenance order flag -->
+              <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{this.ship}?">
+                <remove_value name="global.$GT_MaintenanceOrders.{this.ship}"/>
+              </do_if>
+              
+              <!-- Signal MD that we're done (failed) -->
+              <signal_objects object="this.ship" param="'GT_Maintenance_Complete'"/>
+            </do_else>
           </do_if>
-          <do_else>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAILED to create build order!'" chance="100"/>
-              <debug_text text="'[GT-AI]    This usually means the station cannot build the requested items'" chance="100"/>
-              <debug_text text="'[GT-AI] ═══════════════════════════════════════════════════════'" chance="100"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  Build order creation failed - station cannot fulfill order'" chance="100"/>
-            </do_if>
-            
-            <!-- Clean up resupply data -->
-            <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
-            
-            <!-- Apply cooldown to prevent immediate retry -->
-            <do_if value="not global.$GT_MaintenanceFailedResupply?">
-              <set_value name="global.$GT_MaintenanceFailedResupply" exact="table[]"/>
-            </do_if>
-            <set_value name="global.$GT_MaintenanceFailedResupply.{this.ship}" exact="player.age + 300s"/>
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🕒 Applied 5-minute cooldown due to failed build order'" chance="100"/>
-            
-            <!-- Remove maintenance order flag -->
-            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{this.ship}?">
-              <remove_value name="global.$GT_MaintenanceOrders.{this.ship}"/>
-            </do_if>
-            
-            <!-- Signal MD that we're done (failed) -->
-            <signal_objects object="this.ship" param="'GT_Maintenance_Complete'"/>
-          </do_else>
+          <!-- End: Only create resupply order if docking check passed -->
+          <!-- End: Only create resupply order if docking check passed -->
         </do_if>
         <do_else>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -2806,35 +2872,8 @@
                   <continue/>
                 </do_if>
                 
-                <!-- Check cargo space BEFORE executing trade -->
-                <!-- The ship might have gained cargo between trade search and execution -->
-                <!-- For sell-only trades, skip cargo space check (ship already has cargo) -->
-                <do_if value="not $isSellOnlyTrade">
-                  <set_value name="$requiredCargoSpace" exact="$currentTrade.$Amount"/>
-                  <set_value name="$availableCargoSpace" exact="this.ship.cargo.{$ware}.free"/>
-                  <set_value name="$hasEnoughCargoSpace" exact="$availableCargoSpace ge $requiredCargoSpace"/>
-                  
-                  <do_if value="not $hasEnoughCargoSpace">
-                    <!-- NOT ENOUGH CARGO SPACE - Skip to next trade -->
-                    <set_value name="$tradesRejectedCargo" operation="add"/>
-                    
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  Trade ' + $tradeIdx + '/' + (if $tradeList? then $tradeList.count else 0) + ' INSUFFICIENT CARGO SPACE:' +
-                        '\n  Ware: ' + @$ware.name + 
-                        '\n  Amount: ' + $requiredCargoSpace + ' units' +
-                        '\n  Available: ' + $availableCargoSpace + '/' + this.ship.cargo.{$ware}.max + ' units' +
-                        '\n  Needed: ' + ($requiredCargoSpace - $availableCargoSpace) + ' more units' +
-                        '\n  Reason: Ship does not have enough free cargo space for this trade' +
-                        '\n  → Trying next trade in list...'" 
-                        chance="100"/>
-                    </do_if>
-                    
-                    <!-- Continue to next trade in list -->
-                    <continue/>
-                  </do_if>
-                </do_if>
-                
                 <!-- Validation passed - this trade is valid -->
+                <!-- Note: Cargo space and money validation will be handled by clamp_trade_amount before order creation -->
                 <!-- Use safe access for tradeIdx -->
                 <set_value name="$tradeIdxSafe" exact="if $tradeIdx? then $tradeIdx else 0"/>
                 <set_value name="$tradeListCountSafe" exact="if $tradeList? then $tradeList.count else 0"/>
@@ -2859,6 +2898,10 @@
                     <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
                     <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and $sellOfferAmount ge $currentTrade.$Amount"/>
                   </do_if>
+                  <do_else>
+                    <!-- Sell-only trade but no sell offer - invalid -->
+                    <set_value name="$sellOfferStillValid" exact="false"/>
+                  </do_else>
                 </do_if>
                 <do_else>
                   <!-- Normal trade: check both offers -->
@@ -2873,16 +2916,33 @@
                     <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
                     <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and $sellOfferAmount ge $currentTrade.$Amount"/>
                   </do_if>
+                  <do_else>
+                    <!-- Normal trade but missing offers - invalid -->
+                    <set_value name="$buyOfferStillValid" exact="false"/>
+                    <set_value name="$sellOfferStillValid" exact="false"/>
+                  </do_else>
                 </do_else>
                 
-                <do_if value="not $buyOfferStillValid or not $sellOfferStillValid">
+                <!-- Check if offers are valid - conditional based on trade type -->
+                <set_value name="$offersInvalid" exact="false"/>
+                <do_if value="$isSellOnlyTrade">
+                  <!-- Sell-only trade: only check sell offer -->
+                  <set_value name="$offersInvalid" exact="not $sellOfferStillValid"/>
+                </do_if>
+                <do_else>
+                  <!-- Normal trade: check both offers -->
+                  <set_value name="$offersInvalid" exact="not $buyOfferStillValid or not $sellOfferStillValid"/>
+                </do_else>
+                
+                <do_if value="$offersInvalid">
                   <!-- Offer became invalid - try next trade in list -->
                   <set_value name="$tradesRejectedDocking" operation="add"/>  <!-- Reuse counter for "offer invalid" -->
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                     <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' offer became invalid:' +
-                      '\n  Buy offer: available=' + (if $buyOfferAvailable? then $buyOfferAvailable else 'null') + ', amount=' + (if $buyOfferAmount? then $buyOfferAmount else 'null') + ' (needed: ' + $currentTrade.$Amount + ')' +
+                      '\n  Trade type: ' + (if $isSellOnlyTrade then 'SELL-ONLY' else 'NORMAL') +
+                      '\n  Buy offer: ' + (if $isSellOnlyTrade then 'N/A' else (if $buyOfferAvailable? then ('available=' + $buyOfferAvailable + ', amount=' + (if $buyOfferAmount? then $buyOfferAmount else 'null') + ' (needed: ' + $currentTrade.$Amount + ')') else 'MISSING')) +
                       '\n  Sell offer: available=' + (if $sellOfferAvailable? then $sellOfferAvailable else 'null') + ', amount=' + (if $sellOfferAmount? then $sellOfferAmount else 'null') + ' (needed: ' + $currentTrade.$Amount + ')' +
-                      '\n  Reason: Offer consumed/reserved by another ship' +
+                      '\n  Reason: Offer consumed/reserved by another ship or missing' +
                       '\n  → Trying next trade in list...'" 
                       chance="100"/>
                   </do_if>
@@ -2891,12 +2951,167 @@
                   <continue/>
                 </do_if>
                 
-                <!-- All checks passed - this trade is valid with valid offers -->
+                <!-- HYBRID APPROACH: Use clamp_trade_amount for final amount validation BEFORE breaking -->
+                <!-- This handles cargo space, money, and offer availability automatically -->
+                <!-- If clamping results in 0, continue to next trade instead of breaking -->
+                <set_value name="$finalBuyAmount" exact="$currentTrade.$Amount"/>
+                <set_value name="$finalSellAmount" exact="$currentTrade.$Amount"/>
+                <set_value name="$buyClampReason" exact="null"/>
+                <set_value name="$sellClampReason" exact="null"/>
+                <set_value name="$clampFailed" exact="false"/>
+                
+                <!-- Clamp buy order amount (for non-sell-only trades) -->
+                <do_if value="not $isSellOnlyTrade and $currentTrade.$BuyOffer?">
+                  <clamp_trade_amount 
+                    trade="$currentTrade.$BuyOffer" 
+                    amount="$finalBuyAmount" 
+                    buyer="this.ship" 
+                    seller="@$currentTrade.$BuyOffer.seller" 
+                    result="$finalBuyAmount"
+                    reason="$buyClampReason"/>
+                  
+                  <do_if value="not $finalBuyAmount? or $finalBuyAmount == 0 or $finalBuyAmount lt 0">
+                    <!-- Amount clamped to 0 or invalid - try next trade -->
+                    <set_value name="$tradesRejectedCargo" operation="add"/>
+                    <set_value name="$clampFailed" exact="true"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <set_value name="$clampReasonText" exact="if $buyClampReason? then $buyClampReason else 'unknown'"/>
+                      <set_value name="$amountStatus" exact="if not $finalBuyAmount? then 'null' else if $finalBuyAmount lt 0 then 'negative (' + $finalBuyAmount + ')' else 'zero'"/>
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' buy amount clamped to invalid value:' +
+                        '\n  Original amount: ' + $currentTrade.$Amount +
+                        '\n  Clamped amount: ' + $amountStatus +
+                        '\n  Clamp reason: ' + $clampReasonText +
+                        '\n  Reason: ' + (if $buyClampReason == 'buyer_cargo' then 'Insufficient cargo space' else if $buyClampReason == 'buyer_money' then 'Insufficient funds' else if $buyClampReason == 'seller_cargo' then 'Seller has insufficient stock' else 'Offer constraints') +
+                        '\n  → Trying next trade in list...'" 
+                        chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <do_if value="not $clampFailed and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $finalBuyAmount != $currentTrade.$Amount">
+                    <set_value name="$clampReasonText" exact="if $buyClampReason? then $buyClampReason else 'unknown'"/>
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' buy amount adjusted:' +
+                      '\n  Original: ' + $currentTrade.$Amount +
+                      '\n  Clamped: ' + $finalBuyAmount +
+                      '\n  Reason: ' + $clampReasonText"
+                      chance="100"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Clamp sell order amount -->
+                <do_if value="not $clampFailed and $currentTrade.$SellOffer?">
+                  <do_if value="$isSellOnlyTrade">
+                    <!-- Sell-only trade: Ship already has cargo, validate against ship cargo -->
+                    <clamp_trade_amount 
+                      trade="$currentTrade.$SellOffer" 
+                      amount="$finalSellAmount" 
+                      buyer="@$currentTrade.$SellOffer.buyer" 
+                      seller="this.ship" 
+                      result="$finalSellAmount"
+                      reason="$sellClampReason"/>
+                  </do_if>
+                  <do_else>
+                    <!-- Normal trade: Ship doesn't have cargo yet (will buy first), don't check seller cargo -->
+                    <!-- Match vanilla pattern: clamp without seller parameter (only checks buyer constraints) -->
+                    <!-- Vanilla comment: "it is possible that this doesn't have the wares yet if they still need to be bought" -->
+                    <clamp_trade_amount 
+                      trade="$currentTrade.$SellOffer" 
+                      amount="$finalSellAmount" 
+                      buyer="@$currentTrade.$SellOffer.buyer" 
+                      result="$finalSellAmount"
+                      reason="$sellClampReason"/>
+                  </do_else>
+                  
+                  <do_if value="not $finalSellAmount? or $finalSellAmount == 0 or $finalSellAmount lt 0">
+                    <!-- Amount clamped to 0 or invalid - try next trade -->
+                    <set_value name="$tradesRejectedCargo" operation="add"/>
+                    <set_value name="$clampFailed" exact="true"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <set_value name="$clampReasonText" exact="if $sellClampReason? then $sellClampReason else 'unknown'"/>
+                      <set_value name="$amountStatus" exact="if not $finalSellAmount? then 'null' else if $finalSellAmount lt 0 then 'negative (' + $finalSellAmount + ')' else 'zero'"/>
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' sell amount clamped to invalid value:' +
+                        '\n  Trade type: ' + (if $isSellOnlyTrade then 'SELL-ONLY' else 'NORMAL') +
+                        '\n  Original amount: ' + $currentTrade.$Amount +
+                        '\n  Clamped amount: ' + $amountStatus +
+                        '\n  Clamp reason: ' + $clampReasonText +
+                        '\n  Reason: ' + (if $sellClampReason == 'buyer_cargo' then 'Buyer has insufficient cargo space' else if $sellClampReason == 'buyer_money' then 'Buyer has insufficient funds' else if $sellClampReason == 'seller_cargo' then 'Ship has insufficient cargo' else 'Offer constraints') +
+                        '\n  → Trying next trade in list...'" 
+                        chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <do_if value="not $clampFailed and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $finalSellAmount != $currentTrade.$Amount">
+                    <set_value name="$clampReasonText" exact="if $sellClampReason? then $sellClampReason else 'unknown'"/>
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' sell amount adjusted:' +
+                      '\n  Trade type: ' + (if $isSellOnlyTrade then 'SELL-ONLY' else 'NORMAL') +
+                      '\n  Original: ' + $currentTrade.$Amount +
+                      '\n  Clamped: ' + $finalSellAmount +
+                      '\n  Reason: ' + $clampReasonText"
+                      chance="100"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- If clamping failed, continue to next trade -->
+                <do_if value="$clampFailed">
+                  <continue/>
+                </do_if>
+                
+                <!-- FINAL DOCKING VERIFICATION: Use find_dockingbay for accurate dock size/permission check -->
+                <!-- This is more accurate than dockingallowed and catches dock size mismatches -->
+                <!-- Check BEFORE breaking so we can continue to next trade if docking fails -->
+                <set_value name="$finalDockingCheck" exact="true"/>
+                
+                <!-- Check buy station docking (for non-sell-only trades) -->
+                <!-- Match MD script pattern exactly: Only check size and storage (relations already checked via dockingallowed) -->
+                <do_if value="not $isSellOnlyTrade and $finalDockingCheck and $buyStation?">
+                  <find_dockingbay name="$testBuyDock" object="$buyStation" checkoperational="true" multiple="false">
+                    <match_dock size="this.ship.docksize" storage="false"/>
+                  </find_dockingbay>
+                  <do_if value="not $testBuyDock">
+                    <set_value name="$finalDockingCheck" exact="false"/>
+                    <set_value name="$tradesRejectedDocking" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' Final docking check FAILED (buy station): ' + @$buyStation.knownname + 
+                        '\n  Sector: ' + @$buyStation.sector.knownname + 
+                        '\n  Reason: No dock available for ship size ' + this.ship.docksize + ' (station may not have L/XL docks)' +
+                        '\n  → Trying next trade in list...'" 
+                        chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- Check sell station docking -->
+                <!-- Match MD script pattern exactly: Only check size and storage (relations already checked via dockingallowed) -->
+                <do_if value="$finalDockingCheck and $sellStation?">
+                  <find_dockingbay name="$testSellDock" object="$sellStation" checkoperational="true" multiple="false">
+                    <match_dock size="this.ship.docksize" storage="false"/>
+                  </find_dockingbay>
+                  <do_if value="not $testSellDock">
+                    <set_value name="$finalDockingCheck" exact="false"/>
+                    <set_value name="$tradesRejectedDocking" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' Final docking check FAILED (sell station): ' + @$sellStation.knownname + 
+                        '\n  Sector: ' + @$sellStation.sector.knownname + 
+                        '\n  Reason: No dock available for ship size ' + this.ship.docksize + ' (station may not have L/XL docks)' +
+                        '\n  → Trying next trade in list...'" 
+                        chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- If final docking check failed, continue to next trade -->
+                <do_if value="not $finalDockingCheck">
+                  <continue/>
+                </do_if>
+                
+                <!-- All checks passed including clamping and final docking verification - this trade is valid -->
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' is VALID - using this trade!'" chance="100"/>
                 </do_if>
                 <set_value name="$validTradeFound" exact="true"/>
                 <set_value name="$pendingTrade" exact="$currentTrade"/>
+                <!-- Store clamped amounts in pendingTrade for use after loop -->
+                <set_value name="$pendingTrade.$FinalBuyAmount" exact="$finalBuyAmount"/>
+                <set_value name="$pendingTrade.$FinalSellAmount" exact="$finalSellAmount"/>
                 <!-- Break out of loop - we found a valid trade -->
                 <break/>
               </do_if>
@@ -2997,19 +3212,22 @@
               chance="100"/>
           </do_if>
           
-          <!-- Final offer validity check moved inside loop -->
-          <!-- Offers are now validated before breaking out of the loop -->
-          <!-- This allows trying the next trade if offers are consumed, instead of restarting the search -->
-          
-          <!-- All checks passed - safe to create orders -->
+          <!-- Final offer validity check and clamping moved inside loop -->
+          <!-- Offers are validated and clamped before breaking out of the loop -->
+          <!-- Final docking verification also moved inside loop - allows trying next trade if docking fails -->
+          <!-- All checks passed including final docking verification (checked in loop) - safe to create orders with clamped amounts -->
+          <!-- Clamped amounts are stored in $pendingTrade.$FinalBuyAmount and $pendingTrade.$FinalSellAmount -->
           <!-- Create X4 native TradePerform orders with blacklist routing -->
           <!-- Removed internal="true" - let vanilla handle internalorder via patch -->
           <!-- For sell-only trades, skip buy order (ship already has cargo) -->
+          <set_value name="$finalBuyAmount" exact="if $pendingTrade.$FinalBuyAmount? then $pendingTrade.$FinalBuyAmount else $pendingTrade.$Amount"/>
+          <set_value name="$finalSellAmount" exact="if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount"/>
+          
           <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$pendingTrade.$Amount" immediate="false"/>
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="false"/>
           </do_if>
           <do_if value="$pendingTrade.$SellOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$pendingTrade.$Amount" immediate="false"/>
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="false"/>
           </do_if>
           
           <!-- Add state update signal AFTER order creation -->
