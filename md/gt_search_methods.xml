@@ -1384,13 +1384,24 @@
           <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
         </do_if>
         
-        <!-- NEW: Async cue-based pattern with CPU yielding (replaces synchronous GT_BuildTradeSectorLists) -->
-        <!-- Debug logging -->
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Search] SearchLiveTrades: Storing state and signaling GT_IncrementalRadiusSearch - Ship=' + $ship.idcode + ', HomeSector=' + @$homeSector.knownname + ', MaxDistance=' + $maxDistance" chance="100"/>
+        <!-- FIX: Check if a search is already in progress for this ship -->
+        <!-- This prevents race conditions where multiple searches overwrite each other's state -->
+        <do_if value="global.$GT_SearchLiveTrades_State.{$ship}?">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] SearchLiveTrades: Search already in progress for ship ' + $ship.idcode + ' - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+          </do_if>
+          <!-- Exit immediately - SearchLiveTrades_Resume will signal SearchTradeRoutes when search completes -->
+          <cancel_cue cue="this"/>
         </do_if>
-        <!-- Store state in global variables for resume cue -->
-        <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[
+        <do_else>
+          <!-- Only proceed if search is NOT already in progress -->
+          <!-- NEW: Async cue-based pattern with CPU yielding (replaces synchronous GT_BuildTradeSectorLists) -->
+          <!-- Debug logging -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] SearchLiveTrades: Storing state and signaling GT_IncrementalRadiusSearch - Ship=' + $ship.idcode + ', HomeSector=' + @$homeSector.knownname + ', MaxDistance=' + $maxDistance" chance="100"/>
+          </do_if>
+          <!-- Store state in global variables for resume cue -->
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[
           $Ship = $ship,
           $HomeSector = $homeSector,
           $MaxDistance = $maxDistance,
@@ -1419,16 +1430,17 @@
           $BlacklistGroup = $blacklistgroup
         ]"/>
         
-        <!-- Signal incremental search cue to start (async with CPU yielding) -->
-        <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
-          $Ship = $ship,
-          $HomeSector = $homeSector,
-          $MaxDistance = $maxDistance,
-          $BlacklistGroup = $blacklistgroup
-        ]"/>
-        
-        <!-- Cancel current cue - SearchLiveTrades_Resume will continue processing -->
-        <cancel_cue cue="this"/>
+          <!-- Signal incremental search cue to start (async with CPU yielding) -->
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+            $Ship = $ship,
+            $HomeSector = $homeSector,
+            $MaxDistance = $maxDistance,
+            $BlacklistGroup = $blacklistgroup
+          ]"/>
+          
+          <!-- Cancel current cue - SearchLiveTrades_Resume will continue processing -->
+          <cancel_cue cue="this"/>
+        </do_else>
         </do_if>
         
         <!-- CONTINUATION: If continuing from SearchLiveTrades_Resume, process trade finding -->
@@ -2070,37 +2082,45 @@
           <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback search triggered: MaxDistance=' + $fallbackMaxDistance + ', Ship not isolated'" chance="100"/>
           <debug_text text="'[GT-Search] (' + $ship.idcode + ') Fallback profit thresholds relaxed: ROI ' + $params.$MinROI + '% → ' + $fallbackMinROI + '%, Profit fixed at 100 Cr (all levels)'" chance="100"/>
         </do_if>
-        <set_value name="$liveSearchParams" exact="table[
-          $Ship = $ship,
-          $MaxDistance = $fallbackMaxDistance,
-          $OriginalMaxDistance = $params.$OriginalMaxDistance,
-          $MinROI = $fallbackMinROI,
-          $MinAbsoluteProfit = $fallbackMinAbsoluteProfit,
-          $FactionPriority = $params.$FactionPriority,
-          $FactionPriorityText = $params.$FactionPriorityText,
-          $DistancePenaltyMultiplier = $params.$DistancePenaltyMultiplier,
-          $SkillLevel = $params.$SkillLevel,
-          $ThreatIntel = $params.$ThreatIntel,
-          $FleetCoord = $params.$FleetCoord,
-          $AdvancedAnalytics = $params.$AdvancedAnalytics
-        ]"/>
-        <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$liveSearchParams"/>
-        
-        <!-- CRITICAL FIX: Check if batch processing started after signaling SearchLiveTrades -->
-        <!-- SearchLiveTrades sets $WaitingForBatch = true when it prepares batch data -->
-        <!-- If batch started, exit immediately - SearchLiveTrades_Resume will signal us again when complete -->
-        <set_value name="$batchStarted" exact="false"/>
-        <do_if value="global.$GT_SearchResult.$WaitingForBatch?">
-          <set_value name="$batchStarted" exact="global.$GT_SearchResult.$WaitingForBatch"/>
+        <!-- FIX: Check if a search is already in progress before starting fallback search -->
+        <!-- This prevents race conditions where fallback search overwrites the original search's state -->
+        <set_value name="$searchInProgress" exact="false"/>
+        <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+          <set_value name="$searchInProgress" exact="true"/>
         </do_if>
         
-        <do_if value="$batchStarted">
+        <do_if value="$searchInProgress">
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Search] (' + $ship.idcode + ')   Batch processing started (fallback) - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ')   Fallback search blocked - search already in progress (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
           </do_if>
-          <!-- Exit - SearchLiveTrades_Resume will signal this cue again when batch completes -->
+          <!-- Exit - SearchLiveTrades_Resume will signal SearchTradeRoutes again when search completes -->
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
+          <!-- Only proceed if search is NOT in progress -->
+          <set_value name="$liveSearchParams" exact="table[
+            $Ship = $ship,
+            $MaxDistance = $fallbackMaxDistance,
+            $OriginalMaxDistance = $params.$OriginalMaxDistance,
+            $MinROI = $fallbackMinROI,
+            $MinAbsoluteProfit = $fallbackMinAbsoluteProfit,
+            $FactionPriority = $params.$FactionPriority,
+            $FactionPriorityText = $params.$FactionPriorityText,
+            $DistancePenaltyMultiplier = $params.$DistancePenaltyMultiplier,
+            $SkillLevel = $params.$SkillLevel,
+            $ThreatIntel = $params.$ThreatIntel,
+            $FleetCoord = $params.$FleetCoord,
+            $AdvancedAnalytics = $params.$AdvancedAnalytics
+          ]"/>
+          <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$liveSearchParams"/>
+          
+          <!-- Exit immediately after signaling SearchLiveTrades -->
+          <!-- SearchLiveTrades_Resume will signal SearchTradeRoutes again when search completes -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ')   Fallback SearchLiveTrades signaled - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_else>
         
         <!-- SearchLiveTrades will handle the rest (signals SearchLiveTrades_Resume, which signals SearchTradeRoutes) -->
         <!-- Results will be processed the same way as normal live search -->

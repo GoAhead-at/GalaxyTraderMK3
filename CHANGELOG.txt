@@ -4,6 +4,95 @@
 Version 0.6.13 - 2025-01-21
 ---------------------------
 
+FIX: Per-Sector Trade Queries (Vanilla Pattern)
+  - Changed cargo disposal search to query stations per-sector instead of galaxy-wide
+  - Problem: `SearchSellOpportunities` used `space="player.galaxy"` which requires initialized market data
+    * Ships couldn't find trades without satellites or pre-scanned sectors
+    * New freighters in unexplored areas failed to find disposal trades
+    * Galaxy-wide queries may require market intelligence to be initialized
+  - Solution: Query stations per-sector (matching vanilla X4 behavior)
+    * Build sector list using `GT_FindSectorsInRange` (within `maxDistance` from home sector)
+    * Iterate through sectors and query `find_buy_offer` with `space="$sector"` for each sector
+    * Matches vanilla pattern: `trade.find.free.xml` queries stations in specific sectors
+  - Implementation:
+    * `SearchSellOpportunities` now builds `$sellspaces` list before querying
+    * Per-sector queries allow ships to check prices at stations they can detect (gravidar range)
+    * Works without satellites: Ships can query stations in sectors they're in or have visited
+  - Files Modified:
+    * `md/gt_trading_search.xml`:
+      - Modified `SearchSellOpportunities` to build sector list and query per-sector (lines ~2950-3047)
+      - Replaced galaxy-wide `find_buy_offer` with per-sector loop
+      - Added home sector determination and blacklistgroup setup
+  - Benefits:
+    * Ships can find trades even without initialized market data (satellites)
+    * More realistic: Traders check prices at nearby stations they can detect
+    * Matches vanilla X4 behavior for consistency
+    * New freighters can find trades immediately without requiring scout activity
+  - Technical Notes:
+    * Main live search (`SearchLiveTrades`) already used per-sector queries
+    * This change aligns cargo disposal search with the same pattern
+    * Per-sector queries are more efficient than galaxy-wide queries
+
+FIX: Race Condition Prevention in SearchLiveTrades
+  - Fixed race condition where multiple searches could overwrite each other's state
+  - Problem: Multiple `SearchLiveTrades` instances could run concurrently for the same ship
+    * `SearchTradeRoutes` could start fallback search before original search completed
+    * Second search overwrote `global.$GT_SearchLiveTrades_State.{$ship}` 
+    * `SearchLiveTrades_Resume` couldn't find state when original search completed
+    * Error: "Ship state not found in global.$GT_SearchLiveTrades_State - cannot continue trade search"
+  - Root Cause:
+    * `cancel_cue` doesn't immediately stop execution - code after it still runs
+    * Guard checks passed but code continued executing, overwriting state
+    * Incorrect guard: Checked `global.$GT_SearchResult.{$ship}.$WaitingForBatch` (doesn't exist)
+  - Solution: Proper guard checks with `do_else` blocks to prevent execution
+    * Check `global.$GT_SearchLiveTrades_State.{$ship}` exists before starting new search
+    * Wrap state storage/signaling code in `do_else` blocks so it only runs if guard passes
+    * Added guards in three places:
+      - `SearchTradeRoutes`: Checks before signaling `SearchLiveTrades`
+      - `SearchFallbackTrades`: Checks before signaling `SearchLiveTrades`
+      - `SearchLiveTrades`: Checks at start and exits if state already exists
+  - Implementation:
+    * `SearchTradeRoutes` (gt_trading_search.xml, lines ~773-808):
+      - Checks if search in progress before signaling
+      - Exits immediately if search already running
+    * `SearchFallbackTrades` (gt_search_methods.xml, lines ~2083-2119):
+      - Checks if search in progress before signaling fallback search
+      - Wraps signaling code in `do_else` to prevent execution if blocked
+    * `SearchLiveTrades` (gt_search_methods.xml, lines ~1387-1443):
+      - Checks at start if state already exists
+      - Wraps state storage/signaling in `do_else` to prevent overwriting
+  - Files Modified:
+    * `md/gt_trading_search.xml`: Added guard check before signaling `SearchLiveTrades`
+    * `md/gt_search_methods.xml`: Added guards in `SearchFallbackTrades` and `SearchLiveTrades`
+  - Benefits:
+    * Prevents state overwrite errors
+    * Ensures only one search runs per ship at a time
+    * Eliminates "state not found" errors in `SearchLiveTrades_Resume`
+    * Proper synchronization prevents race conditions
+
+FIX: State Abbreviation Null Handling
+  - Fixed ship state abbreviations showing as null instead of default values
+  - Problem: When user hadn't entered custom values, abbreviations returned null
+    * `Get_State_Abbreviation` checked `$customAbbr?` which returns true even for null values
+    * Null values were returned instead of defaults
+    * Ship names showed `[null]` instead of `[RS]`, `[TR]`, etc.
+  - Solution: Proper null/empty string validation before using custom abbreviations
+    * Extract custom abbreviation with safe operator `@`
+    * Check that value exists, is not null, and is not empty string
+    * Only use custom abbreviation if all checks pass, otherwise return default
+  - Implementation:
+    * `Get_State_Abbreviation` library (gt_ship_management.xml, lines ~1368-1381):
+      - Added explicit null check: `$customAbbrTemp != null`
+      - Added empty string check: `$customAbbrTemp != ''`
+      - Only sets `$hasCustomAbbr = true` if value is valid non-empty string
+      - Returns default abbreviation if custom value is null or empty
+  - Files Modified:
+    * `md/gt_ship_management.xml`: Fixed null handling in `Get_State_Abbreviation` library
+  - Benefits:
+    * Ship names always show valid abbreviations (never null)
+    * Defaults work correctly when user hasn't customized values
+    * Proper fallback behavior ensures system always has valid state text
+
 FEATURE: Training License Costs
   - Added training license fees that must be paid when pilots begin certification training
   - Problem: Training was free, making pilot progression cost-free
