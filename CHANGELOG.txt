@@ -1,6 +1,158 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.13 - 2025-01-21
+---------------------------
+
+FEATURE: Training License Costs
+  - Added training license fees that must be paid when pilots begin certification training
+  - Problem: Training was free, making pilot progression cost-free
+  - Solution: Implemented tiered cost structure based on training level
+    * Level 3: 5,000 Cr (Apprentice certification)
+    * Level 6: 12,000 Cr (Courier certification)
+    * Level 9: 35,000 Cr (Supplier certification)
+    * Level 12: 100,000 Cr (Master Trader certification - final exam)
+  - Implementation:
+    * Cost calculation in `InitiateTraining` cue (gt_xp_training.xml, lines ~1346-1400)
+    * Costs deducted immediately when training starts using `reward_player` with negative value
+    * Cost stored in `global.$GT_Pilots.{$pilot}.$TrainingCost` for reference
+    * Training notifications show cost paid
+  - Insufficient Funds Handling:
+    * If player lacks funds, training is blocked but ship continues trading
+    * XP remains blocked (via BlockedLevel) until training can be completed
+    * Logbook entry created explaining cost, available funds, and shortfall
+    * System automatically retries after next trade run
+    * Behavior matches "no training station found" scenario (ship trades, XP blocked)
+  - User Experience:
+    * Training notifications include cost information
+    * Logbook entries provide detailed financial breakdown when funds insufficient
+    * Clear communication about why training cannot proceed
+  - Files Modified:
+    * `md/gt_xp_training.xml` (added cost calculation and insufficient funds handling, lines ~1346-1400)
+  - Files Created:
+    * `DOCS/Training_License_Costs.md` (complete feature documentation)
+  - Benefits:
+    * Adds economic depth to pilot progression system
+    * Creates meaningful resource management decisions
+    * Higher-level certifications cost more, reflecting their value
+    * Non-blocking: Ships continue trading even if funds insufficient
+    * Clear communication via logbook entries
+  - Documentation:
+    * Complete feature documentation in `DOCS/Training_License_Costs.md`
+    * Updated `HowTo/Training-System.md` with cost information
+
+OPTIMIZATION: Incremental Radius Search with CPU Yielding
+  - Implemented cue-based incremental radius search to replace synchronous sector enumeration
+  - Problem: Synchronous `GT_BuildTradeSectorLists` could cause game stutter when processing many sectors
+    * Large search radii (10+ jumps) processed all sectors in single frame
+    * No CPU yielding between sector processing
+    * Could freeze game UI during trade searches
+  - Solution: Cue-based asynchronous pattern with CPU yielding between radius increments
+    * New cue: `GT_IncrementalRadiusSearch` (instantiate="true") processes one radius per iteration
+    * CPU yielding: `<delay exact="10ms"/>` between each radius increment
+    * State persistence: Uses cue instance variables (`this.$variable`) to maintain state across delays
+    * Recursive signaling: Signals itself for next radius iteration with continuation flag
+    * Completion handler: `GT_IncrementalRadiusSearch_Complete` signals `SearchLiveTrades_Resume` when done
+  - Implementation Details:
+    * Escape Path Detection (Phase 1):
+      - Searches from ship's current position for closest non-blacklisted sector
+      - Validates escape sector is within `maxDistance` from home sector
+      - Prefers sectors closer to home sector when multiple candidates found
+      - Max escape search radius: 10 jumps
+      - Marks ship as isolated if no escape path found
+    * Trade Search:
+      - Searches from ship's current position, incrementing radius from 0 to `maxDistance`
+      - Validates each sector is within `maxDistance` from home sector before adding to lists
+      - Early termination: Stops if radius returns only fallback current sector (no new sectors found)
+      - Isolation detection: If radius 1 returns only fallback, ship is marked as isolated
+      - Collects sectors into `$buyspaces` and `$sellspaces` lists for downstream processing
+    * Fallback Detection:
+      - Distinguishes legitimate radius 0 results (current sector expected) from fallbacks
+      - Radius 0: Always processes current sector
+      - Radius > 0: Only fallback if only current sector returned
+      - Prevents false isolation detection and premature termination
+    * Integration:
+      - `SearchLiveTrades` stores state in `global.$GT_SearchLiveTrades_State.{$ship}` before signaling incremental search
+      - `SearchLiveTrades_Resume` receives results and restores state, then signals `SearchLiveTrades` with continuation flag
+      - `SearchLiveTrades` checks for continuation flag and skips sector list building, proceeding directly to trade finding
+  - Files Modified:
+    * `md/gt_libraries_pathfinding.xml`:
+      - Added `GT_IncrementalRadiusSearch` cue (lines ~800-1100)
+      - Added `GT_IncrementalRadiusSearch_Complete` cue (lines ~1096-1133)
+      - Implements escape path detection, trade search, isolation detection, and fallback handling
+    * `md/gt_search_methods.xml`:
+      - Modified `SearchLiveTrades` to use async incremental search (lines ~1355-1440)
+      - Added `SearchLiveTrades_Resume` cue to handle incremental search completion (lines ~1442-1570)
+      - State storage/restoration pattern for seamless continuation
+  - Benefits:
+    * Eliminates game stutter during trade searches
+    * Cooperative multitasking: Game engine regains control between radius increments
+    * Better performance: Large searches no longer freeze UI
+    * Early termination: Stops searching when no new sectors found (saves CPU)
+    * Isolation detection: Identifies ships trapped in blacklisted sectors
+    * Escape path detection: Finds closest non-blacklisted sector for isolated ships
+    * Maintains compatibility: Drop-in replacement for `GT_BuildTradeSectorLists`
+  - Technical Notes:
+    * Uses recursive `signal_cue_instantly` pattern (not `resume`/`label` - invalid in MD scripts)
+    * Cue instance variables persist across delays (unlike local variables)
+    * Continuation pattern allows seamless state transfer between cue instances
+    * Same-sector `gatedistance` edge case handled explicitly (returns error, not 0)
+  - Performance:
+    * CPU yielding: 10ms delay between radius increments
+    * Typical search (radius 0-10): ~110ms total delay (11 iterations × 10ms)
+    * Prevents frame drops even with large search radii
+    * Early termination reduces delay when no sectors found
+
+FEATURE: Ship Status Renaming - Customizable State Abbreviations
+  - Added user-configurable abbreviations for ship operational states in ship names
+  - Solution: Text input fields in global settings menu with default values
+    * Default abbreviations: RS (Resupply), RP (Repair), MT (Maintenance), TR (Training), RR (Reroute), CL (Clearance), BL (Blocked), FB (Fallback), IS (Isolated), TD (Trading), ID (Idle)
+    * Players can override any abbreviation via text input fields
+    * Maximum 12 characters per abbreviation
+    * Changes apply immediately to all ship names
+  - Implementation:
+    * Library function: `Get_State_Abbreviation` in `gt_ship_management.xml`
+      - Checks custom values first (`global.$GT_GlobalSettings.$ShipNaming.$StateAbbreviations`)
+      - Falls back to defaults if custom value not set
+    * Menu section: "Ship State Naming" in global settings menu
+      - 11 text input fields (one per state) using `Make_EditBox` widget
+      - Each field shows current/default value
+      - Tooltips explain each field
+    * Callback handler: `GT_StateAbbreviation_Update`
+      - Saves custom abbreviations to global settings
+      - Trims whitespace and enforces character limit
+      - Automatically updates all ship names when changed
+      - Restores default if field is cleared
+    * Ship naming integration:
+      - Updated operational states (Resupply, Repair, Maintenance, Reroute, Clearance) to use abbreviations
+      - Updated status states (Blocked, Training, Fallback, Isolated) to use abbreviations
+      - All states display as `[ABBR]` format (e.g., `[RS]`, `[TR]`)
+  - Files Modified:
+    * `md/gt_global_settings.xml`:
+      - Added default abbreviation initialization (lines ~82-92)
+      - Added "Ship State Naming" menu section with text input fields (lines ~2178-2350)
+      - Added `GT_StateAbbreviation_Update` callback handler (lines ~2664-2705)
+    * `md/gt_ship_management.xml`:
+      - Added `Get_State_Abbreviation` library function (lines ~1326-1385)
+    * `md/gt_xp_training.xml`:
+      - Updated operational state text to use abbreviations (lines ~1148-1167)
+      - Updated status text to use abbreviations (lines ~1068-1081)
+    * All translation files (`t/0001-l*.xml`):
+      - Added translation IDs 9250-9261 (labels) and 9350-9361 (tooltips)
+      - Translations added for all 9 supported languages
+  - Benefits:
+    * User customization: Players can set abbreviations that make sense in their language
+    * Language-neutral defaults: 2-character abbreviations work across all languages
+    * Real-time updates: Changes apply immediately to all ship names
+    * Fallback protection: Defaults ensure system always has valid abbreviations
+    * Character limit: Prevents overly long abbreviations from breaking UI
+  - User Experience:
+    * Simple text input fields in global settings menu
+    * Default values shown in input boxes
+    * Clear tooltips explain each field
+    * Changes take effect immediately
+    * Empty fields restore defaults automatically
+
 Version 0.6.12 - 2025-01-21
 ---------------------------
 
