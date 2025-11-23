@@ -686,5 +686,447 @@
       </actions>
     </library>
     
+    <!-- ========================================= -->
+    <!-- INCREMENTAL RADIUS SEARCH (Cue-Based) -->
+    <!-- ========================================= -->
+    
+    <!-- Incremental Radius Search Cue -->
+    <!-- Cue-based pattern with CPU yielding between radius increments -->
+    <!-- Phase 1: Detection only - no runtime behavior changes -->
+    <!-- Uses recursive signaling pattern (MD script compatible) -->
+    <cue name="GT_IncrementalRadiusSearch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- CPU YIELDING: Delay before each iteration (including recursive signals) -->
+      <!-- This ensures CPU is yielded between radius increments, preventing game stutter -->
+      <delay exact="10ms"/>
+      <actions>
+        <!-- Extract parameters from signal -->
+        <set_value name="$params" exact="event.param"/>
+        
+        <!-- Check if this is initialization or continuation -->
+        <do_if value="not this.$initialized?">
+          <!-- Check if this is a continuation from a previous instance -->
+          <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
+            <!-- CONTINUATION: Restore state from previous instance -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$debugShip" exact="@$params.$Ship"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: CONTINUATION - Ship=' + (if $debugShip? then $debugShip.idcode else 'NULL') + ', Phase=' + $params.$Phase + ', EscapeRadius=' + $params.$EscapeSearchRadius + ', TradeRadius=' + $params.$TradeSearchRadius + ', BuySpaces=' + (if $params.$BuySpaces? then $params.$BuySpaces.count else 0) + ', SellSpaces=' + (if $params.$SellSpaces? then $params.$SellSpaces.count else 0)" chance="100"/>
+            </do_if>
+            <set_value name="this.$initialized" exact="true"/>
+            <set_value name="this.$ship" exact="$params.$Ship"/>
+            <set_value name="this.$homeSector" exact="$params.$HomeSector"/>
+            <set_value name="this.$maxDistance" exact="$params.$MaxDistance"/>
+            <set_value name="this.$blacklistgroup" exact="$params.$BlacklistGroup"/>
+            <set_value name="this.$phase" exact="$params.$Phase"/>
+            <set_value name="this.$escapeSearchRadius" exact="$params.$EscapeSearchRadius"/>
+            <set_value name="this.$tradeSearchRadius" exact="$params.$TradeSearchRadius"/>
+            <set_value name="this.$buyspaces" exact="$params.$BuySpaces"/>
+            <set_value name="this.$sellspaces" exact="$params.$SellSpaces"/>
+            <set_value name="this.$shipIsIsolated" exact="$params.$ShipIsIsolated"/>
+            <set_value name="this.$escapeSector" exact="$params.$EscapeSector"/>
+            <set_value name="this.$currentSector" exact="$params.$CurrentSector"/>
+            <set_value name="this.$currentSectorIsBlacklisted" exact="$params.$CurrentSectorIsBlacklisted"/>
+            <set_value name="this.$escapeMaxRadius" exact="10"/>
+          </do_if>
+          <do_else>
+            <!-- INITIALIZATION: First signal - set up state -->
+            <set_value name="$ship" exact="$params.$Ship"/>
+            <set_value name="$homeSector" exact="$params.$HomeSector"/>
+            <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
+            <set_value name="$blacklistgroup" exact="$params.$BlacklistGroup"/>
+            
+            <!-- Debug logging for initialization -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$homeSectorName" exact="@$homeSector.knownname"/>
+              <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: INITIALIZATION - Ship=' + $ship.idcode + ', HomeSector=' + (if $homeSectorName? then $homeSectorName else 'NULL') + ', CurrentSector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', MaxDistance=' + $maxDistance" chance="100"/>
+            </do_if>
+            
+            <!-- Initialize state in cue instance variables (persists across delays) -->
+            <set_value name="this.$initialized" exact="true"/>
+            <set_value name="this.$buyspaces" exact="[]"/>
+            <set_value name="this.$sellspaces" exact="[]"/>
+            <set_value name="this.$shipIsIsolated" exact="false"/>
+            <set_value name="this.$escapeSector" exact="null"/>
+            <set_value name="this.$currentSector" exact="$ship.sector"/>
+            <set_value name="this.$currentSectorIsBlacklisted" exact="false"/>
+            <set_value name="this.$escapeSearchRadius" exact="0"/>
+            <set_value name="this.$escapeMaxRadius" exact="10"/>
+            <set_value name="this.$tradeSearchRadius" exact="0"/>
+            <set_value name="this.$phase" exact="'escape'"/>
+            <set_value name="this.$ship" exact="$ship"/>
+            <set_value name="this.$homeSector" exact="$homeSector"/>
+            <set_value name="this.$maxDistance" exact="$maxDistance"/>
+            <set_value name="this.$blacklistgroup" exact="$blacklistgroup"/>
+            
+            <!-- Check if current sector is blacklisted (for escape detection) -->
+            <do_if value="this.$currentSector? and $blacklistgroup?">
+              <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="this.$currentSectorIsBlacklisted">
+                <param name="sector" value="this.$currentSector"/>
+                <param name="ship" value="$ship"/>
+                <param name="blacklistgroup" value="$blacklistgroup"/>
+              </run_actions>
+            </do_if>
+            
+            <!-- Start with escape path search if current sector is blacklisted -->
+            <do_if value="this.$currentSectorIsBlacklisted">
+              <set_value name="this.$phase" exact="'escape'"/>
+              <set_value name="this.$escapeSearchRadius" exact="0"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting ESCAPE search (current sector blacklisted) - Ship=' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- Skip escape search, go directly to trade search -->
+              <set_value name="this.$phase" exact="'trade'"/>
+              <set_value name="this.$tradeSearchRadius" exact="0"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting TRADE search (current sector not blacklisted) - Ship=' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_else>
+          </do_else>
+        </do_if>
+        
+        <!-- CONTINUATION: Process based on current phase -->
+        <!-- Escape Path Search Phase -->
+        <do_if value="this.$phase == 'escape'">
+          <!-- Check if escape path already found or max radius reached -->
+          <do_if value="this.$escapeSector? or this.$escapeSearchRadius gt this.$escapeMaxRadius">
+            <!-- Escape search complete - transition to trade search or mark as isolated -->
+            <do_if value="not this.$escapeSector?">
+              <!-- NO ESCAPE PATH FOUND: Mark ship as isolated (Phase 1: detection only) -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') ⚠️ NO ESCAPE PATH FOUND: Ship in blacklisted sector, no valid escape route within range. Ship marked as isolated (Phase 1: detection only).'" chance="100"/>
+              </do_if>
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <set_value name="this.$escapeSector" exact="null"/>
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            <do_else>
+              <!-- Escape path found - transition to trade search -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$escapeSectorName" exact="@this.$escapeSector.knownname"/>
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: ESCAPE found, transitioning to TRADE search - Ship=' + this.$ship.idcode + ', EscapeSector=' + (if $escapeSectorName? then $escapeSectorName else 'NULL')" chance="100"/>
+              </do_if>
+              <set_value name="this.$phase" exact="'trade'"/>
+              <set_value name="this.$tradeSearchRadius" exact="0"/>
+              <!-- Continue to trade search processing below -->
+            </do_else>
+          </do_if>
+          <do_else>
+            <!-- Process current escape search radius -->
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$escapeRadiusSectors">
+              <param name="refobject" value="this.$currentSector"/>
+              <param name="mingatedistance" value="this.$escapeSearchRadius"/>
+              <param name="maxgatedistance" value="this.$escapeSearchRadius"/>
+              <param name="ship" value="this.$ship"/>
+              <param name="blacklistgroup" value="this.$blacklistgroup"/>
+              <param name="applyblacklist" value="false"/>
+            </run_actions>
+            
+            <!-- Check for fallback vs legitimate sectors -->
+            <set_value name="$newSectorsFound" exact="false"/>
+            <set_value name="$onlyFallbackSector" exact="false"/>
+            <do_if value="$escapeRadiusSectors? and $escapeRadiusSectors.count gt 0">
+              <!-- Radius 0: Current sector is expected, always process it -->
+              <do_if value="this.$escapeSearchRadius == 0">
+                <set_value name="$newSectorsFound" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Radius > 0: Check if only current sector returned (fallback) -->
+                <set_value name="$onlyCurrentSector" exact="false"/>
+                <do_if value="$escapeRadiusSectors.count == 1">
+                  <do_if value="$escapeRadiusSectors.{1} == this.$currentSector">
+                    <set_value name="$onlyCurrentSector" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$onlyCurrentSector and this.$escapeSearchRadius gt 0">
+                  <set_value name="$onlyFallbackSector" exact="true"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$newSectorsFound" exact="true"/>
+                </do_else>
+              </do_else>
+            </do_if>
+            
+            <!-- Process sectors: Radius 0 always processes, radius > 0 processes if legitimate (not fallback) -->
+            <do_if value="$newSectorsFound">
+              <do_all exact="$escapeRadiusSectors.count" counter="$i">
+                <set_value name="$testSector" exact="$escapeRadiusSectors.{$i}"/>
+                <do_if value="$testSector?">
+                  <set_value name="$testSectorIsBlacklisted" exact="false"/>
+                  <set_value name="$testSectorInRange" exact="false"/>
+                  
+                  <!-- Check if sector is blacklisted -->
+                  <do_if value="$testSector? and this.$blacklistgroup?">
+                    <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$testSectorIsBlacklisted">
+                      <param name="sector" value="$testSector"/>
+                      <param name="ship" value="this.$ship"/>
+                      <param name="blacklistgroup" value="this.$blacklistgroup"/>
+                    </run_actions>
+                  </do_if>
+                  
+                  <!-- Check if candidate sector is within jump distance from HOME sector -->
+                  <do_if value="not $testSectorIsBlacklisted and $testSector? and this.$homeSector?">
+                    <!-- Special case: home sector is the escape candidate (distance = 0) -->
+                    <do_if value="$testSector == this.$homeSector">
+                      <set_value name="$distanceFromHome" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <!-- Calculate distance from home sector to candidate sector -->
+                      <set_value name="$distanceFromHome" exact="this.$homeSector.gatedistance.{$testSector}"/>
+                    </do_else>
+                    <do_if value="$distanceFromHome ge 0 and $distanceFromHome le this.$maxDistance">
+                      <set_value name="$testSectorInRange" exact="true"/>
+                      <set_value name="$testSectorDistanceFromHome" exact="$distanceFromHome"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- First non-blacklisted sector found (within home sector range) = escape path -->
+                  <do_if value="not $testSectorIsBlacklisted and $testSectorInRange">
+                    <do_if value="not this.$escapeSector?">
+                      <!-- First candidate found -->
+                      <set_value name="this.$escapeSector" exact="$testSector"/>
+                    </do_if>
+                    <do_elseif value="$testSectorDistanceFromHome lt this.$homeSector.gatedistance.{this.$escapeSector}">
+                      <!-- New candidate is closer to home sector - prefer this one -->
+                      <set_value name="this.$escapeSector" exact="$testSector"/>
+                    </do_elseif>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <!-- If escape path found, transition to trade search -->
+              <do_if value="this.$escapeSector?">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$escapeSectorName" exact="@this.$escapeSector.knownname"/>
+                  <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') 🚀 ESCAPE PATH FOUND: ' + (if $escapeSectorName? then $escapeSectorName else 'UNKNOWN') + ' at radius ' + this.$escapeSearchRadius + ' from current position'" chance="100"/>
+                </do_if>
+                <!-- Escape path found - transition to trade search -->
+                <set_value name="this.$phase" exact="'trade'"/>
+                <set_value name="this.$tradeSearchRadius" exact="0"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Early termination: Only fallback current sector returned = no new sectors found -->
+            <do_if value="$onlyFallbackSector">
+              <!-- Only current sector returned (fallback) means no new sectors at this radius -->
+              <!-- Further radii will also be empty, so stop searching -->
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <set_value name="this.$escapeSector" exact="null"/>
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- Increment radius for next iteration (if not found and not terminated) -->
+            <do_if value="not this.$escapeSector? and not $onlyFallbackSector">
+              <set_value name="this.$escapeSearchRadius" operation="add"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- Trade Search Phase -->
+        <do_if value="this.$phase == 'trade'">
+          <!-- Check if max radius reached -->
+          <do_if value="this.$tradeSearchRadius gt this.$maxDistance">
+            <!-- Trade search complete - signal completion -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: TRADE search COMPLETE (max radius reached) - Ship=' + this.$ship.idcode + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count + ', FinalRadius=' + this.$tradeSearchRadius" chance="100"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <!-- Process current trade search radius -->
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$radiusSectors">
+              <param name="refobject" value="this.$currentSector"/>
+              <param name="mingatedistance" value="this.$tradeSearchRadius"/>
+              <param name="maxgatedistance" value="this.$tradeSearchRadius"/>
+              <param name="ship" value="this.$ship"/>
+              <param name="blacklistgroup" value="this.$blacklistgroup"/>
+              <param name="applyblacklist" value="true"/>
+            </run_actions>
+            
+            <!-- Check for fallback vs legitimate sectors -->
+            <set_value name="$newSectorsFound" exact="false"/>
+            <set_value name="$onlyFallbackSector" exact="false"/>
+            <do_if value="$radiusSectors? and $radiusSectors.count gt 0">
+              <!-- Radius 0: Current sector is expected, always process it -->
+              <do_if value="this.$tradeSearchRadius == 0">
+                <set_value name="$newSectorsFound" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Radius > 0: Check if only current sector returned (fallback) -->
+                <set_value name="$onlyCurrentSector" exact="false"/>
+                <do_if value="$radiusSectors.count == 1">
+                  <do_if value="$radiusSectors.{1} == this.$currentSector">
+                    <set_value name="$onlyCurrentSector" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$onlyCurrentSector and this.$tradeSearchRadius gt 0">
+                  <set_value name="$onlyFallbackSector" exact="true"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$newSectorsFound" exact="true"/>
+                </do_else>
+              </do_else>
+            </do_if>
+            
+            <!-- ISOLATION DETECTION: If radius 1 returns only fallback current sector, ship is isolated -->
+            <do_if value="this.$tradeSearchRadius == 1 and $onlyFallbackSector">
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') 🔒 ISOLATED: Only fallback current sector returned at radius 1 (all connected sectors blacklisted or unreachable)'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Process sectors: Radius 0 always processes, radius > 0 processes if legitimate (not fallback) -->
+            <do_if value="$newSectorsFound">
+              <!-- Debug logging for sector collection -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Processing TRADE radius ' + this.$tradeSearchRadius + ' - Found ' + $radiusSectors.count + ' sectors - Ship=' + this.$ship.idcode" chance="100"/>
+              </do_if>
+              <!-- Collect sectors at this radius for downstream processing -->
+              <do_all exact="$radiusSectors.count" counter="$i">
+                <set_value name="$sectorToAdd" exact="$radiusSectors.{$i}"/>
+                <do_if value="$sectorToAdd? and $sectorToAdd.exists">
+                  <!-- CRITICAL: Validate sector is within maxDistance from HOME SECTOR -->
+                  <set_value name="$sectorDistanceFromHome" exact="-1"/>
+                  <do_if value="$sectorToAdd? and this.$homeSector?">
+                    <!-- Special case: sector is home sector (distance = 0) -->
+                    <do_if value="$sectorToAdd == this.$homeSector">
+                      <set_value name="$sectorDistanceFromHome" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <!-- Calculate distance from home sector to candidate sector -->
+                      <set_value name="$sectorDistanceFromHome" exact="this.$homeSector.gatedistance.{$sectorToAdd}"/>
+                    </do_else>
+                  </do_if>
+                  
+                  <!-- Only add sector if it's within maxDistance from home sector -->
+                  <do_if value="$sectorDistanceFromHome ge 0 and $sectorDistanceFromHome le this.$maxDistance">
+                    <!-- Add to buy spaces list -->
+                    <append_to_list name="this.$buyspaces" exact="$sectorToAdd"/>
+                    <!-- Add to sell spaces list -->
+                    <append_to_list name="this.$sellspaces" exact="$sectorToAdd"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Early termination: Only fallback current sector returned = no new sectors found -->
+            <do_if value="$onlyFallbackSector">
+              <!-- Only current sector returned (fallback) means no new sectors at this radius -->
+              <!-- Further radii will also be empty, so stop searching -->
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- CRITICAL FIX: Check BEFORE incrementing to determine if we should signal next iteration -->
+            <!-- We need to signal when current radius <= maxDistance so next iteration can check completion -->
+            <do_if value="not $onlyFallbackSector">
+              <!-- Check if we should continue (before incrementing) -->
+              <set_value name="$shouldContinue" exact="this.$tradeSearchRadius le this.$maxDistance"/>
+              
+              <!-- Increment radius for next iteration -->
+              <set_value name="this.$tradeSearchRadius" operation="add"/>
+              
+              <!-- Signal next iteration if we should continue -->
+              <do_if value="$shouldContinue">
+                <!-- Debug logging for recursive signaling -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next TRADE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + this.$tradeSearchRadius + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count" chance="100"/>
+                </do_if>
+                <!-- Signal new instance for next radius iteration with current state -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+                  $Ship = this.$ship,
+                  $HomeSector = this.$homeSector,
+                  $MaxDistance = this.$maxDistance,
+                  $BlacklistGroup = this.$blacklistgroup,
+                  $IsContinuation = true,
+                  $Phase = this.$phase,
+                  $EscapeSearchRadius = this.$escapeSearchRadius,
+                  $TradeSearchRadius = this.$tradeSearchRadius,
+                  $BuySpaces = this.$buyspaces,
+                  $SellSpaces = this.$sellspaces,
+                  $ShipIsIsolated = this.$shipIsIsolated,
+                  $EscapeSector = this.$escapeSector,
+                  $CurrentSector = this.$currentSector,
+                  $CurrentSectorIsBlacklisted = this.$currentSectorIsBlacklisted
+                ]"/>
+              </do_if>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- CPU YIELDING: Signal new instance for next iteration (ESCAPE phase) -->
+        <!-- Only signal if we haven't completed (not cancelled) -->
+        <!-- Note: Delay happens at cue level (before actions), so each recursive signal gets delayed -->
+        <!-- Pass current state via params so new instance can restore it -->
+        <do_if value="this.$phase == 'escape' and not this.$escapeSector? and this.$escapeSearchRadius le this.$escapeMaxRadius">
+          <!-- Debug logging for recursive signaling -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next ESCAPE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + (this.$escapeSearchRadius + 1)" chance="100"/>
+          </do_if>
+          <!-- Signal new instance for next radius iteration with current state -->
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+            $Ship = this.$ship,
+            $HomeSector = this.$homeSector,
+            $MaxDistance = this.$maxDistance,
+            $BlacklistGroup = this.$blacklistgroup,
+            $IsContinuation = true,
+            $Phase = this.$phase,
+            $EscapeSearchRadius = this.$escapeSearchRadius,
+            $TradeSearchRadius = this.$tradeSearchRadius,
+            $BuySpaces = this.$buyspaces,
+            $SellSpaces = this.$sellspaces,
+            $ShipIsIsolated = this.$shipIsIsolated,
+            $EscapeSector = this.$escapeSector,
+            $CurrentSector = this.$currentSector,
+            $CurrentSectorIsBlacklisted = this.$currentSectorIsBlacklisted
+          ]"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Completion Handler -->
+    <cue name="GT_IncrementalRadiusSearch_Complete" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- Extract state from signaled cue instance -->
+        <set_value name="$searchInstance" exact="event.param"/>
+        
+        <!-- Debug logging -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$debugShip" exact="@$searchInstance.$ship"/>
+          <set_value name="$debugBuySpacesCount" exact="0"/>
+          <set_value name="$debugSellSpacesCount" exact="0"/>
+          <do_if value="$searchInstance.$buyspaces?">
+            <set_value name="$debugBuySpacesCount" exact="$searchInstance.$buyspaces.count"/>
+          </do_if>
+          <do_if value="$searchInstance.$sellspaces?">
+            <set_value name="$debugSellSpacesCount" exact="$searchInstance.$sellspaces.count"/>
+          </do_if>
+          <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch_Complete: Ship=' + (if $debugShip? then $debugShip.idcode else 'NULL') + ', BuySpaces=' + $debugBuySpacesCount + ', SellSpaces=' + $debugSellSpacesCount + ', Isolated=' + $searchInstance.$shipIsIsolated" chance="100"/>
+        </do_if>
+        
+        <!-- Build result table (matches GT_BuildTradeSectorLists format for drop-in replacement) -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$Ship" exact="$searchInstance.$ship"/>
+        <set_value name="$result.$BuySpaces" exact="$searchInstance.$buyspaces"/>
+        <set_value name="$result.$SellSpaces" exact="$searchInstance.$sellspaces"/>
+        <set_value name="$result.$ShipIsIsolated" exact="$searchInstance.$shipIsIsolated"/>
+        <set_value name="$result.$EscapeSector" exact="$searchInstance.$escapeSector"/>
+        
+        <!-- Signal original caller with results -->
+        <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades_Resume" param="$result"/>
+      </actions>
+    </cue>
+    
   </cues>
 </mdscript>
