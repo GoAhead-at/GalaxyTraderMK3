@@ -2947,6 +2947,33 @@
           <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') === SELL SEARCH START ===' + '\nShip: ' + $ship.knownname + '\nCurrent Sector: ' + $ship.sector.knownname + '\nMax Distance: ' + $maxDistance + ' jumps' + '\nMin Profit: ' + $minProfit + ' Cr'" chance="100"/>
         </do_if>
         
+        <!-- Determine home sector for sell search (needed for sector list building) -->
+        <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Determine blacklistgroup (needed for sector list building) -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Build sell sectors list (per-sector queries like vanilla) -->
+        <!-- FIX: Query per-sector instead of galaxy-wide to work without initialized market data -->
+        <!-- Vanilla pattern: query stations in specific sectors, not galaxy-wide -->
+        <set_value name="$sellspaces" exact="[]"/>
+        <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$sellspaces">
+          <param name="refobject" value="$homeSector"/>
+          <param name="mingatedistance" value="0"/>
+          <param name="maxgatedistance" value="$maxDistance"/>
+          <param name="applyblacklist" value="true"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Sell] (' + $ship.idcode + ') Found ' + $sellspaces.count + ' sell sectors within ' + $maxDistance + ' jumps from home sector'" chance="100"/>
+        </do_if>
+        
         <!-- Find best sell location for current cargo -->
         <set_value name="$bestOffer" exact="null"/>
         <set_value name="$bestPrice" exact="0"/>
@@ -2982,29 +3009,48 @@
             <debug_text text="'[GT-Sell] ' + $ship.idcode + ': Cargo contains ' + $currentCargo.count + ' ware types, attempting to sell ware ' + $selectedIndex + '/' + $currentCargo.count + ': ' + @$selectedWare.name + ' x' + $selectedAmount + ' (rotating through cargo to avoid stuck on unsellable wares)'" chance="100"/>
           </do_if>
           
-          <!-- Find buy offers for the selected ware -->
-          <!-- CRITICAL: tradepartner="$ship" ensures only executable offers (relations, permissions, F6 limitations) -->
-          <!-- CARGO DISPOSAL: Accept any amount ≥ 1 (ship must clear cargo, even if very small) -->
-          <!-- Without explicit filters, find_buy_offer may filter out offers where ship has less cargo than station wants -->
-          <find_buy_offer tradepartner="$ship" space="player.galaxy" result="$buyOffers" multiple="true" wares="$selectedWare">
-            <match_buyer tradesknownto="$ship.owner">
-              <match_gate_distance object="$ship" max="$maxDistance"/>
-            </match_buyer>
-            <amount min="1"/>
-            <totalvolume min="1"/>
-          </find_buy_offer>
+          <!-- FIX: Query per-sector instead of galaxy-wide (like vanilla) -->
+          <!-- This allows ships to find trades even without initialized market data (satellites) -->
+          <!-- Vanilla pattern: iterate through sectors and query stations in each sector -->
+          <set_value name="$buyOffers" exact="[]"/>
+          <do_all exact="$sellspaces.count" counter="$i">
+            <set_value name="$sector" exact="$sellspaces.{$i}"/>
+            <do_if value="not $sector? or not $sector.exists">
+              <continue/>
+            </do_if>
+            
+            <!-- Initialize per-sector offer list -->
+            <set_value name="$sectorBuyOffers" exact="[]"/>
+            
+            <!-- Query buy offers in this sector (ship sells to stations' buy offers) -->
+            <find_buy_offer tradepartner="$ship" space="$sector" result="$sectorBuyOffers" multiple="true" wares="$selectedWare">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <amount min="1"/>
+              <totalvolume min="1"/>
+            </find_buy_offer>
+            
+            <!-- Append sector's offers to main list -->
+            <set_value name="$sectorBuyOffersCount" exact="0"/>
+            <do_if value="$sectorBuyOffers?">
+              <set_value name="$sectorBuyOffersCountTemp" exact="@$sectorBuyOffers.count"/>
+              <do_if value="$sectorBuyOffersCountTemp?">
+                <set_value name="$sectorBuyOffersCount" exact="$sectorBuyOffersCountTemp"/>
+              </do_if>
+            </do_if>
+            <do_all exact="$sectorBuyOffersCount" counter="$j">
+              <append_to_list name="$buyOffers" exact="$sectorBuyOffers.{$j}"/>
+            </do_all>
+          </do_all>
           
           <!-- Debug: Log if no offers found -->
           <do_if value="$buyOffers.count == 0">
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Sell] ' + $ship.idcode + ': No buy offers found for ' + @$selectedWare.name + ' (ship cargo: ' + $selectedAmount + ' units)'" chance="100"/>
+              <debug_text text="'[GT-Sell] ' + $ship.idcode + ': No buy offers found for ' + @$selectedWare.name + ' (ship cargo: ' + $selectedAmount + ' units) after querying ' + $sellspaces.count + ' sectors'" chance="100"/>
             </do_if>
           </do_if>
-          
-          <!-- Determine blacklistgroup (same logic as SearchLiveTrades_Resume) -->
-          <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
-            <param name="ship" value="$ship"/>
-          </run_actions>
           
           <!-- Find best price -->
           <do_all exact="$buyOffers.count" counter="$j">
