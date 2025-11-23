@@ -150,5 +150,153 @@
       </actions>
     </library>
     
+    <!-- Check GT Order Status (COMPREHENSIVE) -->
+    <!-- Unified function that checks ALL conditions for GT order detection -->
+    <!-- Consolidates logic from: order.wait.xml, order.trade.galaxytrader.xml, order.assist.xml, etc. -->
+    <!-- Returns comprehensive status table for cleanup detection -->
+    <library name="GT_CheckGTOrderStatus" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check GT order status for"/>
+        <param name="checkRegistry" default="true" comment="Check if ship is in GT_Ships registry"/>
+        <param name="checkState" default="true" comment="Check state registry for historical data"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[]"/>
+        
+        <!-- Initialize all result fields -->
+        <set_value name="$result.$HasDirectGTOrder" exact="false"/>
+        <set_value name="$result.$HasGTCommander" exact="false"/>
+        <set_value name="$result.$IsGTControlled" exact="false"/>
+        <set_value name="$result.$IsSubordinate" exact="false"/>
+        <set_value name="$result.$DefaultOrder" exact="null"/>
+        <set_value name="$result.$Commander" exact="null"/>
+        <set_value name="$result.$CommanderExists" exact="false"/>
+        <set_value name="$result.$InRegistry" exact="false"/>
+        <set_value name="$result.$WasSubordinate" exact="false"/>
+        <set_value name="$result.$StateSaysHasGTOrder" exact="false"/>
+        <set_value name="$result.$ShouldCleanup" exact="false"/>
+        <set_value name="$result.$ShouldRestoreName" exact="false"/>
+        <set_value name="$result.$IsPermanentRemoval" exact="false"/>
+        
+        <!-- Get current default order -->
+        <set_value name="$currentDefaultOrder" exact="@$ship.defaultorder.id"/>
+        <set_value name="$result.$DefaultOrder" exact="$currentDefaultOrder"/>
+        
+        <!-- CHECK 1: Direct GT Order -->
+        <do_if value="$currentDefaultOrder == 'GalaxyTraderMK3'">
+          <set_value name="$result.$HasDirectGTOrder" exact="true"/>
+          <set_value name="$result.$IsGTControlled" exact="true"/>
+        </do_if>
+        
+        <!-- CHECK 2: Commander Status (if not direct GT) -->
+        <do_if value="not $result.$HasDirectGTOrder">
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckCommanderStatus" result="$commanderStatus">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <set_value name="$result.$CommanderExists" exact="$commanderStatus.$HasCommander"/>
+          <set_value name="$result.$Commander" exact="$commanderStatus.$Commander"/>
+          <set_value name="$result.$HasGTCommander" exact="$commanderStatus.$CommanderHasGT"/>
+          
+          <!-- CHECK 3: Subordinate with Assist order AND GT commander -->
+          <do_if value="$currentDefaultOrder == 'Assist' and $result.$HasGTCommander">
+            <set_value name="$result.$IsSubordinate" exact="true"/>
+            <set_value name="$result.$IsGTControlled" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CHECK 4: Registry Status -->
+        <do_if value="$checkRegistry">
+          <set_value name="$result.$InRegistry" exact="global.$GT_Ships? and global.$GT_Ships.{$ship}?"/>
+        </do_if>
+        
+        <!-- CHECK 5: State Registry (Historical Data) -->
+        <set_value name="$state" exact="null"/>
+        <do_if value="$checkState and global.$GT_Ship_State? and global.$GT_Ship_State.{$ship}?">
+          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+          
+          <!-- State says ship had GT order -->
+          <do_if value="$state.$HasGTOrder? and $state.$HasGTOrder">
+            <set_value name="$result.$StateSaysHasGTOrder" exact="true"/>
+          </do_if>
+          
+          <!-- State says ship was subordinate -->
+          <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+            <set_value name="$result.$WasSubordinate" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CHECK 6: Cleanup Decision Logic -->
+        <!-- Should cleanup if: ship was GT-controlled but no longer is -->
+        <set_value name="$wasGTControlled" exact="false"/>
+        <do_if value="$result.$InRegistry or $result.$StateSaysHasGTOrder or $result.$WasSubordinate">
+          <set_value name="$wasGTControlled" exact="true"/>
+        </do_if>
+        
+        <!-- Cleanup needed if: was GT-controlled but now is NOT -->
+        <do_if value="$wasGTControlled and not $result.$IsGTControlled">
+          <set_value name="$result.$ShouldCleanup" exact="true"/>
+          
+          <!-- Permanent removal if: no direct GT AND no GT commander -->
+          <do_if value="not $result.$HasDirectGTOrder and not $result.$HasGTCommander">
+            <set_value name="$result.$IsPermanentRemoval" exact="true"/>
+          </do_if>
+          
+          <!-- Should restore name if: not subordinate to GT commander -->
+          <do_if value="not $result.$IsSubordinate and $ship.pilot?">
+            <set_value name="$result.$ShouldRestoreName" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- SPECIAL CASE: Subordinate with Assist order but commander check might fail due to timing -->
+        <!-- If ship has Assist order, treat as active subordinate (even if commander check fails temporarily) -->
+        <do_if value="$currentDefaultOrder == 'Assist' and $result.$CommanderExists">
+          <!-- Commander exists - check if it has GT order -->
+          <do_if value="$result.$HasGTCommander">
+            <set_value name="$result.$IsSubordinate" exact="true"/>
+            <set_value name="$result.$IsGTControlled" exact="true"/>
+            <set_value name="$result.$ShouldCleanup" exact="false"/>
+            <set_value name="$result.$ShouldRestoreName" exact="false"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Ship Should Trigger Cleanup -->
+    <!-- Simplified wrapper that returns boolean for cleanup decision -->
+    <library name="GT_ShouldTriggerCleanup" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+        <param name="checkRegistry" default="true" comment="Check registry"/>
+        <param name="checkState" default="true" comment="Check state"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$status">
+          <param name="ship" value="$ship"/>
+          <param name="checkRegistry" value="$checkRegistry"/>
+          <param name="checkState" value="$checkState"/>
+        </run_actions>
+        <return value="$status.$ShouldCleanup"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Ship is GT-Controlled (Quick Check) -->
+    <!-- Simplified wrapper for quick GT-controlled check -->
+    <library name="GT_IsGTControlled" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$status">
+          <param name="ship" value="$ship"/>
+          <param name="checkRegistry" value="false"/>
+          <param name="checkState" value="false"/>
+        </run_actions>
+        <return value="$status.$IsGTControlled"/>
+      </actions>
+    </library>
+    
   </cues>
 </mdscript>
