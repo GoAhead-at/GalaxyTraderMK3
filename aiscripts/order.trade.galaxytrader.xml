@@ -433,6 +433,9 @@
     <!-- MODULAR INITIALIZATION - REPLACES ~200 LINES OF COMPLEX INITIALIZATION CODE -->
     <!-- ============================================================================= -->
     
+    <!-- CRITICAL DEBUG: Log that init block started -->
+    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': === INIT BLOCK STARTED === (Ship: ' + this.ship.knownname + ', Pilot: ' + (if this.ship.pilot then this.ship.pilot.name else 'NONE') + ')'" chance="100"/>
+    
     <!-- Create order parameters table for library compatibility -->
     <set_value name="$orderParams" exact="table[]"/>
     
@@ -724,10 +727,13 @@
     <!-- END MODULAR INITIALIZATION                                                   -->
     <!-- ============================================================================= -->
     
-    <!-- Initialize pilot tracking for instant pilot change detection -->
+    <!-- Initialize pilot tracking for event-driven pilot change detection -->
+    <!-- Pilot changes are detected at natural restart points: -->
+    <!-- - After successful trade completion (trade_completed label) -->
+    <!-- - On script restart (init label) -->
     <set_value name="this.$trackedPilot" exact="this.ship.pilot"/>
     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Tracking pilot: ' + @this.$trackedPilot.name + ' (instant detection enabled)'" chance="$debugchance"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Tracking pilot: ' + @this.$trackedPilot.name + ' (event-driven detection enabled)'" chance="$debugchance"/>
     </do_if>
     
     <!-- Do not initialize commander tracking here - let init label handle it -->
@@ -737,6 +743,45 @@
     <!-- Register pilot on first run (for initial assignment or ship with existing cargo) -->
     <!-- This ensures ships get renamed even when first assigned to GT order -->
     <do_if value="this.ship.pilot">
+      <!-- CRITICAL: Wait for pilot transfer to complete if pilot is still transferring -->
+      <!-- Pilot transfer takes time (crew transfer pod travel), but UI shows pilot as assigned immediately -->
+      <!-- Check if pilot is actually on ship by verifying pilot's ship property matches -->
+      <set_value name="$pilotTransferComplete" exact="false"/>
+      <set_value name="$transferWaitAttempts" exact="0"/>
+      <set_value name="$maxTransferWaitAttempts" exact="600"/> <!-- 5 minutes max (600 * 0.5s = 300s) -->
+      
+      <do_while value="not $pilotTransferComplete and $transferWaitAttempts lt $maxTransferWaitAttempts">
+        <!-- Check if pilot is actually on ship -->
+        <!-- If pilot is still transferring, pilot.ship will be null or not match this.ship -->
+        <set_value name="$pilotShip" exact="@this.ship.pilot.ship"/>
+        <do_if value="$pilotShip? and $pilotShip == this.ship">
+          <!-- Pilot is on ship - transfer complete -->
+          <set_value name="$pilotTransferComplete" exact="true"/>
+        </do_if>
+        <do_else>
+          <!-- Pilot still transferring - wait and check again -->
+          <set_value name="$transferWaitAttempts" operation="add"/>
+          <do_if value="$transferWaitAttempts == 1">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pilot transfer in progress - waiting for pilot to arrive on ship...'" chance="100"/>
+            </do_if>
+          </do_if>
+          <!-- Wait 0.5 seconds before checking again -->
+          <wait exact="1000ms"/>
+        </do_else>
+      </do_while>
+      
+      <do_if value="not $pilotTransferComplete">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] WARNING: ' + this.ship.idcode + ': Pilot transfer timeout after 5 minutes - proceeding anyway'" chance="100"/>
+        </do_if>
+      </do_if>
+      <do_else>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pilot transfer complete - pilot is on ship, proceeding with registration'" chance="100"/>
+        </do_if>
+      </do_else>
+      
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INITIAL REGISTRATION: Registering pilot ' + @this.ship.pilot.name + ' on order start'" chance="100"/>
       </do_if>
@@ -746,6 +791,39 @@
         $pilot = this.ship.pilot,
         $oldPilot = null
       ]"/>
+      
+      <!-- CRITICAL: Wait for registration to complete before continuing -->
+      <!-- This ensures ship is registered in global.$GT_Ships before trade search starts -->
+      <!-- Registration happens synchronously via run_actions, but signal processing needs a moment -->
+      <wait exact="200ms"/>
+      
+      <!-- Verify ship is registered (defensive check) -->
+      <set_value name="$registrationComplete" exact="false"/>
+      <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+        <set_value name="$registrationComplete" exact="true"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship registration verified - ready to proceed'" chance="100"/>
+        </do_if>
+      </do_if>
+      <do_else>
+        <!-- Ship not registered yet - wait longer -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship not yet registered - waiting longer...'" chance="100"/>
+        </do_if>
+        <wait exact="500ms"/>
+        <!-- Check again -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+          <set_value name="$registrationComplete" exact="true"/>
+        </do_if>
+      </do_else>
+      
+      <!-- If still not registered after waits, log warning but continue anyway -->
+      <!-- Registration will complete eventually, and trade search can retry -->
+      <do_if value="not $registrationComplete">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] WARNING: ' + this.ship.idcode + ': Ship registration not complete after waits - continuing anyway (registration will complete asynchronously)'" chance="100"/>
+        </do_if>
+      </do_if>
     </do_if>
     
     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -757,8 +835,34 @@
   <attention min="unknown">
     <actions>
       
+      <!-- Debug: Confirm we entered attention block -->
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': === ATTENTION BLOCK ENTERED ==='" chance="100"/>
+      </do_if>
+      
       <!-- Subordinate reinitialization: Jump here to restart and re-inherit commander settings -->
       <label name="init"/>
+      
+      <!-- ======================================= -->
+      <!-- PILOT CHANGE DETECTION (Script Restart) -->
+      <!-- ======================================= -->
+      <!-- Check for pilot changes when script restarts (natural restart point) -->
+      <set_value name="$currentPilot" exact="this.ship.pilot"/>
+      <do_if value="this.$trackedPilot? and $currentPilot != this.$trackedPilot">
+        <!-- Pilot changed! Send signal to MD system -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': PILOT CHANGE DETECTED on script restart! Old: ' + @this.$trackedPilot.name + ', New: ' + @$currentPilot.name" chance="100"/>
+        </do_if>
+        
+        <signal_objects object="player.galaxy" param="'GT_Update_Ship'" param2="table[
+          $updateType = 'pilot_change',
+          $ship = this.ship,
+          $pilot = $currentPilot,
+          $oldPilot = this.$trackedPilot
+        ]"/>
+      </do_if>
+      <!-- Update tracked pilot (always, even if no change) -->
+      <set_value name="this.$trackedPilot" exact="$currentPilot"/>
       
       <!-- Restore XPBlocked if BlockedLevel still exists (ship restart/reinit) -->
       <!-- Also update ship name to show ADVANCE label when XPBlocked is restored -->
@@ -1097,6 +1201,11 @@
       
       <label name="main_loop"/>
       
+      <!-- Debug: Confirm we reached main loop -->
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': === MAIN LOOP STARTED === (Pilot: ' + (if this.ship.pilot then this.ship.pilot.name else 'NONE') + ')'" chance="100"/>
+      </do_if>
+      
       <!-- Check if GT order was removed (main loop detection) -->
       <!-- This catches cases where GT order is manually removed but script continues running -->
       <set_value name="$currentDefaultOrder" exact="@this.ship.defaultorder.id"/>
@@ -1174,23 +1283,11 @@
       </do_if>
       
       <!-- ======================================= -->
-      <!-- PILOT CHANGE DETECTION (Instant)       -->
+      <!-- PILOT CHANGE DETECTION (Event-Driven)  -->
       <!-- ======================================= -->
-      <!-- Track the current pilot and detect if player swaps pilots -->
-      <set_value name="$currentPilot" exact="this.ship.pilot"/>
-      <do_if value="this.$trackedPilot? and $currentPilot != this.$trackedPilot">
-        <!-- Pilot changed! Send signal to MD system -->
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': PILOT CHANGE DETECTED! Old: ' + @this.$trackedPilot.name + ', New: ' + @$currentPilot.name" chance="100"/>
-        
-        <signal_objects object="player.galaxy" param="'GT_Update_Ship'" param2="table[
-          $updateType = 'pilot_change',
-          $ship = this.ship,
-          $pilot = $currentPilot,
-          $oldPilot = this.$trackedPilot
-        ]"/>
-      </do_if>
-      <!-- Update tracked pilot -->
-      <set_value name="this.$trackedPilot" exact="$currentPilot"/>
+      <!-- NOTE: Pilot change detection moved to restart points (trade_completed, init) -->
+      <!-- Polling removed - detection happens at natural restart points where GT order reruns -->
+      <!-- This ensures detection happens when order naturally restarts, not constantly polling -->
       
       <!-- ======================================= -->
       <!-- Commander change detection (Main Loop) -->
@@ -1964,7 +2061,23 @@
         <resume label="main_loop"/>
       </do_if>
       <do_else>
-        <!-- Ship ready for new trade - check cargo status -->
+        <!-- Ship ready for new trade - ensure ship is registered before requesting trade search -->
+        <!-- This is critical when pilot is transferred to a new ship -->
+        <do_if value="not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?">
+          <!-- Ship not registered yet - wait a moment for registration to complete -->
+          <!-- Registration happens via GT_Update_Ship signal sent in init block -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship not yet registered - waiting for registration to complete...'" chance="100"/>
+          </do_if>
+          <wait exact="100ms"/>
+          <!-- Check again after wait -->
+          <do_if value="not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?">
+            <!-- Still not registered - wait longer -->
+            <wait exact="500ms"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Check cargo status -->
         <!-- Only trade if cargo is EMPTY -->
         <set_value name="$hasCargo" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>
         
@@ -3610,6 +3723,28 @@
       </do_if>
       
       <label name="trade_completed"/>
+      
+      <!-- ======================================= -->
+      <!-- PILOT CHANGE DETECTION (After Trade)   -->
+      <!-- ======================================= -->
+      <!-- Check for pilot changes after successful trade completion -->
+      <!-- This is a natural restart point where the GT default order reruns -->
+      <set_value name="$currentPilot" exact="this.ship.pilot"/>
+      <do_if value="this.$trackedPilot? and $currentPilot != this.$trackedPilot">
+        <!-- Pilot changed! Send signal to MD system -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': PILOT CHANGE DETECTED after trade completion! Old: ' + @this.$trackedPilot.name + ', New: ' + @$currentPilot.name" chance="100"/>
+        </do_if>
+        
+        <signal_objects object="player.galaxy" param="'GT_Update_Ship'" param2="table[
+          $updateType = 'pilot_change',
+          $ship = this.ship,
+          $pilot = $currentPilot,
+          $oldPilot = this.$trackedPilot
+        ]"/>
+      </do_if>
+      <!-- Update tracked pilot (always, even if no change) -->
+      <set_value name="this.$trackedPilot" exact="$currentPilot"/>
       
       <!-- Check if this is a pathfinding retry (try next cached alternative) -->
       <do_if value="this.$tryNextTrade?">
