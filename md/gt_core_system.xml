@@ -512,110 +512,209 @@
         <set_value name="$abortData" exact="event.param2"/>
         <set_value name="$ship" exact="$abortData.$Ship"/>
         <set_value name="$pilot" exact="$abortData.$Pilot"/>
-        <set_value name="$reason" exact="$abortData.$Reason"/>
+        <!-- Ensure $reason is always a string -->
+        <!-- Default to empty string, then set from signal if present -->
+        <set_value name="$reason" exact="''"/>
+        <do_if value="$abortData.$Reason?">
+          <set_value name="$reasonTemp" exact="$abortData.$Reason"/>
+          <!-- Force string conversion by concatenating with empty string -->
+          <!-- This ensures $reason is always a string type that supports indexof -->
+          <do_if value="$reasonTemp?">
+            <set_value name="$reason" exact="'' + $reasonTemp"/>
+          </do_if>
+        </do_if>
         <set_value name="$originalName" exact="$abortData.$OriginalName"/>
         
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GalaxyTrader MK3] Ship order aborted for ' + $ship.knownname + ': ' + $reason" chance="100"/>
-        </do_if>
-        
-        <!-- ============================================= -->
-        <!-- SHIP NAME RESTORATION                        -->
-        <!-- ============================================= -->
-        
-        <!-- Use extracted library function to restore original ship name -->
-        <run_actions ref="md.GT_Ship_Management.Restore_Original_Ship_Name">
-          <param name="ship" value="$ship"/>
-          <param name="pilot" value="$pilot"/>
-          <param name="originalName" value="$originalName"/>
-        </run_actions>
-
-        <!-- ============================================= -->
-        <!-- SHIP MODIFICATION CLEANUP                   -->
-        <!-- ============================================= -->
-        
-        <!-- Clean up any ship modification tracking -->
-        <do_if value="global.$GT_Applied_Mods? and global.$GT_Applied_Mods.{$ship}?">
-          <remove_value name="global.$GT_Applied_Mods.{$ship}"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3] Ship modification tracking cleared for ' + $ship.knownname" chance="100"/>
+        <!-- Check if ship is a subordinate with Assist order -->
+        <set_value name="$isSubordinate" exact="false"/>
+        <do_if value="$ship.defaultorder?">
+          <do_if value="@$ship.defaultorder.id == 'Assist'">
+            <set_value name="$isSubordinate" exact="true"/>
           </do_if>
         </do_if>
         
-        <!-- ============================================= -->
-        <!-- REGISTRY CLEANUP                             -->
-        <!-- ============================================= -->
-        
-        <!-- Remove ship from GT_Ships registry -->
-        <do_if value="global.$GT_Ships.{$ship}?">
-          <remove_value name="global.$GT_Ships.{$ship}"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3] Ship removed from GT_Ships registry: ' + $ship.idcode" chance="100"/>
+        <!-- Check if cleanup reason is commander-related -->
+        <set_value name="$isCommanderCleanup" exact="false"/>
+        <!-- Check reason string - only check exact known reason strings to avoid indexof errors -->
+        <!-- Known reasons that indicate commander cleanup (from various sources): -->
+        <do_if value="$reason? and $reason != ''">
+          <!-- Check for exact known commander-related reason strings -->
+          <do_if value="$reason == 'Commander lost GT order' or $reason == 'Commander removed' or $reason == 'Commander lost GT order (Lua detection)' or $reason == 'Commander cleanup'">
+            <set_value name="$isCommanderCleanup" exact="true"/>
           </do_if>
         </do_if>
         
-        <!-- Preserve pilot XP data - NEVER remove pilots from registry -->
-        <!-- Instead, mark them as paused/inactive so they can be reactivated later with their XP intact -->
-        <do_if value="$pilot and global.$GT_Pilots.{$pilot}?">
-          <set_value name="$pilotHasOtherShips" exact="false"/>
-          
-          <!-- Check if pilot has other active GalaxyTrader ships -->
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
-            <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
-            <do_all exact="$shipKeys.count" counter="$i">
-              <set_value name="$otherShip" exact="$shipKeys.{$i}"/>
-              <do_if value="$otherShip.pilot == $pilot">
-                <set_value name="$pilotHasOtherShips" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
+        <!-- Skip cleanup if subordinate has pilot and commander is being cleaned up -->
+        <!-- Let subordinates finish their orders when commander is cleaned up -->
+        <do_if value="$isSubordinate and $pilot? and $isCommanderCleanup">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Skipping cleanup for subordinate with pilot (commander cleanup): ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') - letting ship finish orders'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') - ' + $reason" chance="100"/>
           </do_if>
           
-          <!-- Mark pilot as paused instead of removing from registry -->
-          <!-- This preserves XP, skill level, trades, profit, and all training data -->
-          <do_if value="not $pilotHasOtherShips">
-            <!-- No other active ships - mark pilot as paused to preserve all data -->
-            <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
-            <set_value name="global.$GT_Pilots.{$pilot}.$PausedTime" exact="player.age"/>
-            <set_value name="global.$GT_Pilots.{$pilot}.$PausedReason" exact="'Order aborted - preserving XP data for reactivation'"/>
-            <!-- Clear ship association since order is aborted -->
-            <remove_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip"/>
-            <remove_value name="global.$GT_Pilots.{$pilot}.$Ship"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3] Pilot paused (preserving XP data): ' + $pilot.name + ' (XP: ' + global.$GT_Pilots.{$pilot}.$XP + ', Level: ' + (if global.$GT_Pilots.{$pilot}.$Level? then global.$GT_Pilots.{$pilot}.$Level else 1) + ')'" chance="100"/>
+          <!-- ============================================= -->
+          <!-- ORDER CANCELLATION (only if no pilot)        -->
+          <!-- ============================================= -->
+          
+          <!-- Determine if orders should be cancelled -->
+          <!-- Trust Lua detection: if reason indicates missing pilot, cancel orders -->
+          <!-- Also check if passed pilot is null or ship has no pilot -->
+          <set_value name="$shouldCancelOrders" exact="false"/>
+          <do_if value="not $pilot">
+            <set_value name="$shouldCancelOrders" exact="true"/>
+          </do_if>
+          <do_elseif value="$reason? and $reason != ''">
+            <!-- Check if reason indicates missing pilot -->
+            <!-- Only check exact known reason strings to avoid indexof errors -->
+            <do_if value="$reason == 'Missing pilot (Lua detection)' or $reason == 'Missing pilot' or $reason == 'Pilot transferred away - GT order cannot run without pilot' or $reason == 'No pilot assigned'">
+              <set_value name="$shouldCancelOrders" exact="true"/>
             </do_if>
-            
-            <!-- Send logbook message thanking player for holiday -->
-            <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-            <set_value name="$logbookMessage" exact="{77000,3215}.[player.name]"/>
-            
-            <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-              <param name="Message" value="$logbookMessage"/>
-              <param name="Category" value="'general'"/>
-              <param name="Title" value="'Pilot Status: ' + $pilot.name"/>
-              <param name="Object" value="$ship"/>
-              <param name="Interaction" value="'showonmap'"/>
-            </run_actions>
-          </do_if>
+          </do_elseif>
           <do_else>
-            <!-- Pilot has other active ships - keep them active -->
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3] Pilot kept active (has other active ships): ' + $pilot.name" chance="100"/>
+            <!-- Double-check ship's current pilot status -->
+            <!-- CRITICAL: Check if pilot is actually assigned to THIS ship, not just if pilot exists -->
+            <set_value name="$hasPilot" exact="false"/>
+            <do_if value="$ship.pilot?">
+              <set_value name="$pilotObj" exact="@$ship.pilot"/>
+              <do_if value="$pilotObj and $pilotObj.exists">
+                <!-- Verify pilot is actually assigned to THIS ship (not transferred to another ship) -->
+                <do_if value="$pilotObj.ship? and $pilotObj.ship == $ship">
+                  <set_value name="$hasPilot" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_if value="not $hasPilot">
+              <set_value name="$shouldCancelOrders" exact="true"/>
             </do_if>
           </do_else>
-        </do_if>
-        
-        <!-- Update ship status (legacy compatibility) -->
-        <do_if value="md.GT_Ship_Management.Update_Ship_Status?">
-          <run_actions ref="md.GT_Ship_Management.Update_Ship_Status">
+          
+          <do_if value="$shouldCancelOrders">
+            <!-- No pilot => Remove everything (default order and current orders) -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] No pilot detected - cancelling all orders and removing default order: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- First: Cancel default order (stops order script from creating new orders) -->
+            <do_if value="$ship.defaultorder?">
+              <cancel_order order="$ship.defaultorder"/>
+            </do_if>
+            
+            <!-- Then: Cancel all active orders on the ship (including trade orders, etc.) -->
+            <cancel_all_orders object="$ship"/>
+          </do_if>
+          <do_else>
+            <!-- Pilot present => Only remove from registry, don't touch orders -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Ship has pilot - removing from registry only, leaving orders intact: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <!-- ============================================= -->
+          <!-- SHIP NAME RESTORATION                        -->
+          <!-- ============================================= -->
+          
+          <!-- Use extracted library function to restore original ship name -->
+          <run_actions ref="md.GT_Ship_Management.Restore_Original_Ship_Name">
             <param name="ship" value="$ship"/>
-            <param name="status" value="'aborted'"/>
+            <param name="pilot" value="$pilot"/>
+            <param name="originalName" value="$originalName"/>
           </run_actions>
-        </do_if>
-        
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GalaxyTrader MK3] Ship cleanup completed for ' + $ship.idcode" chance="100"/>
-        </do_if>
+
+          <!-- ============================================= -->
+          <!-- SHIP MODIFICATION CLEANUP                   -->
+          <!-- ============================================= -->
+          
+          <!-- Clean up any ship modification tracking -->
+          <do_if value="global.$GT_Applied_Mods? and global.$GT_Applied_Mods.{$ship}?">
+            <remove_value name="global.$GT_Applied_Mods.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] Ship modification tracking cleared for ' + $ship.knownname" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ============================================= -->
+          <!-- REGISTRY CLEANUP                             -->
+          <!-- ============================================= -->
+          
+          <!-- Remove ship from GT_Ships registry -->
+          <do_if value="global.$GT_Ships.{$ship}?">
+            <remove_value name="global.$GT_Ships.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] Ship removed from GT_Ships registry: ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ============================================= -->
+          <!-- PILOT DATA PRESERVATION                       -->
+          <!-- ============================================= -->
+          
+          <!-- Preserve pilot XP data - NEVER remove pilots from registry -->
+          <!-- Instead, mark them as paused/inactive so they can be reactivated later with their XP intact -->
+          <do_if value="$pilot and global.$GT_Pilots.{$pilot}?">
+            <set_value name="$pilotHasOtherShips" exact="false"/>
+            
+            <!-- Check if pilot has other active GalaxyTrader ships -->
+            <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+              <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+              <do_all exact="$shipKeys.count" counter="$i">
+                <set_value name="$otherShip" exact="$shipKeys.{$i}"/>
+                <do_if value="$otherShip.pilot == $pilot">
+                  <set_value name="$pilotHasOtherShips" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Mark pilot as paused instead of removing from registry -->
+            <!-- This preserves XP, skill level, trades, profit, and all training data -->
+            <do_if value="not $pilotHasOtherShips">
+              <!-- No other active ships - mark pilot as paused to preserve all data -->
+              <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
+              <set_value name="global.$GT_Pilots.{$pilot}.$PausedTime" exact="player.age"/>
+              <set_value name="global.$GT_Pilots.{$pilot}.$PausedReason" exact="'Order aborted - preserving XP data for reactivation'"/>
+              <!-- Clear ship association since order is aborted -->
+              <remove_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip"/>
+              <remove_value name="global.$GT_Pilots.{$pilot}.$Ship"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GalaxyTrader MK3] Pilot paused (preserving XP data): ' + $pilot.name + ' (XP: ' + global.$GT_Pilots.{$pilot}.$XP + ', Level: ' + (if global.$GT_Pilots.{$pilot}.$Level? then global.$GT_Pilots.{$pilot}.$Level else 1) + ')'" chance="100"/>
+              </do_if>
+              
+              <!-- Send logbook message thanking player for holiday -->
+              <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+              <set_value name="$logbookMessage" exact="{77000,3215}.[player.name]"/>
+              
+              <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                <param name="Message" value="$logbookMessage"/>
+                <param name="Category" value="'general'"/>
+                <param name="Title" value="'Pilot Status: ' + $pilot.name"/>
+                <param name="Object" value="$ship"/>
+                <param name="Interaction" value="'showonmap'"/>
+              </run_actions>
+            </do_if>
+            <do_else>
+              <!-- Pilot has other active ships - keep them active -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GalaxyTrader MK3] Pilot kept active (has other active ships): ' + $pilot.name" chance="100"/>
+              </do_if>
+            </do_else>
+          </do_if>
+          
+          <!-- Update ship status (legacy compatibility) -->
+          <do_if value="md.GT_Ship_Management.Update_Ship_Status?">
+            <run_actions ref="md.GT_Ship_Management.Update_Ship_Status">
+              <param name="ship" value="$ship"/>
+              <param name="status" value="'aborted'"/>
+            </run_actions>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Ship cleanup completed for ' + $ship.idcode" chance="100"/>
+          </do_if>
+        </do_else>
       </actions>
     </cue>
 
@@ -706,209 +805,122 @@
     <!-- Polling monitor has been removed. Order removal is now detected instantly via signal from AI script's <on_abort> handler. -->
     <!-- This provides instant response (0ms latency) and zero CPU overhead. Professional code doesn't crash - we trust the signal system. -->
 
-    <!-- Orphaned Pilot Registry Cleanup - Catches edge cases where pilots are registered but ships no longer have GT orders -->
-    <cue name="OrphanedPilotCleanup" instantiate="true">
+    <!-- Event-Driven Orphaned Ship Check - Checks a single ship when triggered -->
+    <!-- This replaces polling-based cleanup with event-driven checks -->
+    <!-- Triggered from: GT_Update_Ship (pilot_change), GT_Ship_State_Update (GT_Order_Cancelled), Wait/Assist orders, GT order on_abort -->
+    <cue name="CheckShipOrphaned" instantiate="true">
       <conditions>
-        <event_cue_signalled/>
-        <!-- Run cleanup if there are pilots OR ships in registry (ships might not have pilots registered) -->
-        <check_value value="(global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0) or (global.$GT_Ships? and global.$GT_Ships.keys.count gt 0)"/>
+        <event_object_signalled object="player.galaxy" param="'GT_Check_Ship_Orphaned'"/>
       </conditions>
-      <delay exact="1s"/><!-- Small delay to let game stabilize after load -->
       <actions>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Core] Running orphaned pilot registry cleanup check...'" chance="100"/>
-        </do_if>
+        <set_value name="$ship" exact="event.param2.$Ship"/>
         
-        <set_value name="$cleanedCount" exact="0"/>
-        <set_value name="$pilotKeys" exact="global.$GT_Pilots.keys.list"/>
-        
-        <do_all exact="$pilotKeys.count" counter="$i">
-          <set_value name="$pilot" exact="$pilotKeys.{$i}"/>
-          
-          <!-- Skip if pilot object no longer exists -->
-          <do_if value="not $pilot.exists">
-            <continue/>
-          </do_if>
-          
-          <!-- Get pilot's current ship -->
-          <set_value name="$currentShip" exact="@$pilot.ship"/>
-          <do_if value="not $currentShip or not $currentShip.exists">
-            <!-- Pilot not on any ship - skip -->
-            <continue/>
-          </do_if>
-          
-          <!-- Check if ship has active GT order -->
-          <set_value name="$hasGTOrder" exact="false"/>
-          
-          <!-- Direct GT order check -->
-          <do_if value="$currentShip.defaultorder?">
-            <do_if value="@$currentShip.defaultorder.id == 'GalaxyTraderMK3'">
-              <set_value name="$hasGTOrder" exact="true"/>
-            </do_if>
-            
-            <!-- Subordinate check: If ship has Assist order, check commander -->
-            <do_elseif value="@$currentShip.defaultorder.id == 'Assist'">
-              <do_if value="$currentShip.commander and $currentShip.commander.exists and $currentShip.commander != $currentShip">
-                <do_if value="$currentShip.commander.defaultorder?">
-                  <do_if value="@$currentShip.commander.defaultorder.id == 'GalaxyTraderMK3'">
-                    <set_value name="$hasGTOrder" exact="true"/>
-                  </do_if>
-                </do_if>
-              </do_if>
-            </do_elseif>
-          </do_if>
-          
-          <!-- If ship doesn't have GT order but pilot is registered (active OR paused), check if name needs restoration -->
-          <do_if value="not $hasGTOrder and global.$GT_Pilots.{$pilot}?">
-            <!-- Check if ship name is different from original (indicating it still has GT-style name) -->
-            <set_value name="$needsNameRestore" exact="false"/>
-            <do_if value="global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-              <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
-              <!-- If current name differs from original, it needs restoration -->
-              <do_if value="$currentShip.knownname != $originalName">
-                <set_value name="$needsNameRestore" exact="true"/>
-              </do_if>
-            </do_if>
-            
-            <do_if value="$needsNameRestore">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Core] ORPHANED PILOT DETECTED: ' + $pilot.name + ' on ship ' + $currentShip.knownname + ' (original: ' + $originalName + ') - no GT order found!'" chance="100"/>
-              </do_if>
-              
-              <!-- OPTIMIZED: Use extracted library function to restore original ship name -->
-              <run_actions ref="md.GT_Ship_Management.Restore_Original_Ship_Name">
-                <param name="ship" value="$currentShip"/>
-                <param name="pilot" value="$pilot"/>
-                <param name="originalName" value="$originalName"/>
-              </run_actions>
-              
-              <!-- Mark pilot as paused if not already (preserve XP) -->
-              <do_if value="not global.$GT_Pilots.{$pilot}.$Status? or global.$GT_Pilots.{$pilot}.$Status != 'paused'">
-                <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
-                <set_value name="global.$GT_Pilots.{$pilot}.$PausedTime" exact="player.age"/>
-                <set_value name="global.$GT_Pilots.{$pilot}.$PausedReason" exact="'Orphaned registration cleanup - ship no longer has GT order'"/>
-              </do_if>
-              
-              <set_value name="$cleanedCount" exact="$cleanedCount + 1"/>
-            </do_if>
-          </do_if>
-        </do_all>
-        
-        <!-- ============================================= -->
-        <!-- SHIP REGISTRY CLEANUP -->
-        <!-- Check ships in global.$GT_Ships that no longer have GT orders -->
-        <!-- This catches ships reassigned to vanilla station traders or other orders -->
-        <!-- ============================================= -->
-        <set_value name="$cleanedShipCount" exact="0"/>
-        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
-          <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
-          
-          <do_all exact="$shipKeys.count" counter="$j">
-            <set_value name="$ship" exact="$shipKeys.{$j}"/>
-            
-            <!-- Skip if ship no longer exists -->
-            <do_if value="not $ship.exists">
-              <continue/>
-            </do_if>
-            
-            <!-- Check if ship still has active GT order -->
-            <set_value name="$hasGTOrder" exact="false"/>
-            
-            <!-- Direct GT order check -->
-            <do_if value="$ship.defaultorder?">
-              <do_if value="@$ship.defaultorder.id == 'GalaxyTraderMK3'">
-                <set_value name="$hasGTOrder" exact="true"/>
-              </do_if>
-              
-              <!-- Subordinate check: If ship has Assist order, check commander -->
-              <do_elseif value="@$ship.defaultorder.id == 'Assist'">
-                <do_if value="$ship.commander and $ship.commander.exists and $ship.commander != $ship">
-                  <do_if value="$ship.commander.defaultorder?">
-                    <do_if value="@$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
-                      <set_value name="$hasGTOrder" exact="true"/>
-                    </do_if>
-                  </do_if>
-                </do_if>
-              </do_elseif>
-            </do_if>
-            
-            <!-- If ship doesn't have GT order but is still in registry, remove it -->
-            <do_if value="not $hasGTOrder">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Core] ORPHANED SHIP DETECTED: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') - no GT order found, removing from registry'" chance="100"/>
-              </do_if>
-              
-              <!-- CRITICAL: Restore original ship name before cleanup -->
-              <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
-                <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
-                <set_object_name object="$ship" name="$originalName"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Core] Restored original name for orphaned ship ' + $ship.knownname + ' -> ' + $originalName" chance="100"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Remove ship from GT_Ships registry -->
-              <remove_value name="global.$GT_Ships.{$ship}"/>
-              
-              <!-- Clean up fleet data -->
-              <do_if value="global.$GT_FleetData? and global.$GT_FleetData.{$ship}?">
-                <remove_value name="global.$GT_FleetData.{$ship}"/>
-              </do_if>
-              
-              <!-- Clear pending trade data -->
-              <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
-                <param name="ship" value="$ship"/>
-              </run_actions>
-              
-              <!-- Update active trader count if ship was operational -->
-              <do_if value="$ship.isoperational and global.$GT_ActiveTraderCount? and global.$GT_ActiveTraderCount gt 0">
-                <set_value name="global.$GT_ActiveTraderCount" operation="subtract"/>
-              </do_if>
-              
-              <set_value name="$cleanedShipCount" exact="$cleanedShipCount + 1"/>
-            </do_if>
-            
-            <!-- CRITICAL: Check for missing pilot (ship has GT order but no pilot) -->
-            <!-- This catches cases where pilot was transferred but GT order script didn't restart -->
-            <do_elseif value="$hasGTOrder and not $ship.pilot?">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Core] MISSING PILOT DETECTED: Ship ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') has GT order but no pilot - triggering cleanup'" chance="100"/>
-              </do_if>
-              
-              <!-- Get original ship name from ship registry -->
-              <set_value name="$originalName" exact="null"/>
-              <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
-                <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
-              </do_if>
-              
-              <!-- Send cleanup signal (same as missing pilot detection in GT order script) -->
-              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                $Ship = $ship,
-                $Pilot = null,
-                $Reason = 'Pilot transferred away - GT order cannot run without pilot (detected in orphaned cleanup)',
-                $OriginalName = $originalName
-              ]"/>
-              
-              <set_value name="$cleanedShipCount" exact="$cleanedShipCount + 1"/>
-            </do_elseif>
-          </do_all>
-        </do_if>
-        
-        <!-- Report cleanup results -->
-        <set_value name="$totalCleaned" exact="$cleanedCount + $cleanedShipCount"/>
-        <do_if value="$totalCleaned gt 0">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] Orphaned cleanup complete: ' + $cleanedCount + ' pilots cleaned up, ' + $cleanedShipCount + ' ships removed from registry'" chance="100"/>
-          </do_if>
+        <!-- Skip if ship doesn't exist -->
+        <do_if value="not $ship.exists">
         </do_if>
         <do_else>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] Orphaned cleanup complete: No orphaned pilots or ships found'" chance="100"/>
+          <!-- Check if ship is in registry -->
+          <set_value name="$shipInRegistry" exact="false"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="$shipInRegistry" exact="true"/>
           </do_if>
-        </do_else>
+          
+          <!-- Only process cleanup if ship is in registry (reliable data source) -->
+          <do_if value="not $shipInRegistry">
+          </do_if>
+          <do_else>
+            <!-- Ship is in registry - continue with orphaned check -->
         
-        <!-- Schedule next cleanup in 5 minutes -->
-        <signal_cue_instantly cue="OrphanedPilotCleanupScheduler"/>
+        <!-- Check if ship still has active GT order -->
+        <set_value name="$hasGTOrder" exact="false"/>
+        <set_value name="$hasAssistOrder" exact="false"/>
+        <set_value name="$commanderStatusKnown" exact="false"/>
+        
+        <!-- Direct GT order check -->
+        <do_if value="$ship.defaultorder?">
+          <do_if value="@$ship.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasGTOrder" exact="true"/>
+            <set_value name="$commanderStatusKnown" exact="true"/>
+          </do_if>
+          
+          <!-- Subordinate check: If ship has Assist order, check commander -->
+          <do_elseif value="@$ship.defaultorder.id == 'Assist'">
+            <set_value name="$hasAssistOrder" exact="true"/>
+            <do_if value="$ship.commander and $ship.commander.exists and $ship.commander != $ship">
+              <do_if value="$ship.commander.defaultorder?">
+                <set_value name="$commanderStatusKnown" exact="true"/>
+                <do_if value="@$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+                  <set_value name="$hasGTOrder" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <!-- If commander check failed (commander doesn't exist, etc.), commanderStatusKnown stays false -->
+            <!-- This means we can't verify commander status, so we should NOT clean up the ship -->
+          </do_elseif>
+        </do_if>
+        
+        <!-- Only clean up if we can VERIFY ship doesn't have GT order -->
+        <!-- If ship has Assist order but commander status is unknown, keep it to avoid false positives -->
+        <do_if value="not $hasGTOrder and (not $hasAssistOrder or $commanderStatusKnown)">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up orphaned ship: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Get original ship name from ship registry (try multiple sources) -->
+          <set_value name="$originalName" exact="null"/>
+          <!-- Try ship registry first -->
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          <!-- Fallback: Try pilot registry -->
+          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_elseif>
+          <!-- Last resort: Use macro name (unformatted) -->
+          <do_elseif value="$ship.macro?">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_elseif>
+          
+          <!-- Send cleanup signal (reuses existing HandleShipOrderAborted logic) -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+            $Ship = $ship,
+            $Pilot = $ship.pilot,
+            $Reason = 'Orphaned ship detected (event-driven check)',
+            $OriginalName = $originalName
+          ]"/>
+        </do_if>
+        
+        <!-- Check for missing pilot (ship has GT order but no pilot) -->
+        <do_elseif value="$hasGTOrder and not $ship.pilot?">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship without pilot: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Set default order to Wait (hold position) before cleanup -->
+          <do_if value="$ship.defaultorder?">
+            <create_order id="'Wait'" object="$ship" default="true">
+              <param name="allowdocked" value="true"/>
+              <param name="holdfire" value="false"/>
+              <param name="noattackresponse" value="false"/>
+            </create_order>
+          </do_if>
+          
+          <!-- Get original ship name from ship registry -->
+          <set_value name="$originalName" exact="null"/>
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          
+          <!-- Send cleanup signal -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+            $Ship = $ship,
+            $Pilot = null,
+            $Reason = 'Pilot transferred away - GT order cannot run without pilot (event-driven check)',
+            $OriginalName = $originalName
+          ]"/>
+        </do_elseif>
+          </do_else>
+        </do_else>
       </actions>
     </cue>
     
@@ -958,9 +970,9 @@
                 <set_value name="global.$GT_Ships.{$ship}.$OriginalShipName" exact="$pilotData.$OriginalShipName"/>
                 <set_value name="$migratedCount" operation="add"/>
                 
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <!-- <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Core] Migrated original name for ship ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') from pilot ' + $pilot.name + ': ' + $pilotData.$OriginalShipName" chance="100"/>
-                </do_if>
+                </do_if> -->
               </do_if>
               <do_else>
                 <!-- Ship already has OriginalShipName - skip migration -->
@@ -982,29 +994,44 @@
       </actions>
     </cue>
     
-    <!-- Trigger orphaned cleanup on game load (scheduler will be started by cleanup cue itself) -->
-    <cue name="TriggerCleanupOnLoad" instantiate="true">
-      <conditions>
-        <event_game_loaded/>
-      </conditions>
-      <actions>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Core] Game loaded - triggering orphaned pilot cleanup...'" chance="100"/>
-        </do_if>
-        <signal_cue_instantly cue="OrphanedPilotCleanup"/>
-        <!-- Scheduler will be triggered by OrphanedPilotCleanup when it completes -->
-      </actions>
-    </cue>
+    <!-- Polling-based cleanup removed - now using event-driven checks -->
+    <!-- Orphaned ships are checked when:
+         - Pilot is transferred (GT_Update_Ship with pilot_change) → checks old ship
+         - GT order is canceled (GT_Ship_State_Update with GT_Order_Cancelled) → checks ship
+         - Wait/Assist orders detect GT order removal → checks ship
+    -->
     
-    <!-- Scheduler for recurring cleanup every 5 minutes -->
-    <cue name="OrphanedPilotCleanupScheduler" instantiate="true">
+    <!-- Handler for GT_Ship_State_Update - Triggers orphaned check when GT order is cancelled -->
+    <cue name="HandleShipStateUpdate" instantiate="true">
       <conditions>
-        <event_cue_signalled/>
+        <event_object_signalled object="player.galaxy" param="'GT_Ship_State_Update'"/>
       </conditions>
-      <delay exact="5min"/>
       <actions>
-        <signal_cue_instantly cue="OrphanedPilotCleanup"/>
-        <reset_cue cue="OrphanedPilotCleanupScheduler"/>
+        <set_value name="$params" exact="event.param2"/>
+        <set_value name="$updateType" exact="@$params.$UpdateType"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        
+        <!-- Trigger orphaned check when GT order is cancelled -->
+        <do_if value="$updateType == 'GT_Order_Cancelled' and $ship.exists">
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $ship]"/>
+          </do_if>
+          
+          <!-- EVENT-DRIVEN: Also check all subordinates of this ship (commander lost GT order) -->
+          <!-- When a commander loses GT order, all subordinates need to be checked -->
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+            <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
+            <do_all exact="$shipKeys.count" counter="$i">
+              <set_value name="$potentialSubordinate" exact="$shipKeys.{$i}"/>
+              <do_if value="$potentialSubordinate.exists and $potentialSubordinate.commander? and $potentialSubordinate.commander.exists and $potentialSubordinate.commander == $ship">
+                <!-- This ship is a subordinate of the commander that lost GT order -->
+                <do_if value="global.$GT_Ships.{$potentialSubordinate}?">
+                  <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $potentialSubordinate]"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
       </actions>
     </cue>
 
@@ -1308,6 +1335,22 @@
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Core] Processing pilot change on ' + $ship.knownname + ' - Old: ' + @$oldPilot.name + ', New: ' + @$pilot.name" chance="100"/>
             </do_if>
+          </do_if>
+          
+          <!-- EVENT-DRIVEN: Check old ship for orphaned status (if old pilot was transferred away) -->
+          <!-- CRITICAL: Don't require registry membership - ship might have been cleaned up already, but we should still check -->
+          <!-- The CheckShipOrphaned cue will handle registry checks internally -->
+          <do_if value="$oldPilot and $oldPilot.exists and $oldPilot.ship? and $oldPilot.ship.exists and $oldPilot.ship != $ship">
+            <set_value name="$oldShip" exact="$oldPilot.ship"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$oldShipInRegistry" exact="false"/>
+              <do_if value="global.$GT_Ships? and global.$GT_Ships.{$oldShip}?">
+                <set_value name="$oldShipInRegistry" exact="true"/>
+              </do_if>
+              <debug_text text="'[GT-Core] Pilot change: Checking old ship ' + $oldShip.idcode + ' (inRegistry=' + (if $oldShipInRegistry then 'YES' else 'NO') + ')'" chance="100"/>
+            </do_if>
+            <!-- Always trigger check - CheckShipOrphaned will handle registry membership internally -->
+            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $oldShip]"/>
           </do_if>
           
           <!-- Check if new pilot is a registered GT pilot -->

@@ -359,6 +359,11 @@
               $UpdateType = 'GT_Order_Cancelled'
             ]"/>
             
+            <!-- EVENT-DRIVEN: Trigger orphaned ship check -->
+            <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+              <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.ship]"/>
+            </do_if>
+            
             <!-- Restore ship name if not GT-controlled (direct or subordinate) -->
             <do_if value="not $hasDirectGTOrder and not $hasGTCommander and this.ship.pilot?">
               <set_value name="$originalName" exact="null"/>
@@ -743,44 +748,9 @@
     <!-- Register pilot on first run (for initial assignment or ship with existing cargo) -->
     <!-- This ensures ships get renamed even when first assigned to GT order -->
     <do_if value="this.ship.pilot">
-      <!-- CRITICAL: Wait for pilot transfer to complete if pilot is still transferring -->
+      <!-- NOTE: Cannot use wait/do_while in init block - pilot transfer check moved to main loop -->
       <!-- Pilot transfer takes time (crew transfer pod travel), but UI shows pilot as assigned immediately -->
-      <!-- Check if pilot is actually on ship by verifying pilot's ship property matches -->
-      <set_value name="$pilotTransferComplete" exact="false"/>
-      <set_value name="$transferWaitAttempts" exact="0"/>
-      <set_value name="$maxTransferWaitAttempts" exact="600"/> <!-- 5 minutes max (600 * 0.5s = 300s) -->
-      
-      <do_while value="not $pilotTransferComplete and $transferWaitAttempts lt $maxTransferWaitAttempts">
-        <!-- Check if pilot is actually on ship -->
-        <!-- If pilot is still transferring, pilot.ship will be null or not match this.ship -->
-        <set_value name="$pilotShip" exact="@this.ship.pilot.ship"/>
-        <do_if value="$pilotShip? and $pilotShip == this.ship">
-          <!-- Pilot is on ship - transfer complete -->
-          <set_value name="$pilotTransferComplete" exact="true"/>
-        </do_if>
-        <do_else>
-          <!-- Pilot still transferring - wait and check again -->
-          <set_value name="$transferWaitAttempts" operation="add"/>
-          <do_if value="$transferWaitAttempts == 1">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pilot transfer in progress - waiting for pilot to arrive on ship...'" chance="100"/>
-            </do_if>
-          </do_if>
-          <!-- Wait 0.5 seconds before checking again -->
-          <wait exact="1000ms"/>
-        </do_else>
-      </do_while>
-      
-      <do_if value="not $pilotTransferComplete">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] WARNING: ' + this.ship.idcode + ': Pilot transfer timeout after 5 minutes - proceeding anyway'" chance="100"/>
-        </do_if>
-      </do_if>
-      <do_else>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pilot transfer complete - pilot is on ship, proceeding with registration'" chance="100"/>
-        </do_if>
-      </do_else>
+      <!-- Main loop will check if pilot is actually on ship before proceeding -->
       
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INITIAL REGISTRATION: Registering pilot ' + @this.ship.pilot.name + ' on order start'" chance="100"/>
@@ -792,38 +762,9 @@
         $oldPilot = null
       ]"/>
       
-      <!-- CRITICAL: Wait for registration to complete before continuing -->
-      <!-- This ensures ship is registered in global.$GT_Ships before trade search starts -->
-      <!-- Registration happens synchronously via run_actions, but signal processing needs a moment -->
-      <wait exact="200ms"/>
-      
-      <!-- Verify ship is registered (defensive check) -->
-      <set_value name="$registrationComplete" exact="false"/>
-      <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
-        <set_value name="$registrationComplete" exact="true"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship registration verified - ready to proceed'" chance="100"/>
-        </do_if>
-      </do_if>
-      <do_else>
-        <!-- Ship not registered yet - wait longer -->
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship not yet registered - waiting longer...'" chance="100"/>
-        </do_if>
-        <wait exact="500ms"/>
-        <!-- Check again -->
-        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
-          <set_value name="$registrationComplete" exact="true"/>
-        </do_if>
-      </do_else>
-      
-      <!-- If still not registered after waits, log warning but continue anyway -->
-      <!-- Registration will complete eventually, and trade search can retry -->
-      <do_if value="not $registrationComplete">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] WARNING: ' + this.ship.idcode + ': Ship registration not complete after waits - continuing anyway (registration will complete asynchronously)'" chance="100"/>
-        </do_if>
-      </do_if>
+      <!-- NOTE: Cannot use wait in init block - registration check will happen in main loop -->
+      <!-- Registration happens synchronously via run_actions, but signal processing is asynchronous -->
+      <!-- Main loop will check registration status before requesting trade search -->
     </do_if>
     
     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -2092,18 +2033,26 @@
       <do_else>
         <!-- Ship ready for new trade - ensure ship is registered before requesting trade search -->
         <!-- This is critical when pilot is transferred to a new ship -->
+        <set_value name="$shipNotRegistered" exact="false"/>
         <do_if value="not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?">
           <!-- Ship not registered yet - wait a moment for registration to complete -->
           <!-- Registration happens via GT_Update_Ship signal sent in init block -->
+          <set_value name="$shipNotRegistered" exact="true"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Ship not yet registered - waiting for registration to complete...'" chance="100"/>
           </do_if>
+        </do_if>
+        <!-- Wait for registration (must be at top level, not inside do_if) -->
+        <do_if value="$shipNotRegistered">
           <wait exact="100ms"/>
-          <!-- Check again after wait -->
-          <do_if value="not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?">
-            <!-- Still not registered - wait longer -->
-            <wait exact="500ms"/>
-          </do_if>
+        </do_if>
+        <!-- Check again after wait -->
+        <do_if value="$shipNotRegistered and (not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?)">
+          <!-- Still not registered - wait longer -->
+        </do_if>
+        <!-- Wait longer if still not registered (must be at top level) -->
+        <do_if value="$shipNotRegistered and (not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?)">
+          <wait exact="500ms"/>
         </do_if>
         
         <!-- Check cargo status -->
@@ -4344,6 +4293,11 @@
           $Ship = this.ship,
           $UpdateType = 'GT_Order_Cancelled'
         ]"/>
+        
+        <!-- EVENT-DRIVEN: Trigger orphaned ship check -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+          <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.ship]"/>
+        </do_if>
         
         <!-- Restore ship name if not GT-controlled (direct or subordinate) -->
         <!-- Check if ship WAS a subordinate BEFORE GT order was cancelled -->
