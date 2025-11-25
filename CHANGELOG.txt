@@ -1,8 +1,131 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.6.13 - 2025-11-23
+Version 0.6.13 - 2025-11-24
 ---------------------------
+
+FIX: Trade Rule Validation - Respect "Internal Only" and Other Trade Rules
+  - Fixed GT ships attempting to trade at stations with trade rule restrictions
+  - Problem: GT ships were finding and attempting trades at stations with "internal only" trade rules
+    * Ships could find trade offers at stations they shouldn't trade with
+    * Trade orders were created but failed when executed (trade rules enforced by X4)
+    * Example: GT ships buying friendly faction and trying to sell at player's "internal only" warehouse
+  - Root Cause:
+    * Some `find_sell_offer`/`find_buy_offer` calls were missing `tradepartner` parameter
+    * Without `tradepartner`, X4's trade offer search doesn't filter by trade rules
+    * Trade rules (like "internal only") are only enforced when `tradepartner` is specified
+  - Solution: Added `tradepartner` parameter to all trade offer searches + final validation
+    * Added `tradepartner="$ship"` to cache validation in `gt_search_methods.xml` (lines 676, 681)
+    * Added `tradepartner="this.ship"` to library trade finding in `gt_libraries_general.xml` (lines 2508, 2528)
+    * Added final validation before `create_trade_order` in `order.trade.galaxytrader.xml` (lines 3340-3375)
+    * Final validation re-checks offers with `tradepartner` to ensure trade rules are respected
+  - Implementation:
+    * Cache validation (`gt_search_methods.xml`):
+      - `find_sell_offer` now includes `tradepartner="$ship"` when refreshing cached buy offers
+      - `find_buy_offer` now includes `tradepartner="$ship"` when refreshing cached sell offers
+    * Library function (`gt_libraries_general.xml`):
+      - `find_buy_offer` now includes `tradepartner="this.ship"` in `GT_FindBestTradeForShip`
+      - `find_sell_offer` now includes `tradepartner="this.ship"` when finding matching sell offers
+    * Final validation (`order.trade.galaxytrader.xml`):
+      - Before creating trade orders, re-validates both buy and sell offers using `find_*_offer` with `tradepartner`
+      - If offers are invalid (trade rules violation), skips order creation and signals `GT_No_Trade_Found` to retry
+      - Prevents failed trade orders and wasted time traveling to stations that won't trade
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added `tradepartner="$ship"` to cache validation offer searches
+    * `md/gt_libraries_general.xml`: Added `tradepartner="this.ship"` to library trade finding
+    * `aiscripts/order.trade.galaxytrader.xml`: Added final trade rule validation before order creation
+  - Benefits:
+    * Respects trade rules: GT ships no longer attempt trades at "internal only" stations
+    * Prevents wasted time: Ships don't travel to stations that will reject trades
+    * Matches vanilla behavior: Uses same `tradepartner` filtering pattern as vanilla X4
+    * Reliable: Final validation catches edge cases where offers might have been found without proper filtering
+  - Technical Details:
+    * X4's `find_sell_offer`/`find_buy_offer` functions filter trade offers based on trade rules when `tradepartner` is specified
+    * Trade rules like "internal only" restrict trading to same-owner ships
+    * Without `tradepartner`, all offers are visible regardless of trade rules
+    * With `tradepartner`, only offers that respect trade rules for that specific ship are returned
+    * Pattern matches vanilla `order.trade.perform.xml` (lines 168, 172) which always uses `tradepartner="this.ship"`
+  - User Experience:
+    * Automatic: No configuration required, works out of the box
+    * Transparent: Ships simply skip invalid trades and find alternatives
+    * Efficient: No wasted time traveling to stations that won't trade
+    * Reliable: Trade rules are respected at all stages (search, cache validation, order creation)
+
+PERFORMANCE: Ware Filter - Replaced Inefficient Station Scanning with Direct WareDB Query
+  - Major performance improvement: Replaced expensive station scanning with direct WareDB queries
+  - Problem: Ware categorization was using an inefficient method that scanned all stations
+    * Used `find_station` to get ALL stations in the galaxy
+    * Then queried ALL buy/sell offers from each station using `find_buy_offer`/`find_sell_offer`
+    * Extracted unique wares from trade offers
+    * Extremely slow and CPU-intensive, especially in large galaxies with many stations
+    * This was a stupid relic from inexperienced modding knowledge - didn't know about `get_ware_definition`
+  - Solution: Replaced with direct WareDB queries using `get_ware_definition`
+    * Uses X4's native `get_ware_definition` function to query the WareDB directly
+    * Gets wares by groups (hightech, refined, energy, food, medical, water, ore, gas, ice, container, ship, station, equipment)
+    * Combines groups and removes duplicates
+    * Instant access - no station scanning needed
+  - Implementation:
+    * `md/gt_ware_filter.xml` (`CategorizeWares` cue):
+      - Removed: `find_station` + `find_buy_offer`/`find_sell_offer` scanning loop
+      - Added: Multiple `get_ware_definition` calls for different ware groups
+      - Added: List combination and duplicate removal logic
+      - Categorization logic unchanged - still categorizes into low-value, dangerous, high-value
+  - Files Modified:
+    * `md/gt_ware_filter.xml`: Replaced station scanning with `get_ware_definition` queries
+  - Benefits:
+    * Massive performance improvement: Eliminates expensive station/offer queries
+    * Instant initialization: Ware categorization completes immediately instead of taking seconds/minutes
+    * Scales perfectly: Performance doesn't degrade with galaxy size or station count
+    * Proper method: Uses X4's intended API for ware discovery (matches vanilla patterns)
+  - Technical Details:
+    * `get_ware_definition` queries the WareDB directly - no station scanning required
+    * Vanilla X4 uses this method extensively (see `md/diplomacy.xml`, `md/factiongoal_hold_space.xml`)
+    * Pattern matches TaterTrader and other professional mods that use WareDB queries
+    * Old method was a naive approach that didn't leverage X4's built-in ware database
+  - User Experience:
+    * Faster mod initialization: Ware categorization completes instantly
+    * No stutter: Eliminates CPU spikes during ware categorization
+    * More reliable: Gets all wares from WareDB, not just what's currently being traded
+
+FIX: Commander Destruction Handling - Event-Driven Subordinate Cleanup
+  - Added event-driven handler for commander ship destruction
+  - Problem: When a commander ship with subordinates was destroyed, subordinates weren't properly handled
+    * Subordinates could remain in GT registry even after commander destroyed
+    * No detection of X4's automatic commander promotion (subordinates reassigned to new commander)
+    * Subordinates with new non-GT commanders weren't cleaned up
+  - Solution: Event-driven `event_object_destroyed` handler for commander destruction
+    * Detects when a GT commander ship is destroyed
+    * Checks all subordinates of destroyed commander
+    * Handles X4's automatic promotion: If new commander exists and has GT order, subordinate continues
+    * If no new commander OR new commander doesn't have GT order, triggers cleanup
+    * Matches vanilla pattern from `order.fight.escort.xml` (lines 1849-1885)
+  - Implementation:
+    * New cue `HandleCommanderDestroyed` in `gt_core_system.xml`:
+      - Listens to `event_object_destroyed object="player.entity"`
+      - Checks if destroyed ship was GT commander (`global.$GT_Ships` registry)
+      - Iterates through `$destroyedCommander.allsubordinates`
+      - For each subordinate:
+        * Checks if X4 auto-assigned new commander (`$subordinate.commander`)
+        * If new commander has GT order: Updates state, subordinate continues
+        * If no new commander or new commander lacks GT order: Triggers cleanup via `GT_Ship_Order_Aborted`
+    * Event-driven only: No polling fallback (as per user request)
+    * Cleanup includes original name restoration and proper registry cleanup
+  - Files Modified:
+    * `md/gt_core_system.xml`: Added `HandleCommanderDestroyed` cue (after `UnregisterShip`)
+  - Benefits:
+    * Immediate detection: Subordinates handled as soon as commander is destroyed
+    * Respects X4 auto-promotion: Subordinates continue with new GT commander if available
+    * Proper cleanup: Subordinates cleaned up when no valid GT commander remains
+    * Event-driven: No polling overhead, matches vanilla pattern
+  - Technical Details:
+    * Uses `event_object_destroyed` for immediate detection (matches vanilla `order.assist.xml` pattern)
+    * Checks `$subordinate.commander` to detect X4's automatic promotion
+    * Verifies new commander has GT order before allowing subordinate to continue
+    * Triggers `GT_Ship_Order_Aborted` for cleanup when no valid GT commander exists
+  - User Experience:
+    * Automatic: No player intervention required
+    * Transparent: Debug logging shows commander destruction and subordinate handling
+    * Reliable: Subordinates properly cleaned up or reassigned based on new commander status
 
 FEATURE: Lua Order Monitor - Event-Driven Ship Cleanup Detection
   - Replaced polling-based orphaned ship cleanup with efficient batched Lua monitoring

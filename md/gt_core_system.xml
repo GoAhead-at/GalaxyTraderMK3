@@ -180,6 +180,186 @@
       </actions>
     </cue>
     
+    <!-- Commander Destruction Handler - Handle Subordinates When Commander is Destroyed -->
+    <cue name="HandleCommanderDestroyed" instantiate="true">
+      <conditions>
+        <event_object_destroyed object="player.entity"/>
+      </conditions>
+      <actions>
+        <set_value name="$destroyedCommander" exact="event.object"/>
+        
+        <!-- Check if destroyed ship was a commander with GT order -->
+        <do_if value="global.$GT_Ships.{$destroyedCommander}?">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] Commander destroyed: ' + $destroyedCommander.knownname + ' (ID: ' + $destroyedCommander.idcode + ') - checking subordinates'" chance="100"/>
+          </do_if>
+          
+          <!-- Find all subordinates of this commander -->
+          <!-- Use safe operator since ship is destroyed and allsubordinates might not be accessible -->
+          <set_value name="$subordinates" exact="[]"/>
+          <do_if value="$destroyedCommander.allsubordinates?">
+            <set_value name="$subordinates" exact="@$destroyedCommander.allsubordinates"/>
+          </do_if>
+          <do_if value="$subordinates? and $subordinates.count gt 0">
+            <!-- First pass: Identify promoted subordinate (if any) -->
+            <!-- When X4 promotes a subordinate to commander, it:
+                 1. No longer has a commander (or commander is destroyed)
+                 2. Gets a GT order directly (not via Assist)
+                 3. May have subordinates assigned (but timing can vary) -->
+            <set_value name="$promotedSubordinate" exact="null"/>
+            <do_all exact="$subordinates.count" counter="$i">
+              <set_value name="$subordinate" exact="$subordinates.{$i}"/>
+              <do_if value="$subordinate.exists and global.$GT_Ships.{$subordinate}?">
+                <!-- Check if this subordinate was promoted -->
+                <set_value name="$hasNoCommander" exact="false"/>
+                <do_if value="not $subordinate.commander? or not $subordinate.commander.exists or $subordinate.commander == $destroyedCommander">
+                  <set_value name="$hasNoCommander" exact="true"/>
+                </do_if>
+                
+                <!-- Check if subordinate has GT order directly (not via Assist) - indicates promotion -->
+                <set_value name="$hasDirectGTOrder" exact="false"/>
+                <do_if value="$hasNoCommander and $subordinate.defaultorder? and @$subordinate.defaultorder.id == 'GalaxyTraderMK3'">
+                  <set_value name="$hasDirectGTOrder" exact="true"/>
+                </do_if>
+                
+                <!-- Also check if subordinate has subordinates (another indicator) -->
+                <set_value name="$hasSubordinates" exact="false"/>
+                <do_if value="$subordinate.allsubordinates? and @$subordinate.allsubordinates.count gt 0">
+                  <set_value name="$hasSubordinates" exact="true"/>
+                </do_if>
+                
+                <!-- If subordinate has no commander AND (has direct GT order OR has subordinates), it was promoted -->
+                <do_if value="$hasNoCommander and ($hasDirectGTOrder or $hasSubordinates)">
+                  <set_value name="$promotedSubordinate" exact="$subordinate"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' was promoted to commander (has direct GT order: ' + $hasDirectGTOrder + ', has subordinates: ' + $hasSubordinates + ')'" chance="100"/>
+                  </do_if>
+                  <break/>
+                </do_if>
+              </do_if>
+            </do_all>
+            
+            <!-- Second pass: Process all subordinates -->
+            <do_all exact="$subordinates.count" counter="$i">
+              <set_value name="$subordinate" exact="$subordinates.{$i}"/>
+              
+              <!-- Check if subordinate is in GT registry -->
+              <do_if value="$subordinate.exists and global.$GT_Ships.{$subordinate}?">
+                <!-- Skip cleanup if this subordinate was promoted to commander -->
+                <do_if value="$promotedSubordinate? and $subordinate == $promotedSubordinate">
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Core] Skipping cleanup for promoted subordinate ' + $subordinate.idcode + ' (now commander)'" chance="100"/>
+                  </do_if>
+                  
+                  <!-- Update state to reflect promotion (no longer subordinate, now commander) -->
+                  <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+                    $Ship = $subordinate,
+                    $UpdateType = 'Promoted_To_Commander',
+                    $Commander = null,
+                    $CommanderHasGT = false
+                  ]"/>
+                </do_if>
+                <do_else>
+                  <!-- Check if X4 automatically assigned a new commander -->
+                  <set_value name="$newCommander" exact="null"/>
+                  <set_value name="$hasNewCommander" exact="false"/>
+                  <do_if value="$subordinate.commander? and $subordinate.commander.exists and $subordinate.commander != $destroyedCommander">
+                    <set_value name="$newCommander" exact="$subordinate.commander"/>
+                    <set_value name="$hasNewCommander" exact="true"/>
+                  </do_if>
+                  
+                  <!-- If no explicit commander but promoted subordinate exists, check if subordinate should follow promoted one -->
+                  <!-- CRITICAL: Check both commander property AND promoted subordinate's subordinates list -->
+                  <!-- X4 might not have updated $subordinate.commander yet, but subordinates list is updated immediately -->
+                  <do_if value="not $hasNewCommander and $promotedSubordinate? and $promotedSubordinate.exists">
+                    <!-- Check 1: Is subordinate's commander property updated? -->
+                    <do_if value="$subordinate.commander? and $subordinate.commander == $promotedSubordinate">
+                      <set_value name="$newCommander" exact="$promotedSubordinate"/>
+                      <set_value name="$hasNewCommander" exact="true"/>
+                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' has commander property updated to ' + $promotedSubordinate.idcode" chance="100"/>
+                      </do_if>
+                    </do_if>
+                    <!-- Check 2: Is subordinate in promoted subordinate's subordinates list? (handles timing issues) -->
+                    <do_if value="not $hasNewCommander and $promotedSubordinate.allsubordinates?">
+                      <set_value name="$promotedSubordinates" exact="@$promotedSubordinate.allsubordinates"/>
+                      <do_if value="$promotedSubordinates? and $promotedSubordinates.count gt 0">
+                        <do_all exact="$promotedSubordinates.count" counter="$j">
+                          <do_if value="$promotedSubordinates.{$j} == $subordinate">
+                            <set_value name="$newCommander" exact="$promotedSubordinate"/>
+                            <set_value name="$hasNewCommander" exact="true"/>
+                            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                              <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' found in promoted commander ' + $promotedSubordinate.idcode + ' subordinates list (timing workaround)'" chance="100"/>
+                            </do_if>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
+                    </do_if>
+                    <!-- Debug: Log if subordinate still not found -->
+                    <do_if value="not $hasNewCommander and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <set_value name="$subCommander" exact="null"/>
+                      <do_if value="$subordinate.commander?">
+                        <set_value name="$subCommander" exact="$subordinate.commander"/>
+                      </do_if>
+                      <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' not reassigned to promoted commander ' + $promotedSubordinate.idcode + ' (commander: ' + $subCommander + ', promoted has ' + (@$promotedSubordinate.allsubordinates.count) + ' subordinates)'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Check if new commander has GT order -->
+                  <set_value name="$newCommanderHasGT" exact="false"/>
+                  <do_if value="$hasNewCommander and $newCommander.defaultorder? and @$newCommander.defaultorder.id == 'GalaxyTraderMK3'">
+                    <set_value name="$newCommanderHasGT" exact="true"/>
+                  </do_if>
+                  
+                  <do_if value="$hasNewCommander and $newCommanderHasGT">
+                    <!-- New commander exists and has GT order - subordinate continues with new commander -->
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' automatically reassigned to new GT commander ' + $newCommander.idcode + ' (X4 auto-promotion)'" chance="100"/>
+                    </do_if>
+                    
+                    <!-- Update state to reflect new commander -->
+                    <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+                      $Ship = $subordinate,
+                      $UpdateType = 'Commander_Changed',
+                      $Commander = $newCommander,
+                      $CommanderHasGT = true
+                    ]"/>
+                  </do_if>
+                  <do_else>
+                    <!-- No new commander OR new commander doesn't have GT order - trigger cleanup -->
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' lost GT commander (destroyed) - triggering cleanup'" chance="100"/>
+                    </do_if>
+                    
+                    <!-- Get original name for cleanup -->
+                    <set_value name="$originalName" exact="null"/>
+                    <do_if value="global.$GT_Ships.{$subordinate}? and global.$GT_Ships.{$subordinate}.$OriginalShipName?">
+                      <set_value name="$originalName" exact="global.$GT_Ships.{$subordinate}.$OriginalShipName"/>
+                    </do_if>
+                    <do_elseif value="$subordinate.pilot? and global.$GT_Pilots.{$subordinate.pilot}? and global.$GT_Pilots.{$subordinate.pilot}.$OriginalShipName?">
+                      <set_value name="$originalName" exact="global.$GT_Pilots.{$subordinate.pilot}.$OriginalShipName"/>
+                    </do_elseif>
+                    <do_elseif value="$subordinate.macro?">
+                      <set_value name="$originalName" exact="@$subordinate.macro.name"/>
+                    </do_elseif>
+                    
+                    <!-- Trigger cleanup -->
+                    <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                      $Ship = $subordinate,
+                      $Pilot = $subordinate.pilot,
+                      $Reason = 'Commander destroyed (no new GT commander)',
+                      $OriginalName = $originalName
+                    ]"/>
+                  </do_else>
+                </do_else>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
     <!-- Periodic System Maintenance -->
     <cue name="SystemMaintenance" instantiate="true" checkinterval="60s">
       <conditions>
@@ -544,11 +724,83 @@
           </do_if>
         </do_if>
         
-        <!-- Skip cleanup if subordinate has pilot and commander is being cleaned up -->
-        <!-- Let subordinates finish their orders when commander is cleaned up -->
-        <do_if value="$isSubordinate and $pilot? and $isCommanderCleanup">
+        <!-- Handle subordinates differently when commander is cleaned up -->
+        <!-- Subordinates get cleaned up (registry removal, name restoration) but keep their active orders -->
+        <do_if value="$isSubordinate and $isCommanderCleanup">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Cleanup] Skipping cleanup for subordinate with pilot (commander cleanup): ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') - letting ship finish orders'" chance="100"/>
+            <debug_text text="'[GT-Cleanup] Cleaning up subordinate (commander lost GT order): ' + $ship.knownname + ' (ID: ' + $ship.idcode + ') - preserving active orders'" chance="100"/>
+          </do_if>
+          
+          <!-- Skip order cancellation - subordinates keep their active orders (trade orders continue) -->
+          <!-- Only do registry cleanup and name restoration -->
+          
+          <!-- ============================================= -->
+          <!-- SHIP NAME RESTORATION                        -->
+          <!-- ============================================= -->
+          
+          <!-- Use extracted library function to restore original ship name -->
+          <run_actions ref="md.GT_Ship_Management.Restore_Original_Ship_Name">
+            <param name="ship" value="$ship"/>
+            <param name="pilot" value="$pilot"/>
+            <param name="originalName" value="$originalName"/>
+          </run_actions>
+
+          <!-- ============================================= -->
+          <!-- SHIP MODIFICATION CLEANUP                   -->
+          <!-- ============================================= -->
+          
+          <!-- Clean up any ship modification tracking -->
+          <do_if value="global.$GT_Applied_Mods? and global.$GT_Applied_Mods.{$ship}?">
+            <remove_value name="global.$GT_Applied_Mods.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] Ship modification tracking cleared for ' + $ship.knownname" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ============================================= -->
+          <!-- REGISTRY CLEANUP                             -->
+          <!-- ============================================= -->
+          
+          <!-- Remove ship from GT_Ships registry -->
+          <do_if value="global.$GT_Ships.{$ship}?">
+            <remove_value name="global.$GT_Ships.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] Ship removed from GT_Ships registry: ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- ============================================= -->
+          <!-- PILOT DATA PRESERVATION (CRITICAL)            -->
+          <!-- ============================================= -->
+          
+          <!-- CRITICAL: DO NOT remove pilot from GT_Pilots registry - preserve XP data -->
+          <!-- When commander gets GT order again, subordinates will be re-registered and need their XP -->
+          <do_if value="$pilot and global.$GT_Pilots.{$pilot}?">
+            <!-- Mark pilot as paused/inactive but keep all XP data -->
+            <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$PausedTime" exact="player.age"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$PausedReason" exact="'Commander lost GT order'"/>
+            
+            <!-- PRESERVE TRAINING STATE: Save training requirements if active -->
+            <!-- Don't clear training flags - keep them so training requirement is preserved when pilot is reactivated -->
+            <do_if value="global.$GT_Pilots.{$pilot}.$XPBlocked?">
+              <set_value name="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded" exact="true"/>
+              <set_value name="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel" exact="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GalaxyTrader MK3] TRAINING STATE PRESERVED: Pilot ' + $pilot.name + ' was XP blocked at level ' + global.$GT_Pilots.{$pilot}.$BlockedLevel + ' - will restore training requirement'" chance="100"/>
+              </do_if>
+              <!-- Keep XPBlocked and BlockedLevel flags - Initialize_Pilot_Data will handle restoration -->
+              <!-- Only clear TrainingInProgress since training is paused -->
+              <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingInProgress"/>
+            </do_if>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] Pilot marked as paused (XP preserved): ' + $pilot.name + ' - XP: ' + global.$GT_Pilots.{$pilot}.$XP + ' (will be restored when re-registered)'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Ship cleanup completed for ' + $ship.idcode + ' (pilot XP preserved)'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
@@ -1018,7 +1270,8 @@
           </do_if>
           
           <!-- EVENT-DRIVEN: Also check all subordinates of this ship (commander lost GT order) -->
-          <!-- When a commander loses GT order, all subordinates need to be checked -->
+          <!-- When a commander loses GT order, subordinates need cleanup (registry removal, name restoration) -->
+          <!-- BUT: Subordinates keep their active orders (trade orders continue) -->
           <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
             <set_value name="$shipKeys" exact="global.$GT_Ships.keys.list"/>
             <do_all exact="$shipKeys.count" counter="$i">
@@ -1026,7 +1279,25 @@
               <do_if value="$potentialSubordinate.exists and $potentialSubordinate.commander? and $potentialSubordinate.commander.exists and $potentialSubordinate.commander == $ship">
                 <!-- This ship is a subordinate of the commander that lost GT order -->
                 <do_if value="global.$GT_Ships.{$potentialSubordinate}?">
-                  <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $potentialSubordinate]"/>
+                  <!-- Trigger cleanup with commander cleanup reason so orders are preserved -->
+                  <set_value name="$originalName" exact="null"/>
+                  <do_if value="global.$GT_Ships.{$potentialSubordinate}? and global.$GT_Ships.{$potentialSubordinate}.$OriginalShipName?">
+                    <set_value name="$originalName" exact="global.$GT_Ships.{$potentialSubordinate}.$OriginalShipName"/>
+                  </do_if>
+                  <do_elseif value="$potentialSubordinate.pilot? and global.$GT_Pilots.{$potentialSubordinate.pilot}? and global.$GT_Pilots.{$potentialSubordinate.pilot}.$OriginalShipName?">
+                    <set_value name="$originalName" exact="global.$GT_Pilots.{$potentialSubordinate.pilot}.$OriginalShipName"/>
+                  </do_elseif>
+                  <do_elseif value="$potentialSubordinate.macro?">
+                    <set_value name="$originalName" exact="@$potentialSubordinate.macro.name"/>
+                  </do_elseif>
+                  
+                  <!-- Trigger cleanup with commander cleanup reason -->
+                  <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                    $Ship = $potentialSubordinate,
+                    $Pilot = $potentialSubordinate.pilot,
+                    $Reason = 'Commander lost GT order',
+                    $OriginalName = $originalName
+                  ]"/>
                 </do_if>
               </do_if>
             </do_all>
