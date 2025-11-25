@@ -100,6 +100,28 @@
         <param name="ship" comment="Associated ship"/>
       </params>
       <actions>
+        <!-- CRITICAL: Store original ship name BEFORE renaming -->
+        <!-- Initialize ship registry if needed -->
+        <do_if value="not global.$GT_Ships?">
+          <set_value name="global.$GT_Ships" exact="table[]"/>
+        </do_if>
+        
+        <!-- Store original ship name in ship registry (per ship, not per pilot) -->
+        <!-- Only set if not already stored (preserve user's custom rename via MK3 rename functionality) -->
+        <!-- MUST be done BEFORE Update_Pilot_Ship_Name renames the ship -->
+        <do_if value="not global.$GT_Ships.{$ship}?">
+          <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Ships.{$ship}.$OriginalShipName?">
+          <run_actions ref="Strip_GT_Name_Formatting" result="$cleanedName">
+            <param name="shipName" value="$ship.knownname"/>
+          </run_actions>
+          <set_value name="global.$GT_Ships.{$ship}.$OriginalShipName" exact="$cleanedName"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Stored original ship name BEFORE renaming: ' + $ship.knownname + ' -> ' + $cleanedName" chance="100"/>
+          </do_if>
+        </do_if>
+        
         <!-- Use extracted initialization library -->
         <!-- This handles: new pilots, existing active pilots, and reactivated paused pilots -->
         <run_actions ref="Initialize_Pilot_Data" result="$wasNewPilot">
@@ -161,12 +183,46 @@
         <!-- Update ship association -->
         <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
         
+        <!-- Initialize ship registry if needed -->
+        <do_if value="not global.$GT_Ships?">
+          <set_value name="global.$GT_Ships" exact="table[]"/>
+        </do_if>
+        
+        <!-- Ensure ship is fully registered in global.$GT_Ships -->
+        <!-- This is critical for trade search to work properly -->
+        <!-- Note: Ship registry entry was already created above (before renaming) -->
+        <do_if value="not global.$GT_Ships.{$ship}.$RegisterTime?">
+          <set_value name="global.$GT_Ships.{$ship}.$RegisterTime" exact="player.age"/>
+          <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+          <set_value name="global.$GT_Ships.{$ship}.$Status" exact="'active'"/>
+          <set_value name="global.$GT_Ships.{$ship}.$Pilot" exact="$pilot"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Registered ship in Register_Pilot: ' + $ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Ship already registered - update pilot reference and last update time -->
+          <set_value name="global.$GT_Ships.{$ship}.$Pilot" exact="$pilot"/>
+          <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+        </do_else>
+        
+        <!-- Original ship name already stored above (before renaming) -->
+        
         <!-- Store ship ID for reliable swap detection (ship objects can become invalid) -->
         <!-- Use both ship object AND ship ID for comparison - ID is more reliable for persistence -->
         <set_value name="$currentShipID" exact="$ship.idcode"/>
         <set_value name="$previousShipID" exact="null"/>
+        <set_value name="$oldShip" exact="null"/>
         <do_if value="global.$GT_Pilots.{$pilot}.$ShipID?">
           <set_value name="$previousShipID" exact="global.$GT_Pilots.{$pilot}.$ShipID"/>
+          <!-- Try to get old ship object if it still exists -->
+          <do_if value="global.$GT_Pilots.{$pilot}.$Ship? and global.$GT_Pilots.{$pilot}.$Ship.exists">
+            <set_value name="$oldShip" exact="global.$GT_Pilots.{$pilot}.$Ship"/>
+            <!-- Verify ID matches (ship object might have been reassigned) -->
+            <do_if value="$oldShip.idcode != $previousShipID">
+              <set_value name="$oldShip" exact="null"/>
+            </do_if>
+          </do_if>
         </do_if>
         
         <!-- Determine if this is a new ship assignment or resuming on same ship -->
@@ -210,15 +266,66 @@
             <set_value name="$isNewShip" exact="true"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$currentShipID"/>
-            <!-- Update original ship name if ship changed, but only if not already set (preserve user's custom rename) -->
-            <do_if value="not global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-              <run_actions ref="Strip_GT_Name_Formatting" result="$cleanedName">
-                <param name="shipName" value="$ship.knownname"/>
-              </run_actions>
-              <set_value name="global.$GT_Pilots.{$pilot}.$OriginalShipName" exact="$cleanedName"/>
-            </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-ShipMgmt] Pilot ' + $pilot.name + ' reassigned to NEW ship: ' + $ship.knownname + ' (ID: ' + $currentShipID + ', previous ID: ' + $previousShipID + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- ======================================= -->
+            <!-- OLD SHIP CLEANUP (Pilot Transfer)      -->
+            <!-- ======================================= -->
+            <!-- Handle cleanup of old ship when pilot is transferred -->
+            <do_if value="$oldShip and $oldShip.exists">
+              <set_value name="$oldShipHasGTOrder" exact="false"/>
+              <set_value name="$oldShipHasPilot" exact="false"/>
+              
+              <!-- Check if old ship has GT order -->
+              <do_if value="$oldShip.defaultorder?">
+                <do_if value="@$oldShip.defaultorder.id == 'GalaxyTraderMK3'">
+                  <set_value name="$oldShipHasGTOrder" exact="true"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Check if old ship has a pilot -->
+              <do_if value="$oldShip.pilot?">
+                <set_value name="$oldShipHasPilot" exact="true"/>
+              </do_if>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-ShipMgmt] Old ship cleanup check: ' + $oldShip.knownname + ' (GT order: ' + $oldShipHasGTOrder + ', Pilot: ' + $oldShipHasPilot + ')'" chance="100"/>
+              </do_if>
+              
+              <!-- Case: Old ship has GT order but NO pilot -->
+              <!-- The old ship's GT order will detect missing pilot at its next restart point -->
+              <!-- No cleanup needed from transferring ship's perspective -->
+              <do_if value="$oldShipHasGTOrder and not $oldShipHasPilot">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-ShipMgmt] Old ship ' + $oldShip.knownname + ' has GT order but no pilot - cleanup handled by that ship\'s GT order'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Case: Old ship has NO GT order -->
+              <!-- Restore original name if stored in ship registry -->
+              <do_elseif value="not $oldShipHasGTOrder">
+                <set_value name="$oldShipOriginalName" exact="null"/>
+                <do_if value="global.$GT_Ships.{$oldShip}? and global.$GT_Ships.{$oldShip}.$OriginalShipName?">
+                  <set_value name="$oldShipOriginalName" exact="global.$GT_Ships.{$oldShip}.$OriginalShipName"/>
+                </do_if>
+                
+                <do_if value="$oldShipOriginalName">
+                  <set_object_name object="$oldShip" name="$oldShipOriginalName"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-ShipMgmt] Restored original name for old ship ' + $oldShip.knownname + ' -> ' + $oldShipOriginalName" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_elseif>
+              
+              <!-- Case: Old ship has GT order with different pilot -->
+              <!-- No cleanup needed - that pilot handles the ship -->
+              <do_elseif value="$oldShipHasGTOrder and $oldShipHasPilot">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-ShipMgmt] Old ship ' + $oldShip.knownname + ' has GT order with different pilot - no cleanup needed'" chance="100"/>
+                </do_if>
+              </do_elseif>
             </do_if>
             
             <!-- Send logbook message when pilot is transferred to new ship after reactivation -->
@@ -250,13 +357,7 @@
           <set_value name="$isNewShip" exact="true"/>
           <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
           <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$currentShipID"/>
-          <!-- Ensure original name is stored -->
-          <do_if value="not global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-            <run_actions ref="Strip_GT_Name_Formatting" result="$cleanedName">
-              <param name="shipName" value="$ship.knownname"/>
-            </run_actions>
-            <set_value name="global.$GT_Pilots.{$pilot}.$OriginalShipName" exact="$cleanedName"/>
-          </do_if>
+          <!-- Original ship name already stored above (per ship, not per pilot) -->
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-ShipMgmt] First-time registration - pilot ' + $pilot.name + ' on ship: ' + $ship.knownname + ' (ID: ' + $currentShipID + ')'" chance="100"/>
           </do_if>
@@ -1070,7 +1171,15 @@
         
         <do_if value="$pilotExists">
           <!-- Pilot exists - check if they were paused -->
-          <do_if value="global.$GT_Pilots.{$pilot}.$Status? and global.$GT_Pilots.{$pilot}.$Status == 'paused'">
+          <!-- CRITICAL: If Status is missing, treat as paused to preserve XP (defensive check) -->
+          <set_value name="$pilotStatus" exact="null"/>
+          <do_if value="global.$GT_Pilots.{$pilot}.$Status?">
+            <set_value name="$pilotStatus" exact="global.$GT_Pilots.{$pilot}.$Status"/>
+          </do_if>
+          
+          <!-- If pilot exists but Status is missing/null, treat as paused to preserve XP -->
+          <!-- This prevents accidental XP loss if Status field was somehow cleared -->
+          <do_if value="not $pilotStatus? or $pilotStatus == 'paused'">
             <set_value name="$wasPaused" exact="true"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-ShipMgmt] Reactivating PAUSED pilot: ' + $pilot.name + ' (XP: ' + (if global.$GT_Pilots.{$pilot}.$XP? then global.$GT_Pilots.{$pilot}.$XP else 0) + ', Level: ' + (if global.$GT_Pilots.{$pilot}.$Level? then global.$GT_Pilots.{$pilot}.$Level else 1) + ')'" chance="100"/>
@@ -1092,13 +1201,7 @@
               <param name="pilot" value="$pilot"/>
             </run_actions>
             
-            <!-- Update original ship name if ship changed, but only if not already set (preserve user's custom rename) -->
-            <do_if value="not global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-              <run_actions ref="Strip_GT_Name_Formatting" result="$cleanedName">
-                <param name="shipName" value="$ship.knownname"/>
-              </run_actions>
-              <set_value name="global.$GT_Pilots.{$pilot}.$OriginalShipName" exact="$cleanedName"/>
-            </do_if>
+            <!-- Original ship name storage handled by Register_Pilot (per ship, not per pilot) -->
             
             <!-- Restore management skill level based on XP (not stored Level) -->
             <!-- Calculate current skill level from preserved XP -->
@@ -1117,6 +1220,20 @@
             
             <!-- Update stored Level field to match calculated level -->
             <set_value name="global.$GT_Pilots.{$pilot}.$Level" exact="$currentSkillLevel"/>
+            
+            <!-- Restore paused training state if it was preserved during cleanup -->
+            <do_if value="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded?">
+              <set_value name="global.$GT_Pilots.{$pilot}.$XPBlocked" exact="true"/>
+              <set_value name="global.$GT_Pilots.{$pilot}.$BlockedLevel" exact="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel"/>
+              
+              <!-- Clean up paused training placeholders -->
+              <remove_value name="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded"/>
+              <remove_value name="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-ShipMgmt] TRAINING STATE RESTORED: Reactivated pilot ' + $pilot.name + ' still needs level ' + global.$GT_Pilots.{$pilot}.$BlockedLevel + ' training'" chance="100"/>
+              </do_if>
+            </do_if>
             
             <return value="false"/>  <!-- Returns false because pilot was reactivated, not newly initialized -->
           </do_if>
@@ -1146,7 +1263,23 @@
           </do_else>
         </do_if>
         <do_else>
-          <!-- Initialize from scratch -->
+          <!-- Initialize from scratch - ONLY if pilot truly doesn't exist -->
+          <!-- CRITICAL: Double-check pilot doesn't exist before overwriting (defensive check) -->
+          <do_if value="global.$GT_Pilots.{$pilot}?">
+            <!-- Pilot exists but wasn't detected - this should never happen, but preserve XP if it does -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] WARNING: Pilot ' + $pilot.name + ' exists but was treated as new - preserving existing XP: ' + (if global.$GT_Pilots.{$pilot}.$XP? then global.$GT_Pilots.{$pilot}.$XP else 0)" chance="100"/>
+            </do_if>
+            <!-- Don't overwrite - treat as existing pilot instead -->
+            <set_value name="$wasNewPilot" exact="false"/>
+            <!-- Update ship association only -->
+            <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
+            <return value="false"/>
+          </do_if>
+          
+          <!-- Pilot truly doesn't exist - initialize from scratch -->
           <set_value name="$wasNewPilot" exact="true"/>
           <set_value name="global.$GT_Pilots.{$pilot}" exact="table[]"/>
           <set_value name="global.$GT_Pilots.{$pilot}.$XP" exact="0"/>
@@ -1161,11 +1294,7 @@
           <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
           <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'active'"/>
           
-          <!-- Store original ship name (strip GT formatting) -->
-          <run_actions ref="Strip_GT_Name_Formatting" result="$cleanedName">
-            <param name="shipName" value="$ship.knownname"/>
-          </run_actions>
-          <set_value name="global.$GT_Pilots.{$pilot}.$OriginalShipName" exact="$cleanedName"/>
+          <!-- Original ship name storage handled by Register_Pilot (per ship, not per pilot) -->
           
           <!-- Set initial management skill to level 1 -->
           <set_skill entity="$pilot" type="skilltype.management" exact="1"/>
@@ -1366,13 +1495,20 @@
         </do_elseif>
         
         <!-- Check for custom abbreviation first -->
+        <!-- FIX: Properly handle null/empty values - only use custom if it's a non-empty string -->
         <set_value name="$customAbbr" exact="null"/>
+        <set_value name="$hasCustomAbbr" exact="false"/>
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ShipNaming? and global.$GT_GlobalSettings.$ShipNaming.$StateAbbreviations?">
-          <set_value name="$customAbbr" exact="@global.$GT_GlobalSettings.$ShipNaming.$StateAbbreviations.{$stateType}"/>
+          <set_value name="$customAbbrTemp" exact="@global.$GT_GlobalSettings.$ShipNaming.$StateAbbreviations.{$stateType}"/>
+          <!-- Only use custom abbreviation if it exists, is not null, and is not empty -->
+          <do_if value="$customAbbrTemp? and $customAbbrTemp != null and $customAbbrTemp != ''">
+            <set_value name="$customAbbr" exact="$customAbbrTemp"/>
+            <set_value name="$hasCustomAbbr" exact="true"/>
+          </do_if>
         </do_if>
         
-        <!-- Return custom if exists, otherwise default -->
-        <do_if value="$customAbbr? and $customAbbr != ''">
+        <!-- Return custom if valid, otherwise default -->
+        <do_if value="$hasCustomAbbr">
           <return value="$customAbbr"/>
         </do_if>
         <do_else>

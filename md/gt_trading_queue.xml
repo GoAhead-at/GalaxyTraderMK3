@@ -42,6 +42,26 @@
             
             <!-- Process ship trading with optional skill-based pre-search delay -->
             <do_if value="$ship.exists and $ship.isoperational">
+              <!-- CRITICAL: Verify AI parameters exist before processing -->
+              <!-- Parameters may have been deleted between queueing and processing -->
+              <!-- This prevents "AI parameters missing" errors when parameters are cleaned up -->
+              <do_if value="not (global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?)">
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping ship - AI parameters missing (may have been cleaned up or released between queueing and processing)'" chance="100"/>
+                </do_if>
+                <!-- Signal AI that no trade is available -->
+                <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+                <!-- Release any stale lock if it exists -->
+                <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+                  <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                    <param name="ship" value="$ship"/>
+                    <param name="reason" value="'parameters_missing_in_queue'"/>
+                  </run_actions>
+                </do_if>
+                <!-- Skip to next ship -->
+                <continue/>
+              </do_if>
+              
               <!-- Resolve pilot skill level -->
               <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level" result="$skillInfo">
                 <param name="ship" value="$ship"/>
@@ -148,6 +168,22 @@
       </actions>
       <delay exact="this.$delayTime"/>
       <actions>
+        <!-- FIX: Check if AI parameters still exist after delay expires -->
+        <!-- Race condition: Live search may have completed during delay and cleaned up parameters -->
+        <do_if value="not (global.$GT_AIParameters? and global.$GT_AIParameters.{this.$ship}?)">
+          <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + this.$shipID + ') Stale delayed cue: AI parameters missing (search already completed) - canceling [instance: ' + this + ']'" chance="100"/>
+          </do_if>
+          
+          <!-- Signal AI script that no new trade is available -->
+          <do_if value="this.$ship.exists">
+            <signal_objects object="this.$ship" param="'GT_No_Trade_Found'"/>
+          </do_if>
+          
+          <!-- Cancel this stale delayed cue instance -->
+          <cancel_cue cue="this"/>
+        </do_if>
+        
         <!-- Check if ship is currently busy with orders -->
         <set_value name="$isBusy" exact="false"/>
         
@@ -224,7 +260,14 @@
         <!-- Receive ship as parameter -->
         <set_value name="$ship" exact="event.param"/>
         
-        <!-- Validate ship -->
+        <!-- CRITICAL: Check AI parameters IMMEDIATELY (before any other processing) -->
+        <!-- Race condition: Parameters may be cleaned up between ProcessTradingQueue check and here -->
+        <!-- This matches the guard in FindBestTrade_Delayed (lines 171-185) for zero-delay pilots -->
+        <!-- Wrap ALL processing in do_if - only execute when parameters exist -->
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+          <!-- Parameters exist - proceed with all processing -->
+          
+          <!-- Validate ship -->
         <run_actions ref="md.GT_Libraries_General.GT_ValidateShip" result="$shipValid">
           <param name="ship" value="$ship"/>
         </run_actions>
@@ -429,25 +472,46 @@
             $ForceLiveSearch = $forceLiveSearch
           ]"/>
           
-          <!-- Try cache first (instant, no queue) -->
-          <signal_cue_instantly cue="CheckTradeCache" param="$searchParams"/>
+           <!-- Try cache first (instant, no queue) -->
+           <signal_cue_instantly cue="CheckTradeCache" param="$searchParams"/>
+         </do_if>
+         <do_else>
+           <do_if value="$isBusy">
+             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+               <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping trade search; ship is busy'" chance="100"/>
+             </do_if>
+             
+             <!-- CRITICAL FIX: Signal AI script that no new trade is available (ship is busy) -->
+             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+             
+             <!-- Release lock and parameters using Request Registry -->
+             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+               <param name="ship" value="$ship"/>
+               <param name="reason" value="'ship_busy'"/>
+             </run_actions>
+           </do_if>
+           <!-- Note: Invalid ship cleanup now happens immediately after validation (above), so this else only handles busy ships -->
+         </do_else>
         </do_if>
         <do_else>
-          <do_if value="$isBusy">
-            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping trade search; ship is busy'" chance="100"/>
-            </do_if>
-            
-            <!-- CRITICAL FIX: Signal AI script that no new trade is available (ship is busy) -->
+          <!-- Parameters missing - cleanup and exit immediately -->
+          <!-- Nothing after this point executes when parameters are missing -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradingQueue] (' + $ship.idcode + ') AI parameters missing at FindBestTrade entry - may have been cleaned up between queue check and processing'" chance="100"/>
+          </do_if>
+          <!-- Signal AI that no trade is available -->
+          <do_if value="$ship.exists">
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-            
-            <!-- Release lock and parameters using Request Registry -->
+          </do_if>
+          <!-- Release any stale lock if it exists -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
               <param name="ship" value="$ship"/>
-              <param name="reason" value="'ship_busy'"/>
+              <param name="reason" value="'parameters_missing_at_findbesttrade'"/>
             </run_actions>
           </do_if>
-          <!-- Note: Invalid ship cleanup now happens immediately after validation (above), so this else only handles busy ships -->
+          <!-- Exit immediately - don't process without parameters -->
+          <cancel_cue cue="this"/>
         </do_else>
       </actions>
     </cue>

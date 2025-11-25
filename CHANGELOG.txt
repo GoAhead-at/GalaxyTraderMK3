@@ -1,8 +1,423 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.6.13 - 2025-01-21
+Version 0.6.13 - 2025-11-24
 ---------------------------
+
+FIX: Trade Rule Validation - Respect "Internal Only" and Other Trade Rules
+  - Fixed GT ships attempting to trade at stations with trade rule restrictions
+  - Problem: GT ships were finding and attempting trades at stations with "internal only" trade rules
+    * Ships could find trade offers at stations they shouldn't trade with
+    * Trade orders were created but failed when executed (trade rules enforced by X4)
+    * Example: GT ships buying friendly faction and trying to sell at player's "internal only" warehouse
+  - Root Cause:
+    * Some `find_sell_offer`/`find_buy_offer` calls were missing `tradepartner` parameter
+    * Without `tradepartner`, X4's trade offer search doesn't filter by trade rules
+    * Trade rules (like "internal only") are only enforced when `tradepartner` is specified
+  - Solution: Added `tradepartner` parameter to all trade offer searches + final validation
+    * Added `tradepartner="$ship"` to cache validation in `gt_search_methods.xml` (lines 676, 681)
+    * Added `tradepartner="this.ship"` to library trade finding in `gt_libraries_general.xml` (lines 2508, 2528)
+    * Added final validation before `create_trade_order` in `order.trade.galaxytrader.xml` (lines 3340-3375)
+    * Final validation re-checks offers with `tradepartner` to ensure trade rules are respected
+  - Implementation:
+    * Cache validation (`gt_search_methods.xml`):
+      - `find_sell_offer` now includes `tradepartner="$ship"` when refreshing cached buy offers
+      - `find_buy_offer` now includes `tradepartner="$ship"` when refreshing cached sell offers
+    * Library function (`gt_libraries_general.xml`):
+      - `find_buy_offer` now includes `tradepartner="this.ship"` in `GT_FindBestTradeForShip`
+      - `find_sell_offer` now includes `tradepartner="this.ship"` when finding matching sell offers
+    * Final validation (`order.trade.galaxytrader.xml`):
+      - Before creating trade orders, re-validates both buy and sell offers using `find_*_offer` with `tradepartner`
+      - If offers are invalid (trade rules violation), skips order creation and signals `GT_No_Trade_Found` to retry
+      - Prevents failed trade orders and wasted time traveling to stations that won't trade
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added `tradepartner="$ship"` to cache validation offer searches
+    * `md/gt_libraries_general.xml`: Added `tradepartner="this.ship"` to library trade finding
+    * `aiscripts/order.trade.galaxytrader.xml`: Added final trade rule validation before order creation
+  - Benefits:
+    * Respects trade rules: GT ships no longer attempt trades at "internal only" stations
+    * Prevents wasted time: Ships don't travel to stations that will reject trades
+    * Matches vanilla behavior: Uses same `tradepartner` filtering pattern as vanilla X4
+    * Reliable: Final validation catches edge cases where offers might have been found without proper filtering
+  - Technical Details:
+    * X4's `find_sell_offer`/`find_buy_offer` functions filter trade offers based on trade rules when `tradepartner` is specified
+    * Trade rules like "internal only" restrict trading to same-owner ships
+    * Without `tradepartner`, all offers are visible regardless of trade rules
+    * With `tradepartner`, only offers that respect trade rules for that specific ship are returned
+    * Pattern matches vanilla `order.trade.perform.xml` (lines 168, 172) which always uses `tradepartner="this.ship"`
+  - User Experience:
+    * Automatic: No configuration required, works out of the box
+    * Transparent: Ships simply skip invalid trades and find alternatives
+    * Efficient: No wasted time traveling to stations that won't trade
+    * Reliable: Trade rules are respected at all stages (search, cache validation, order creation)
+
+PERFORMANCE: Ware Filter - Replaced Inefficient Station Scanning with Direct WareDB Query
+  - Major performance improvement: Replaced expensive station scanning with direct WareDB queries
+  - Problem: Ware categorization was using an inefficient method that scanned all stations
+    * Used `find_station` to get ALL stations in the galaxy
+    * Then queried ALL buy/sell offers from each station using `find_buy_offer`/`find_sell_offer`
+    * Extracted unique wares from trade offers
+    * Extremely slow and CPU-intensive, especially in large galaxies with many stations
+    * This was a stupid relic from inexperienced modding knowledge - didn't know about `get_ware_definition`
+  - Solution: Replaced with direct WareDB queries using `get_ware_definition`
+    * Uses X4's native `get_ware_definition` function to query the WareDB directly
+    * Gets wares by groups (hightech, refined, energy, food, medical, water, ore, gas, ice, container, ship, station, equipment)
+    * Combines groups and removes duplicates
+    * Instant access - no station scanning needed
+  - Implementation:
+    * `md/gt_ware_filter.xml` (`CategorizeWares` cue):
+      - Removed: `find_station` + `find_buy_offer`/`find_sell_offer` scanning loop
+      - Added: Multiple `get_ware_definition` calls for different ware groups
+      - Added: List combination and duplicate removal logic
+      - Categorization logic unchanged - still categorizes into low-value, dangerous, high-value
+  - Files Modified:
+    * `md/gt_ware_filter.xml`: Replaced station scanning with `get_ware_definition` queries
+  - Benefits:
+    * Massive performance improvement: Eliminates expensive station/offer queries
+    * Instant initialization: Ware categorization completes immediately instead of taking seconds/minutes
+    * Scales perfectly: Performance doesn't degrade with galaxy size or station count
+    * Proper method: Uses X4's intended API for ware discovery (matches vanilla patterns)
+  - Technical Details:
+    * `get_ware_definition` queries the WareDB directly - no station scanning required
+    * Vanilla X4 uses this method extensively (see `md/diplomacy.xml`, `md/factiongoal_hold_space.xml`)
+    * Pattern matches TaterTrader and other professional mods that use WareDB queries
+    * Old method was a naive approach that didn't leverage X4's built-in ware database
+  - User Experience:
+    * Faster mod initialization: Ware categorization completes instantly
+    * No stutter: Eliminates CPU spikes during ware categorization
+    * More reliable: Gets all wares from WareDB, not just what's currently being traded
+
+FIX: Commander Destruction Handling - Event-Driven Subordinate Cleanup
+  - Added event-driven handler for commander ship destruction
+  - Problem: When a commander ship with subordinates was destroyed, subordinates weren't properly handled
+    * Subordinates could remain in GT registry even after commander destroyed
+    * No detection of X4's automatic commander promotion (subordinates reassigned to new commander)
+    * Subordinates with new non-GT commanders weren't cleaned up
+  - Solution: Event-driven `event_object_destroyed` handler for commander destruction
+    * Detects when a GT commander ship is destroyed
+    * Checks all subordinates of destroyed commander
+    * Handles X4's automatic promotion: If new commander exists and has GT order, subordinate continues
+    * If no new commander OR new commander doesn't have GT order, triggers cleanup
+    * Matches vanilla pattern from `order.fight.escort.xml` (lines 1849-1885)
+  - Implementation:
+    * New cue `HandleCommanderDestroyed` in `gt_core_system.xml`:
+      - Listens to `event_object_destroyed object="player.entity"`
+      - Checks if destroyed ship was GT commander (`global.$GT_Ships` registry)
+      - Iterates through `$destroyedCommander.allsubordinates`
+      - For each subordinate:
+        * Checks if X4 auto-assigned new commander (`$subordinate.commander`)
+        * If new commander has GT order: Updates state, subordinate continues
+        * If no new commander or new commander lacks GT order: Triggers cleanup via `GT_Ship_Order_Aborted`
+    * Event-driven only: No polling fallback (as per user request)
+    * Cleanup includes original name restoration and proper registry cleanup
+  - Files Modified:
+    * `md/gt_core_system.xml`: Added `HandleCommanderDestroyed` cue (after `UnregisterShip`)
+  - Benefits:
+    * Immediate detection: Subordinates handled as soon as commander is destroyed
+    * Respects X4 auto-promotion: Subordinates continue with new GT commander if available
+    * Proper cleanup: Subordinates cleaned up when no valid GT commander remains
+    * Event-driven: No polling overhead, matches vanilla pattern
+  - Technical Details:
+    * Uses `event_object_destroyed` for immediate detection (matches vanilla `order.assist.xml` pattern)
+    * Checks `$subordinate.commander` to detect X4's automatic promotion
+    * Verifies new commander has GT order before allowing subordinate to continue
+    * Triggers `GT_Ship_Order_Aborted` for cleanup when no valid GT commander exists
+  - User Experience:
+    * Automatic: No player intervention required
+    * Transparent: Debug logging shows commander destruction and subordinate handling
+    * Reliable: Subordinates properly cleaned up or reassigned based on new commander status
+
+FEATURE: Lua Order Monitor - Event-Driven Ship Cleanup Detection
+  - Replaced polling-based orphaned ship cleanup with efficient batched Lua monitoring
+  - Problem: Previous cleanup system used 5-minute polling intervals
+    * Ships could remain orphaned for up to 5 minutes before cleanup
+    * Polling overhead increased with large fleets
+    * Race conditions between polling checks and manual order removal
+    * Ships with removed GT orders weren't detected immediately
+  - Solution: Lua UI script with batched order change detection
+    * Monitors GT-registered ships continuously (1 ship every 5 frames)
+    * Detects GT order removal, missing pilots, commander changes immediately
+    * Zero overhead when no ships registered (monitoring only active ships)
+    * Event-driven cleanup triggers MD system directly
+  - Implementation:
+    * Lua Script (`ui/gt_order_monitor.lua`):
+      - Uses `onUpdate` hook for batched checks (prevents frame drops)
+      - Tracks previous order IDs, pilot assignments, commander relationships
+      - Detects changes: GT order removed, pilot missing, commander lost GT order
+      - Raises UI events: `GTOrderRemoved`, `MissingPilot`, `CommanderLostGT`, `CommanderRemoved`
+      - FFI integration for order checking (`GetDefaultOrder`, `GetCommander`)
+      - Handles UniverseID conversion and ship ID code mapping
+    * MD Bridge (`md/gt_order_monitor_bridge.xml`):
+      - Sends ship list to Lua monitor (UniverseID:IDCode pairs)
+      - Receives cleanup events from Lua and triggers MD cleanup
+      - Updates ship list when ships removed from GT registry
+      - Periodic updates (30s) to catch new ship registrations
+      - Deduplication prevents multiple updates for same ship removal
+    * Integration:
+      - Removed `OrphanedPilotCleanup` polling cue (gt_core_system.xml)
+      - Removed `OrphanedPilotCleanupScheduler` (5-minute interval)
+      - Lua monitor replaces all polling-based cleanup detection
+      - MD cleanup handlers (`HandleShipOrderAborted`) remain for actual cleanup execution
+  - Files Added:
+    * `ui/gt_order_monitor.lua`: Lua UI script for batched monitoring
+    * `md/gt_order_monitor_bridge.xml`: MD bridge for Lua-MD communication
+  - Files Modified:
+    * `md/gt_core_system.xml`: Removed polling cues (`OrphanedPilotCleanup`, `OrphanedPilotCleanupScheduler`)
+    * `ui.xml`: Added `gt_order_monitor.lua` to UI file list
+  - Benefits:
+    * Immediate detection: Ships cleaned up within seconds instead of up to 5 minutes
+    * Performance: Batched checks (1 ship/5 frames) prevent frame drops even with 100+ ships
+    * Reliability: Detects order removal even when MD events don't fire
+    * Event-driven: No polling overhead when no changes occur
+    * Fleet-aware: Handles commander/subordinate relationships correctly
+    * Pilot tracking: Detects missing pilots immediately
+  - Technical Details:
+    * Check interval: 1 ship every 5 frames (configurable via `L.CHECK_INTERVAL`)
+    * Ship list format: Comma-separated "UniverseID:IDCode" pairs
+    * Cleanup triggers: Direct `GT_Ship_Order_Aborted` signals to MD system
+    * Deduplication: `cleanupTriggered` table prevents duplicate cleanup for same ship
+    * Commander detection: Uses `GetCommander` and `GetDefaultOrder` FFI calls
+    * Pilot detection: Uses `GetComponentData(ship, "assignedpilot")`
+  - User Experience:
+    * Automatic: No configuration required, works out of the box
+    * Transparent: Debug logging shows cleanup actions (if debug enabled)
+    * Reliable: Ships cleaned up immediately when GT order removed or pilot transferred
+    * Efficient: Zero performance impact with large fleets
+
+FIX: Dock Failure Tracking - Missing Failure Text Variable
+  - Fixed property lookup error when tracking dock failures
+  - Problem: `$failuretext` variable was used but never initialized in dock failure tracking
+    * Error: "Property lookup failed: $failuretext" in order.dock.xml line 39
+    * Dock failures couldn't be properly tracked for trade order cleanup
+    * Trade orders couldn't detect pathfinding failures correctly
+  - Solution: Initialize `$failuretext` with translation ID before using it
+    * Set `$failuretext` to `{1045, 124}` (standard error message format)
+    * Initialize before creating failure tracking table
+    * Update in all failure reason branches (no path, blacklisted destination, blacklisted sector)
+  - Implementation:
+    * `order.dock.xml` (lines ~15-27):
+      - Initialize `$failuretext` after determining failure reason
+      - Set appropriate failure text for each failure type
+      - Ensures variable exists before table creation
+  - Files Modified:
+    * `aiscripts/order.dock.xml`: Added `$failuretext` initialization for all failure paths
+  - Benefits:
+    * Dock failures are properly tracked without errors
+    * Trade orders can detect pathfinding failures correctly
+    * No more property lookup errors in dock failure handling
+    * Consistent error message format across all failure types
+
+FIX: False Removal Detection for Subordinates
+  - Fixed subordinates incorrectly triggering removal detection when completing trades
+  - Problem: Subordinates completing trade orders were sending PAUSE signals
+    * PAUSE signal removed ship from `GT_Ships` registry
+    * Assist order cleanup then detected ship as "removed" even though still subordinate
+    * Subordinates were being unregistered while still part of fleet
+    * Log showed: "Ship was tracked as subordinate to GT commander - needs cleanup"
+  - Root Cause:
+    * When trade order completes, `$isActivelyTrading` becomes false
+    * PAUSE signal condition checked only: `not $isActivelyTrading and not transitioning`
+    * Didn't check if ship was subordinate with Assist order
+    * Subordinates should stay registered while part of fleet
+  - Solution: Prevent PAUSE signals for subordinates with Assist orders
+    * Added check: `not ($hasGTCommander and $currentDefaultOrder == 'Assist')`
+    * Subordinates with Assist orders skip PAUSE signal entirely
+    * Subordinates remain registered in `GT_Ships` while commander has GT order
+  - Implementation:
+    * `order.trade.galaxytrader.xml` (lines ~4566-4590):
+      - Modified PAUSE condition to exclude subordinates with Assist orders
+      - Added explicit `elseif` block for subordinates to skip PAUSE
+      - Added debug logging for subordinate skip case
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`: Added subordinate check to prevent PAUSE signals
+  - Benefits:
+    * Subordinates stay registered while part of fleet
+    * No false removal detection when trades complete
+    * Fleet coordination works correctly for subordinates
+    * Subordinates properly tracked until commander order removed or ship reassigned
+
+FEATURE: Commander XP Bonus from Subordinates
+  - Added XP bonus system where commanders gain a percentage of XP from their subordinates' trades
+  - Problem: Commanders managing fleets didn't benefit from their subordinates' trading activities
+  - Solution: Automatic XP bonus awarded to commander pilots when subordinates complete trades
+    * Default bonus: 10% of subordinate XP (configurable)
+    * Commander gains bonus XP every time a subordinate completes a trade
+    * Bonus respects XP blocking and training requirements (same as normal XP)
+    * Commander's skill level and ship name updated automatically if level increases
+  - Implementation:
+    * Configuration: `global.$GT_GlobalSettings.$XP.$CommanderBonusPercent` (default: 10)
+    * XP bonus calculated in `ProcessXPEvents` cue (gt_xp_training.xml)
+    * Checks if ship has commander before awarding bonus
+    * Verifies commander has GT pilot before awarding
+    * Calculates bonus as percentage of subordinate XP gained
+    * Applies same XP blocking/training checks as normal XP
+    * Updates commander ship name if skill level increases
+  - Files Modified:
+    * `md/gt_global_settings.xml`:
+      - Added `$XP.$CommanderBonusPercent` setting (default: 10%)
+      - Added migration/validation for existing saves
+      - Added UI slider in Global Settings menu (0-50% range, step: 1%)
+      - Integrated with `GT_Slider_Update` handler for real-time updates
+    * `md/gt_xp_training.xml`:
+      - Added commander XP bonus logic in `ProcessXPEvents` (lines ~308-380)
+      - Checks commander relationship and awards bonus XP
+      - Updates commander skill level and ship name if needed
+    * `t/0001-l*.xml` (all language files):
+      - Added translation ID 9015: "Commander Bonus Percent" (label)
+      - Added translation ID 9115: Tooltip explaining commander bonus XP system
+  - Benefits:
+    * Encourages fleet management: Commanders benefit from managing subordinates
+    * Realistic progression: Commanders learn from their fleet's trading activities
+    * Configurable: Bonus percentage adjustable via UI slider in Global Settings menu (0-50%, default: 10%)
+      - Accessible through: Global Settings → XP and Training section
+      - Set to 0% to disable commander bonus XP
+      - Real-time adjustment with immediate effect
+    * Balanced: Default 10% provides meaningful bonus without overpowering
+    * Multiple subordinates: Commander gains bonus from each subordinate trade
+  - User Experience:
+    * Automatic: No player intervention required
+    * Transparent: Debug logging shows bonus XP awards
+    * Fair: Respects training requirements (commander must complete training to progress)
+  - Technical Notes:
+    * Bonus XP is integer-rounded (10% of 50 XP = 5 XP)
+    * Commander bonus is separate from subordinate XP (doesn't reduce subordinate's XP)
+    * Works with any number of subordinates (each trade awards bonus)
+    * Commander must have GT pilot to receive bonus (subordinate must be in GT system)
+
+FIX: Per-Sector Trade Queries (Vanilla Pattern)
+  - Changed cargo disposal search to query stations per-sector instead of galaxy-wide
+  - Problem: `SearchSellOpportunities` used `space="player.galaxy"` which requires initialized market data
+    * Ships couldn't find trades without satellites or pre-scanned sectors
+    * New freighters in unexplored areas failed to find disposal trades
+    * Galaxy-wide queries may require market intelligence to be initialized
+  - Solution: Query stations per-sector (matching vanilla X4 behavior)
+    * Build sector list using `GT_FindSectorsInRange` (within `maxDistance` from home sector)
+    * Iterate through sectors and query `find_buy_offer` with `space="$sector"` for each sector
+    * Matches vanilla pattern: `trade.find.free.xml` queries stations in specific sectors
+  - Implementation:
+    * `SearchSellOpportunities` now builds `$sellspaces` list before querying
+    * Per-sector queries allow ships to check prices at stations they can detect (gravidar range)
+    * Works without satellites: Ships can query stations in sectors they're in or have visited
+  - Files Modified:
+    * `md/gt_trading_search.xml`:
+      - Modified `SearchSellOpportunities` to build sector list and query per-sector (lines ~2950-3047)
+      - Replaced galaxy-wide `find_buy_offer` with per-sector loop
+      - Added home sector determination and blacklistgroup setup
+  - Benefits:
+    * Ships can find trades even without initialized market data (satellites)
+    * More realistic: Traders check prices at nearby stations they can detect
+    * Matches vanilla X4 behavior for consistency
+    * New freighters can find trades immediately without requiring scout activity
+  - Technical Notes:
+    * Main live search (`SearchLiveTrades`) already used per-sector queries
+    * This change aligns cargo disposal search with the same pattern
+    * Per-sector queries are more efficient than galaxy-wide queries
+
+FIX: Race Condition Prevention in SearchLiveTrades
+  - Fixed race condition where multiple searches could overwrite each other's state
+  - Problem: Multiple `SearchLiveTrades` instances could run concurrently for the same ship
+    * `SearchTradeRoutes` could start fallback search before original search completed
+    * Second search overwrote `global.$GT_SearchLiveTrades_State.{$ship}` 
+    * `SearchLiveTrades_Resume` couldn't find state when original search completed
+    * Error: "Ship state not found in global.$GT_SearchLiveTrades_State - cannot continue trade search"
+  - Root Cause:
+    * `cancel_cue` doesn't immediately stop execution - code after it still runs
+    * Guard checks passed but code continued executing, overwriting state
+    * Incorrect guard: Checked `global.$GT_SearchResult.{$ship}.$WaitingForBatch` (doesn't exist)
+  - Solution: Proper guard checks with `do_else` blocks to prevent execution
+    * Check `global.$GT_SearchLiveTrades_State.{$ship}` exists before starting new search
+    * Wrap state storage/signaling code in `do_else` blocks so it only runs if guard passes
+    * Added guards in three places:
+      - `SearchTradeRoutes`: Checks before signaling `SearchLiveTrades`
+      - `SearchFallbackTrades`: Checks before signaling `SearchLiveTrades`
+      - `SearchLiveTrades`: Checks at start and exits if state already exists
+  - Implementation:
+    * `SearchTradeRoutes` (gt_trading_search.xml, lines ~773-808):
+      - Checks if search in progress before signaling
+      - Exits immediately if search already running
+    * `SearchFallbackTrades` (gt_search_methods.xml, lines ~2083-2119):
+      - Checks if search in progress before signaling fallback search
+      - Wraps signaling code in `do_else` to prevent execution if blocked
+    * `SearchLiveTrades` (gt_search_methods.xml, lines ~1387-1443):
+      - Checks at start if state already exists
+      - Wraps state storage/signaling in `do_else` to prevent overwriting
+  - Files Modified:
+    * `md/gt_trading_search.xml`: Added guard check before signaling `SearchLiveTrades`
+    * `md/gt_search_methods.xml`: Added guards in `SearchFallbackTrades` and `SearchLiveTrades`
+  - Benefits:
+    * Prevents state overwrite errors
+    * Ensures only one search runs per ship at a time
+    * Eliminates "state not found" errors in `SearchLiveTrades_Resume`
+    * Proper synchronization prevents race conditions
+
+FIX: Operational State Reset After Repair/Resupply Completion
+  - Fixed operational states (`[REPAIR]`, `[RESUPPLY]`) not being cleared after completion
+  - Problem: Ship names showed operational states even after repair/resupply completed
+    * Auto-repair ships: `[REPAIR]` state persisted after successful repair
+    * Stale resupply orders: `[RESUPPLY]` state persisted after resupply completed
+    * States weren't cleared when ships weren't tracked in `$GT_MaintenanceOrders`
+  - Root Cause:
+    * `ProcessRepairComplete` only handled ships in `$GT_MaintenanceOrders`
+    * Auto-repair ships tracked in `$GT_AutoRepair` weren't handled
+    * `ProcessResupplyComplete` didn't clear state for stale orders (ships not in `$GT_MaintenanceOrders`)
+  - Solution: Added state cleanup for all completion paths
+    * Auto-repair completion: Clear `$NeedsRepair` flag and update ship name
+    * Stale resupply completion: Clear `$GT_ResupplyOrders` tracking and update ship name
+    * Both paths trigger ship name update to remove operational state from display
+  - Implementation:
+    * `ProcessRepairComplete` (gt_maintenance.xml, lines ~1544-1572):
+      - Added `do_elseif` block for `$GT_AutoRepair` ships
+      - Clears `$NeedsRepair` flag after repair completes
+      - Triggers ship name update to remove `[REPAIR]` state
+      - Sends `GT_RepairCompleted` signal to AI script
+    * `ProcessResupplyComplete` (gt_maintenance.xml, lines ~1479-1495):
+      - Added cleanup for stale resupply orders (ships not in `$GT_MaintenanceOrders`)
+      - Clears `$GT_ResupplyOrders` tracking
+      - Triggers ship name update to remove `[RESUPPLY]` state
+  - Files Modified:
+    * `md/gt_maintenance.xml`: Added state cleanup for auto-repair and stale resupply orders
+  - Benefits:
+    * Ship names correctly update after repair/resupply completion
+    * No persistent `[REPAIR]` or `[RESUPPLY]` states in ship names
+    * Works for all completion paths (maintenance orders, auto-repair, stale orders)
+    * Consistent behavior across all repair/resupply scenarios
+  - Technical Notes:
+    * Auto-repair ships use Level 12+ pilot ability (no maintenance order created)
+    * Stale orders occur when ships complete resupply but tracking was cleared/aborted
+    * Both scenarios now properly clean up operational states
+
+FIX: Stale Delayed Trade Search Cues Causing "AI Parameters Missing" Errors
+  - Fixed race condition where delayed trade search cues fired after search already completed
+  - Problem: "AI parameters missing for ship" errors occurred when delayed searches fired
+    * `FindBestTrade_Delayed` schedules searches with skill-based delays (e.g., 19 seconds)
+    * During delay, live search can run and complete immediately
+    * Live search cleanup deletes AI parameters via `GT_RequestRegistry_Release`
+    * When delayed cue fires, it calls `FindBestTrade` which expects parameters to exist
+    * Result: "AI parameters missing" error logged
+  - Root Cause:
+    * Delayed cue instances outlived the searches they were meant to trigger
+    * No check to verify parameters still exist before proceeding after delay
+    * Race condition: Search completes faster than delay expires
+  - Solution: Added parameter existence check after delay expires
+    * Check if `global.$GT_AIParameters.{ship}` still exists after delay
+    * If parameters missing → Search already completed, cancel delayed cue
+    * If parameters exist → Proceed with normal search flow
+  - Implementation:
+    * `FindBestTrade_Delayed` (gt_trading_queue.xml, lines ~181-198):
+      - Added parameter existence check after delay expires
+      - If parameters missing: Cancel cue and signal `GT_No_Trade_Found`
+      - If parameters exist: Proceed with normal checks (ship exists, operational, not busy)
+  - Files Modified:
+    * `md/gt_trading_queue.xml`: Added parameter existence check in `FindBestTrade_Delayed`
+  - Benefits:
+    * Prevents "AI parameters missing" errors from stale delayed cues
+    * Handles race condition where search completes during delay
+    * Proper cleanup: Cancels stale delayed instances automatically
+    * No impact on normal operation: Only affects edge case where search completes early
+  - Technical Notes:
+    * This fix addresses a pre-existing race condition, not related to repair/resupply fixes
+    * Occurs when live search completes faster than skill-based delay (common for high-level pilots)
+    * Pattern observed in logs: Multiple ships (BSF-660, KTE-617, NZA-371) affected when delays are long enough
 
 FEATURE: Training License Costs
   - Added training license fees that must be paid when pilots begin certification training
@@ -153,7 +568,7 @@ FEATURE: Ship Status Renaming - Customizable State Abbreviations
     * Changes take effect immediately
     * Empty fields restore defaults automatically
 
-Version 0.6.12 - 2025-01-21
+Version 0.6.12 - 2025-11-21
 ---------------------------
 
 FIX: RouteCacheCleanup Property Lookup Errors
@@ -389,7 +804,7 @@ FIX: Debug Message Gating
     * Debug messages now properly respect full debug toggle setting
     * Reduces log spam when full debug is disabled
 
-Version 0.6.11 - 2025-01-21
+Version 0.6.11 - 2025-11-21
 ---------------------------
 
 FIX: Ship Registry Cleanup for Reassigned Ships
@@ -551,7 +966,7 @@ FIX: SearchFallbackTrades Namespace Missing
     * "Property lookup failed: SearchFallbackTrades"
     * "Evaluated value 'null' is not of type cue"
 
-Version 0.6.10 - 2025-01-19
+Version 0.6.10 - 2025-11-19
 ---------------------------
 
 PERFORMANCE: Removed Redundant Maintenance Timeout Monitor
@@ -659,7 +1074,7 @@ PERFORMANCE: Event-Driven Mobile Satellite Intelligence (Replaces Polling System
     * Scales efficiently with fleet size (event-driven, not per-ship polling)
   - Impact: Eliminates unnecessary CPU polling every 10 seconds for all active trading ships
 
-Version 0.6.9 - 2025-01-19
+Version 0.6.9 - 2025-11-19
 ---------------------------
 
 FEATURE: Configurable Report Frequencies
@@ -763,7 +1178,7 @@ FIX: Sector Whitelist Null Property Access
     * Prevents crashes when ships don't have sector whitelists configured
 
 
-Version 0.6.8 - 2025-01-19
+Version 0.6.8 - 2025-11-19
 ---------------------------
 
 FEATURE: Additional Trade Filters - Carrier/Aux and Build Storage Exclusion
@@ -845,7 +1260,7 @@ REMOVED: Risk Tolerance Setting
     * `md/gt_trading_ai.xml` (parameter removed from signal handlers)
   - Note: Global risk tolerance config setting remains (unused, may be used in future)
 
-Version 0.6.7 - 2025-01-15
+Version 0.6.7 - 2025-11-15
 ---------------------------
 
 FIX: Race Condition in Search Results - Per-Ship Global Table
@@ -1037,7 +1452,7 @@ NEW FEATURE: Ship Name Label [ISOLATED] for Isolated Ships
     * Proper localization for all supported languages
 
 
-Version 0.6.6 - 2025-01-15 => reverted
+Version 0.6.6 - 2025-11-15 => reverted
 ---------------------------
 
 FIX: Search Queue Deadlock - Config Reload Recovery => reverted
@@ -1146,7 +1561,7 @@ FEATURE: Logbook Message for Training Station Search Failure
     * Clear communication about XP blocking and retry behavior
     * Proper localization for all supported languages
 
-Version 0.6.5 - 2025-01-15
+Version 0.6.5 - 2025-11-15
 ---------------------------
 
 FIX: Cache Hit Detection - Trade List Execution => reverted
@@ -1222,7 +1637,7 @@ FIX: TradeList Preservation - Waiting Ship State Protection => reverted
     * No state is lost or overwritten
     * Waiting ship's continuation can find TradeList intact when SearchLiveTrades_Resume completes
 
-Version 0.6.4 - 2025-01-15
+Version 0.6.4 - 2025-11-15
 ---------------------------
 
 FEATURE: MK3 Rename - Custom Ship Renaming via Context Menu
