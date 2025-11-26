@@ -15,7 +15,7 @@ local function debugLog(message)
 end
 
 -- ==============================================================================
--- ACTION SENDERS (UI → MD)
+-- ACTION SENDERS (UI MD)
 -- ==============================================================================
 
 -- Send ship to training
@@ -86,7 +86,7 @@ function Mods.GalaxyTrader.PilotControl.stopAllOrders(shipId)
 end
 
 -- ==============================================================================
--- CONFIRMATION HANDLERS (MD → Lua)
+-- CONFIRMATION HANDLERS (MD Lua)
 -- ==============================================================================
 
 -- Handle action confirmation from MD

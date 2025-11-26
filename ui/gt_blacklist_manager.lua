@@ -171,7 +171,7 @@ local function updateFleetBlacklist(threatened_macro_list, relation_value)
         if macro_name and macro_name ~= "" and macro_name ~= "nil" then
             -- Store FFI string to prevent GC
             table.insert(macro_strings, ffi.new("char[?]", #macro_name + 1, macro_name))
-            debugLog(string.format("  → Added threatened sector macro: %s", macro_name))
+            debugLog(string.format("  Added threatened sector macro: %s", macro_name))
         else
             debugLog(string.format("WARNING: Skipping invalid macro: '%s'", tostring(macro_name)), "WARN")
         end
@@ -346,7 +346,7 @@ local function applyFleetBlacklistToAllShips(ship_list)
         
         -- Debug first 3 conversions
         if i <= 3 then
-            debugLog(string.format("  Ship %d: '%s' → ID: %s", i, ship_id_string, tostring(ship_id)))
+            debugLog(string.format("  Ship %d: '%s' ID: %s", i, ship_id_string, tostring(ship_id)))
         end
         
         if ship_id ~= 0 then
@@ -492,7 +492,7 @@ local function onInitialize(_, event_data)
     
     -- If we created a NEW blacklist, notify MD to store the ID
     if existing_id == 0 and GT_Blacklist.fleet_blacklist_id then
-        debugLog(string.format("📤 Notifying MD of new blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
+        debugLog(string.format("Notifying MD of new blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
         AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
     end
     
