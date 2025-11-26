@@ -12,8 +12,13 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
-        <!-- REMOVED: Configurable delay - now hardcoded to 50ms for performance -->
-        <set_value name="this.$batchDelayTime" exact="50ms"/>
+        <!-- Calculate delay from global Performance settings -->
+        <set_value name="$batchDelay" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+          <set_value name="$batchDelay" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+        </do_if>
+        <!-- Convert to time value (milliseconds) -->
+        <set_value name="this.$batchDelayTime" exact="$batchDelay * 1ms"/>
       </actions>
       <delay exact="this.$batchDelayTime"/>
       <actions>
@@ -186,8 +191,11 @@
         </do_else>
         <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
         
-        <!-- REMOVED: Configurable MaxOffersPerWareForMatching - now hardcoded to 20 -->
-        <set_value name="$maxOffersPerWareForMatching" exact="20"/>
+        <!-- Use global setting for max offers per ware for matching -->
+        <set_value name="$maxOffersPerWareForMatching" exact="20"/> <!-- Default fallback -->
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching?">
+          <set_value name="$maxOffersPerWareForMatching" exact="global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching"/>
+        </do_if>
         
         <!-- Calculate batch boundaries using wareKeysList (list, not table) -->
         <set_value name="$wareCount" exact="0"/>
@@ -804,7 +812,7 @@
                           
                           <!-- PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
                           <!-- Only cache if home sector is valid -->
-                          <do_if value="$homeSector? and $homeSector.exists">
+                          <do_if value="@$homeSector.exists">
                             <!-- Initialize home sector cache if needed -->
                             <do_if value="not global.$GT_TradeCache.{$homeSector}?">
                               <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
@@ -855,6 +863,122 @@
                               </do_if>
                             </do_if>
                             
+                            <!-- Cache target types (for cache-side filtering) -->
+                            <!-- Buy target = owner of $BuyOffer (= $sellOfferOwner) -->
+                            <!-- Sell target = owner of $SellOffer (= $buyOfferOwner) -->
+                            <set_value name="$buyTargetType" exact="'Station'"/>
+                            <do_if value="$sellOfferOwner.isclass.buildstorage">
+                              <set_value name="$buyTargetType" exact="'Buildstorage'"/>
+                            </do_if>
+                            <do_elseif value="$sellOfferOwner.isclass.station">
+                              <set_value name="$buyPrimaryPurpose" exact="@$sellOfferOwner.primarypurpose"/>
+                              <do_if value="$buyPrimaryPurpose == purpose.auxiliary">
+                                <set_value name="$buyTargetType" exact="'Aux'"/>
+                              </do_if>
+                              <do_elseif value="$buyPrimaryPurpose == purpose.fight">
+                                <set_value name="$buyTargetType" exact="'Carrier'"/>
+                              </do_elseif>
+                            </do_elseif>
+                            
+                            <set_value name="$sellTargetType" exact="'Station'"/>
+                            <do_if value="$buyOfferOwner.isclass.buildstorage">
+                              <set_value name="$sellTargetType" exact="'Buildstorage'"/>
+                            </do_if>
+                            <do_elseif value="$buyOfferOwner.isclass.station">
+                              <set_value name="$sellPrimaryPurpose" exact="@$buyOfferOwner.primarypurpose"/>
+                              <do_if value="$sellPrimaryPurpose == purpose.auxiliary">
+                                <set_value name="$sellTargetType" exact="'Aux'"/>
+                              </do_if>
+                              <do_elseif value="$sellPrimaryPurpose == purpose.fight">
+                                <set_value name="$sellTargetType" exact="'Carrier'"/>
+                              </do_elseif>
+                            </do_elseif>
+                            
+                            <!-- Cache docking capability profile (physical docks by size) -->
+                            <!-- Used by cache search to skip trades that cannot physically dock for a ship's docksize -->
+                            <!-- NOTE: This is physical capability only (no relation/permission). -->
+                            <do_if value="not global.$GT_DockCapsCache?">
+                              <set_value name="global.$GT_DockCapsCache" exact="table[]"/>
+                            </do_if>
+                            
+                            <!-- Buy station (= seller of BuyOffer / $sellOfferOwner) -->
+                            <set_value name="$buyDockCaps" exact="null"/>
+                            <do_if value="global.$GT_DockCapsCache.{$sellOfferOwner}?">
+                              <set_value name="$buyDockCaps" exact="global.$GT_DockCapsCache.{$sellOfferOwner}"/>
+                            </do_if>
+                            <do_else>
+                              <set_value name="$buyDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
+                              
+                              <find_dockingbay name="$buyDockS" object="$sellOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_s" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$buyDockS">
+                                <set_value name="$buyDockCaps.$S" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$buyDockM" object="$sellOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_m" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$buyDockM">
+                                <set_value name="$buyDockCaps.$M" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$buyDockL" object="$sellOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_l" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$buyDockL">
+                                <set_value name="$buyDockCaps.$L" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$buyDockXL" object="$sellOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_xl" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$buyDockXL">
+                                <set_value name="$buyDockCaps.$XL" exact="true"/>
+                              </do_if>
+                              
+                              <set_value name="global.$GT_DockCapsCache.{$sellOfferOwner}" exact="$buyDockCaps"/>
+                            </do_else>
+                            
+                            <!-- Sell station (= buyer of SellOffer / $buyOfferOwner) -->
+                            <set_value name="$sellDockCaps" exact="null"/>
+                            <do_if value="global.$GT_DockCapsCache.{$buyOfferOwner}?">
+                              <set_value name="$sellDockCaps" exact="global.$GT_DockCapsCache.{$buyOfferOwner}"/>
+                            </do_if>
+                            <do_else>
+                              <set_value name="$sellDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
+                              
+                              <find_dockingbay name="$sellDockS" object="$buyOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_s" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$sellDockS">
+                                <set_value name="$sellDockCaps.$S" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$sellDockM" object="$buyOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_m" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$sellDockM">
+                                <set_value name="$sellDockCaps.$M" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$sellDockL" object="$buyOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_l" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$sellDockL">
+                                <set_value name="$sellDockCaps.$L" exact="true"/>
+                              </do_if>
+                              
+                              <find_dockingbay name="$sellDockXL" object="$buyOfferOwner" checkoperational="true" multiple="false">
+                                <match_dock size="tag.dock_xl" storage="false"/>
+                              </find_dockingbay>
+                              <do_if value="$sellDockXL">
+                                <set_value name="$sellDockCaps.$XL" exact="true"/>
+                              </do_if>
+                              
+                              <set_value name="global.$GT_DockCapsCache.{$buyOfferOwner}" exact="$sellDockCaps"/>
+                            </do_else>
+                            
                             <!-- Append trade entry to THIS home sector's cache list -->
                             <!-- CRITICAL: Store route distance (buy station sell station) for position-independent validation -->
                             <!-- PERFORMANCE OPTIMIZATION: Pre-computed distances from home sector -->
@@ -865,6 +989,10 @@
                               $BuyStationId = $sellOfferOwner.idcode,
                               $BuyOffer = $sellOffer,
                               $SellOffer = $buyOffer,
+                              $BuyTargetType = $buyTargetType,
+                              $SellTargetType = $sellTargetType,
+                              $BuyDockCaps = $buyDockCaps,
+                              $SellDockCaps = $sellDockCaps,
                               $Amount = $maxAmount,
                               $TotalVolume = $totalVolume,
                               $Profit = $profit,

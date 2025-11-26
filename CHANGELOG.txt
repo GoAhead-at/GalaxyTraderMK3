@@ -1,6 +1,168 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.14 - 2025-12-XX
+---------------------------
+
+PERFORMANCE: Batch Processor Concurrency Limiting
+  - Added concurrency limiting for batch processors to prevent multiple concurrent processors
+  - Problem: Batch processors could run concurrently without limits, causing CPU spikes
+    * Each batch processor runs nested loops (sell offers × buy offers) every 50ms
+    * Multiple concurrent batch processors = multiplicative CPU load
+    * Could cause periodic game stutter when multiple searches complete simultaneously
+  - Solution: Implemented batch processor queue with max concurrent limit (hardcoded to 1)
+    * Similar to search queue pattern - ensures only 1 batch processor runs at a time
+    * Queues ships when batch processor slots are full
+    * Automatically processes queue when slots become available
+  - Implementation:
+    * Initialization (`md/gt_trading_ai.xml`): Added `global.$GT_BatchProcessorQueue` with `$MaxConcurrent = 1`
+    * Concurrency check (`md/gt_search_methods.xml`): Checks slot availability before starting batch processor
+    * Queue processor (`md/gt_trading_batch_processor.xml`): New `ProcessBatchQueue` cue handles queued ships
+    * Counter management: Incremented on start, decremented on completion/cancellation
+  - Files Modified:
+    * `md/gt_trading_ai.xml`: Added batch processor queue initialization
+    * `md/gt_search_methods.xml`: Added concurrency check before signaling batch processor
+    * `md/gt_trading_batch_processor.xml`: Added queue processor cue and counter management
+  - Benefits:
+    * Prevents multiple concurrent batch processors (max 1 at a time)
+    * Reduces CPU load from nested loops
+    * Prevents stutter from simultaneous batch processing
+    * Queues ships when busy (no lost requests)
+    * Consistent with search queue pattern
+
+PERFORMANCE: Cargo Drone Filtering Optimization
+  - Optimized cargo drone availability checks using caching
+  - Problem: Cargo drone checks (`availableunits.{unitcategory.transport}.count`) were performed repeatedly
+    * Checked for every offer in filtering loops
+    * Same stations checked multiple times
+    * Property lookups are expensive operations
+  - Solution: Build cache of unique stations before filtering loops
+    * Collects unique stations from all offers
+    * Caches cargo drone availability per station (one lookup per unique station)
+    * Uses cache in filtering loops instead of repeated property lookups
+  - Implementation:
+    * Live search (`md/gt_search_methods.xml`): Builds cache before filtering sell/buy offers
+    * Cache search (`md/gt_search_methods.xml`): Builds cache before processing cache entries
+    * Cache format: `$cargoDroneCache.{$station} = true/false`
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added cargo drone cache building and usage in filtering loops
+  - Benefits:
+    * 90%+ reduction in property lookups (unique stations only vs all offers)
+    * Faster filtering: O(unique stations) instead of O(all offers)
+    * Example: 1000 offers from 50 unique stations = 50 lookups instead of 1000
+    * Reduces CPU overhead in filtering operations
+
+PERFORMANCE: Station Operational Status Cache
+  - Optimized station operational checks using caching
+  - Problem: `isoperational` property was checked repeatedly for same stations
+    * Checked for every cache entry during validation
+    * Same stations checked multiple times across different cache entries
+  - Solution: Build cache of operational status before processing cache entries
+    * Collects unique stations from cache entries
+    * Caches `isoperational` status per station (one lookup per unique station)
+    * Uses cache in validation loop instead of repeated property lookups
+  - Implementation:
+    * Cache search (`md/gt_search_methods.xml`): Builds operational cache before processing cache entries
+    * Cache format: `$operationalCache.{$station} = true/false`
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added operational cache building and usage in validation loop
+  - Benefits:
+    * 80%+ reduction in property lookups (unique stations only vs all cache entries)
+    * Faster validation: O(unique stations) instead of O(cache entries)
+    * Example: 500 cache entries with 100 unique stations = 100 checks instead of 500
+
+PERFORMANCE: Offer Property Pre-Extraction
+  - Pre-extract offer properties before nested loops to reduce property lookups
+  - Problem: `offer.owner` and `offer.unitprice` accessed repeatedly in nested loops
+    * Property lookups in tight nested loops (sell offers × buy offers)
+    * Same properties accessed multiple times
+  - Solution: Pre-extract properties before nested loops, store in indexed tables
+    * Extracts `owner` and `unitprice` once before loops
+    * Stores in indexed tables for fast lookup
+    * Uses cached values in nested loops instead of property access
+  - Implementation:
+    * Batch processor (`md/gt_trading_batch_processor.xml`): Pre-extracts properties for intra-sector and cross-sector loops
+    * Cache format: `$intraSellOfferOwners.{$i}`, `$intraSellOfferPrices.{$i}`, etc.
+  - Files Modified:
+    * `md/gt_trading_batch_processor.xml`: Added property pre-extraction before nested loops
+  - Benefits:
+    * Reduces property lookups in nested loops
+    * Faster nested loop execution: O(N + M) extractions + O(N × M) cache lookups vs O(N × M) property lookups
+    * Example: 20 sell × 20 buy = 40 extractions + 400 cache lookups vs 400 property lookups
+
+PERFORMANCE: Batch Cache Cleanup Optimization
+  - Optimized failed trades cache cleanup to prevent CPU spikes
+  - Problem: Cache cleanup ran on every search, processing entire cache synchronously
+    * Large caches (1000+ entries) processed in single frame
+    * Could cause CPU spikes and game stutter
+  - Solution: Batch cleanup with size limits and time-based triggers
+    * Only cleans when cache > 50 entries OR last cleanup > 5 minutes ago
+    * Limits cleanup to 100 entries per iteration
+    * Tracks last cleanup time per ship (`global.$GT_FailedTradesLastCleanup`)
+  - Implementation:
+    * Cache search (`md/gt_search_methods.xml`): Added conditional cleanup with size/time checks
+    * Live search (`md/gt_search_methods.xml`): Same optimization applied
+    * Initialization (`md/gt_trading_ai.xml`): Added `global.$GT_FailedTradesLastCleanup` table
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added batch cleanup logic (3 locations)
+    * `md/gt_trading_ai.xml`: Added cleanup tracking initialization
+  - Benefits:
+    * 90%+ reduction in cleanup operations (skips cleanup on most searches)
+    * Spreads cleanup work across multiple searches
+    * Prevents CPU spikes from large cache cleanups
+    * Limits cleanup size per iteration (max 100 entries)
+
+FEATURE: Cargo Drone Availability Filtering
+  - Filter out stations without cargo drones to prevent ships getting stuck
+  - Problem: Ships without cargo drones could dock at stations without cargo drones
+    * Trading cannot happen without cargo drones (neither station nor ship has them)
+    * Ships would dock and get stuck waiting for impossible trades
+    * Applied to normal trades but missing from sell-only disposal trades
+  - Solution: Filter stations during trade search based on cargo drone availability
+    * Checks if station has cargo drones OR ship has cargo drones
+    * Filters out stations without drones if ship also has no drones
+    * Prevents ships from selecting trades at stations without cargo drones
+    * Applied to both normal trades AND sell-only disposal trades
+  - Implementation:
+    * Live search (`md/gt_search_methods.xml`): Filters offers by cargo drone availability
+    * Cache search (`md/gt_search_methods.xml`): Validates cargo drone availability for cache entries
+    * Sell-only disposal search (`md/gt_trading_search.xml`): Added cargo drone filtering to `SearchSellOpportunities`
+    * Uses vanilla pattern: `$station.availableunits.{unitcategory.transport}.count`
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added cargo drone filtering in live search and cache validation
+    * `md/gt_trading_search.xml`: Added cargo drone filtering to sell-only disposal search
+  - Benefits:
+    * Prevents ships from getting stuck at stations without cargo drones (all trade types)
+    * Matches vanilla X4 behavior (see `order.trade.perform.xml` line 145)
+    * Ships only select trades where cargo transfer is possible
+    * Reduces failed trade attempts
+    * Consistent filtering across all trade search paths (normal, cache, disposal)
+
+FIX: Property Lookup Error - $shipNotRegistered Variable Initialization
+  - Fixed "Property lookup failed: $shipNotRegistered" error in AI script
+  - Problem: Variable `$shipNotRegistered` could fail property lookup in boolean expressions
+    * Error occurred at line 2054 (now 2069): `$shipNotRegistered and (not global.$GT_Ships? or not global.$GT_Ships.{this.ship}?)`
+    * Variable was initialized at `start_trading` label but edge cases could cause it to be undefined
+    * X4 throws error when using undefined variable in boolean expressions
+  - Solution: Added defensive initialization check to ensure variable always exists
+    * Primary initialization at `start_trading` label entry (line 2007) - unconditional
+    * Defensive check in `do_else` block (line 2051) - ensures variable exists before any use
+    * Simplified boolean expressions - removed redundant `?` checks since variable is guaranteed to exist
+  - Implementation:
+    * `aiscripts/order.trade.galaxytrader.xml`:
+      - Line 2007: Unconditional initialization at `start_trading` label entry
+      - Line 2051: Added defensive check: `if not $shipNotRegistered? then set to false`
+      - Lines 2065, 2069, 2071: Simplified boolean expressions (removed redundant `?` checks)
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`: Added defensive variable initialization check
+  - Benefits:
+    * Prevents property lookup errors in edge cases
+    * Ensures variable always exists before use in boolean expressions
+    * Defensive programming approach catches any initialization edge cases
+    * More reliable ship registration checking logic
+
+    Many other performance optimizations
+
 Version 0.6.13 - 2025-11-24
 ---------------------------
 
@@ -5238,6 +5400,96 @@ FIXES:
   - Fixed reversed buy/sell assignments
   - Better error handling throughout
 
+PERFORMANCE: Removed Dead Territory Management Code
+  - Removed AnalyzeSectors and CalculateSectorMetrics cues
+  - Problem: Expensive sector analysis ran every 10 minutes but results were never used
+    * Analyzed all sectors (find_sector, find_station, find_offers)
+    * Calculated security, competition, scores
+    * Assigned territories to ships
+    * But territories were never checked during trade search
+  - Solution: Removed entire sector analysis system
+    * AnalyzeSectors cue (every 600s): Removed
+    * CalculateSectorMetrics cue: Removed
+    * OptimizeTerritories: Removed (never called, handlers were never triggered)
+    * HandleSectorChangeEvent: Removed (never triggered)
+    * HandleShipAssignmentEvent: Removed (never triggered)
+  - Files Modified:
+    * `md/gt_territory_management.xml`: Removed AnalyzeSectors, CalculateSectorMetrics, OptimizeTerritories, and unused event handlers
+  - Benefits:
+    * Eliminates expensive find_sector/find_station/find_offers operations every 10 minutes
+    * Removes unused territory assignment logic
+    * Reduces code complexity and maintenance burden
+    * Territory expertise system still functional (XP bonuses on trade completion)
+
+PERFORMANCE: Removed ShipRecovery Safety Net
+  - Removed ShipRecovery cue that recovered idle ships and cleaned stale locks
+  - Problem: Safety net masked bugs instead of fixing root causes
+    * Recovered ships idle > 300s without orders
+    * Cleaned stale search locks > 60s old
+    * If code is stable, these scenarios shouldn't happen
+  - Solution: Removed recovery system - normal flow should handle all cases
+    * Trade completes → resume main_loop → request trade → added to queue
+    * Trade fails → failure handler → added to queue
+    * Search completes → releases lock → creates order OR adds to queue
+    * Search fails → releases lock → added to queue
+  - Files Modified:
+    * `md/gt_trading_execution.xml`: Removed ShipRecovery cue
+  - Benefits:
+    * Eliminates periodic iteration through all ships every 60 seconds
+    * Removes nested loops checking queue membership
+    * Forces bugs to surface instead of being hidden
+    * Better long-term stability (fix root causes, not symptoms)
+
+PERFORMANCE: Removed Periodic Ship Iterations
+  - Removed LastUpdate timestamp update from SystemMaintenance
+  - Problem: Periodic timestamp update made all ships appear "active"
+    * Updated LastUpdate for all ships every 60 seconds
+    * Active check: (player.age - LastUpdate) < 600s
+    * Since update interval (60s) < active threshold (600s), all ships always appeared active
+    * Made "active ship" check meaningless
+  - Solution: LastUpdate only updates when ships actually do something
+    * Updated on trade completion, registration, status changes, etc.
+    * SystemMaintenance still runs for session stats and periodic reports
+    * Active check now works correctly
+  - Files Modified:
+    * `md/gt_core_system.xml`: Removed LastUpdate update from SystemMaintenance
+  - Benefits:
+    * Eliminates periodic iteration through all ships every 60 seconds
+    * Active ship check now functional (ships only active when actually trading)
+    * More accurate ship activity tracking
+
+PERFORMANCE: Removed Unnecessary Territory Conflict Resolution
+  - Removed ResolveConflicts cue
+  - Problem: Territory conflict resolution ran every 15 minutes but territories aren't used
+    * Iterated through all ships to build territory assignment map
+    * Checked for conflicts (multiple ships in same territory)
+    * Reassigned ships based on expertise
+    * But territories aren't checked during trade search
+  - Solution: Removed conflict resolution system
+    * ResolveConflicts cue (every 900s): Removed
+    * Signal call from HandleConflictEvent: Removed
+  - Files Modified:
+    * `md/gt_territory_management.xml`: Removed ResolveConflicts cue
+  - Benefits:
+    * Eliminates periodic iteration through all ships every 15 minutes
+    * Removes unnecessary territory reassignment logic
+    * Reduces CPU overhead
+
+PERFORMANCE: Removed Periodic Debug Status
+  - Removed PeriodicDebugStatus cue
+  - Problem: Iterated through all ships every 5 minutes for debug output
+    * Counted ship states (active, blocked, training)
+    * Output debug statistics
+    * Only useful during development/debugging
+  - Solution: Removed periodic debug output
+    * Debug information available on-demand via ShowStatus cue if needed
+  - Files Modified:
+    * `md/gt_debug.xml`: Removed PeriodicDebugStatus cue and nested cues
+  - Benefits:
+    * Eliminates periodic iteration through all ships every 5 minutes
+    * Reduces CPU overhead
+    * Debug info still available on-demand
+
 FILES CHANGED:
   - gt_core_system.xml
   - gt_territory_management.xml
@@ -5249,6 +5501,7 @@ FILES CHANGED:
   - gt_global_settings.xml
   - gt_trading_maintenance.xml
   - gt_fleet_coordination.xml
+  - gt_debug.xml
 
 Version 0.2.0 - 2024-01-01
 --------------------------
