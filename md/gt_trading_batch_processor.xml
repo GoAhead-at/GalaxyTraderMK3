@@ -25,6 +25,56 @@
         <!-- Retrieve ship object from signal (used as table key) -->
         <set_value name="$ship" exact="event.param"/>
         
+        <!-- CRITICAL FIX: Check GT order status BEFORE processing -->
+        <!-- If ship no longer has GT order, cancel immediately to prevent blocking queue -->
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_IsGTControlled" result="$hasGTOrder">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- CRITICAL FIX: Check if ship is in maintenance BEFORE processing -->
+        <!-- Ships in maintenance shouldn't process batch data (waste CPU, blocks queue) -->
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_IsShipInMaintenance" result="$isInMaintenance">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <!-- Cancel if ship no longer has GT order OR is in maintenance -->
+        <do_if value="not $hasGTOrder or $isInMaintenance">
+          <!-- CRITICAL FIX: Check if ship is in ActiveShips BEFORE removing -->
+          <!-- If ship is in ActiveShips, it means ActiveProcessors was incremented -->
+          <!-- We MUST decrement ActiveProcessors when removing from ActiveShips -->
+          <set_value name="$wasInActiveShips" exact="false"/>
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
+            <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
+              <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
+                <set_value name="$wasInActiveShips" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- Remove ship from active ships list FIRST -->
+          <do_if value="$wasInActiveShips and global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+          </do_if>
+          
+          <!-- CRITICAL FIX: Decrement ActiveProcessors if ship was in ActiveShips -->
+          <!-- This fixes the bug where continuation batches cancel but don't decrement counter -->
+          <do_if value="$wasInActiveShips and global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+          </do_if>
+          
+          <!-- Process next queued batch processor if any -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$cancelReason" exact="if not $hasGTOrder then 'no GT order' else 'in maintenance'"/>
+            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Cancelling batch processor - ' + $cancelReason + ' (wasInActiveShips: ' + $wasInActiveShips + ', ActiveProcessors: ' + (if global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? then global.$GT_BatchProcessorQueue.$ActiveProcessors else 0) + ')'" chance="100"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
         <!-- Initialize batch processor queue if needed -->
         <do_if value="not global.$GT_BatchProcessorQueue?">
           <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
@@ -92,31 +142,13 @@
         <!-- Retrieve state from GLOBAL TABLE using ship object as key (persists after SearchLiveTrades ends) -->
         <set_value name="$state" exact="@global.$GT_BatchDataList.{$ship}"/>
         
-        <!-- Check if state exists AND is not null (X4 ? operator only checks existence, not null) -->
-        <!-- If state doesn't exist or is null, entry was cleaned up or never created (initialization handles old saves) -->
-        <!-- Check if $state is a valid table by trying to access .keys property -->
+        <!-- Check if state exists and has expected batch fields -->
         <set_value name="$stateValid" exact="false"/>
-        <do_if value="$state?">
-          <!-- State variable exists - verify it's actually a valid table (not null) -->
-          <!-- Try accessing .keys property - if state is null, @ operator returns null safely -->
-          <set_value name="$stateKeysTest" exact="@$state.keys"/>
-          <!-- If state is null, $stateKeysTest will be null -->
-          <!-- Check if we got a valid list back (not null) by trying to access .count -->
-          <set_value name="$stateKeysCountTest" exact="@$stateKeysTest.count"/>
-          <!-- Check if count is actually a number (not null) -->
-          <!-- If $stateKeysCountTest is null, we can't compare it, so check if it exists AND is >= 0 -->
-          <do_if value="$stateKeysCountTest?">
-            <!-- Count variable exists - verify it's actually a number by checking it's >= 0 -->
-            <!-- If count is null, the comparison will fail or be false -->
-            <do_if value="$stateKeysCountTest ge 0">
-              <!-- Comparison succeeded - count is >= 0, so it's a valid number and state is valid table -->
-              <!-- Also verify state has expected property ($batchId) to confirm it's batch state, not just any table -->
-              <set_value name="$stateBatchIdTest" exact="@$state.$batchId"/>
-              <do_if value="$stateBatchIdTest?">
-                <!-- State has $batchId - it's valid batch state -->
-                <set_value name="$stateValid" exact="true"/>
-              </do_if>
-            </do_if>
+        <set_value name="$stateBatchIdTest" exact="null"/>
+        <do_if value="$state">
+          <set_value name="$stateBatchIdTest" exact="@$state.$batchId"/>
+          <do_if value="$stateBatchIdTest?">
+            <set_value name="$stateValid" exact="true"/>
           </do_if>
         </do_if>
         <do_if value="not $stateValid">
@@ -126,16 +158,7 @@
           </do_if>
           <!-- Remove ship from active ships list -->
           <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
-            <set_value name="$shipIndex" exact="-1"/>
-            <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
-              <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
-                <set_value name="$shipIndex" exact="$i"/>
-                <break/>
-              </do_if>
-            </do_all>
-            <do_if value="$shipIndex ge 0">
-              <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" index="$shipIndex"/>
-            </do_if>
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
           </do_if>
           <!-- Process next queued batch processor if any -->
           <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
@@ -143,7 +166,7 @@
           </do_if>
           
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] Batch state not found or null for ship ' + $ship.idcode + ' - cancelling (stateKeysCountTest: ' + $stateKeysCountTest + ')'" chance="100"/>
+            <debug_text text="'[GT-Batch] Batch state not found/invalid for ship ' + $ship.idcode + ' - cancelling (state: ' + $state + ', batchId: ' + $stateBatchIdTest + ')'" chance="100"/>
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
@@ -1330,16 +1353,7 @@
             </do_if>
             <!-- Remove ship from active ships list -->
             <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
-              <set_value name="$shipIndex" exact="-1"/>
-              <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
-                <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
-                  <set_value name="$shipIndex" exact="$i"/>
-                  <break/>
-                </do_if>
-              </do_all>
-              <do_if value="$shipIndex ge 0">
-                <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" index="$shipIndex"/>
-              </do_if>
+              <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
             </do_if>
             <!-- Process next queued batch processor if any -->
             <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
@@ -1416,24 +1430,182 @@
           <set_value name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="[]"/>
         </do_if>
         
+        <!-- CRITICAL FIX: Clean up stale entries proactively (ships without GT orders) -->
+        <!-- This prevents queue from accumulating stale entries from save games -->
+        <set_value name="$staleEntriesRemoved" exact="0"/>
+        <do_if value="global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+          <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i" reverse="true">
+            <set_value name="$queuedShip" exact="global.$GT_BatchProcessorQueue.$Ships.{$i}"/>
+            
+            <!-- Check if ship is GT-controlled -->
+            <run_actions ref="md.GT_Ship_State_Utilities.GT_IsGTControlled" result="$hasGTOrder">
+              <param name="ship" value="$queuedShip"/>
+            </run_actions>
+            
+            <!-- Remove stale entries (ships without GT orders) -->
+            <do_if value="not $hasGTOrder">
+              <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$queuedShip"/>
+              <set_value name="$staleEntriesRemoved" operation="add"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Log cleanup if any stale entries were removed -->
+        <do_if value="$staleEntriesRemoved gt 0">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] Cleaned up ' + $staleEntriesRemoved + ' stale queue entries (ships without GT orders)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Verify active processors are still valid -->
+        <!-- Check if ActiveShips list contains ships that no longer have batch data or GT orders -->
+        <set_value name="$staleActiveProcessorsRemoved" exact="0"/>
+        <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips? and global.$GT_BatchProcessorQueue.$ActiveShips.count gt 0">
+          <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i" reverse="true">
+            <set_value name="$activeShip" exact="global.$GT_BatchProcessorQueue.$ActiveShips.{$i}"/>
+            <set_value name="$isValidActive" exact="false"/>
+            
+            <!-- DEBUG: Log which ship is being validated -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] Validating active processor: ' + $activeShip.idcode" chance="100"/>
+            </do_if>
+            
+            <!-- Check if ship is GT-controlled -->
+            <run_actions ref="md.GT_Ship_State_Utilities.GT_IsGTControlled" result="$hasGTOrder">
+              <param name="ship" value="$activeShip"/>
+            </run_actions>
+            
+            <!-- Check if ship still has batch data (processor is actually running) -->
+            <set_value name="$hasBatchData" exact="false"/>
+            <set_value name="$batchStartTime" exact="null"/>
+            <do_if value="$hasGTOrder and global.$GT_BatchDataList? and global.$GT_BatchDataList.{$activeShip}?">
+              <set_value name="$batchState" exact="@global.$GT_BatchDataList.{$activeShip}"/>
+              <do_if value="$batchState">
+                <set_value name="$batchIdTest" exact="@$batchState.$batchId"/>
+                <set_value name="$batchStartTime" exact="@$batchState.$batchStartTime"/>
+                <do_if value="$batchIdTest?">
+                  <set_value name="$hasBatchData" exact="true"/>
+                  <set_value name="$isValidActive" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
+            <!-- CRITICAL FIX: Check if ship is in maintenance -->
+            <!-- Ships in maintenance shouldn't process batch data -->
+            <set_value name="$isInMaintenance" exact="false"/>
+            <do_if value="$isValidActive">
+              <run_actions ref="md.GT_Ship_State_Utilities.GT_IsShipInMaintenance" result="$isInMaintenance">
+                <param name="ship" value="$activeShip"/>
+              </run_actions>
+              <do_if value="$isInMaintenance">
+                <set_value name="$isValidActive" exact="false"/>
+              </do_if>
+            </do_if>
+            
+            <!-- CRITICAL FIX: Check if batch processor has been running too long (timeout) -->
+            <!-- If batch processor has been active for > 60 seconds, consider it stuck and remove it -->
+            <!-- Also: If batch data exists but doesn't have batchStartTime, it's old (created before fix) - treat as stale -->
+            <set_value name="$isTimedOut" exact="false"/>
+            <do_if value="$isValidActive">
+              <do_if value="$batchStartTime?">
+                <!-- New batch data with start time - check timeout -->
+                <set_value name="$elapsedTime" exact="player.age - $batchStartTime"/>
+                <do_if value="$elapsedTime gt 60s">
+                  <set_value name="$isTimedOut" exact="true"/>
+                  <set_value name="$isValidActive" exact="false"/>
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Batch] Active processor TIMEOUT: ' + $activeShip.idcode + ' has been processing for ' + ($elapsedTime / 1s) + ' seconds - removing from active processors'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Old batch data without batchStartTime - treat as stale (created before timeout fix) -->
+                <set_value name="$isTimedOut" exact="true"/>
+                <set_value name="$isValidActive" exact="false"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Batch] Active processor STALE: ' + $activeShip.idcode + ' has old batch data without batchStartTime - removing from active processors'" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_if>
+            
+            <!-- Remove stale active processors (no GT order, no batch data, in maintenance, or timed out) -->
+            <do_if value="not $isValidActive">
+              <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$activeShip"/>
+              <set_value name="$staleActiveProcessorsRemoved" operation="add"/>
+              <!-- Decrement ActiveProcessors counter -->
+              <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+                <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+              </do_if>
+              <!-- Clean up batch data for stale processor -->
+              <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$activeShip}?">
+                <remove_value name="global.$GT_BatchDataList.{$activeShip}"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Log cleanup if any stale active processors were removed -->
+        <do_if value="$staleActiveProcessorsRemoved gt 0">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] Cleaned up ' + $staleActiveProcessorsRemoved + ' stale active processors (no GT order, no batch data, or in maintenance)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Ensure ActiveProcessors counter matches ActiveShips.count -->
+        <!-- This MUST run BEFORE the concurrency check, otherwise stuck counters block the queue -->
+        <!-- This prevents counter from getting stuck if cleanup logic fails -->
+        <set_value name="$actualActiveCount" exact="0"/>
+        <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips?">
+          <set_value name="$actualActiveCount" exact="global.$GT_BatchProcessorQueue.$ActiveShips.count"/>
+        </do_if>
+        <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors != $actualActiveCount">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] Counter mismatch detected - ActiveProcessors=' + global.$GT_BatchProcessorQueue.$ActiveProcessors + ', ActiveShips.count=' + $actualActiveCount + ' - correcting'" chance="100"/>
+          </do_if>
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="$actualActiveCount"/>
+        </do_if>
+        
         <!-- ATOMIC LOCK: Process if below max concurrent processors (prevents race conditions) -->
+        <!-- NOTE: Counter validation above ensures ActiveProcessors is accurate before this check -->
         <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors lt global.$GT_BatchProcessorQueue.$MaxConcurrent and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
           
           <!-- Get first ship from queue -->
           <set_value name="$ship" exact="global.$GT_BatchProcessorQueue.$Ships.{1}"/>
           <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
           
-          <!-- Don't increment here - ProcessTradeMatchingBatch will handle it -->
-          <!-- This prevents double-increment and ensures proper continuation batch detection -->
+          <!-- PERFORMANCE FIX: Check GT order status before processing -->
+          <!-- Skip ships that no longer have GT orders (prevents processing stale queue entries) -->
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_IsGTControlled" result="$isGTControlled">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR QUEUED - starting (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued: ' + global.$GT_BatchProcessorQueue.$Ships.count + ')'" chance="100"/>
+          <!-- Skip ships without GT orders and process next queued ship -->
+          <do_if value="not $isGTControlled">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Skipping - ship no longer has GT order (queued: ' + global.$GT_BatchProcessorQueue.$Ships.count + ')'" chance="100"/>
+            </do_if>
+            <!-- Process next queued ship if any -->
+            <do_if value="global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+            </do_if>
           </do_if>
-          
-          <!-- Start the batch processor (it will increment ActiveProcessors) -->
-          <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+          <do_else>
+            <!-- Ship IS GT-controlled - proceed with batch processing -->
+            <!-- Don't increment here - ProcessTradeMatchingBatch will handle it -->
+            <!-- This prevents double-increment and ensures proper continuation batch detection -->
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR QUEUED - starting (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued: ' + global.$GT_BatchProcessorQueue.$Ships.count + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- Start the batch processor (it will increment ActiveProcessors) -->
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+          </do_else>
         </do_if>
         <do_else>
+          <!-- Queue is blocked - check if counter is actually correct -->
+          <!-- If ActiveProcessors >= MaxConcurrent but ActiveShips is empty or has invalid ships, counter is wrong -->
+          <!-- Counter validation runs before the concurrency gate (1601+). If we get here, queue is legitimately blocked. -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0 and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
             <debug_text text="'[GT-Batch] Batch processor in progress, skipping (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + ', queued: ' + global.$GT_BatchProcessorQueue.$Ships.count + ')'" chance="100"/>
           </do_if>
