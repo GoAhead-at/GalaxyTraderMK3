@@ -107,74 +107,96 @@
       
       <set_value name="$state" exact="global.$GT_Ship_State.{this.assignedcontrolled}"/>
       
-      <!-- Check if ship was subordinate to GT commander (commander was removed) -->
-      <set_value name="$wasSubordinateToGTCommander" exact="false"/>
-      
-      <!-- Method 1: Check state (if it was tracked) -->
-      <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
-        <do_if value="$state.$CommanderHasGT? and $state.$CommanderHasGT">
-          <set_value name="$wasSubordinateToGTCommander" exact="true"/>
-        </do_if>
+      <!-- CRITICAL FIX: Check if ship is being newly assigned to a commander -->
+      <!-- During assignment transition, commander might not be detected yet, but ship might have been idle before -->
+      <!-- Get old commander from state (if tracked) -->
+      <set_value name="$oldCommander" exact="null"/>
+      <do_if value="$state.$Commander? and $state.$Commander.exists">
+        <set_value name="$oldCommander" exact="$state.$Commander"/>
       </do_if>
       
-      <!-- Method 2: PRIMARY CHECK - Ship is in GT_Ships registry (indicates it was GT-controlled) -->
-      <!-- ALL ships with GT orders are in global.$GT_Ships, regardless of modifications -->
-      <do_if value="not $wasSubordinateToGTCommander and global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?">
-        <set_value name="$wasSubordinateToGTCommander" exact="true"/>
+      <!-- Check if ship is being newly assigned (had no commander before, now has one) -->
+      <set_value name="$newlyAssignedToCommander" exact="false"/>
+      <do_if value="(not $oldCommander.exists or $oldCommander == null) and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists">
+        <set_value name="$newlyAssignedToCommander" exact="true"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Assist] ' + this.assignedcontrolled.idcode + ' - Ship is in GT_Ships registry - treating as GT subordinate removal'" chance="100"/>
+          <debug_text text="'[GT-Assist] ' + this.assignedcontrolled.idcode + ' - NEWLY ASSIGNED to commander ' + this.assignedcontrolled.commander.idcode + ' (was idle before) - skipping cleanup'" chance="100"/>
         </do_if>
       </do_if>
       
-      <!-- If ship was subordinate to GT commander and is now removed, restore name and send cancellation signal -->
-      <do_if value="$wasSubordinateToGTCommander">
-      <!-- CRITICAL FIX: Check if ship still has GT order (direct or via new commander) BEFORE sending cancellation -->
-      <!-- Ship might have been reassigned to another GT commander or got direct GT order -->
-      <set_value name="$stillHasGTOrder" exact="false"/>
-      
-      <!-- Check 1: Direct GT order -->
-      <do_if value="this.assignedcontrolled.defaultorder? and @this.assignedcontrolled.defaultorder.id == 'GalaxyTraderMK3'">
-        <set_value name="$stillHasGTOrder" exact="true"/>
-      </do_if>
-      
-      <!-- Check 2: Subordinate to GT commander (new commander) -->
-      <do_if value="not $stillHasGTOrder and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
-        <do_if value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3'">
+      <!-- Only proceed if ship was NOT newly assigned -->
+      <do_if value="not $newlyAssignedToCommander">
+        <!-- Check if ship was subordinate to GT commander (commander was removed) -->
+        <set_value name="$wasSubordinateToGTCommander" exact="false"/>
+        
+        <!-- Method 1: Check state (if it was tracked) -->
+        <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+          <do_if value="$state.$CommanderHasGT? and $state.$CommanderHasGT">
+            <set_value name="$wasSubordinateToGTCommander" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Method 2: PRIMARY CHECK - Ship is in GT_Ships registry (indicates it was GT-controlled) -->
+        <!-- ALL ships with GT orders are in global.$GT_Ships, regardless of modifications -->
+        <do_if value="not $wasSubordinateToGTCommander and global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?">
+          <set_value name="$wasSubordinateToGTCommander" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Assist] ' + this.assignedcontrolled.idcode + ' - Ship is in GT_Ships registry - treating as GT subordinate removal'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- If ship was subordinate to GT commander and is now removed, restore name and send cancellation signal -->
+        <do_if value="$wasSubordinateToGTCommander">
+        <!-- CRITICAL FIX: Check if ship still has GT order (direct or via new commander) BEFORE sending cancellation -->
+        <!-- Ship might have been reassigned to another GT commander or got direct GT order -->
+        <set_value name="$stillHasGTOrder" exact="false"/>
+        
+        <!-- Check 1: Direct GT order -->
+        <do_if value="this.assignedcontrolled.defaultorder? and @this.assignedcontrolled.defaultorder.id == 'GalaxyTraderMK3'">
           <set_value name="$stillHasGTOrder" exact="true"/>
         </do_if>
-      </do_if>
-      
-      <!-- Only send cancellation signal if ship NO LONGER has GT order -->
-      <do_if value="not $stillHasGTOrder">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Subordinate removed from GT commander (detected in Assist order) - GT order truly cancelled'" chance="100"/>
-        </do_if>
         
-        <!-- Update state to reflect GT order cancellation -->
-        <set_value name="$state.$HasGTOrder" exact="false"/>
-        <set_value name="$state.$OperationalState" exact="'orphaned'"/>
-        <set_value name="$state.$ActiveTradeOrders" exact="0"/>
-        <set_value name="$state.$Commander" exact="null"/>
-        <set_value name="$state.$CommanderHasGT" exact="false"/>
-        <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
-        <set_value name="$state.$LastStateUpdate" exact="player.age"/>
-        
-        <!-- MOD REMOVAL: Send GT_Ship_State_Update signal for mod removal system -->
-        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
-          $Ship = this.assignedcontrolled,
-          $UpdateType = 'GT_Order_Cancelled'
-        ]"/>
-        
-          <!-- EVENT-DRIVEN: Trigger orphaned ship check for subordinate -->
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?">
-            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.assignedcontrolled]"/>
+        <!-- Check 2: Subordinate to GT commander (new commander) -->
+        <do_if value="not $stillHasGTOrder and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
+          <do_if value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$stillHasGTOrder" exact="true"/>
           </do_if>
-      </do_if>
-      <do_else>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Subordinate removed from GT commander BUT ship still has GT order (direct or via new commander) - NOT sending cancellation'" chance="100"/>
         </do_if>
-      </do_else>
+      
+        <!-- Only send cancellation signal if ship NO LONGER has GT order -->
+        <do_if value="not $stillHasGTOrder">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Subordinate removed from GT commander (detected in Assist order) - GT order truly cancelled'" chance="100"/>
+          </do_if>
+          
+          <!-- Update state to reflect GT order cancellation -->
+          <set_value name="$state.$HasGTOrder" exact="false"/>
+          <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+          <set_value name="$state.$ActiveTradeOrders" exact="0"/>
+          <set_value name="$state.$Commander" exact="null"/>
+          <set_value name="$state.$CommanderHasGT" exact="false"/>
+          <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+          <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+          
+          <!-- MOD REMOVAL: Send GT_Ship_State_Update signal for mod removal system -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+            $Ship = this.assignedcontrolled,
+            $UpdateType = 'GT_Order_Cancelled'
+          ]"/>
+          
+            <!-- EVENT-DRIVEN: Trigger orphaned ship check for subordinate -->
+            <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?">
+              <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.assignedcontrolled]"/>
+            </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - Subordinate removed from GT commander BUT ship still has GT order (direct or via new commander) - NOT sending cancellation'" chance="100"/>
+          </do_if>
+        </do_else>
+        </do_if>
+      <!-- End: Only proceed if ship was NOT newly assigned -->
+      </do_if>
       
       <!-- NAME RESTORATION: Restore ship name (only if no GT order) -->
       <set_value name="$hasDirectGTOrder" exact="false"/>
@@ -203,7 +225,6 @@
           </do_if>
         </do_if>
       </do_if>
-    </do_if>
     </do_if>
     <!-- End: Only process if commander was actually removed -->
     
