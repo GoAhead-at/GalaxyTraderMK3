@@ -33,6 +33,7 @@ ffi.cdef[[
         bool istemporder;
     } Order;
     bool GetDefaultOrder(Order* result, UniverseID controllableid);
+    uint32_t GetNumSubordinatesOfGroup(UniverseID commanderid, int group);
 ]]
 
 function Init()
@@ -163,15 +164,37 @@ function L.OnUpdate()
     
     local previousOrderID = L.previousOrders[ship] or "NONE"
     local previousPilotID = L.previousPilots[ship] or "NONE"
+    local previousCommanderID = L.previousCommanders[ship] or "NONE"
+    
+    -- Check if ship was promoted to commander (had commander before, no commander now)
+    local wasPromotedToCommander = false
+    if previousCommanderID ~= "NONE" and currentCommanderID == "NONE" then
+        -- Ship previously had a commander, now has none - might have been promoted
+        -- Check if ship has subordinates (confirms it's a commander)
+        local numSubordinates = 0
+        for group = 1, 10 do
+            local count = C.GetNumSubordinatesOfGroup(ship, group)
+            if count and count > 0 then
+                numSubordinates = numSubordinates + count
+            end
+        end
+        if numSubordinates > 0 then
+            wasPromotedToCommander = true
+        end
+    end
     
     if currentOrderID ~= previousOrderID then
         if previousOrderID == "GalaxyTraderMK3" and currentOrderID ~= "GalaxyTraderMK3" then
-            L.cleanupTriggered[ship] = true
-            AddUITriggeredEvent("GT_OrderMonitor", "GTOrderRemoved", {
-                ship = shipIDCode,
-                oldOrder = previousOrderID,
-                newOrder = currentOrderID
-            })
+            -- Only trigger cleanup if ship wasn't promoted to commander
+            -- Newly promoted commanders might temporarily lose order while X4 assigns it
+            if not wasPromotedToCommander then
+                L.cleanupTriggered[ship] = true
+                AddUITriggeredEvent("GT_OrderMonitor", "GTOrderRemoved", {
+                    ship = shipIDCode,
+                    oldOrder = previousOrderID,
+                    newOrder = currentOrderID
+                })
+            end
         end
         L.previousOrders[ship] = currentOrderID
     end
@@ -217,6 +240,11 @@ function L.OnUpdate()
             -- Commander status unknown - keep ship to avoid false positives
             shouldKeepShip = true
         end
+    elseif wasPromotedToCommander then
+        -- Ship was promoted to commander (had commander before, now has subordinates)
+        -- Keep it even if it doesn't have GT order yet - X4 needs time to assign order
+        -- This handles vanilla's automatic commander promotion when old commander destroyed
+        shouldKeepShip = (currentPilotID ~= "NONE")
     end
     
     if not L.cleanupTriggered[ship] and not shouldKeepShip then
