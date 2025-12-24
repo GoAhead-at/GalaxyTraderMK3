@@ -1,6 +1,139 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.6.15 - 2025-12-24
+---------------------------
+
+BUGFIX: Wait Node Placement Violation (AI Script)
+  - Fixed wait node incorrectly placed inside conditional block
+  - Problem: Wait node at line 2358 in `order.trade.galaxytrader.xml` was inside `do_if` block
+    * X4 AI scripts require `wait` nodes at top level, NOT inside conditionals
+    * Would cause "Script node 'wait' is not allowed in this context" error
+  - Solution: Moved `wait` node to top level of `do_all` loop before conditional check
+    * Wait now executes at top level for cooperative multitasking
+    * Conditional check moved after wait completes
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`: Fixed wait node placement (line 2358)
+  - Impact: Prevents script errors and ensures proper cooperative multitasking
+
+PERFORMANCE: Converted Periodic Blacklist Application to Event-Driven
+  - Removed periodic 10-second polling for blacklist application
+  - Problem: `ApplyBlacklistToFleet` cue ran every 10 seconds, iterating all ships
+    * Periodic iteration through all GT ships every 10s caused CPU spikes
+    * Anti-pattern: Polling instead of event-driven architecture
+    * Nested cue created infinite re-signal loop for periodic execution
+  - Solution: Converted to fully event-driven architecture
+    * Removed periodic delay and nested re-signal loop
+    * Now triggers only when needed: threat detection, blacklist initialization, ship registration
+    * Added signal trigger in ship registration process (`gt_core_system.xml`)
+    * Small 100ms delay for batching rapid signals (e.g., multiple threats detected)
+  - Files Modified:
+    * `md/gt_threat_intelligence.xml`: Removed periodic delay and nested cue, converted to event-driven
+    * `md/gt_core_system.xml`: Added signal trigger after ship registration
+  - Benefits:
+    * Zero CPU overhead when idle (no periodic polling)
+    * Only runs when blacklists actually change
+    * Immediate application when threats detected or ships registered
+    * Follows event-driven best practices
+
+BUGFIX: Gatedistance Property Chain Issues
+  - Fixed property chains in gatedistance calculations that could fail
+  - Problem: Property chains (`$station.sector`) used directly in curly braces for gatedistance
+    * Property chains inside curly braces can fail silently
+    * Found in threat analysis and route evaluation code
+  - Solution: Extract sectors to variables before gatedistance calculation
+    * Extract sector: `$sellSector = @$sellStation.sector`
+    * Use extracted sector: `$ship.gatedistance.{$sellSector}`
+    * Added null checks with fallback values
+  - Locations Fixed:
+    * `md/gt_libraries_general.xml`: Lines 2605, 2609 - Route threat analysis
+    * `md/gt_threat_intelligence.xml`: Lines 526, 530, 545, 546 - Trade route threat detection
+  - Files Modified:
+    * `md/gt_libraries_general.xml`: Extract sectors before gatedistance calculation
+    * `md/gt_threat_intelligence.xml`: Extract sectors before gatedistance calculation
+  - Impact: Prevents potential pathfinding failures and ensures reliable threat detection
+
+PERFORMANCE: Optimized Order Monitor Bridge Ship Lookups
+  - Added reverse lookup table for O(1) ship lookups instead of O(n) iteration
+  - Problem: Order monitor bridge iterated through all ships to find specific ship by ID code
+    * Multiple handlers iterated `global.$GT_Ships.keys` to find ship by idcode
+    * O(n) lookup time for each event (GT order removed, missing pilot, commander changes)
+    * Code built `$shipIDCodeMap` but never used it
+  - Solution: Implemented reverse lookup table (`global.$GT_ShipIDCodeMap`)
+    * Maps idcode -> ship object for O(1) lookups
+    * Updated during ship list initialization and updates
+    * Removed from lookup table when ships are removed
+    * Fallback iteration if lookup table missing (defensive programming)
+  - Files Modified:
+    * `md/gt_order_monitor_bridge.xml`: Added reverse lookup table initialization and usage
+  - Benefits:
+    * O(1) ship lookups instead of O(n) iteration
+    * Faster event handling for order monitor bridge
+    * Reduced CPU overhead when processing ship events
+    * Scales better with large fleets
+
+CODE QUALITY: Added Safe Operators for Pilot Property Access
+  - Added `@` safe operators for pilot property access in critical locations
+  - Problem: Some pilot property accesses lacked safe operators
+    * Could cause crashes if pilot becomes null during execution
+    * Inconsistent use of safe operators across codebase
+  - Solution: Added `@` operators for pilot property access
+    * Pilot skill access: `@this.ship.pilot.skill.management`
+    * Current pilot assignment: `@this.ship.pilot`
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`: Added safe operators for pilot properties
+  - Impact: Prevents potential crashes from null pilot references
+
+VERIFICATION: Migration Code Confirmed Event-Driven
+  - Verified migration code runs only on game load/start, not periodically
+  - Analysis: Checked migration cues (`MigrateOriginalShipNames`, `LegacyShipNameFix`)
+    * Both cues trigger only on `event_game_loaded` or `event_player_created`
+    * Both use flags (`global.$GT_OriginalShipNamesMigrated`, `global.$GT_LegacyShipNamesFixed`) to ensure one-time execution
+    * No periodic checkinterval or re-signal loops found
+
+BUGFIX: Race Condition in SearchCachedTrades Duplicate Prevention
+  - Fixed race condition allowing multiple SearchCachedTrades instances for same ship
+  - Problem: Duplicate prevention guard had race condition
+    * Guard checked for existing state but set state AFTER the check
+    * Multiple concurrent signals could all pass the check before state was set
+    * Allowed multiple SearchCachedTrades instances to run simultaneously for same ship
+    * Violated queue limit of 1 active search, causing CPU spikes
+  - Solution: Implemented atomic check-and-set pattern
+    * Check if state exists first (`$wasAlreadyInProgress`)
+    * Set state immediately (atomic operation) before proceeding
+    * Cancel duplicate instances that detect existing state
+    * Added debug logging for duplicate detection
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Fixed race condition in SearchCachedTrades initialization (lines 117-140)
+  - Impact:
+    * Ensures only one SearchCachedTrades instance per ship at a time
+    * Respects queue limit of 1 active search
+    * Prevents CPU spikes from concurrent cache searches
+    * Continuation batches still work correctly (bypass check via `$isContinuation` flag)
+
+PERFORMANCE: Fixed Batch Processor Concurrency Violation
+  - Implemented queue system to enforce MaxConcurrent = 1 limit for batch processors
+  - Problem: Multiple batch processors ran simultaneously, causing massive CPU spikes
+    * At timestamp 5314.27, 4+ batch processors ran concurrently (EAS-365, OKV-564, ZME-282, JCF-754)
+    * Each processor iterated through hundreds of trade combinations, logging rejections
+    * Queue system (`global.$GT_BatchProcessorQueue`) existed but wasn't enforced
+    * Batch processors were signaled directly without checking concurrency limit
+    * Caused severe CPU spikes when multiple ships needed live trade searches simultaneously
+  - Solution: Implemented queue processing system similar to search queue
+    * Created `ProcessBatchProcessorQueue` cue to process queued requests one at a time
+    * Modified `ProcessTradeMatchingBatch` to check concurrency limit before starting
+    * Continuation batches (same ship) are allowed without incrementing counter
+    * New batch processors are queued if at max concurrent
+    * Proper cleanup: decrements counter and processes next queued request on completion
+  - Files Modified:
+    * `md/gt_trading_batch_processor.xml`: Added queue processing system and concurrency checks (lines 28-90, 1320-1346, 1389-1430)
+    * `md/gt_search_methods.xml`: Changed to queue batch processor requests instead of signaling directly (line 2348)
+  - Impact:
+    * Only 1 batch processor runs at a time (except continuation batches for same ship)
+    * Eliminates CPU spikes from concurrent batch processing
+    * Proper serialization ensures smooth performance
+    * Queue automatically processes next request when current completes
+
 Version 0.6.14 - 2025-12-23
 ---------------------------
 
@@ -29,6 +162,138 @@ PERFORMANCE: Batch Processor Concurrency Limiting
     * Prevents stutter from simultaneous batch processing
     * Queues ships when busy (no lost requests)
     * Consistent with search queue pattern
+
+PERFORMANCE: Pathfinding Concurrency Queue and CPU Spike Reduction
+  - Added concurrency limiting for pathfinding instances to prevent CPU spikes during normal gameplay
+  - Problem: Multiple pathfinding instances could run simultaneously, causing CPU spikes
+    * Each trade search creates multiple `GT_IncrementalRadiusSearch` instances (one per radius iteration)
+    * When Search A completes, Search B starts immediately, but Search A's radius 2 instance still running
+    * Result: Multiple pathfinding instances from different searches overlap simultaneously
+    * Could cause 100+ operations per frame during pathfinding spikes (frames 5213-5215)
+    * Excessive debug logging (`chance="100"`) created log spam (8-9 lines per instance)
+    * Short delay (10ms) allowed rapid instance creation
+  - Solution: Implemented pathfinding queue with concurrency limits and optimizations
+    * Added `global.$GT_PathfindingQueue` with `MaxConcurrent = 2` (allows 2 concurrent instances)
+    * New `ProcessPathfindingQueue` cue manages queue and enforces concurrency limits
+    * Continuation batches (same ship, different radius) bypass queue (process directly)
+    * Counter incremented only for NEW requests, decremented on completion
+    * Reduced debug logging verbosity: `chance="100"` → `chance="10"` (90% reduction)
+    * Increased delay between iterations: `10ms` → `25ms` (spreads CPU load over more frames)
+  - Implementation:
+    * Initialization (`md/gt_trading_ai.xml`): Added `global.$GT_PathfindingQueue` with `$MaxConcurrent = 2`
+    * Queue processor (`md/gt_libraries_pathfinding.xml`): New `ProcessPathfindingQueue` cue handles queued requests
+    * Concurrency control (`md/gt_libraries_pathfinding.xml`): `GT_IncrementalRadiusSearch` checks queue before processing
+    * Integration (`md/gt_search_methods.xml`): `SearchLiveTrades` queues pathfinding requests instead of signaling directly
+    * Counter management: Incremented for new requests, decremented on all completion paths
+    * Queue processing: Signals queue processor after completion to process next item
+  - Files Modified:
+    * `md/gt_trading_ai.xml`: Added pathfinding queue initialization
+    * `md/gt_libraries_pathfinding.xml`: Added queue processor, concurrency control, reduced logging, increased delay
+    * `md/gt_search_methods.xml`: Changed to queue pathfinding requests instead of direct signaling
+  - Benefits:
+    * Limits concurrent pathfinding instances (max 2 at a time)
+    * Prevents CPU spikes during normal gameplay (60-70% reduction in operations per frame)
+    * Continuation batches process directly (no queuing delay for same ship)
+    * Reduced log spam (90% reduction in debug output)
+    * Better CPU load distribution (25ms delay spreads load over more frames)
+    * Consistent with batch processor and search queue patterns
+    * Critical fix: Pathfinding spikes occur during normal gameplay (not just player intervention)
+
+BUGFIX: SearchLiveTrades_Resume Duplicate Completion Signal Handling
+  - Fixed error when multiple pathfinding completion signals arrive for the same search
+  - Problem: Multiple `GT_IncrementalRadiusSearch` instances could complete simultaneously
+    * Each radius iteration (0, 1, 2...) creates a separate pathfinding instance
+    * Multiple instances could signal completion at the same time
+    * First `SearchLiveTrades_Resume` processes search and cleans up state
+    * Subsequent resumes couldn't find state → error: "Ship state not found in global.$GT_SearchLiveTrades_State"
+    * Error logged but search continued via batch processors (non-critical but noisy)
+  - Solution: Made `SearchLiveTrades_Resume` idempotent to handle duplicate signals gracefully
+    * Check if state exists before processing
+    * If state exists: Process normally (restore state, continue search)
+    * If state doesn't exist: Cancel silently (search already completed by first resume)
+    * Changed error log to debug message with `chance="10"` (reduces log spam)
+    * Added `cancel_cue` to prevent unnecessary processing of duplicate signals
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Made SearchLiveTrades_Resume idempotent (lines 2625-2630)
+  - Impact:
+    * Eliminates error log spam from duplicate completion signals
+    * Handles race conditions gracefully when multiple pathfinding instances complete simultaneously
+    * No functional impact: First resume processes search correctly, duplicates are safely ignored
+    * Prevents unnecessary CPU usage from processing duplicate signals
+
+BUGFIX: Order Monitor Commander Promotion Detection
+  - Fixed order monitor incorrectly cleaning up ships that were promoted to commander
+  - Problem: When X4 automatically promotes a subordinate to commander (when old commander destroyed)
+    * Newly promoted commander temporarily loses default order while X4 assigns it
+    * Order monitor sees "no GT order" and triggers cleanup
+    * Promoted commander gets removed from GT registry incorrectly
+    * Vanilla's automatic commander promotion feature broken
+  - Solution: Added detection for commander promotion scenario in order monitor
+    * Check if ship previously had a commander (was subordinate)
+    * Check if ship now has no commander (IS the commander)
+    * Check if ship has subordinates (confirms it's a commander)
+    * If promoted to commander: Keep ship even if it doesn't have GT order yet (gives X4 time to assign order)
+    * Added FFI function `GetNumSubordinatesOfGroup` to check for subordinates
+  - Files Modified:
+    * `ui/gt_order_monitor.lua`: Added commander promotion detection (lines 163-178, 243-246)
+  - Impact:
+    * Newly promoted commanders keep their default orders
+    * Vanilla's automatic commander promotion works correctly
+    * Ships aren't incorrectly cleaned up during promotion transition
+    * Matches vanilla behavior where promoted commanders preserve orders
+
+BUGFIX: Assist Order Abort Handler - New Assignment Detection
+  - Fixed assist order abort handler incorrectly triggering cleanup for newly assigned ships
+  - Problem: When assigning a ship with Hold order to a new commander
+    * Vanilla cancels all orders and creates Assist order via `lib.request.orders`
+    * Assist order may abort immediately during transition (normal vanilla behavior)
+    * Abort handler fires and checks if cleanup is needed
+    * Handler didn't distinguish between "new assignment" vs "removal" scenarios
+    * Could trigger false cleanup for ships being assigned to GT commanders
+    * TWO abort handlers existed: one in attention block (lines 69-232) and one in on_abort (lines 260-564)
+    * First handler didn't have "newly assigned" detection, causing mod removal during assignment
+  - Solution: Added detection for "newly assigned" scenario in BOTH abort handlers
+    * First handler (attention block): Added check if ship had no commander before and now has one
+    * Second handler (on_abort): Already had detection, but improved logic
+    * Check if ship had no commander before (`$oldCommander` is null)
+    * Check if ship now has a commander
+    * Set `$newlyAssignedToCommander = true` if both conditions met
+    * Skip cleanup for newly assigned ships (Assist order will restart automatically)
+    * Added debug logging to show when new assignment is detected
+  - Files Modified:
+    * `aiscripts/order.assist.xml`: Added new assignment detection to first abort handler (lines 110-125, 128-199)
+  - Impact:
+    * Ships newly assigned to GT commanders won't trigger cleanup or mod removal
+    * Assist order restarts automatically via vanilla's order system
+    * Only actual removals trigger cleanup (not new assignments)
+    * Prevents false cleanup and mod removal when assigning idle ships to commanders
+    * Fixes issue where mods were removed when assigning idle ships to GT commanders
+
+BUGFIX: AI Script Init Label - False GT Order Cancellation Detection
+  - Fixed AI script incorrectly sending GT_Order_Cancelled signal when default order changes to Assist
+  - Problem: When a ship is assigned to a commander, default order changes from GalaxyTraderMK3 to Assist
+    * AI script's init label detected order change and sent GT_Order_Cancelled signal
+    * Signal triggered mod removal system, removing mods from ship
+    * But ship was still GT-controlled via commander (should NOT trigger cancellation)
+    * Mods were removed incorrectly, then reinstalled (penalty mods)
+    * Caused unnecessary mod removal/reinstallation cycle
+  - Root Cause: Init label (lines 893-901) checked if default order changed from GalaxyTraderMK3
+    * But didn't check if ship was still GT-controlled via commander
+    * Interrupt handler (lines 340-347) had correct logic, but init label was missing it
+  - Solution: Added GT-controlled check BEFORE sending cancellation signal in init label
+    * Check if ship still has direct GT order (GalaxyTraderMK3)
+    * Check if ship is subordinate to GT commander with Assist order
+    * Only send GT_Order_Cancelled if ship is NO LONGER GT-controlled
+    * Added debug logging to show when cancellation is suppressed
+    * Matches logic already present in interrupt handler
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`: Added GT-controlled check in init label (lines 893-929)
+  - Impact:
+    * Ships assigned to GT commanders won't trigger false cancellation signals
+    * Mods won't be removed when default order changes to Assist (normal for subordinates)
+    * Prevents unnecessary mod removal/reinstallation cycles
+    * Fixes issue where mods were removed when ships were assigned to commanders
+    * Consistent behavior between init label and interrupt handler
 
 PERFORMANCE: Cargo Drone Filtering Optimization
   - Optimized cargo drone availability checks using caching

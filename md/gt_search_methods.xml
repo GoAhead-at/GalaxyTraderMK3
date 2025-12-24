@@ -115,8 +115,27 @@
         
         <!-- Start: initialize once -->
         <do_if value="not $isContinuation">
-          <!-- Prevent duplicate cache searches for the same ship -->
+          <!-- ATOMIC CHECK: Prevent duplicate cache searches for the same ship -->
+          <!-- Initialize state table if needed -->
+          <do_if value="not global.$GT_SearchCachedTrades_State?">
+            <set_value name="global.$GT_SearchCachedTrades_State" exact="table[]"/>
+          </do_if>
+          
+          <!-- Check if already in progress BEFORE setting state (race condition prevention) -->
+          <set_value name="$wasAlreadyInProgress" exact="false"/>
           <do_if value="global.$GT_SearchCachedTrades_State.{$ship}?">
+            <set_value name="$wasAlreadyInProgress" exact="true"/>
+          </do_if>
+          
+          <!-- Set state immediately to prevent race conditions (atomic operation) -->
+          <!-- Use a marker table to indicate search is in progress -->
+          <set_value name="global.$GT_SearchCachedTrades_State.{$ship}" exact="table[$Started = player.age]"/>
+          
+          <!-- Cancel if this was already in progress (duplicate signal detected) -->
+          <do_if value="$wasAlreadyInProgress">
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cache] Duplicate SearchCachedTrades signal detected for ' + $ship.idcode + ' - cancelling duplicate instance'" chance="100"/>
+            </do_if>
             <cancel_cue cue="this"/>
           </do_if>
           
@@ -1754,13 +1773,22 @@
           $BlacklistGroup = $blacklistgroup
         ]"/>
         
-          <!-- Signal incremental search cue to start (async with CPU yielding) -->
-          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+          <!-- Signal pathfinding queue processor (enforces concurrency limits) -->
+          <do_if value="not global.$GT_PathfindingQueue?">
+            <set_value name="global.$GT_PathfindingQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_PathfindingQueue.$Requests?">
+            <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
+          </do_if>
+          
+          <append_to_list name="global.$GT_PathfindingQueue.$Requests" exact="table[
             $Ship = $ship,
             $HomeSector = $homeSector,
             $MaxDistance = $maxDistance,
             $BlacklistGroup = $blacklistgroup
           ]"/>
+          
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
           
           <!-- Cancel current cue - SearchLiveTrades_Resume will continue processing -->
           <cancel_cue cue="this"/>
@@ -2325,8 +2353,38 @@
             <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Prepared batch data: ' + $wareKeysList.count + ' wares, batchIndex=' + $batchIndex" chance="100"/>
           </do_if>
           
-          <!-- Signal batch processor to start first batch (pass ship object as key) -->
-          <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+          <!-- Queue batch processor request (enforces MaxConcurrent = 1 limit) -->
+          <do_if value="not global.$GT_BatchProcessorQueue?">
+            <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
+            <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
+          </do_if>
+          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+          </do_if>
+          <do_if value="not global.$GT_BatchProcessorQueue.$MaxConcurrent?">
+            <set_value name="global.$GT_BatchProcessorQueue.$MaxConcurrent" exact="1"/>
+          </do_if>
+          
+          <!-- Check if already in queue -->
+          <set_value name="$alreadyInQueue" exact="false"/>
+          <do_if value="global.$GT_BatchProcessorQueue.$Ships?">
+            <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
+              <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
+                <set_value name="$alreadyInQueue" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- Add to queue if not already there -->
+          <do_if value="not $alreadyInQueue">
+            <append_to_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+          </do_if>
+          
+          <!-- Signal queue processor -->
+          <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
           
           <!-- Exit - SearchLiveTrades_Resume will handle results -->
           <!-- Include offer counts for diagnostics (even though batch processing hasn't completed yet) -->
@@ -2565,10 +2623,15 @@
           ]"/>
         </do_if>
         <do_else>
-          <!-- Ship not found in state - log error and abort -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-ERROR] SearchLiveTrades_Resume: Ship state not found in global.$GT_SearchLiveTrades_State - cannot continue trade search'" chance="100"/>
+          <!-- Ship not found in state - this is a duplicate completion signal -->
+          <!-- The first resume already processed the search and cleaned up the state -->
+          <!-- This can happen when multiple pathfinding instances complete simultaneously -->
+          <!-- Just cancel silently - search already completed -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$debugShip" exact="@$ship"/>
+            <debug_text text="'[GT-Search] SearchLiveTrades_Resume: Duplicate completion signal for ' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ' - state already cleaned up (search completed)'" chance="10"/>
           </do_if>
+          <cancel_cue cue="this"/>
         </do_else>
       </actions>
     </cue>
