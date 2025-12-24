@@ -690,6 +690,51 @@
     <!-- INCREMENTAL RADIUS SEARCH (Cue-Based) -->
     <!-- ========================================= -->
     
+    <!-- Pathfinding Queue Processor -->
+    <!-- Manages concurrency for pathfinding instances to prevent CPU spikes -->
+    <cue name="ProcessPathfindingQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- Initialize queue properties if they don't exist -->
+        <do_if value="not global.$GT_PathfindingQueue?">
+          <set_value name="global.$GT_PathfindingQueue" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$Requests?">
+          <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$ActiveInstances?">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" exact="0"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$MaxConcurrent?">
+          <set_value name="global.$GT_PathfindingQueue.$MaxConcurrent" exact="2"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$ActiveShips?">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveShips" exact="[]"/>
+        </do_if>
+
+        <!-- Process if below max concurrent and there are requests in the queue -->
+        <do_if value="global.$GT_PathfindingQueue.$ActiveInstances lt global.$GT_PathfindingQueue.$MaxConcurrent and global.$GT_PathfindingQueue.$Requests.count gt 0">
+          <set_value name="$request" exact="global.$GT_PathfindingQueue.$Requests.{1}"/>
+          <remove_from_list name="global.$GT_PathfindingQueue.$Requests" exact="$request"/>
+          
+          <set_value name="$ship" exact="$request.$Ship"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Pathfinding-Queue] Processing queued pathfinding for ' + $ship.idcode + ' (active: ' + global.$GT_PathfindingQueue.$ActiveInstances + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ', queued: ' + global.$GT_PathfindingQueue.$Requests.count + ')'" chance="10"/>
+          </do_if>
+
+          <!-- Increment active instances counter -->
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="add"/>
+          <append_to_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$ship"/>
+
+          <!-- Signal the actual pathfinding cue -->
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="$request"/>
+        </do_if>
+      </actions>
+    </cue>
+    
     <!-- Incremental Radius Search Cue -->
     <!-- Cue-based pattern with CPU yielding between radius increments -->
     <!-- Phase 1: Detection only - no runtime behavior changes -->
@@ -700,19 +745,61 @@
       </conditions>
       <!-- CPU YIELDING: Delay before each iteration (including recursive signals) -->
       <!-- This ensures CPU is yielded between radius increments, preventing game stutter -->
-      <delay exact="10ms"/>
+      <delay exact="25ms"/>
       <actions>
         <!-- Extract parameters from signal -->
         <set_value name="$params" exact="event.param"/>
+        
+        <!-- CONCURRENCY CONTROL: Check if this is a NEW request (not continuation) -->
+        <!-- Continuation batches (IsContinuation=true) don't need queuing - they're for the same ship -->
+        <set_value name="$isContinuation" exact="false"/>
+        <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
+          <set_value name="$isContinuation" exact="true"/>
+        </do_if>
+        
+        <!-- For NEW requests (not continuation), check concurrency before processing -->
+        <do_if value="not $isContinuation">
+          <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$MaxConcurrent?">
+            <do_if value="global.$GT_PathfindingQueue.$ActiveInstances ge global.$GT_PathfindingQueue.$MaxConcurrent">
+              <!-- Max concurrent reached - queue this request -->
+              <do_if value="not global.$GT_PathfindingQueue.$Requests?">
+                <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
+              </do_if>
+              
+              <append_to_list name="global.$GT_PathfindingQueue.$Requests" exact="$params"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$debugShip" exact="@$params.$Ship"/>
+                <debug_text text="'[GT-Pathfinding-Queue] Pathfinding queued for ' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ' (active: ' + global.$GT_PathfindingQueue.$ActiveInstances + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ')'" chance="10"/>
+              </do_if>
+              
+              <!-- Signal queue processor -->
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              
+              <!-- Cancel this instance - queue will process it -->
+              <cancel_cue cue="this"/>
+            </do_if>
+            <do_else>
+              <!-- Below max concurrent - increment counter for NEW requests -->
+              <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="add"/>
+              <do_if value="not global.$GT_PathfindingQueue.$ActiveShips?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveShips" exact="[]"/>
+              </do_if>
+              <set_value name="$debugShip" exact="@$params.$Ship"/>
+              <append_to_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$debugShip"/>
+            </do_else>
+          </do_if>
+        </do_if>
         
         <!-- Check if this is initialization or continuation -->
         <do_if value="not this.$initialized?">
           <!-- Check if this is a continuation from a previous instance -->
           <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
             <!-- CONTINUATION: Restore state from previous instance -->
+            <!-- Note: Continuation batches don't increment active counter (same ship) -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$debugShip" exact="@$params.$Ship"/>
-              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: CONTINUATION - Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', Phase=' + $params.$Phase + ', EscapeRadius=' + $params.$EscapeSearchRadius + ', TradeRadius=' + $params.$TradeSearchRadius + ', BuySpaces=' + (if @$params.$BuySpaces != null then @$params.$BuySpaces.count else 0) + ', SellSpaces=' + (if @$params.$SellSpaces != null then @$params.$SellSpaces.count else 0)" chance="100"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: CONTINUATION - Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', Phase=' + $params.$Phase + ', EscapeRadius=' + $params.$EscapeSearchRadius + ', TradeRadius=' + $params.$TradeSearchRadius + ', BuySpaces=' + (if @$params.$BuySpaces != null then @$params.$BuySpaces.count else 0) + ', SellSpaces=' + (if @$params.$SellSpaces != null then @$params.$SellSpaces.count else 0)" chance="10"/>
             </do_if>
             <set_value name="this.$initialized" exact="true"/>
             <set_value name="this.$ship" exact="$params.$Ship"/>
@@ -741,7 +828,7 @@
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$homeSectorName" exact="@$homeSector.knownname"/>
               <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
-              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: INITIALIZATION - Ship=' + $ship.idcode + ', HomeSector=' + (if $homeSectorName? then $homeSectorName else 'NULL') + ', CurrentSector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', MaxDistance=' + $maxDistance" chance="100"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: INITIALIZATION - Ship=' + $ship.idcode + ', HomeSector=' + (if $homeSectorName? then $homeSectorName else 'NULL') + ', CurrentSector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', MaxDistance=' + $maxDistance" chance="10"/>
             </do_if>
             
             <!-- Initialize state in cue instance variables (persists across delays) -->
@@ -775,7 +862,7 @@
               <set_value name="this.$phase" exact="'escape'"/>
               <set_value name="this.$escapeSearchRadius" exact="0"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting ESCAPE search (current sector blacklisted) - Ship=' + $ship.idcode" chance="100"/>
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting ESCAPE search (current sector blacklisted) - Ship=' + $ship.idcode" chance="10"/>
               </do_if>
             </do_if>
             <do_else>
@@ -809,7 +896,7 @@
               <!-- Escape path found - transition to trade search -->
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$escapeSectorName" exact="@this.$escapeSector.knownname"/>
-                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: ESCAPE found, transitioning to TRADE search - Ship=' + this.$ship.idcode + ', EscapeSector=' + (if $escapeSectorName? then $escapeSectorName else 'NULL')" chance="100"/>
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: ESCAPE found, transitioning to TRADE search - Ship=' + this.$ship.idcode + ', EscapeSector=' + (if $escapeSectorName? then $escapeSectorName else 'NULL')" chance="10"/>
               </do_if>
               <set_value name="this.$phase" exact="'trade'"/>
               <set_value name="this.$tradeSearchRadius" exact="0"/>
@@ -917,6 +1004,17 @@
               <!-- Further radii will also be empty, so stop searching -->
               <set_value name="this.$shipIsIsolated" exact="true"/>
               <set_value name="this.$escapeSector" exact="null"/>
+              
+              <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+              <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                  <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+                </do_if>
+                <!-- Signal queue processor to process next item -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              </do_if>
+              
               <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
               <cancel_cue cue="this"/>
             </do_if>
@@ -934,8 +1032,19 @@
           <do_if value="this.$tradeSearchRadius gt this.$maxDistance">
             <!-- Trade search complete - signal completion -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: TRADE search COMPLETE (max radius reached) - Ship=' + this.$ship.idcode + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count + ', FinalRadius=' + this.$tradeSearchRadius" chance="100"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: TRADE search COMPLETE (max radius reached) - Ship=' + this.$ship.idcode + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count + ', FinalRadius=' + this.$tradeSearchRadius" chance="10"/>
             </do_if>
+            
+            <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+            <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+              <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+              </do_if>
+              <!-- Signal queue processor to process next item -->
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+            </do_if>
+            
             <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
             <cancel_cue cue="this"/>
           </do_if>
@@ -987,7 +1096,7 @@
             <do_if value="$newSectorsFound">
               <!-- Debug logging for sector collection -->
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Processing TRADE radius ' + this.$tradeSearchRadius + ' - Found ' + $radiusSectors.count + ' sectors - Ship=' + this.$ship.idcode" chance="100"/>
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Processing TRADE radius ' + this.$tradeSearchRadius + ' - Found ' + $radiusSectors.count + ' sectors - Ship=' + this.$ship.idcode" chance="10"/>
               </do_if>
               <!-- Collect sectors at this radius for downstream processing -->
               <do_all exact="$radiusSectors.count" counter="$i">
@@ -1021,6 +1130,17 @@
             <do_if value="$onlyFallbackSector">
               <!-- Only current sector returned (fallback) means no new sectors at this radius -->
               <!-- Further radii will also be empty, so stop searching -->
+              
+              <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+              <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                  <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+                </do_if>
+                <!-- Signal queue processor to process next item -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              </do_if>
+              
               <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
               <cancel_cue cue="this"/>
             </do_if>
@@ -1038,9 +1158,10 @@
               <do_if value="$shouldContinue">
                 <!-- Debug logging for recursive signaling -->
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next TRADE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + this.$tradeSearchRadius + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count" chance="100"/>
+                  <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next TRADE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + this.$tradeSearchRadius + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count" chance="10"/>
                 </do_if>
                 <!-- Signal new instance for next radius iteration with current state -->
+                <!-- Note: Continuation batches signal directly (don't go through queue) -->
                 <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
                   $Ship = this.$ship,
                   $HomeSector = this.$homeSector,
@@ -1069,7 +1190,7 @@
         <do_if value="this.$phase == 'escape' and not this.$escapeSector? and this.$escapeSearchRadius le this.$escapeMaxRadius">
           <!-- Debug logging for recursive signaling -->
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next ESCAPE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + (this.$escapeSearchRadius + 1)" chance="100"/>
+            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next ESCAPE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + (this.$escapeSearchRadius + 1)" chance="10"/>
           </do_if>
           <!-- Signal new instance for next radius iteration with current state -->
           <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
@@ -1108,7 +1229,7 @@
           <set_value name="$debugSellSpacesCount" exact="0"/>
           <set_value name="$debugBuySpacesCount" exact="if @$searchInstance.$buyspaces != null then @$searchInstance.$buyspaces.count else 0"/>
           <set_value name="$debugSellSpacesCount" exact="if @$searchInstance.$sellspaces != null then @$searchInstance.$sellspaces.count else 0"/>
-          <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch_Complete: Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', BuySpaces=' + $debugBuySpacesCount + ', SellSpaces=' + $debugSellSpacesCount + ', Isolated=' + $searchInstance.$shipIsIsolated" chance="100"/>
+          <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch_Complete: Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', BuySpaces=' + $debugBuySpacesCount + ', SellSpaces=' + $debugSellSpacesCount + ', Isolated=' + $searchInstance.$shipIsIsolated" chance="10"/>
         </do_if>
         
         <!-- Build result table (matches GT_BuildTradeSectorLists format for drop-in replacement) -->
