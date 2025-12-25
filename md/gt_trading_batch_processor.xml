@@ -12,19 +12,95 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
-        <!-- Calculate delay from global Performance settings -->
-        <set_value name="$batchDelay" exact="50"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
-          <set_value name="$batchDelay" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
-        </do_if>
-        <!-- Convert to time value (milliseconds); add jitter to avoid synchronized wakeups across many continuations -->
-        <set_value name="$batchDelayJitter" min="0" max="20"/>
-        <set_value name="this.$batchDelayTime" exact="($batchDelay + $batchDelayJitter) * 1ms"/>
-      </actions>
-      <delay exact="this.$batchDelayTime"/>
-      <actions>
+        <!-- CRITICAL PERFORMANCE FIX: Check concurrency BEFORE delay to prevent race conditions -->
         <!-- Retrieve ship object from signal (used as table key) -->
         <set_value name="$ship" exact="event.param"/>
+        
+        <!-- OPTIMIZATION: Initialize batch processor queue structure in one block -->
+        <do_if value="not global.$GT_BatchProcessorQueue?">
+          <set_value name="global.$GT_BatchProcessorQueue" exact="table[
+            $ActiveProcessors = 0,
+            $MaxConcurrent = 1,
+            $ActiveShips = [],
+            $Ships = []
+          ]"/>
+        </do_if>
+        <!-- Ensure all required properties exist (defensive programming for save game compatibility) -->
+        <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+        </do_if>
+        <do_if value="not global.$GT_BatchProcessorQueue.$MaxConcurrent?">
+          <set_value name="global.$GT_BatchProcessorQueue.$MaxConcurrent" exact="1"/>
+        </do_if>
+        <do_if value="not global.$GT_BatchProcessorQueue.$ActiveShips?">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
+          <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
+        </do_if>
+        
+        <!-- OPTIMIZATION: Check if this is a continuation batch (same ship) -->
+        <!-- Since continuation batches are now queued, they'll arrive through the queue processor -->
+        <!-- This check is mainly for tracking/debugging purposes -->
+        <set_value name="$isContinuation" exact="false"/>
+        <set_value name="$hasActiveProcessor" exact="false"/>
+        <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips? and global.$GT_BatchProcessorQueue.$ActiveShips.count gt 0">
+          <!-- Check if this ship already has an active processor -->
+          <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
+            <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
+              <set_value name="$hasActiveProcessor" exact="true"/>
+              <set_value name="$isContinuation" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Check concurrency for ALL batches -->
+        <!-- With MaxConcurrent=1, only ONE batch processor should run at a time -->
+        <!-- Continuation batches for the same ship can proceed immediately if their ship is already active -->
+        <!-- New batches must respect the concurrency limit -->
+        <set_value name="$shouldQueue" exact="false"/>
+        <do_if value="$isContinuation">
+          <!-- Continuation batch: Only queue if ship is NOT in ActiveShips (shouldn't happen, but defensive) -->
+          <do_if value="not $hasActiveProcessor">
+            <!-- Ship not in ActiveShips - not a real continuation, queue it -->
+            <set_value name="$shouldQueue" exact="true"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Continuation batch but ship not in ActiveShips - queuing (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <!-- Otherwise, continuation batch proceeds immediately (doesn't increment ActiveProcessors) -->
+        </do_if>
+        <do_else>
+          <!-- New batch: Check overall concurrency limit -->
+          <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors ge global.$GT_BatchProcessorQueue.$MaxConcurrent">
+            <set_value name="$shouldQueue" exact="true"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') New batch - max concurrent reached (' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ') - queuing'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_else>
+        
+        <!-- Queue request if needed -->
+        <do_if value="$shouldQueue">
+          <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
+            <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
+          </do_if>
+          <set_value name="$alreadyInQueue" exact="false"/>
+          <do_if value="global.$GT_BatchProcessorQueue.$Ships?">
+            <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
+              <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
+                <set_value name="$alreadyInQueue" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="not $alreadyInQueue">
+            <append_to_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
         
         <!-- CRITICAL FIX: Check GT order status BEFORE processing -->
         <!-- If ship no longer has GT order, cancel immediately to prevent blocking queue -->
@@ -76,70 +152,7 @@
           <cancel_cue cue="this"/>
         </do_if>
         
-        <!-- Initialize batch processor queue if needed -->
-        <do_if value="not global.$GT_BatchProcessorQueue?">
-          <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
-          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
-        </do_if>
-        <do_if value="not global.$GT_BatchProcessorQueue.$MaxConcurrent?">
-          <set_value name="global.$GT_BatchProcessorQueue.$MaxConcurrent" exact="1"/>
-        </do_if>
-        
-        <!-- Check if this is a continuation batch (same ship) - allow continuation batches -->
-        <set_value name="$isContinuation" exact="false"/>
-        <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
-          <!-- Check if this ship already has an active processor -->
-          <set_value name="$hasActiveProcessor" exact="false"/>
-          <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips?">
-            <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
-              <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
-                <set_value name="$hasActiveProcessor" exact="true"/>
-                <set_value name="$isContinuation" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-        </do_if>
-        
-        <!-- If not continuation and at max concurrent, cancel this instance -->
-        <do_if value="not $isContinuation and global.$GT_BatchProcessorQueue.$ActiveProcessors ge global.$GT_BatchProcessorQueue.$MaxConcurrent">
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Max concurrent processors reached (' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ') - queuing request'" chance="100"/>
-          </do_if>
-          <!-- Queue this request instead -->
-          <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
-            <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
-          </do_if>
-          <set_value name="$alreadyInQueue" exact="false"/>
-          <do_if value="global.$GT_BatchProcessorQueue.$Ships?">
-            <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          <do_if value="not $alreadyInQueue">
-            <append_to_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
-            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        
-        <!-- Increment active processors counter and track active ship -->
-        <do_if value="not $isContinuation">
-          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="add"/>
-          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveShips?">
-            <set_value name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="[]"/>
-          </do_if>
-          <append_to_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR STARTING (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued: ' + (if global.$GT_BatchProcessorQueue.$Ships? then global.$GT_BatchProcessorQueue.$Ships.count else 0) + ')'" chance="100"/>
-          </do_if>
-        </do_if>
-        
+        <!-- Early validation: Check if batch data exists BEFORE delay -->
         <!-- Retrieve state from GLOBAL TABLE using ship object as key (persists after SearchLiveTrades ends) -->
         <set_value name="$state" exact="@global.$GT_BatchDataList.{$ship}"/>
         
@@ -153,15 +166,10 @@
           </do_if>
         </do_if>
         <do_if value="not $stateValid">
-          <!-- Decrement active processors if we're cancelling (cleanup) -->
-          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
-            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
-          </do_if>
-          <!-- Remove ship from active ships list -->
-          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
-            <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
-          </do_if>
-          <!-- Process next queued batch processor if any -->
+          <!-- CRITICAL FIX: Ship was never added to ActiveShips at this point -->
+          <!-- ActiveProcessors is only incremented AFTER this check (line 183) -->
+          <!-- So we don't need to decrement or remove from ActiveShips here -->
+          <!-- Just process next queued batch processor if any -->
           <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
             <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
           </do_if>
@@ -171,6 +179,40 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        
+        <!-- CRITICAL FIX: Store $ship and $state in this.* so they persist across delay -->
+        <!-- Variables don't persist across <delay> elements in X4 MD scripts -->
+        <set_value name="this.$ship" exact="$ship"/>
+        <set_value name="this.$state" exact="$state"/>
+        
+        <!-- Increment active processors counter and track active ship (only if proceeding) -->
+        <do_if value="not $isContinuation">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="add"/>
+          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveShips?">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="[]"/>
+          </do_if>
+          <append_to_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR STARTING (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued: ' + (if global.$GT_BatchProcessorQueue.$Ships? then global.$GT_BatchProcessorQueue.$Ships.count else 0) + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Calculate delay from global Performance settings -->
+        <!-- Only delay if we're actually proceeding with batch processing -->
+        <set_value name="$batchDelay" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+          <set_value name="$batchDelay" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+        </do_if>
+        <!-- Convert to time value (milliseconds); add jitter to avoid synchronized wakeups across many continuations -->
+        <set_value name="$batchDelayJitter" min="0" max="20"/>
+        <set_value name="this.$batchDelayTime" exact="($batchDelay + $batchDelayJitter) * 1ms"/>
+      </actions>
+      <delay exact="this.$batchDelayTime"/>
+      <actions>
+        <!-- All validation passed - proceed with batch processing -->
+        <!-- CRITICAL FIX: Restore $ship and $state from this.* (they don't persist across delay) -->
+        <set_value name="$ship" exact="this.$ship"/>
+        <set_value name="$state" exact="this.$state"/>
         
         <!-- Extract all state variables (use safe operator @ for all extractions) -->
         <set_value name="$batchId" exact="@$state.$batchId"/>
@@ -1176,10 +1218,11 @@
                               <set_value name="global.$GT_DockCapsCache.{$buyOfferOwner}" exact="$sellDockCaps"/>
                             </do_else>
                             
-                            <!-- Append trade entry to THIS home sector's cache list -->
+                            <!-- Insert trade entry into THIS home sector's cache list, maintaining sorted order by Profit (descending) -->
                             <!-- CRITICAL: Store route distance (buy station sell station) for position-independent validation -->
                             <!-- PERFORMANCE OPTIMIZATION: Pre-computed distances from home sector -->
-                            <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="table[
+                            <!-- OPTIMIZATION: Insert in sorted order (by profit) so validation can use top N entries without sorting -->
+                            <set_value name="$newCacheEntry" exact="table[
                               $WareId = $sellOfferWare.id,
                               $WareName = $sellOfferWare.name,
                               $SellStationId = $buyOfferOwner.idcode,
@@ -1202,6 +1245,33 @@
                               $HomeToBuyDistance = $homeToBuyDistance,
                               $HomeToSellDistance = $homeToSellDistance
                             ]"/>
+                            
+                            <!-- Find insertion position: insert where profit > existing profit (maintain descending order) -->
+                            <!-- Example: cache has [300, 200, 100], new entry has 150 -> insert at index 2 (between 200 and 100) -->
+                            <set_value name="$insertIndex" exact="0"/>
+                            <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                            <set_value name="$insertionFound" exact="false"/>
+                            <do_if value="$homeSectorCache.count gt 0">
+                              <!-- Linear search: find first entry with profit < new profit -->
+                              <do_all exact="$homeSectorCache.count" counter="$i">
+                                <set_value name="$existingProfit" exact="if $homeSectorCache.{$i}.$Profit? then $homeSectorCache.{$i}.$Profit else 0"/>
+                                <do_if value="$profit gt $existingProfit">
+                                  <!-- Found insertion point: insert before this entry (it has lower profit) -->
+                                  <set_value name="$insertIndex" exact="$i"/>
+                                  <set_value name="$insertionFound" exact="true"/>
+                                  <break/>
+                                </do_if>
+                              </do_all>
+                            </do_if>
+                            
+                            <!-- Insert at calculated position (or append if at end) -->
+                            <do_if value="$insertionFound">
+                              <set_value name="global.$GT_TradeCache.{$homeSector}.{$insertIndex}" exact="$newCacheEntry" operation="insert"/>
+                            </do_if>
+                            <do_else>
+                              <!-- Append if insertion point is at end (new entry has lowest profit) -->
+                              <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="$newCacheEntry"/>
+                            </do_else>
                           </do_if>
                           
                           <!-- Debug logging for cache population -->
@@ -1483,11 +1553,37 @@
           <!-- Check if more batches needed -->
           <!-- batchEnd1Based is 1-based, wareCount is count (max valid index) -->
           <do_if value="$batchEnd1Based le $wareCount and $tradeList.count lt $earlyExitThreshold">
-            <!-- Signal next batch with same ship - continuation batches are allowed (same ship) -->
-            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+            <!-- CRITICAL FIX: Signal continuation batch directly, but only if ActiveProcessors < MaxConcurrent -->
+            <!-- Continuation batches for the same ship should proceed immediately if there's room -->
+            <!-- If at max concurrent, queue it to ensure proper serialization -->
+            <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors lt global.$GT_BatchProcessorQueue.$MaxConcurrent">
+              <!-- Room available - signal continuation batch directly -->
+              <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+            </do_if>
+            <do_else>
+              <!-- At max concurrent - queue continuation batch -->
+              <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
+                <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
+              </do_if>
+              <!-- Check if ship is already in queue (avoid duplicates) -->
+              <set_value name="$alreadyInQueue" exact="false"/>
+              <do_if value="global.$GT_BatchProcessorQueue.$Ships?">
+                <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
+                  <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
+                    <set_value name="$alreadyInQueue" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="not $alreadyInQueue">
+                <append_to_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+                <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+              </do_if>
+            </do_else>
           </do_if>
           <do_else>
             <!-- All batches complete - decrement active processors counter -->
+            <!-- CRITICAL FIX: Decrement BEFORE removing from ActiveShips to maintain counter accuracy -->
             <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
               <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
             </do_if>
