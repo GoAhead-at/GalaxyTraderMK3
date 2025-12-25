@@ -152,16 +152,88 @@
           <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
         </do_if>
         <do_else>
-          <!-- Trigger maintenance execution -->
-          <signal_cue_instantly cue="ExecuteMaintenance" param="table[
-            $Ship = $ship,
-            $PilotLevel = $pilotLevel,
-            $NeedsRepair = $needsRepair,
-            $NeedsEquipment = $needsEquipment,
-            $HullPercentage = $hullPercentage,
-            $RepairThreshold = $repairThreshold
-          ]"/>
+          <!-- CRITICAL PERFORMANCE FIX: Queue maintenance execution to prevent CPU spikes -->
+          <!-- When many ships need maintenance simultaneously (save load, fleet init), unlimited concurrent instances cause massive spikes -->
+          <!-- Initialize queue if needed -->
+          <do_if value="not global.$GT_MaintenanceQueue?">
+            <set_value name="global.$GT_MaintenanceQueue" exact="table[]"/>
+            <set_value name="global.$GT_MaintenanceQueue.$Requests" exact="[]"/>
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" exact="0"/>
+            <set_value name="global.$GT_MaintenanceQueue.$MaxConcurrent" exact="2"/>
+          </do_if>
+          
+          <!-- Check concurrency limit -->
+          <set_value name="$shouldQueue" exact="false"/>
+          <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances ge global.$GT_MaintenanceQueue.$MaxConcurrent">
+            <set_value name="$shouldQueue" exact="true"/>
+          </do_if>
+          
+          <do_if value="$shouldQueue">
+            <!-- At max concurrent - queue request -->
+            <append_to_list name="global.$GT_MaintenanceQueue.$Requests" exact="table[
+              $Ship = $ship,
+              $PilotLevel = $pilotLevel,
+              $NeedsRepair = $needsRepair,
+              $NeedsEquipment = $needsEquipment,
+              $HullPercentage = $hullPercentage,
+              $RepairThreshold = $repairThreshold
+            ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Maintenance request QUEUED for ' + $ship.idcode + ' (active: ' + global.$GT_MaintenanceQueue.$ActiveInstances + '/' + global.$GT_MaintenanceQueue.$MaxConcurrent + ', queued: ' + global.$GT_MaintenanceQueue.$Requests.count + ')'" chance="10"/>
+            </do_if>
+            <!-- Signal queue processor -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
+          <do_else>
+            <!-- Below limit - process immediately -->
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Processing maintenance immediately for ' + $ship.idcode + ' (active: ' + global.$GT_MaintenanceQueue.$ActiveInstances + '/' + global.$GT_MaintenanceQueue.$MaxConcurrent + ')'" chance="10"/>
+            </do_if>
+            <signal_cue_instantly cue="ExecuteMaintenance" param="table[
+              $Ship = $ship,
+              $PilotLevel = $pilotLevel,
+              $NeedsRepair = $needsRepair,
+              $NeedsEquipment = $needsEquipment,
+              $HullPercentage = $hullPercentage,
+              $RepairThreshold = $repairThreshold
+            ]"/>
+          </do_else>
         </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Maintenance Queue Processor -->
+    <cue name="ProcessMaintenanceQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- Process next request in queue if below concurrency limit -->
+        <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$Requests? and global.$GT_MaintenanceQueue.$Requests.count gt 0">
+          <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances lt global.$GT_MaintenanceQueue.$MaxConcurrent">
+            <!-- Below limit - process next request -->
+            <set_value name="$nextRequest" exact="global.$GT_MaintenanceQueue.$Requests.{1}"/>
+            <do_if value="$nextRequest?">
+              <remove_from_list name="global.$GT_MaintenanceQueue.$Requests" exact="$nextRequest"/>
+              <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+              
+              <!-- Process request -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ExecuteMaintenance" param="$nextRequest"/>
+              
+              <!-- Continue processing queue -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+            </do_if>
+            <do_else>
+              <!-- Invalid request - remove it and continue -->
+              <do_if value="global.$GT_MaintenanceQueue.$Requests.count gt 0">
+                <remove_from_list name="global.$GT_MaintenanceQueue.$Requests" exact="global.$GT_MaintenanceQueue.$Requests.{1}"/>
+              </do_if>
+              <!-- Continue processing queue -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+            </do_else>
+          </do_if>
+        </do_if>
       </actions>
     </cue>
     
@@ -306,30 +378,22 @@
                 $AcceptedCost = $estimatedCost
               ]"/>
               
-              <!-- Trigger ship rename to show [REPAIR] state -->
-              <do_if value="@$pilot and global.$GT_Pilots.{$pilot}?">
-                <signal_cue_instantly cue="md.GT_XP_Training.UpdateShipName" param="table[
-                  $ship=$ship, 
-                  $pilot=$pilot, 
-                  $xp=global.$GT_Pilots.{$pilot}.$XP, 
-                  $level=global.$GT_Pilots.{$pilot}.$Level,
-                  $rank=@global.$GT_Pilots.{$pilot}.$CurrentRank,
-                  $nameType='trader'
-                ]"/>
+              <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (ship renaming, logbook messages) -->
+              <!-- These operations don't affect gameplay and can be processed later to reduce spike size -->
+              <do_if value="not global.$GT_DeferredUIUpdates?">
+                <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
               </do_if>
-              
-              <!-- Write logbook entry about repair -->
-              <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-              <set_value name="$logbookMessage" exact="{77000,3205}.[$hullPercentage,$repairThreshold,$pilotLevel,$repairStation.knownname,($estimatedCost/100),$ship.knownname]"/>
-              
-              <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-                <param name="Message" value="$logbookMessage"/>
-                <param name="Category" value="'upkeep'"/>
-                <param name="Title" value="'Auto-Repair: ' + $ship.knownname"/>
-                <param name="Object" value="$repairStation"/>
-                <param name="Interaction" value="'showonmap'"/>
-                <param name="CheckGlobalSettings" value="false"/>
-              </run_actions>
+              <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+                $Type = 'repair',
+                $Ship = $ship,
+                $Pilot = @$ship.pilot,
+                $LogbookMessage = '{77000,3205}.[' + $hullPercentage + ',' + $repairThreshold + ',' + $pilotLevel + ',' + $repairStation.knownname + ',' + ($estimatedCost/100) + ',' + $ship.knownname + ']',
+                $LogbookCategory = 'upkeep',
+                $LogbookTitle = 'Auto-Repair: ' + $ship.knownname,
+                $LogbookObject = $repairStation,
+                $LogbookInteraction = 'showonmap'
+              ]"/>
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
               
               <set_value name="$repairOrderCreated" exact="true"/>
             </do_if>
@@ -391,45 +455,99 @@
             <debug_text text="'[GT-Maintenance] Max jump distance: ' + $maxJumpDistance + ' jumps'" chance="100"/>
           </do_if>
           
-          <!-- Use capability-based search instead of station type checks -->
-          <!-- Vanilla pattern: Stations can resupply if they can supply the ship's class -->
-          <!-- Find stations that can supply equipment, then validate cansupplyclass manually -->
-          <!-- Note: find_station doesn't support cansupplyclass filter directly, so we search broadly and validate capability -->
-          <find_station name="$potentialStations" 
-            space="player.galaxy" 
-            multiple="true" 
-            knownto="player.entity" 
-            checkoperational="true" 
-            sortbygatedistanceto="$ship"
-            equipmentdock="true">
-            <match class="class.station"/>
-            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-          </find_station>
+          <!-- PERFORMANCE OPTIMIZATION: Cache station search results (stations don't change often) -->
+          <!-- Cache key: 'equipment_stations' (same for all ships, stations rarely change) -->
+          <!-- Cache age: 300 seconds (5 minutes) - stations can be destroyed/built, but rarely -->
+          <set_value name="$cacheKey" exact="'equipment_stations'"/>
+          <set_value name="$cacheAge" exact="300s"/>
+          <set_value name="$useCache" exact="false"/>
           
-          <!-- Also search wharfs and shipyards (they can also supply equipment) -->
-          <find_station name="$wharfs" 
-            space="player.galaxy" 
-            multiple="true" 
-            knownto="player.entity" 
-            checkoperational="true" 
-            sortbygatedistanceto="$ship"
-            wharf="true">
-            <match class="class.station"/>
-            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-          </find_station>
+          <!-- Check if cache exists and is fresh -->
+          <!-- CRITICAL: Use {'$' + $cacheKey} pattern for string keys in X4 tables -->
+          <set_value name="$cacheKeyWithDollar" exact="'$' + $cacheKey"/>
+          <do_if value="global.$GT_MaintenanceStationCache? and global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}?">
+            <set_value name="$cacheEntry" exact="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}"/>
+            <set_value name="$cacheTime" exact="@$cacheEntry.$Timestamp"/>
+            <do_if value="(player.age - $cacheTime) lt $cacheAge">
+              <set_value name="$useCache" exact="true"/>
+              <!-- Extract cached lists and ensure they're lists (not null) -->
+              <!-- CRITICAL: Always initialize as empty lists if cache values are null -->
+              <set_value name="$cachedEquipmentDocks" exact="@$cacheEntry.$EquipmentDocks"/>
+              <set_value name="$cachedWharfs" exact="@$cacheEntry.$Wharfs"/>
+              <set_value name="$cachedShipyards" exact="@$cacheEntry.$Shipyards"/>
+              
+              <!-- Initialize as empty lists if null -->
+              <set_value name="$potentialStations" exact="if $cachedEquipmentDocks? then $cachedEquipmentDocks else []"/>
+              <set_value name="$wharfs" exact="if $cachedWharfs? then $cachedWharfs else []"/>
+              <set_value name="$shipyards" exact="if $cachedShipyards? then $cachedShipyards else []"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Using cached equipment station search (age: ' + (player.age - $cacheTime) + 's, EquipmentDocks: ' + $potentialStations.count + ', Wharfs: ' + $wharfs.count + ', Shipyards: ' + $shipyards.count + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
           
-          <find_station name="$shipyards" 
-            space="player.galaxy" 
-            multiple="true" 
-            knownto="player.entity" 
-            checkoperational="true" 
-            sortbygatedistanceto="$ship"
-            shipyard="true">
-            <match class="class.station"/>
-            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-          </find_station>
+          <!-- Only search if cache miss or expired -->
+          <do_if value="not $useCache">
+            <!-- Use capability-based search instead of station type checks -->
+            <!-- Vanilla pattern: Stations can resupply if they can supply the ship's class -->
+            <!-- Find stations that can supply equipment, then validate cansupplyclass manually -->
+            <!-- Note: find_station doesn't support cansupplyclass filter directly, so we search broadly and validate capability -->
+            <find_station name="$potentialStations" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              equipmentdock="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <!-- Also search wharfs and shipyards (they can also supply equipment) -->
+            <find_station name="$wharfs" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              wharf="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <find_station name="$shipyards" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              shipyard="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <!-- Store in cache -->
+            <!-- CRITICAL: Ensure lists are never null before storing in cache -->
+            <do_if value="not global.$GT_MaintenanceStationCache?">
+              <set_value name="global.$GT_MaintenanceStationCache" exact="table[]"/>
+            </do_if>
+            <!-- Ensure all lists are initialized (never null) -->
+            <set_value name="$equipmentDocksToCache" exact="if $potentialStations? then $potentialStations else []"/>
+            <set_value name="$wharfsToCache" exact="if $wharfs? then $wharfs else []"/>
+            <set_value name="$shipyardsToCache" exact="if $shipyards? then $shipyards else []"/>
+            <set_value name="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}" exact="table[
+              $EquipmentDocks = $equipmentDocksToCache,
+              $Wharfs = $wharfsToCache,
+              $Shipyards = $shipyardsToCache,
+              $Timestamp = player.age
+            ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Cached equipment station search results (EquipmentDocks: ' + $potentialStations.count + ', Wharfs: ' + $wharfs.count + ', Shipyards: ' + $shipyards.count + ')'" chance="100"/>
+            </do_if>
+          </do_if>
           
-          <!-- Combine all station types into one list -->
+          <!-- Combine all station types into one list (always needed, even with cache) -->
           <do_all exact="$wharfs.count" counter="$i">
             <append_to_list name="$potentialStations" exact="$wharfs.{$i}"/>
           </do_all>
@@ -437,7 +555,9 @@
             <append_to_list name="$potentialStations" exact="$shipyards.{$i}"/>
           </do_all>
           
+          <!-- PERFORMANCE OPTIMIZATION: Batch station distance calculations -->
           <!-- Re-sort combined list by distance (equipment docks + wharfs + shipyards merged) -->
+          <!-- CRITICAL: Always re-sort, even with cache, because distances are ship-specific -->
           <!-- After combining, the list is no longer sorted - need to sort by distance from ship -->
           <set_value name="$stationDistances" exact="table[]"/>
           <do_all exact="$potentialStations.count" counter="$i">
@@ -500,6 +620,7 @@
             </do_if>
           </do_all>
           
+          <!-- CRITICAL: Use validatedStations directly to avoid list copy issues -->
           <set_value name="$potentialStations" exact="$validatedStations"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Validated ' + $potentialStations.count + ' stations with resupply capability (can supply class ' + $ship.class + ') and docking capability (size ' + $ship.docksize + ')'" chance="100"/>
@@ -522,8 +643,51 @@
           <set_value name="$stationsSkippedBlacklist" exact="0"/>
           <set_value name="$stationsSkippedDocking" exact="0"/>
           
-          <do_all exact="$potentialStations.count" counter="$i">
+          <!-- CRITICAL DEBUG: Verify list before loop -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] DEBUG: About to loop through ' + $potentialStations.count + ' stations, list exists: ' + $potentialStations?" chance="100"/>
+            <do_if value="$potentialStations.count gt 0">
+              <debug_text text="'[GT-Maintenance] DEBUG: First station: ' + $potentialStations.{1}.knownname" chance="100"/>
+              <debug_text text="'[GT-Maintenance] DEBUG: List type check - count: ' + $potentialStations.count + ', validatedStations count: ' + $validatedStations.count" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- CRITICAL: Ensure we have stations to process -->
+          <!-- PERFORMANCE: Limit to first 20 closest stations (already sorted by distance) -->
+          <!-- This prevents processing hundreds of stations when only a few nearby ones matter -->
+          <set_value name="$maxStationsToCheck" exact="20"/>
+          <set_value name="$stationsToProcess" exact="if $potentialStations.count lt $maxStationsToCheck then $potentialStations.count else $maxStationsToCheck"/>
+          
+          <do_if value="$stationsToProcess gt 0">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] DEBUG: Processing ' + $stationsToProcess + ' of ' + $potentialStations.count + ' stations (limited to closest ' + $maxStationsToCheck + ')'" chance="100"/>
+            </do_if>
+            
+            <do_all exact="$stationsToProcess" counter="$i">
+            <!-- CRITICAL DEBUG: Log loop iteration start -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] DEBUG: Loop iteration ' + $i + ', equipmentStation is null: ' + ($equipmentStation == null)" chance="100"/>
+            </do_if>
+            
+            <!-- PERFORMANCE OPTIMIZATION: Early exit - stop if we already found a valid station -->
+            <!-- CRITICAL: Check != null, not ? (because ? returns true even for null values) -->
+            <do_if value="$equipmentStation != null">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] DEBUG: Early exit triggered at iteration ' + $i + ' (equipmentStation found)'" chance="100"/>
+              </do_if>
+              <break/>
+            </do_if>
+            
+            <!-- CRITICAL: Extract station BEFORE any checks to ensure loop processes items -->
             <set_value name="$station" exact="$potentialStations.{$i}"/>
+            
+            <!-- CRITICAL DEBUG: Verify station was extracted correctly -->
+            <do_if value="not $station?">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] ERROR: Station at index ' + $i + ' is null!'" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
             
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Maintenance] ───────────────────────────────────────────────────────'" chance="100"/>
@@ -727,11 +891,12 @@
               </do_else>
             </do_if>
           </do_all>
+          </do_if>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Maintenance] ═══════════════════════════════════════════════════════'" chance="100"/>
             <debug_text text="'[GT-Maintenance] STATION SEARCH SUMMARY:'" chance="100"/>
-            <debug_text text="'[GT-Maintenance]    Total found: ' + $potentialStations.count" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Total found: ' + $potentialStations.count + ' (checked: ' + (if $stationsToProcess? then $stationsToProcess else 0) + ')'" chance="100"/>
             <debug_text text="'[GT-Maintenance]    Skipped (blacklisted): ' + $stationsSkippedBlacklist" chance="100"/>
             <debug_text text="'[GT-Maintenance]    Skipped (distance): ' + $stationsSkippedDistance" chance="100"/>
             <debug_text text="'[GT-Maintenance]    Skipped (no docking rights): ' + $stationsSkippedDocking" chance="100"/>
@@ -1075,47 +1240,43 @@
               $RepairDronesBefore = $beforeRepairDrones
             ]"/>
             
-            <!-- Trigger ship rename to show [RESUPPLY] or [MAINTENANCE] state -->
-            <!-- Set $pilot before checking (same pattern as completion handlers at lines 1099/1193) -->
-            <set_value name="$pilot" exact="$ship.pilot"/>
-            <do_if value="@$pilot and global.$GT_Pilots.{$pilot}?">
-              <signal_cue_instantly cue="md.GT_XP_Training.UpdateShipName" param="table[
-                $ship=$ship, 
-                $pilot=$pilot, 
-                $xp=global.$GT_Pilots.{$pilot}.$XP, 
-                $level=global.$GT_Pilots.{$pilot}.$Level,
-                $rank=@global.$GT_Pilots.{$pilot}.$CurrentRank,
-                $nameType='trader'
-              ]"/>
+            <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (ship renaming, logbook messages) -->
+            <do_if value="not global.$GT_DeferredUIUpdates?">
+              <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
             </do_if>
+            <set_value name="$pilot" exact="$ship.pilot"/>
+            <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+              $Type = 'equipment',
+              $Ship = $ship,
+              $Pilot = @$pilot,
+              $LogbookMessage = '{77000,3207}.[' + $pilotLevel + ',' + $equipmentStation.knownname + ',' + $ship.knownname + ']',
+              $LogbookCategory = 'upkeep',
+              $LogbookTitle = 'Defensive Equipment Auto-Replenishment: ' + $ship.knownname,
+              $LogbookObject = $equipmentStation,
+              $LogbookInteraction = 'showonmap'
+            ]"/>
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
             
             <set_value name="$equipmentOrderCreated" exact="true"/>
-            
-            <!-- Write logbook entry -->
-            <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-            <set_value name="$logbookMessage" exact="{77000,3207}.[$pilotLevel,$equipmentStation.knownname,$ship.knownname]"/>
-            
-            <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-              <param name="Message" value="$logbookMessage"/>
-              <param name="Category" value="'upkeep'"/>
-              <param name="Title" value="'Defensive Equipment Auto-Replenishment: ' + $ship.knownname"/>
-              <param name="Object" value="$equipmentStation"/>
-              <param name="Interaction" value="'showonmap'"/>
-              <param name="CheckGlobalSettings" value="false"/>
-            </run_actions>
           </do_if>
           <do_else>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Maintenance] No equipment station found for ' + $ship.idcode" chance="100"/>
             </do_if>
-            <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-              <param name="Message" value="'Level ' + $pilotLevel + ' ' + $ship.knownname + ' needs equipment but no suitable station found within ' + $maxJumpDistance + ' jumps.'"/>
-              <param name="Category" value="'upkeep'"/>
-              <param name="Title" value="'Defensive Equipment Auto-Replenishment Failed'"/>
-              <param name="Object" value="$ship"/>
-              <param name="Interaction" value="'showonmap'"/>
-              <param name="CheckGlobalSettings" value="false"/>
-            </run_actions>
+            <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (logbook messages) -->
+            <do_if value="not global.$GT_DeferredUIUpdates?">
+              <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+              $Type = 'equipment_failed',
+              $Ship = $ship,
+              $LogbookMessage = 'Level ' + $pilotLevel + ' ' + $ship.knownname + ' needs equipment but no suitable station found within ' + $maxJumpDistance + ' jumps.',
+              $LogbookCategory = 'upkeep',
+              $LogbookTitle = 'Defensive Equipment Auto-Replenishment Failed',
+              $LogbookObject = $ship,
+              $LogbookInteraction = 'showonmap'
+            ]"/>
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
           </do_else>
         </do_if>
         
@@ -1174,10 +1335,26 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Maintenance] ⏳ Tracking maintenance for ' + $ship.idcode + ' (Repair: ' + $repairOrderCreated + ', Equipment: ' + $equipmentOrderCreated + ')'" chance="100"/>
           </do_if>
+          
+          <!-- CONCURRENCY CONTROL: Decrement counter when ExecuteMaintenance completes (orders created, will complete later via ProcessResupplyComplete/ProcessRepairComplete) -->
+          <!-- Note: Completion handlers will signal GT_Maintenance_Complete, but counter is decremented here when ExecuteMaintenance instance ends -->
+          <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+            <!-- Signal queue processor to process next item -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
         </do_if>
         <do_else>
           <!-- No orders created - proceed to trading, will retry after next trade -->
           <debug_text text="'[GT-Maintenance] No maintenance orders created for ' + $ship.idcode + ' (no stations with stock or no work needed), proceeding to trading'" chance="100"/>
+          
+          <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+          <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+            <!-- Signal queue processor to process next item -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
+          
           <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
         </do_else>
       </actions>
@@ -1417,6 +1594,13 @@
                       ]"/>
                     </do_if>
                     
+                    <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+                    <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+                      <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+                      <!-- Signal queue processor to process next item -->
+                      <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+                    </do_if>
+                    
                     <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
                     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <debug_text text="'[GT-Maintenance] All maintenance complete for ' + $ship.idcode" chance="100"/>
@@ -1553,6 +1737,13 @@
                   ]"/>
                 </do_if>
                 
+                <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+                <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+                  <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+                  <!-- Signal queue processor to process next item -->
+                  <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+                </do_if>
+                
                 <signal_objects object="$ship" param="'GT_Maintenance_Complete'"/>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Maintenance] All maintenance complete for ' + $ship.idcode" chance="100"/>
@@ -1604,21 +1795,61 @@
         <param name="maxJumpDistance" comment="Maximum jump distance to search for repair stations"/>
       </params>
       <actions>
-        <!-- Use capability-based search instead of station type checks -->
-        <!-- Vanilla pattern: Stations can repair if they have shiptrader AND can build OR supply the ship's class -->
-        <!-- Source: interrupt.restock.xml:778, order.repair.xml:71-73 -->
-        <!-- Find stations with shiptrader (repair capability), then validate canbuildclass OR cansupplyclass manually -->
-        <!-- Note: find_station doesn't support OR logic for canbuildclass/cansupplyclass, so we search for shiptrader and validate capability -->
-        <find_station name="$potentialStations" 
-          space="player.galaxy" 
-          multiple="true" 
-          knownto="player.entity" 
-          checkoperational="true" 
-          sortbygatedistanceto="$ship"
-          hascontrolentity="controlpost.shiptrader">
-          <match class="class.station"/>
-          <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-        </find_station>
+        <!-- PERFORMANCE OPTIMIZATION: Cache station search results (stations don't change often) -->
+        <!-- Cache key: 'repair_stations' (same for all ships, stations rarely change) -->
+        <!-- Cache age: 300 seconds (5 minutes) - stations can be destroyed/built, but rarely -->
+        <set_value name="$cacheKey" exact="'repair_stations'"/>
+        <set_value name="$cacheAge" exact="300s"/>
+        <set_value name="$useCache" exact="false"/>
+        
+        <!-- Check if cache exists and is fresh -->
+        <!-- CRITICAL: Use {'$' + $cacheKey} pattern for string keys in X4 tables -->
+        <set_value name="$cacheKeyWithDollar" exact="'$' + $cacheKey"/>
+        <do_if value="global.$GT_MaintenanceStationCache? and global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}?">
+          <set_value name="$cacheEntry" exact="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}"/>
+          <set_value name="$cacheTime" exact="@$cacheEntry.$Timestamp"/>
+          <do_if value="(player.age - $cacheTime) lt $cacheAge">
+            <set_value name="$useCache" exact="true"/>
+            <set_value name="$potentialStations" exact="@$cacheEntry.$Stations"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Using cached repair station search (age: ' + (player.age - $cacheTime) + 's)'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Only search if cache miss or expired -->
+        <do_if value="not $useCache">
+          <!-- Use capability-based search instead of station type checks -->
+          <!-- Vanilla pattern: Stations can repair if they have shiptrader AND can build OR supply the ship's class -->
+          <!-- Source: interrupt.restock.xml:778, order.repair.xml:71-73 -->
+          <!-- Find stations with shiptrader (repair capability), then validate canbuildclass OR cansupplyclass manually -->
+          <!-- Note: find_station doesn't support OR logic for canbuildclass/cansupplyclass, so we search for shiptrader and validate capability -->
+          <find_station name="$potentialStations" 
+            space="player.galaxy" 
+            multiple="true" 
+            knownto="player.entity" 
+            checkoperational="true" 
+            sortbygatedistanceto="$ship"
+            hascontrolentity="controlpost.shiptrader">
+            <match class="class.station"/>
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+          </find_station>
+          
+          <!-- Store in cache -->
+          <!-- CRITICAL: Ensure list is never null before storing in cache -->
+          <do_if value="not global.$GT_MaintenanceStationCache?">
+            <set_value name="global.$GT_MaintenanceStationCache" exact="table[]"/>
+          </do_if>
+          <!-- Ensure list is initialized (never null) -->
+          <set_value name="$stationsToCache" exact="if $potentialStations? then $potentialStations else []"/>
+          <set_value name="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}" exact="table[
+            $Stations = $stationsToCache,
+            $Timestamp = player.age
+          ]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Cached repair station search results (' + $potentialStations.count + ' stations)'" chance="100"/>
+          </do_if>
+        </do_if>
         
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Found ' + $potentialStations.count + ' stations with shiptrader (sorted by distance)'" chance="100"/>
@@ -1662,6 +1893,11 @@
         <set_value name="$nearestStation" exact="null"/>
         
         <do_all exact="$potentialStations.count" counter="$i">
+          <!-- PERFORMANCE OPTIMIZATION: Early exit - stop if we already found a valid station -->
+          <do_if value="$nearestStation?">
+            <break/>
+          </do_if>
+          
           <set_value name="$station" exact="$potentialStations.{$i}"/>
           <set_value name="$isValid" exact="true"/>
           
@@ -1815,6 +2051,60 @@
         <return value="$nearestStation"/>
       </actions>
     </library>
+    
+    <!-- ============================================================================= -->
+    <!-- PERFORMANCE OPTIMIZATION: Process Deferred UI Updates                       -->
+    <!-- Deferred operations: Ship renaming, logbook messages                        -->
+    <!-- These operations don't affect gameplay and are processed after critical path -->
+    <!-- ============================================================================= -->
+    <cue name="ProcessDeferredUIUpdates" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="100ms"/> <!-- Process after a small delay to allow ExecuteMaintenance to complete -->
+      <actions>
+        <!-- Process all deferred UI updates -->
+        <do_if value="global.$GT_DeferredUIUpdates?">
+          <set_value name="$updateKeys" exact="@global.$GT_DeferredUIUpdates.keys"/>
+          <do_if value="$updateKeys?">
+            <set_value name="$updateKeysCount" exact="@$updateKeys.count"/>
+            <do_if value="$updateKeysCount? and $updateKeysCount gt 0">
+              <do_all exact="$updateKeysCount" counter="$i">
+                <set_value name="$ship" exact="$updateKeys.{$i}"/>
+                <set_value name="$update" exact="global.$GT_DeferredUIUpdates.{$ship}"/>
+                
+                <!-- Ship rename (for repair and equipment orders) -->
+                <do_if value="($update.$Type == 'repair' or $update.$Type == 'equipment') and $update.$Pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$update.$Pilot}?">
+                  <signal_cue_instantly cue="md.GT_XP_Training.UpdateShipName" param="table[
+                    $ship=$update.$Ship, 
+                    $pilot=$update.$Pilot, 
+                    $xp=global.$GT_Pilots.{$update.$Pilot}.$XP, 
+                    $level=global.$GT_Pilots.{$update.$Pilot}.$Level,
+                    $rank=@global.$GT_Pilots.{$update.$Pilot}.$CurrentRank,
+                    $nameType='trader'
+                  ]"/>
+                </do_if>
+                
+                <!-- Logbook message -->
+                <do_if value="$update.$LogbookMessage?">
+                  <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                    <param name="Message" value="$update.$LogbookMessage"/>
+                    <param name="Category" value="$update.$LogbookCategory"/>
+                    <param name="Title" value="$update.$LogbookTitle"/>
+                    <param name="Object" value="$update.$LogbookObject"/>
+                    <param name="Interaction" value="$update.$LogbookInteraction"/>
+                    <param name="CheckGlobalSettings" value="false"/>
+                  </run_actions>
+                </do_if>
+                
+                <!-- Clean up -->
+                <remove_value name="global.$GT_DeferredUIUpdates.{$ship}"/>
+              </do_all>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
     
   </cues>
 </mdscript>

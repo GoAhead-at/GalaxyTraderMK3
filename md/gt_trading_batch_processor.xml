@@ -264,6 +264,22 @@
         <set_value name="$bestRejectedProfit" exact="@$state.$bestRejectedProfit"/>
         <set_value name="$bestRejectedTrade" exact="@$state.$bestRejectedTrade"/>
         
+        <!-- PERFORMANCE: Chunked processing - process offers in 5×5 chunks to reduce CPU load -->
+        <!-- Initialize chunk tracking variables if not present -->
+        <set_value name="$chunkSize" exact="5"/> <!-- Process 5×5 = 25 combinations per chunk -->
+        <set_value name="$sellOfferChunkStart" exact="0"/>
+        <set_value name="$buyOfferChunkStart" exact="0"/>
+        <set_value name="$currentWareChunkStart" exact="0"/>
+        <do_if value="$state.$sellOfferChunkStart?">
+          <set_value name="$sellOfferChunkStart" exact="@$state.$sellOfferChunkStart"/>
+        </do_if>
+        <do_if value="$state.$buyOfferChunkStart?">
+          <set_value name="$buyOfferChunkStart" exact="@$state.$buyOfferChunkStart"/>
+        </do_if>
+        <do_if value="$state.$currentWareChunkStart?">
+          <set_value name="$currentWareChunkStart" exact="@$state.$currentWareChunkStart"/>
+        </do_if>
+        
         <!-- No sector blacklist cache building - removed for universal processing -->
         <!-- Blacklist filtering happens per-ship during cache retrieval, not during cache building -->
         
@@ -301,7 +317,7 @@
         <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
         
         <!-- Use global setting for max offers per ware for matching -->
-        <set_value name="$maxOffersPerWareForMatching" exact="20"/> <!-- Default fallback -->
+        <set_value name="$maxOffersPerWareForMatching" exact="20"/> <!-- Default fallback (can be changed via global settings menu) -->
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching?">
           <set_value name="$maxOffersPerWareForMatching" exact="global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching"/>
         </do_if>
@@ -342,6 +358,13 @@
             <!-- Get ware from list -->
             <set_value name="$ware" exact="$wareKeysList.{$wareIdx}"/>
             
+            <!-- PERFORMANCE: Reset chunk positions when moving to a new ware -->
+            <do_if value="$wareIdx != $currentWareChunkStart">
+              <set_value name="$sellOfferChunkStart" exact="0"/>
+              <set_value name="$buyOfferChunkStart" exact="0"/>
+              <set_value name="$currentWareChunkStart" exact="$wareIdx"/>
+            </do_if>
+            
             <!-- ═══════════════════════════════════════════════════════════════════════════ -->
             <!-- WARE QUOTA CHECK: Skip this ware if we've already collected enough trades for it -->
             <!-- This ensures diversity by preventing one ware from monopolizing all trade slots -->
@@ -355,6 +378,10 @@
             
             <!-- Skip to next ware if quota reached -->
             <do_if value="$tradesForThisWare ge $maxTradesPerWare">
+              <!-- Reset chunk positions when skipping ware -->
+              <set_value name="$sellOfferChunkStart" exact="0"/>
+              <set_value name="$buyOfferChunkStart" exact="0"/>
+              <set_value name="$currentWareChunkStart" exact="$wareIdx + 1"/>
               <continue/>
             </do_if>
             
@@ -557,10 +584,16 @@
                 <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Phase 1 (INTRA-SECTOR)' + $isolationLabel + ' for ' + $wareName + ' in ' + $sectorName + ': ' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy offers' + (if ($intraSectorSellOffers.count == 0 or $intraSectorBuyOffers.count == 0) then '  MISSING ONE TYPE!' else '')" chance="100"/>
               </do_if>
               <do_if value="$intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
-                <do_all exact="$intraSectorSellOffers.count" counter="$i">
+                <!-- PERFORMANCE: Process intra-sector offers in 5×5 chunks -->
+                <set_value name="$intraSellChunkEnd" exact="[$sellOfferChunkStart + $chunkSize, $intraSectorSellOffers.count].min"/>
+                <set_value name="$intraBuyChunkEnd" exact="[$buyOfferChunkStart + $chunkSize, $intraSectorBuyOffers.count].min"/>
+                
+                <do_all exact="$intraSellChunkEnd - $sellOfferChunkStart" counter="$chunkOffset">
+                  <set_value name="$i" exact="$sellOfferChunkStart + $chunkOffset"/>
                   <set_value name="$sellOffer" exact="$intraSectorSellOffers.{$i}"/>
                 
-                <do_all exact="$intraSectorBuyOffers.count" counter="$j">
+                <do_all exact="$intraBuyChunkEnd - $buyOfferChunkStart" counter="$chunkOffset2">
+                  <set_value name="$j" exact="$buyOfferChunkStart + $chunkOffset2"/>
                   <set_value name="$buyOffer" exact="$intraSectorBuyOffers.{$j}"/>
                   
                   <!-- OPTIMIZATION: Use library function to validate offer pair -->
@@ -778,6 +811,52 @@
                   <break/>
                 </do_if>
               </do_all>
+              
+              <!-- PERFORMANCE: Check if more intra-sector chunks remain -->
+              <set_value name="$hasMoreIntraChunks" exact="false"/>
+              <do_if value="$intraBuyChunkEnd lt $intraSectorBuyOffers.count">
+                <!-- More buy offer chunks remain -->
+                <set_value name="$buyOfferChunkStart" exact="$intraBuyChunkEnd"/>
+                <set_value name="$hasMoreIntraChunks" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Move to next sell offer chunk -->
+                <do_if value="$intraSellChunkEnd lt $intraSectorSellOffers.count">
+                  <set_value name="$sellOfferChunkStart" exact="$intraSellChunkEnd"/>
+                  <set_value name="$buyOfferChunkStart" exact="0"/>
+                  <set_value name="$hasMoreIntraChunks" exact="true"/>
+                </do_if>
+              </do_else>
+              
+              <!-- PERFORMANCE: If more intra-sector chunks remain, signal continuation and exit -->
+              <do_if value="$hasMoreIntraChunks and $tradesForThisWare lt $maxTradesPerWare">
+                <!-- Save state and continue processing this ware's intra-sector chunks -->
+                <set_value name="$state.$sellOfferChunkStart" exact="$sellOfferChunkStart"/>
+                <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
+                <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
+                <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
+                <set_value name="$state.$tradeList" exact="$tradeList"/>
+                <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
+                <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
+                <set_value name="$state.$nonConflictedBestScore" exact="$nonConflictedBestScore"/>
+                <set_value name="$state.$nonConflictedBestTrade" exact="$nonConflictedBestTrade"/>
+                <set_value name="$state.$tradesRejectedProfit" exact="$tradesRejectedProfit"/>
+                <set_value name="$state.$tradesRejectedDocking" exact="$tradesRejectedDocking"/>
+                <set_value name="$state.$tradesRejectedAmount" exact="$tradesRejectedAmount"/>
+                <set_value name="$state.$tradesRejectedDistance" exact="$tradesRejectedDistance"/>
+                <set_value name="$state.$bestRejectedProfit" exact="$bestRejectedProfit"/>
+                <set_value name="$state.$bestRejectedTrade" exact="$bestRejectedTrade"/>
+                <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
+                <!-- Signal continuation for this ware's intra-sector chunks -->
+                <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+                <return/>
+              </do_if>
+              <do_else>
+                <!-- All intra-sector chunks processed - reset chunk positions for cross-sector -->
+                <set_value name="$sellOfferChunkStart" exact="0"/>
+                <set_value name="$buyOfferChunkStart" exact="0"/>
+              </do_else>
             </do_if>
             <do_else>
               <!-- DEBUG: Log when Phase 1 can't run -->
@@ -791,11 +870,17 @@
             <!-- Phase 2: Match all remaining offers (cross-sector with cross-sector, or mixed) -->
             <!-- SKIP if ship is isolated - isolated ships can only trade intra-sector -->
             <do_if value="not $shipIsIsolated">
+              <!-- PERFORMANCE: Process cross-sector offers in 5×5 chunks -->
+              <set_value name="$crossSellChunkEnd" exact="[$sellOfferChunkStart + $chunkSize, $sellOffersForWare.count].min"/>
+              <set_value name="$crossBuyChunkEnd" exact="[$buyOfferChunkStart + $chunkSize, $buyOffersForWare.count].min"/>
+              
               <!-- NOW run nested loops on LIMITED offers with CACHED docking -->
-              <do_all exact="$sellOffersForWare.count" counter="$i">
+              <do_all exact="$crossSellChunkEnd - $sellOfferChunkStart" counter="$chunkOffset">
+                <set_value name="$i" exact="$sellOfferChunkStart + $chunkOffset"/>
                 <set_value name="$sellOffer" exact="$sellOffersForWare.{$i}"/>
                 
-                <do_all exact="$buyOffersForWare.count" counter="$j">
+                <do_all exact="$crossBuyChunkEnd - $buyOfferChunkStart" counter="$chunkOffset2">
+                  <set_value name="$j" exact="$buyOfferChunkStart + $chunkOffset2"/>
                   <set_value name="$buyOffer" exact="$buyOffersForWare.{$j}"/>
                   
                   <!-- OPTIMIZATION: Use library function to validate offer pair -->
@@ -1311,6 +1396,53 @@
                   <break/>  <!-- Exit sell offers loop -->
                   </do_if>
               </do_all>
+              
+              <!-- PERFORMANCE: Check if more cross-sector chunks remain -->
+              <set_value name="$hasMoreCrossChunks" exact="false"/>
+              <do_if value="$crossBuyChunkEnd lt $buyOffersForWare.count">
+                <!-- More buy offer chunks remain -->
+                <set_value name="$buyOfferChunkStart" exact="$crossBuyChunkEnd"/>
+                <set_value name="$hasMoreCrossChunks" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Move to next sell offer chunk -->
+                <do_if value="$crossSellChunkEnd lt $sellOffersForWare.count">
+                  <set_value name="$sellOfferChunkStart" exact="$crossSellChunkEnd"/>
+                  <set_value name="$buyOfferChunkStart" exact="0"/>
+                  <set_value name="$hasMoreCrossChunks" exact="true"/>
+                </do_if>
+                <do_else>
+                  <!-- All cross-sector chunks processed - reset for next ware -->
+                  <set_value name="$sellOfferChunkStart" exact="0"/>
+                  <set_value name="$buyOfferChunkStart" exact="0"/>
+                  <set_value name="$currentWareChunkStart" exact="$wareIdx + 1"/>
+                </do_else>
+              </do_else>
+              
+              <!-- PERFORMANCE: If more chunks remain, signal continuation and exit -->
+              <do_if value="$hasMoreCrossChunks and $tradesForThisWare lt $maxTradesPerWare">
+                <!-- Save state and continue processing this ware's chunks -->
+                <set_value name="$state.$sellOfferChunkStart" exact="$sellOfferChunkStart"/>
+                <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
+                <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
+                <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
+                <set_value name="$state.$tradeList" exact="$tradeList"/>
+                <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
+                <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
+                <set_value name="$state.$nonConflictedBestScore" exact="$nonConflictedBestScore"/>
+                <set_value name="$state.$nonConflictedBestTrade" exact="$nonConflictedBestTrade"/>
+                <set_value name="$state.$tradesRejectedProfit" exact="$tradesRejectedProfit"/>
+                <set_value name="$state.$tradesRejectedDocking" exact="$tradesRejectedDocking"/>
+                <set_value name="$state.$tradesRejectedAmount" exact="$tradesRejectedAmount"/>
+                <set_value name="$state.$tradesRejectedDistance" exact="$tradesRejectedDistance"/>
+                <set_value name="$state.$bestRejectedProfit" exact="$bestRejectedProfit"/>
+                <set_value name="$state.$bestRejectedTrade" exact="$bestRejectedTrade"/>
+                <set_value name="global.$GT_BatchDataList.{$ship}" exact="$state"/>
+                <!-- Signal continuation for this ware's chunks -->
+                <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+                <return/>
+              </do_if>
             </do_if>
             <!-- LINE 998: Closes do_if from line 194 -->
             </do_if>
@@ -1319,6 +1451,10 @@
           <!-- Update state with new progress -->
           <!-- Convert 1-based batchEnd back to 0-based for storage -->
           <set_value name="$state.$currentWareIndex" exact="$batchEnd1Based - 1"/>
+          <!-- Save chunk positions (reset for next ware since we're moving to next ware) -->
+          <set_value name="$state.$sellOfferChunkStart" exact="0"/>
+          <set_value name="$state.$buyOfferChunkStart" exact="0"/>
+          <set_value name="$state.$currentWareChunkStart" exact="$batchEnd1Based"/>
           <set_value name="$state.$tradeList" exact="$tradeList"/>
           <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
           <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
