@@ -148,73 +148,32 @@
         <event_gravidar_has_scanned object="this.ship"/>
         <check_value value="this.ship.pilot? and global.$GT_Pilots.{this.ship.pilot}?"/>
         <check_value value="this.sector"/>
+        <!-- Only Level 9+ pilots and when Mobile Intel is enabled -->
+        <check_value value="@global.$GT_Pilots.{this.ship.pilot}.$Level ge 9"/>
+        <check_value value="not global.$GT_GlobalSettings.$MobileIntel? or global.$GT_GlobalSettings.$MobileIntel.$Enable"/>
+        <!-- PERFORMANCE: Do not run actions unless there is at least 1 station contact -->
+        <!-- Vanilla pattern: use count_gravidar_contacts with min="1" to avoid per-scan work when nothing is detected -->
+        <count_gravidar_contacts result="$_detectedStations" object="this.ship" class="class.station" docked="false" checkoperational="true" multiple="true" min="1"/>
       </conditions>
       <actions>
-        <!-- DIAGNOSTIC: Log when gravidar scan event fires -->
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI-Intel] GRAVIDAR SCAN EVENT FIRED for ' + this.ship.idcode + ' (' + this.ship.knownname + ')'" chance="100"/>
-        </do_if>
-        
-        <!-- Get pilot level -->
+        <!-- Stations were detected (min=1 in conditions). Process a small capped number per scan to smooth spikes. -->
         <set_value name="$level" exact="@global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+        <set_value name="$detectedStations" exact="$_detectedStations"/>
         
-        <!-- DIAGNOSTIC: Log pilot level check -->
+        <!-- Cap work per scan event (prevents large bursts when many stations are in radar range) -->
+        <set_value name="$stationsToProcess" exact="[$detectedStations.count, 5].min"/>
+        
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI-Intel] Pilot level check: ' + this.ship.idcode + ' - Level ' + $level + ' (required: 9+), MobileIntel enabled: ' + (if (not global.$GT_GlobalSettings.$MobileIntel? or global.$GT_GlobalSettings.$MobileIntel.$Enable) then 'YES' else 'NO')" chance="100"/>
+          <debug_text text="'[GT-AI-Intel] ' + this.ship.idcode + ' detected ' + $detectedStations.count + ' station(s) - processing ' + $stationsToProcess" chance="20"/>
         </do_if>
         
-        <!-- Only Level 9+ pilots can do mobile satellite intel -->
-        <do_if value="$level ge 9 and (not global.$GT_GlobalSettings.$MobileIntel? or global.$GT_GlobalSettings.$MobileIntel.$Enable)">
-          <!-- Initialize detected stations list (prevents property lookup errors) -->
-          <set_value name="$detectedStations" exact="[]"/>
-          
-          <!-- Find stations in radar range using gravidar contacts -->
-          <!-- Note: find_gravidar_contact is used in actions blocks, count_gravidar_contacts is only for conditions -->
-          <find_gravidar_contact name="$detectedStations" object="this.ship" class="class.station" docked="false" checkoperational="true" multiple="true">
-            <match_distance object="this.ship" max="this.ship.maxradarrange"/>
-            <match_context macro="this.sector.macro"/>
-          </find_gravidar_contact>
-          
-          <!-- FIX: Ensure detectedStations is a valid list (find_gravidar_contact may fail) -->
-          <do_if value="not $detectedStations?">
-            <set_value name="$detectedStations" exact="[]"/>
+        <do_all exact="$stationsToProcess" counter="$i">
+          <set_value name="$station" exact="$detectedStations.{$i}"/>
+          <do_if value="$station.exists and $station.isoperational">
+            <!-- Signal MD to process this station -->
+            <signal_objects object="player.galaxy" param="'GT_Station_Detected'" param2="table[$ship=this.ship, $station=$station, $pilotLevel=$level]"/>
           </do_if>
-          
-          <!-- DIAGNOSTIC: Log when scan completes (even if no stations found) -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI-Intel] Scan complete for ' + this.ship.idcode + ': Found ' + $detectedStations.count + ' station(s) in radar range'" chance="100"/>
-          </do_if>
-          
-          <!-- DEBUG: Log detection event -->
-          <do_if value="$detectedStations.count gt 0">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI-Intel] ' + this.ship.idcode + ' (' + this.ship.knownname + ') detected ' + $detectedStations.count + ' station(s) in radar range (Level ' + $level + ')'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <!-- Signal MD for each detected station -->
-          <do_if value="$detectedStations.count gt 0">
-            <do_all exact="$detectedStations.count" counter="$i">
-              <set_value name="$station" exact="$detectedStations.{$i}"/>
-              <do_if value="$station.exists and $station.isoperational">
-                <!-- Signal MD to process this station -->
-                <signal_objects object="player.galaxy" param="'GT_Station_Detected'" param2="table[$ship=this.ship, $station=$station, $pilotLevel=$level]"/>
-                
-                <!-- DEBUG: Log individual station detection -->
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-AI-Intel] ' + this.ship.idcode + ' detected station: ' + $station.knownname + ' (signaling MD)'" chance="100"/>
-                </do_if>
-              </do_if>
-            </do_all>
-          </do_if>
-        </do_if>
-        <do_else>
-          <!-- DIAGNOSTIC: Log why station detection was skipped -->
-          <set_value name="$skipReason" exact="if $level lt 9 then 'Pilot level too low (' + $level + ' less than 9)' else 'Mobile Intel disabled'"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI-Intel] Station detection SKIPPED for ' + this.ship.idcode + ': ' + $skipReason" chance="100"/>
-          </do_if>
-        </do_else>
+        </do_all>
       </actions>
     </handler>
     
@@ -3472,11 +3431,12 @@
           
           <!-- Offers valid - proceed with order creation -->
           <!-- CRITICAL: internal="true" enables vanilla pending trades tracking and display -->
-          <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="false" internal="true"/>
-          </do_if>
           <do_if value="$pendingTrade.$SellOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="false" internal="true"/>
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="true" internal="true"/>
+          </do_if>
+          <!-- IMPORTANT: Create the BUY order last so it displaces the sell order and executes first (vanilla pattern) -->
+          <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="true" internal="true"/>
           </do_if>
           
           <!-- Add state update signal AFTER order creation -->
@@ -3711,6 +3671,10 @@
         <wait exact="5s"/>
         <resume label="main_loop"/>
       </do_else>
+      
+      <!-- Stability: vanilla-style micro-yield after creating trade orders -->
+      <!-- NOTE: wait must be at top level (not inside any do_if/do_else) -->
+      <wait exact="1ms"/>
       
       <!-- Non-blocking XP update signal -->
       <do_if value="$gt_enablexp and this.ship.pilot">
