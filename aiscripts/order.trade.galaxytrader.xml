@@ -513,31 +513,30 @@
     <!-- Calculate subordinate's pilot capability (only if subordinate) -->
     <set_value name="$pilotMaxJumps" exact="null"/>
     <do_if value="$isSubordinate and $commanderOrder">
-      <!-- Calculate pilot skill once -->
-      <set_value name="$pilotSkill" exact="1"/>
-      <do_if value="@this.ship.pilot and @this.ship.pilot.skill and @this.ship.pilot.skill.management != null">
-        <set_value name="$pilotSkill" exact="@this.ship.pilot.skill.management"/>
+      <!-- Calculate pilot skill once (management). Do NOT fall back to fake values if skill isn't available yet. -->
+      <set_value name="$pilotSkill" exact="if (@this.ship.pilot and @this.ship.pilot.skill.management != null) then @this.ship.pilot.skill.management else null"/>
+
+      <!-- Only compute pilot capability if we successfully read the pilot management skill -->
+      <do_if value="$pilotSkill != null">
+        <do_if value="$pilotSkill le 2">
+          <set_value name="$pilotMaxJumps" exact="1"/>
+        </do_if>
+        <do_elseif value="$pilotSkill le 5">
+          <set_value name="$pilotMaxJumps" exact="3"/>
+        </do_elseif>
+        <do_elseif value="$pilotSkill le 8">
+          <set_value name="$pilotMaxJumps" exact="5"/>
+        </do_elseif>
+        <do_elseif value="$pilotSkill le 11">
+          <set_value name="$pilotMaxJumps" exact="10"/>
+        </do_elseif>
+        <do_elseif value="$pilotSkill le 13">
+          <set_value name="$pilotMaxJumps" exact="15"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="$pilotMaxJumps" exact="25"/>
+        </do_else>
       </do_if>
-      
-      <!-- Calculate pilot's max jump capability once -->
-      <do_if value="$pilotSkill le 2">
-        <set_value name="$pilotMaxJumps" exact="1"/>
-      </do_if>
-      <do_elseif value="$pilotSkill le 5">
-        <set_value name="$pilotMaxJumps" exact="3"/>
-      </do_elseif>
-      <do_elseif value="$pilotSkill le 8">
-        <set_value name="$pilotMaxJumps" exact="5"/>
-      </do_elseif>
-      <do_elseif value="$pilotSkill le 11">
-        <set_value name="$pilotMaxJumps" exact="10"/>
-      </do_elseif>
-      <do_elseif value="$pilotSkill le 13">
-        <set_value name="$pilotMaxJumps" exact="15"/>
-      </do_elseif>
-      <do_else>
-        <set_value name="$pilotMaxJumps" exact="25"/>
-      </do_else>
     </do_if>
     
     <!-- Max Buy Distance - Inherit from commander, capped at pilot capability -->
@@ -561,6 +560,10 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MaxSell inherited: commander=' + $commanderMaxSell + ', pilot_cap=' + $pilotMaxJumps + ', effective=' + $effectiveMaxSell" chance="100"/>
       </do_if>
     </do_if>
+
+    <!-- Persist effective distances on the cue instance so they are available outside init (e.g. main loop / start_trading) -->
+    <set_value name="this.$effectiveMaxBuy" exact="$effectiveMaxBuy"/>
+    <set_value name="this.$effectiveMaxSell" exact="$effectiveMaxSell"/>
     
     <!-- Debug message for subordinates showing inherited settings -->
     <!-- PERFORMANCE: Only build inherited settings string if debug logging is enabled -->
@@ -1056,10 +1059,10 @@
           <do_if value="$commanderOrder.$sectorwhitelist?"><set_value name="$effectiveSectorWhitelist" exact="$commanderOrder.$sectorwhitelist"/></do_if>
           <!-- Re-inherit max jump distances with pilot capability cap -->
           <do_if value="$commanderOrder.$maxbuy?">
-            <!-- Calculate pilot capability -->
+            <!-- Calculate pilot capability (management); if skill is temporarily missing, keep prior effective values -->
             <set_value name="$pilotSkill" exact="1"/>
-            <do_if value="this.ship.pilot and this.ship.pilot.skill.management?">
-              <set_value name="$pilotSkill" exact="this.ship.pilot.skill.management"/>
+            <do_if value="@this.ship.pilot and @this.ship.pilot.skill.management != null">
+              <set_value name="$pilotSkill" exact="@this.ship.pilot.skill.management"/>
             </do_if>
             <set_value name="$pilotMaxJumps" exact="1"/>
             <do_if value="$pilotSkill le 2"><set_value name="$pilotMaxJumps" exact="1"/></do_if>
@@ -1073,8 +1076,8 @@
           <do_if value="$commanderOrder.$maxsell?">
             <!-- Calculate pilot capability -->
             <set_value name="$pilotSkill" exact="1"/>
-            <do_if value="this.ship.pilot and this.ship.pilot.skill.management?">
-              <set_value name="$pilotSkill" exact="this.ship.pilot.skill.management"/>
+            <do_if value="@this.ship.pilot and @this.ship.pilot.skill.management != null">
+              <set_value name="$pilotSkill" exact="@this.ship.pilot.skill.management"/>
             </do_if>
             <set_value name="$pilotMaxJumps" exact="1"/>
             <do_if value="$pilotSkill le 2"><set_value name="$pilotMaxJumps" exact="1"/></do_if>
@@ -1099,6 +1102,10 @@
       <do_if value="not $effectiveMaxSell?">
         <set_value name="$effectiveMaxSell" exact="$maxsell"/>
       </do_if>
+
+      <!-- Persist effective distances for later labels (start_trading) -->
+      <set_value name="this.$effectiveMaxBuy" exact="$effectiveMaxBuy"/>
+      <set_value name="this.$effectiveMaxSell" exact="$effectiveMaxSell"/>
       
       <!-- Initialize subordinate count tracking -->
       <!-- Track when this ship becomes a commander (gets subordinates) -->
@@ -1951,14 +1958,29 @@
       <!-- ========================================= -->
       
       <label name="start_trading"/>
+
+      <!-- HARD RULE: no silent fallbacks for pilot skill timing issues. -->
+      <!-- If pilot.skill.management isn't available yet, do NOT request a trade search with bogus caps. -->
+      <!-- Wait is only allowed at top-level; use a bounded loop here (not inside any do_if). -->
+      <set_value name="$pilotSkillMissing" exact="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and (@this.ship.pilot == null or @this.ship.pilot.skill.management == null)"/>
+      <set_value name="$pilotSkillWaitTries" exact="0"/>
+      <do_while value="$pilotSkillMissing and $pilotSkillWaitTries lt 10">
+        <wait exact="1s"/>
+        <set_value name="$pilotSkillMissing" exact="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and (@this.ship.pilot == null or @this.ship.pilot.skill.management == null)"/>
+        <set_value name="$pilotSkillWaitTries" operation="add"/>
+      </do_while>
+      <do_if value="$pilotSkillMissing">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ERROR: pilot.skill.management unavailable after ' + $pilotSkillWaitTries + 's - NOT sending trade search request. Will retry on next loop (this is a timing bug we want to SEE).'" chance="100"/>
+        <resume label="main_loop"/>
+      </do_if>
       
       <!-- Ensure effectiveMaxBuy/effectiveMaxSell are initialized before use -->
       <!-- These variables might not exist if start_trading is reached without going through init label -->
       <do_if value="not $effectiveMaxBuy?">
-        <set_value name="$effectiveMaxBuy" exact="$maxbuy"/>
+        <set_value name="$effectiveMaxBuy" exact="if this.$effectiveMaxBuy? then this.$effectiveMaxBuy else $maxbuy"/>
       </do_if>
       <do_if value="not $effectiveMaxSell?">
-        <set_value name="$effectiveMaxSell" exact="$maxsell"/>
+        <set_value name="$effectiveMaxSell" exact="if this.$effectiveMaxSell? then this.$effectiveMaxSell else $maxsell"/>
       </do_if>
       
       <!-- Initialize retry counter if not exists -->
@@ -2078,6 +2100,22 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cargo empty - looking for trade opportunities...'" chance="100"/>
           </do_if>
+
+          <!-- IMPORTANT: If the MD system produced trade results while we were NOT in the wait interrupt (e.g. after an MD timeout),
+               the GT_Trade_Found signal can be missed, but the results remain in global.$GT_PendingTrades.
+               Catch those here to avoid "stops assigning trades" under heavy fleet load. -->
+          <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
+            <set_value name="$pendingCount" exact="0"/>
+            <do_if value="global.$GT_PendingTrades.{this.ship}.count?">
+              <set_value name="$pendingCount" exact="global.$GT_PendingTrades.{this.ship}.count"/>
+            </do_if>
+            <do_if value="$pendingCount gt 0">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Found ' + $pendingCount + ' pending trades from earlier MD result - skipping new request and executing now'" chance="100"/>
+              </do_if>
+              <resume label="trade_found"/>
+            </do_if>
+          </do_if>
           
           <!-- Clear cargo disposal flag (cargo is now empty) -->
           <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
@@ -2107,8 +2145,8 @@
           <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
             $Ship = this.ship,
             $HomeBase = this.$effectiveHome,
-            $MaxBuy = $effectiveMaxBuy,
-            $MaxSell = $effectiveMaxSell,
+            $MaxBuy = if this.$effectiveMaxBuy? then this.$effectiveMaxBuy else $effectiveMaxBuy,
+            $MaxSell = if this.$effectiveMaxSell? then this.$effectiveMaxSell else $effectiveMaxSell,
             $CargoTarget = $gt_cargotarget,
             $WareBasket = $warebasket,
             $AllowIllegal = $gt_allowillegal,
@@ -2124,7 +2162,7 @@
       </do_else>
       
       <!-- Wait for MD system response with interrupt -->
-      <!-- Increase timeout to 90s to account for delayed searches (skill-based delays up to ~30s) -->
+      <!-- Under large fleets, serialized batch matching can exceed 90s. Use a longer fixed wait to avoid premature timeouts. -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait state for MD response at game time ' + player.age" chance="100"/>
       </do_if>
@@ -2133,7 +2171,7 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Wait interrupt handler ACTIVE at game time ' + player.age" chance="100"/>
       </do_if>
       <!-- IMPORTANT: In X4, wait without min is RANDOM (0..max). Use min=max to avoid instant timeouts. -->
-      <wait min="90s" max="90s" comment="Wait for MD system response (fixed 90s; interrupted immediately on response)">
+      <wait min="180s" max="180s" comment="Wait for MD system response (fixed 180s; interrupted immediately on response)">
         <interrupt>
           <conditions>
             <check_any>
@@ -3654,11 +3692,11 @@
             <!-- Include MaxBuy/MaxSell - use effective values if available, otherwise use defaults from order params -->
             <set_value name="$signalMaxBuy" exact="$maxbuy"/>
             <set_value name="$signalMaxSell" exact="$maxsell"/>
-            <do_if value="$effectiveMaxBuy?">
-              <set_value name="$signalMaxBuy" exact="$effectiveMaxBuy"/>
+            <do_if value="this.$effectiveMaxBuy?">
+              <set_value name="$signalMaxBuy" exact="this.$effectiveMaxBuy"/>
             </do_if>
-            <do_if value="$effectiveMaxSell?">
-              <set_value name="$signalMaxSell" exact="$effectiveMaxSell"/>
+            <do_if value="this.$effectiveMaxSell?">
+              <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
             </do_if>
             <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
               $Ship = this.ship,

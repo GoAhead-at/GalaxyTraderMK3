@@ -734,6 +734,9 @@
         <do_if value="global.$GT_PathfindingQueue.$ActiveInstances lt global.$GT_PathfindingQueue.$MaxConcurrent and global.$GT_PathfindingQueue.$Requests.count gt 0">
           <set_value name="$request" exact="global.$GT_PathfindingQueue.$Requests.{1}"/>
           <remove_from_list name="global.$GT_PathfindingQueue.$Requests" exact="$request"/>
+          <!-- Mark request as coming FROM the queue. The queue processor already reserves the concurrency slot,
+               so the worker must NOT re-apply concurrency gating and re-queue itself (would stall forever). -->
+          <set_value name="$request.$FromQueue" exact="true"/>
           
           <set_value name="$ship" exact="$request.$Ship"/>
           
@@ -789,6 +792,11 @@
       <actions>
         <!-- Extract parameters from signal -->
         <set_value name="$params" exact="event.param"/>
+        <set_value name="$shouldProceed" exact="true"/>
+        <set_value name="$fromQueue" exact="false"/>
+        <do_if value="$params.$FromQueue? and $params.$FromQueue == true">
+          <set_value name="$fromQueue" exact="true"/>
+        </do_if>
         
         <!-- CRITICAL FIX: Check if ship still has GT order before processing -->
         <set_value name="$ship" exact="$params.$Ship"/>
@@ -821,6 +829,28 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Ship ' + $ship.idcode + ' no longer has GT order - cancelling pathfinding'" chance="10"/>
           </do_if>
+          <set_value name="$shouldProceed" exact="false"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- CRITICAL FIX: Drop stale pathfinding requests once live-search state is already cleaned up -->
+        <!-- Prevents log spam + wasted CPU after trades are already found/executing -->
+        <do_if value="$shouldProceed and (not global.$GT_SearchLiveTrades_State? or not global.$GT_SearchLiveTrades_State.{$ship}?)">
+          <!-- Clean up from queues if present (this instance might have been started by ProcessPathfindingQueue) -->
+          <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveShips?">
+            <do_all exact="global.$GT_PathfindingQueue.$ActiveShips.count" counter="$i" reverse="true">
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips.{$i} == $ship">
+                <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$ship"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$ActiveInstances gt 0">
+                  <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Dropping stale pathfinding request (no SearchLiveTrades_State) - Ship=' + (if @$ship != null then @$ship.idcode else 'NULL')" chance="10"/>
+          </do_if>
+          <set_value name="$shouldProceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
         
@@ -831,8 +861,9 @@
           <set_value name="$isContinuation" exact="true"/>
         </do_if>
         
-        <!-- For NEW requests (not continuation), check concurrency before processing -->
-        <do_if value="not $isContinuation">
+        <!-- For NEW requests (not continuation), check concurrency before processing.
+             IMPORTANT: Requests coming FROM ProcessPathfindingQueue already reserved the slot, so skip gating. -->
+        <do_if value="not $isContinuation and not $fromQueue">
           <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$MaxConcurrent?">
             <do_if value="global.$GT_PathfindingQueue.$ActiveInstances ge global.$GT_PathfindingQueue.$MaxConcurrent">
               <!-- Max concurrent reached - queue this request -->
@@ -840,6 +871,8 @@
                 <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
               </do_if>
               
+              <!-- Mark as queued so it will bypass concurrency gating when ProcessPathfindingQueue starts it -->
+              <set_value name="$params.$FromQueue" exact="true"/>
               <append_to_list name="global.$GT_PathfindingQueue.$Requests" exact="$params"/>
               
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -851,6 +884,7 @@
               <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
               
               <!-- Cancel this instance - queue will process it -->
+              <set_value name="$shouldProceed" exact="false"/>
               <cancel_cue cue="this"/>
             </do_if>
             <do_else>
@@ -864,9 +898,11 @@
             </do_else>
           </do_if>
         </do_if>
-        
-        <!-- Check if this is initialization or continuation -->
-        <do_if value="not this.$initialized?">
+
+        <!-- cancel_cue does NOT stop the current actions block; explicitly gate the rest -->
+        <do_if value="$shouldProceed">
+          <!-- Check if this is initialization or continuation -->
+          <do_if value="not this.$initialized?">
           <!-- Check if this is a continuation from a previous instance -->
           <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
             <!-- CONTINUATION: Restore state from previous instance -->
@@ -948,7 +984,7 @@
               </do_if>
             </do_else>
           </do_else>
-        </do_if>
+          </do_if>
         
         <!-- CONTINUATION: Process based on current phase -->
         <!-- Escape Path Search Phase -->
@@ -1283,6 +1319,7 @@
             $CurrentSector = this.$currentSector,
             $CurrentSectorIsBlacklisted = this.$currentSectorIsBlacklisted
           ]"/>
+        </do_if>
         </do_if>
       </actions>
     </cue>
