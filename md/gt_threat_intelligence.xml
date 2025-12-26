@@ -19,6 +19,36 @@
         </do_if>
       </actions>
     </cue>
+
+    <!-- Clear blacklist when player builds a defense station in a threatened sector -->
+    <!-- Event-driven: triggered only when a module finishes (vanilla MD event) -->
+    <cue name="ClearThreatOnPlayerDefenseStationBuilt" instantiate="true">
+      <conditions>
+        <!-- Vanilla: fires when a module is completed on a build anchor -->
+        <event_player_build_finished_components/>
+        <check_value value="event.param.buildanchor.isclass.station"/>
+        <check_value value="event.param.buildanchor.isplayerowned"/>
+        <check_value value="event.param.buildanchor.isdefencestation"/>
+      </conditions>
+      <actions>
+        <set_value name="$station" exact="event.param.buildanchor"/>
+        <set_value name="$sector" exact="@$station.sector"/>
+        
+        <!-- Only act if this sector is currently tracked/blacklisted by GT threat system -->
+        <do_if value="$sector? and global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$sector}?">
+          <remove_value name="global.$GT_ThreatIntelligence.{$sector}"/>
+          
+          <!-- Update Lua blacklist immediately (sector will be removed) -->
+          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          <signal_cue_instantly cue="ApplyBlacklistToFleet"/>
+          
+          <show_notification text="'✅ Threat cleared: Player defense station established in ' + $sector.knownname + ' - removing sector from GT blacklist'" timeout="8s"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Blacklist] Cleared blacklisted sector ' + $sector.knownname + ' due to player defense station construction: ' + @$station.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
     
     <!-- ========================================================================= -->
     <!-- LIBRARY: Check if sector should be blacklisted based on player defenses -->
@@ -46,7 +76,9 @@
           </do_if>
         </do_if>
         
-        <!-- Step 2: If no defense station, compare fighting scores -->
+        <!-- Step 2: If no defense station, compare enemy score vs PLAYER COMBAT SHIPS only.
+             IMPORTANT: Only count ships with primarypurpose == purpose.fight (vanilla MD pattern).
+             This prevents L/XL traders from being miscounted as "combat strength". -->
         <do_if value="$shouldBlacklist">
           <!-- Calculate enemy threat score -->
           <!-- Priority: Use EnemyShips if provided, otherwise use EnemyThreatScore -->
@@ -70,14 +102,19 @@
           <do_elseif value="$EnemyThreatScore gt 0">
             <set_value name="$calculatedEnemyScore" exact="$EnemyThreatScore"/>
           </do_elseif>
-          <!-- If neither provided, score remains 0 (no enemies) -->
-          
-          <!-- Calculate player fighting score -->
-          <find_ship name="$playerShips" space="$Sector" owner="faction.player" multiple="true"/>
-          <do_all exact="$playerShips.count" counter="$i">
-            <set_value name="$playerShip" exact="$playerShips.{$i}"/>
-            <!-- Only count combat ships (fighters, destroyers, etc.) -->
-            <do_if value="$playerShip.primarypurpose == purpose.fight or $playerShip.isclass.ship_xl or $playerShip.isclass.ship_l">
+
+          <!-- No enemy score => no blacklist -->
+          <do_if value="$calculatedEnemyScore le 0">
+            <set_value name="$shouldBlacklist" exact="false"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Threat] Sector ' + $Sector.knownname + ' has no detectable threat score - skipping blacklist'" chance="$DebugChance"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Calculate player fighting score (combat ships only) -->
+            <find_ship name="$playerCombatShips" space="$Sector" owner="faction.player" primarypurpose="purpose.fight" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true"/>
+            <do_all exact="$playerCombatShips.count" counter="$j">
+              <set_value name="$playerShip" exact="$playerCombatShips.{$j}"/>
               <do_if value="$playerShip.isclass.ship_xl">
                 <set_value name="$playerFightingScore" exact="$playerFightingScore + 5"/>
               </do_if>
@@ -90,20 +127,20 @@
               <do_else>
                 <set_value name="$playerFightingScore" exact="$playerFightingScore + 1"/>
               </do_else>
+            </do_all>
+
+            <!-- Compare scores -->
+            <do_if value="$playerFightingScore ge $calculatedEnemyScore">
+              <set_value name="$shouldBlacklist" exact="false"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Threat] Sector ' + $Sector.knownname + ' player fighting score (' + $playerFightingScore + ') >= enemy score (' + $calculatedEnemyScore + ') - skipping blacklist'" chance="$DebugChance"/>
+              </do_if>
             </do_if>
-          </do_all>
-          
-          <!-- Compare scores -->
-          <do_if value="$playerFightingScore ge $calculatedEnemyScore">
-            <set_value name="$shouldBlacklist" exact="false"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Threat] Sector ' + $Sector.knownname + ' player fighting score (' + $playerFightingScore + ') >= enemy score (' + $calculatedEnemyScore + ') - skipping blacklist'" chance="$DebugChance"/>
-            </do_if>
-          </do_if>
-          <do_else>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Threat] Sector ' + $Sector.knownname + ' player fighting score (' + $playerFightingScore + ') &lt; enemy score (' + $calculatedEnemyScore + ') - blacklisting'" chance="$DebugChance"/>
-            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Threat] Sector ' + $Sector.knownname + ' player fighting score (' + $playerFightingScore + ') &lt; enemy score (' + $calculatedEnemyScore + ') - blacklisting'" chance="$DebugChance"/>
+              </do_if>
+            </do_else>
           </do_else>
         </do_if>
         
@@ -397,22 +434,49 @@
         <set_value name="$destroyedObject" exact="event.object"/>
         <set_value name="$killer" exact="event.param"/>
         
-        <!-- Only process destruction of GalaxyTrader ships -->
-        <do_if value="$destroyedObject.isplayerowned and global.$GT_Ships.{$destroyedObject}? and $destroyedObject.sector? and $killer?">
-          <set_value name="$currentSector" exact="$destroyedObject.sector"/>
+        <!-- Only process destruction of GalaxyTrader ships.
+             IMPORTANT: Don't require $killer? and don't use strict .$sector? existence checks here.
+             In some destroy cases, event.param can be null and the object can be in the process of being cleaned up.
+             We still want to record the threat and blacklist the sector if appropriate. -->
+        <set_value name="$isGTShip" exact="false"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$destroyedObject}?">
+          <set_value name="$isGTShip" exact="true"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: if ship is still GT-controlled, treat it as GT ship (covers timing/race cleanup).
+               NOTE: default order id is the ORDER ID (e.g. 'GalaxyTraderMK3'), not the script name. -->
+          <set_value name="$orderId" exact="@$destroyedObject.defaultorder.id"/>
+          <do_if value="$orderId? and ($orderId == 'GalaxyTraderMK3' or $orderId == 'order.trade.galaxytrader')">
+            <set_value name="$isGTShip" exact="true"/>
+          </do_if>
+          <do_elseif value="$orderId? and $orderId == 'Assist'">
+            <!-- Subordinate: treat as GT ship if commander has GT default order -->
+            <set_value name="$commander" exact="@$destroyedObject.commander"/>
+            <do_if value="$commander? and @$commander.exists and $commander.defaultorder? and @$commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$isGTShip" exact="true"/>
+            </do_if>
+          </do_elseif>
+        </do_else>
+
+        <set_value name="$currentSector" exact="@$destroyedObject.sector"/>
+        <do_if value="$destroyedObject.isplayerowned and $isGTShip and $currentSector?">
+          <!-- Ensure threat table exists -->
+          <do_if value="not global.$GT_ThreatIntelligence?">
+            <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
+          </do_if>
           
           <!-- Report ship destruction (very high threat level) -->
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}" exact="table[]"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$Timestamp" exact="player.age"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ThreatLevel" exact="5"/>
-          <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$AttackerType" exact="$killer.idcode"/>
-          <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$AttackerFaction" exact="@$killer.owner.knownname"/>
+          <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$AttackerType" exact="if $killer? then $killer.idcode else 'UNKNOWN'"/>
+          <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$AttackerFaction" exact="if $killer? then @$killer.owner.knownname else 'Unknown'"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ReportingShip" exact="'Fleet Intelligence'"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ThreatType" exact="'Ship Destroyed'"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$DestroyedShip" exact="$destroyedObject.knownname"/>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3] 💀 CRITICAL THREAT: ' + $destroyedObject.knownname + ' destroyed by ' + @$killer.knownname + ' (' + @$killer.owner.knownname + ') in ' + $currentSector.knownname" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3] 💀 CRITICAL THREAT: ' + $destroyedObject.knownname + ' destroyed by ' + (if $killer? then @$killer.knownname else 'UNKNOWN') + ' (' + (if $killer? then @$killer.owner.knownname else 'Unknown') + ') in ' + $currentSector.knownname" chance="100"/>
           </do_if>
           
           <!-- Always notify for ship destruction -->
@@ -425,21 +489,26 @@
           </find_ship>
           
           <!-- Check defenses before blacklisting -->
-          <run_actions ref="ShouldBlacklistSector">
+          <run_actions ref="ShouldBlacklistSector" result="$defenseCheck">
             <param name="Sector" value="$currentSector"/>
+            <!-- If we couldn't find enemies (timing), still treat as high threat (ship destroyed). -->
             <param name="EnemyShips" value="$enemyShips"/>
+            <param name="EnemyThreatScore" value="5"/>
             <param name="DebugChance" value="100"/>
           </run_actions>
+          <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ShouldBlacklist" exact="$defenseCheck.$ShouldBlacklist"/>
           
           <!-- Only blacklist if no defenses and player fighting score is lower -->
           <!-- Note: Ship destruction is critical, but we still respect defenses -->
           <do_if value="$defenseCheck.$ShouldBlacklist">
             <!-- Store tracked enemy ships for blacklist tracking -->
-            <run_actions ref="StoreTrackedEnemyShips">
-              <param name="Sector" value="$currentSector"/>
-              <param name="EnemyShips" value="$enemyShips"/>
-              <param name="DebugChance" value="100"/>
-            </run_actions>
+            <do_if value="$enemyShips? and $enemyShips != null and $enemyShips.count gt 0">
+              <run_actions ref="StoreTrackedEnemyShips">
+                <param name="Sector" value="$currentSector"/>
+                <param name="EnemyShips" value="$enemyShips"/>
+                <param name="DebugChance" value="100"/>
+              </run_actions>
+            </do_if>
             
             <!-- Immediately update blacklist when threat is detected -->
             <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
@@ -453,6 +522,27 @@
           <!-- Notify ships with destinations in this sector -->
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
         </do_if>
+        <do_else>
+          <!-- High-signal debug: destruction happened but was ignored (not player-owned GT ship or sector unavailable) -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- NOTE: Avoid invalid syntax '@...?' by extracting safe values first, then testing against null -->
+            <set_value name="$_destroyedName" exact="@$destroyedObject.knownname"/>
+            <set_value name="$_destroyedId" exact="@$destroyedObject.idcode"/>
+            <set_value name="$_defaultOrderId" exact="@$destroyedObject.defaultorder.id"/>
+            <set_value name="$_sectorName" exact="@$currentSector.knownname"/>
+            <set_value name="$_destroyedNameSafe" exact="if $_destroyedName != null then $_destroyedName else 'UNKNOWN'"/>
+            <set_value name="$_destroyedIdSafe" exact="if $_destroyedId != null then $_destroyedId else 'UNKNOWN'"/>
+            <set_value name="$_defaultOrderIdSafe" exact="if $_defaultOrderId != null then $_defaultOrderId else 'NONE'"/>
+            <set_value name="$_sectorNameSafe" exact="if $_sectorName != null then $_sectorName else 'NONE'"/>
+            <debug_text text="'[GT-Threat] Ship destruction ignored (not GT ship / no sector / not player-owned): destroyed='
+              + $_destroyedNameSafe
+              + ' id=' + $_destroyedIdSafe
+              + ' playerOwned=' + (if $destroyedObject? then $destroyedObject.isplayerowned else 0)
+              + ' isGTShip=' + $isGTShip
+              + ' defaultOrder=' + $_defaultOrderIdSafe
+              + ' sector=' + $_sectorNameSafe" chance="100"/>
+          </do_if>
+        </do_else>
       </actions>
     </cue>
     
@@ -1090,13 +1180,13 @@
           <set_value name="$classBreakdown" exact="$classBreakdown + $shipClass_XL + ' XL'"/>
         </do_if>
         <do_if value="$shipClass_L gt 0">
-          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown then ', ' else '') + $shipClass_L + ' L'"/>
+          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown != '' then ', ' else '') + $shipClass_L + ' L'"/>
         </do_if>
         <do_if value="$shipClass_M gt 0">
-          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown then ', ' else '') + $shipClass_M + ' M'"/>
+          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown != '' then ', ' else '') + $shipClass_M + ' M'"/>
         </do_if>
         <do_if value="$shipClass_S gt 0">
-          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown then ', ' else '') + $shipClass_S + ' S'"/>
+          <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown != '' then ', ' else '') + $shipClass_S + ' S'"/>
         </do_if>
         
         <!-- Log to player if significant threat (capital ships or high threat) -->
@@ -1291,8 +1381,10 @@
             
             <!-- Send to Lua immediately (no delay, event-driven) -->
             <raise_lua_event name="'GT_Blacklist.Update'" param="$threatDataString"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Blacklist] Updated ' + $threatCount + ' threatened sectors (event-driven)'" chance="0"/>
+            <!-- Log ONLY when blacklisting is actually triggered (non-empty threatened sector list).
+                 This keeps logs clean while still proving when/why sectors are added. -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $threatCount gt 0">
+              <debug_text text="'[GT-Blacklist] ThreatAvoidance UPDATE: blacklisting ' + $threatCount + ' threatened sector(s) (threshold=' + @global.$GT_GlobalSettings.$ThreatAvoidance.$BlacklistThreshold + ', relation=' + (if @global.$GT_GlobalSettings.$ThreatAvoidance.$BlockEnemyFactions then 'enemy' else 'disabled') + ') data=' + $threatDataString" chance="100"/>
             </do_if>
           </do_if>
         </do_if>

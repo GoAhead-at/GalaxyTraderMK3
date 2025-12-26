@@ -51,6 +51,15 @@
               <!-- Check if destination is valid and in different sector -->
               <do_if value="@$currentDestination.exists and @$currentDestination.sector != null and $newSector != null and $newSector != @$currentDestination.sector">
                 <set_value name="$destinationSector" exact="@$currentDestination.sector"/>
+
+                <!-- Prefer showing the destination's container (station/ship) in logbook messages.
+                     move.generic callers often pass a dockingbay component as destination, whose knownname is unhelpful ("S Standard Docking Bay"). -->
+                <set_value name="$destinationDisplay" exact="$currentDestination"/>
+                <set_value name="$destinationContainer" exact="@$currentDestination.container"/>
+                <do_if value="$destinationContainer != null">
+                  <set_value name="$destinationDisplay" exact="$destinationContainer"/>
+                </do_if>
+                <set_value name="$destinationDisplayName" exact="@$destinationDisplay.knownname"/>
                 
                 <!-- Determine ship's blacklistgroup -->
                 <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
@@ -86,7 +95,7 @@
                   
                   <!-- Player logbook notification about route change -->
                   <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                  <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, @$currentDestination.knownname, @$destinationSector.knownname, -1, 'UNREACHABLE', 'No path available', this.ship.knownname]"/>
+                  <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, -1, 'UNREACHABLE', 'No path available', this.ship.knownname]"/>
                   
                   <!-- Send logbook message via signal (handled by MD cue) -->
                   <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
@@ -95,7 +104,7 @@
                     $Title = 'Route Path Changed: ' + this.ship.knownname,
                     $Object = this.ship,
                     $Interaction = 'showonmap',
-                    $Highlighted = true
+                    $Highlighted = false
                   ]"/>
                   
                   <!-- Signal dock failure to parent order (TradePerform, Repair, Supply, etc.) -->
@@ -141,7 +150,7 @@
                     <set_value name="$statusText" exact="if $blacklistDistance lt 0 then 'No safe path available' else 'Path requires detour'"/>
                     
                     <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                    <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, @$currentDestination.knownname, @$destinationSector.knownname, $normalDistance, $blacklistDistanceText, $statusText, this.ship.knownname]"/>
+                    <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, $normalDistance, $blacklistDistanceText, $statusText, this.ship.knownname]"/>
                     
                     <!-- Send logbook message via signal (handled by MD cue) -->
                     <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
@@ -150,7 +159,7 @@
                       $Title = 'Route Path Changed: ' + this.ship.knownname,
                       $Object = this.ship,
                       $Interaction = 'showonmap',
-                      $Highlighted = true
+                      $Highlighted = false
                     ]"/>
                     
                     <!-- Signal dock failure to parent order (TradePerform, Repair, Supply, etc.) -->
@@ -269,6 +278,146 @@
               </do_all>
             </do_if>
           </do_all>
+        </do_if>
+      </actions>
+    </handler>
+  </add>
+
+  <!-- ThreatAvoidance: Hostile gravidar contact detection (event-driven, vanilla-pattern) -->
+  <!-- WHY HERE: move.generic runs for all movement; ships may not currently be running order.trade.galaxytrader when contacts appear.
+       This provides the most reliable hook with minimal overhead by gating on min=1 contacts (no work when none). -->
+  <add sel="//aiscript[@name='move.generic']/interrupts/handler[@ref='SectorChangeHandler']" pos="before">
+    <handler comment="GT ThreatAvoidance: hostile gravidar contact detection (move.generic)">
+      <conditions>
+        <!-- Vanilla event: fires on gravidar scans -->
+        <event_gravidar_has_scanned object="this.assignedcontrolled"/>
+        <!-- Vanilla safety gates (avoid highways / critical order state) -->
+        <check_value value="this.sector and not this.zone.isclass.highway"/>
+        <check_value value="this.assignedcontrolled.order and this.assignedcontrolled.order.state != orderstate.critical"/>
+
+        <!-- Only for GT ships and only if ThreatAvoidance + DynamicBlacklist are enabled -->
+        <check_value value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?"/>
+        <check_value value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance? and global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled"/>
+        <check_value value="global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+
+        <!-- PERFORMANCE: Do not run actions unless at least 1 hostile ship contact exists (vanilla pattern: min=1 + maybeattackedby) -->
+        <count_gravidar_contacts result="$_detectedHostiles" object="this.assignedcontrolled" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" maybeattackedby="this.assignedcontrolled" checkoperational="false" masstraffic="false" docked="false" multiple="true" min="1">
+          <match_context macro="this.sector.macro"/>
+          <match_context class="class.highway" negate="true"/>
+          <match class="class.buildstorage" negate="true"/>
+          <match state="componentstate.wreck" negate="true"/>
+        </count_gravidar_contacts>
+      </conditions>
+      <actions>
+        <!-- Per-ship throttle (global table; survives across move.generic instances) -->
+        <do_if value="not global.$GT_ThreatDetectThrottle?">
+          <set_value name="global.$GT_ThreatDetectThrottle" exact="table[]"/>
+        </do_if>
+        <set_value name="$_last" exact="@global.$GT_ThreatDetectThrottle.{this.ship}"/>
+        <do_if value="$_last == null">
+          <set_value name="$_last" exact="0s"/>
+        </do_if>
+
+        <!-- Always LOG when hostiles are detected, but avoid log spam by throttling to at most once per 10s per ship -->
+        <set_value name="$_logAllowed" exact="player.age - $_last ge 10s"/>
+
+        <set_value name="$hostiles" exact="$_detectedHostiles"/>
+        <!-- IMPORTANT: $hostiles.count may include non-operational contacts (checkoperational="false").
+             We want HostileCount to match the class breakdown we compute below, so we derive it from class counters. -->
+        <set_value name="$hostileListCount" exact="$hostiles.count"/>
+        <set_value name="$hostileCount" exact="0"/>
+
+        <!-- Compute threat (stop early once we exceed common thresholds) -->
+        <set_value name="$threatScore" exact="0"/>
+        <set_value name="$shipClass_XL" exact="0"/>
+        <set_value name="$shipClass_L" exact="0"/>
+        <set_value name="$shipClass_M" exact="0"/>
+        <set_value name="$shipClass_S" exact="0"/>
+        <set_value name="$factionCounts" exact="table[]"/>
+
+        <do_all exact="$hostileListCount" counter="$i">
+          <set_value name="$h" exact="$hostiles.{$i}"/>
+          <do_if value="@$h.exists and @$h.isoperational">
+            <do_if value="$h.isclass.ship_xl">
+              <set_value name="$threatScore" exact="$threatScore + 5"/>
+              <set_value name="$shipClass_XL" operation="add"/>
+            </do_if>
+            <do_elseif value="$h.isclass.ship_l">
+              <set_value name="$threatScore" exact="$threatScore + 3"/>
+              <set_value name="$shipClass_L" operation="add"/>
+            </do_elseif>
+            <do_elseif value="$h.isclass.ship_m">
+              <set_value name="$threatScore" exact="$threatScore + 2"/>
+              <set_value name="$shipClass_M" operation="add"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$threatScore" exact="$threatScore + 1"/>
+              <set_value name="$shipClass_S" operation="add"/>
+            </do_else>
+
+            <do_if value="@$h.owner != null">
+              <set_value name="$f" exact="$h.owner"/>
+              <set_value name="$factionCounts.{$f}" exact="@$factionCounts.{$f} + 1"/>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <!-- Make HostileCount match class counters -->
+        <set_value name="$hostileCount" exact="$shipClass_XL + $shipClass_L + $shipClass_M + $shipClass_S"/>
+
+        <!-- Determine primary faction (best-effort; used for logging/telemetry) -->
+        <set_value name="$primaryFaction" exact="null"/>
+        <set_value name="$maxFactionCount" exact="0"/>
+        <do_all exact="$factionCounts.keys.count" counter="$fi">
+          <set_value name="$f" exact="$factionCounts.keys.{$fi}"/>
+          <do_if value="$factionCounts.{$f} gt $maxFactionCount">
+            <set_value name="$primaryFaction" exact="$f"/>
+            <set_value name="$maxFactionCount" exact="$factionCounts.{$f}"/>
+          </do_if>
+        </do_all>
+
+        <!-- Convert score to threat level (1-5), matching GT_ThreatIntelligence receiver expectations -->
+        <set_value name="$threatLevel" exact="2"/>
+        <do_if value="$shipClass_XL gt 0 or $shipClass_L gt 0">
+          <set_value name="$threatLevel" exact="4"/>
+        </do_if>
+        <do_elseif value="$threatScore ge 6">
+          <set_value name="$threatLevel" exact="3"/>
+        </do_elseif>
+
+        <!-- Compare to configured threshold (fallback 3) -->
+        <set_value name="$threshold" exact="global.$GT_GlobalSettings.$ThreatAvoidance.$BlacklistThreshold"/>
+        <do_if value="not $threshold?">
+          <set_value name="$threshold" exact="3"/>
+        </do_if>
+
+        <!-- Broadcast throttle (separate from logging throttle) -->
+        <set_value name="$_broadcastAllowed" exact="player.age - $_last ge 30s"/>
+        <do_if value="$hostileCount gt 0 and $_broadcastAllowed and $threatLevel ge $threshold">
+          <signal_objects object="player.galaxy" param="'GT_Threat_Warning'" param2="table[
+            $Sector = this.sector,
+            $DetectedBy = this.ship,
+            $HostileCount = $hostileCount,
+            $PrimaryFaction = $primaryFaction,
+            $ShipClass_XL = $shipClass_XL,
+            $ShipClass_L = $shipClass_L,
+            $ShipClass_M = $shipClass_M,
+            $ShipClass_S = $shipClass_S,
+            $ThreatScore = $threatScore,
+            $Timestamp = player.age
+          ]"/>
+        </do_if>
+
+        <do_if value="$hostileCount gt 0 and $_logAllowed">
+          <set_value name="global.$GT_ThreatDetectThrottle.{this.ship}" exact="player.age"/>
+          <set_value name="$_primaryFactionName" exact="if $primaryFaction? then @$primaryFaction.knownname else 'UNKNOWN'"/>
+          <set_value name="$_broadcasted" exact="if ($_broadcastAllowed and $threatLevel ge $threshold) then 'YES' else 'NO'"/>
+          <debug_text text="'[GT-Threat-Detect] ' + this.ship.idcode + ' in ' + this.sector.knownname
+            + ' - hostiles=' + $hostileCount
+            + ' (XL=' + $shipClass_XL + ', L=' + $shipClass_L + ', M=' + $shipClass_M + ', S=' + $shipClass_S + ')'
+            + ', threatScore=' + $threatScore + ', threatLevel=' + $threatLevel + ', threshold=' + $threshold
+            + ', primaryFaction=' + $_primaryFactionName
+            + ', broadcasted=' + $_broadcasted" chance="100"/>
         </do_if>
       </actions>
     </handler>
