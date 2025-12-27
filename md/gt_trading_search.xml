@@ -1613,29 +1613,96 @@
             </do_if>
           </do_if>
           
-          <!-- Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
+          <!-- Fleet coordination: final claim check (closes race between "select best trade" and "reserve") -->
+          <!-- If the chosen route is already reserved by another ship, pick the next-best non-conflicted trade. -->
           <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
             <!-- Initialize global.$GT_ActiveTradeReservations if it doesn't exist -->
             <do_if value="not global.$GT_ActiveTradeReservations?">
               <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
             </do_if>
             
-            <!-- Use safe operators to access bestTrade properties -->
+            <!-- Build reserved route keys (excluding this ship) -->
+            <set_value name="$reservedRoutes" exact="[]"/>
+            <do_if value="global.$GT_ActiveTradeReservations?">
+              <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$resIdx">
+                <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$resIdx}"/>
+                <do_if value="$otherShip != $ship and $otherShip.exists">
+                  <set_value name="$otherRoute" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
+                  <do_if value="$otherRoute.$BuyStation? and $otherRoute.$SellStation? and $otherRoute.$Ware?">
+                    <do_if value="$otherRoute.$BuyStation.idcode? and $otherRoute.$SellStation.idcode?">
+                      <set_value name="$cacheKey" exact="$otherRoute.$BuyStation.idcode + '_' + $otherRoute.$SellStation.idcode + '_' + $otherRoute.$Ware"/>
+                      <append_to_list name="$reservedRoutes" exact="$cacheKey"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Check current bestTrade -->
             <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
             <set_value name="$fleetSellStation" exact="@$bestTrade.$SellOffer.owner"/>
             <set_value name="$fleetWare" exact="@$bestTrade.$BuyOffer.ware"/>
-            <do_if value="$fleetBuyStation? and $fleetSellStation? and $fleetWare?">
-              <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
-                $BuyStation = $fleetBuyStation,
-                $SellStation = $fleetSellStation,
-                $Ware = $fleetWare,
-                $Timestamp = player.age
-              ]"/>
+            <set_value name="$routeConflicted" exact="false"/>
+            <do_if value="$reservedRoutes.count gt 0 and $fleetBuyStation? and $fleetSellStation? and $fleetWare?">
+              <run_actions ref="md.GT_Libraries_General.GT_CheckRouteConflict" result="$routeConflicted">
+                <param name="sellStation" value="$fleetBuyStation"/>
+                <param name="buyStation" value="$fleetSellStation"/>
+                <param name="ware" value="$fleetWare"/>
+                <param name="reservedRoutes" value="$reservedRoutes"/>
+              </run_actions>
+            </do_if>
+            
+            <do_if value="$routeConflicted">
+              <set_value name="$replacementTrade" exact="null"/>
+              <do_all exact="$tradeList.count" counter="$i">
+                <set_value name="$candidate" exact="$tradeList.{$i}"/>
+                <set_value name="$candBuyStation" exact="@$candidate.$BuyOffer.owner"/>
+                <set_value name="$candSellStation" exact="@$candidate.$SellOffer.owner"/>
+                <set_value name="$candWare" exact="@$candidate.$BuyOffer.ware"/>
+                <do_if value="$candBuyStation? and $candSellStation? and $candWare?">
+                  <run_actions ref="md.GT_Libraries_General.GT_CheckRouteConflict" result="$candConflicted">
+                    <param name="sellStation" value="$candBuyStation"/>
+                    <param name="buyStation" value="$candSellStation"/>
+                    <param name="ware" value="$candWare"/>
+                    <param name="reservedRoutes" value="$reservedRoutes"/>
+                  </run_actions>
+                  <do_if value="not $candConflicted">
+                    <set_value name="$replacementTrade" exact="$candidate"/>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <do_if value="$replacementTrade?">
+                <set_value name="$bestTrade" exact="$replacementTrade"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Fleet] (' + $ship.idcode + ') Best trade was already reserved - switched to next non-conflicted trade'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- No non-conflicted trade available -->
+                <set_value name="$bestTrade" exact="null"/>
+              </do_else>
+            </do_if>
+            
+            <!-- Reserve trade route for fleet coordination (after claim check) -->
+            <do_if value="$bestTrade?">
+              <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
+              <set_value name="$fleetSellStation" exact="@$bestTrade.$SellOffer.owner"/>
+              <set_value name="$fleetWare" exact="@$bestTrade.$BuyOffer.ware"/>
+              <do_if value="$fleetBuyStation? and $fleetSellStation? and $fleetWare?">
+                <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
+                  $BuyStation = $fleetBuyStation,
+                  $SellStation = $fleetSellStation,
+                  $Ware = $fleetWare,
+                  $Timestamp = player.age
+                ]"/>
+              </do_if>
             </do_if>
           </do_if>
           
-          <!-- Execute trade -->
-          <do_if value="true">
+          <!-- Execute trade (only if still valid after claim check) -->
+          <do_if value="$bestTrade?">
             <!-- DEBUG: Log exact trade list being sent to trading AI -->
             <!-- COMMENTED OUT: Reduces log spam - uncomment if needed for debugging -->
             <!-- <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1667,6 +1734,10 @@
             
             <!-- GT_Trade_Found signal now sent FROM ExecuteTrade cue after storing pending trade -->
           </do_if>
+          <do_else>
+            <!-- No non-conflicted trade remained after fleet claim check -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
+          </do_else>
         </do_if>
         
         <do_else>
