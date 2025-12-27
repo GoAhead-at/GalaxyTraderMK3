@@ -136,12 +136,72 @@
           <do_if value="$stateStarted?">
             <set_value name="$stateAge" exact="player.age - $stateStarted"/>
           </do_if>
+          
+          <!-- STALE GUARD (MISSING START TIME):
+               Some stuck live-search states can retain progress markers but lose/never set .$Started.
+               Without a valid $stateAge, the normal stale guards won't fire, causing permanent "in progress" blocking.
+               Treat "no Started timestamp" as stale and clear the state so the ship can start a fresh search. -->
+          <do_if value="$stateAge lt 0">
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$params.$Ship}"/>
+            
+            <!-- Also clear any stale pathfinding markers for this ship (queue entries can outlive the state and block new searches) -->
+            <do_if value="global.$GT_PathfindingQueue?">
+              <!-- Remove from active ships and decrement counter if needed -->
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                <do_all exact="global.$GT_PathfindingQueue.$ActiveShips.count" counter="$pi" reverse="true">
+                  <do_if value="global.$GT_PathfindingQueue.$ActiveShips.{$pi} == $params.$Ship">
+                    <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$params.$Ship"/>
+                    <do_if value="global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$ActiveInstances gt 0">
+                      <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <!-- Remove queued requests for this ship -->
+              <do_if value="global.$GT_PathfindingQueue.$Requests?">
+                <do_all exact="global.$GT_PathfindingQueue.$Requests.count" counter="$qi" reverse="true">
+                  <set_value name="$req" exact="global.$GT_PathfindingQueue.$Requests.{$qi}"/>
+                  <do_if value="$req? and $req.$Ship? and $req.$Ship == $params.$Ship">
+                    <remove_from_list name="global.$GT_PathfindingQueue.$Requests" exact="$req"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+            
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') Clearing STALE live-search state (pre-gate) - missing .$Started timestamp (was blocking new requests)'" chance="100"/>
+            </do_if>
+          </do_if>
 
           <!-- HARD STALE GUARD:
                Even if progress markers exist, a live-search state can get stuck (e.g. lost completion signal).
                If it's too old, clear it so fresh requests don't stall indefinitely. -->
           <do_if value="$stateAge gt 300s">
             <remove_value name="global.$GT_SearchLiveTrades_State.{$params.$Ship}"/>
+            
+            <!-- Also clear stale pathfinding queue/markers for this ship.
+                 Otherwise $hasPathfinding stays true and the pre-gate will still treat it as "in progress" forever. -->
+            <do_if value="global.$GT_PathfindingQueue?">
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                <do_all exact="global.$GT_PathfindingQueue.$ActiveShips.count" counter="$pi" reverse="true">
+                  <do_if value="global.$GT_PathfindingQueue.$ActiveShips.{$pi} == $params.$Ship">
+                    <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$params.$Ship"/>
+                    <do_if value="global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$ActiveInstances gt 0">
+                      <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="global.$GT_PathfindingQueue.$Requests?">
+                <do_all exact="global.$GT_PathfindingQueue.$Requests.count" counter="$qi" reverse="true">
+                  <set_value name="$req" exact="global.$GT_PathfindingQueue.$Requests.{$qi}"/>
+                  <do_if value="$req? and $req.$Ship? and $req.$Ship == $params.$Ship">
+                    <remove_from_list name="global.$GT_PathfindingQueue.$Requests" exact="$req"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+            
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') Clearing STALE live-search state (pre-gate HARD) - stateAge=' + $stateAge + ' (was blocking new requests)'" chance="100"/>
             </do_if>
@@ -172,13 +232,6 @@
               </do_if>
               <!-- Prevent any later cleanup block (if reached) from double-decrementing -->
               <set_value name="$useSearchQueueCounter" exact="false"/>
-            </do_if>
-
-            <!-- IMPORTANT:
-                 Do NOT stall the AI while another live-search is in progress for this ship.
-                 Fail fast so the AI can retry later (and avoid indefinite "waiting for resume" if the live-search state is stuck). -->
-            <do_if value="$params? and $params.$Ship? and $params.$Ship.exists">
-              <signal_objects object="$params.$Ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
             </do_if>
 
             <set_value name="$shouldProceed" exact="false"/>
@@ -1473,8 +1526,12 @@
                   ]"/>
                   <signal_cue_instantly cue="md.GT_Search_Methods.SearchFallbackTrades" param="$fallbackParams"/>
                   
-                  <!-- Exit - SearchFallbackTrades will signal SearchTradeRoutes again when complete -->
-                  <cancel_cue cue="this"/>
+                  <!-- IMPORTANT: We have started an async fallback/live pipeline.
+                       Do NOT signal GT_No_Trade_Found or release the search lock in this invocation.
+                       Let SearchLiveTrades_Resume signal SearchTradeRoutes again when results are ready. -->
+                  <set_value name="$waitingForLiveSearch" exact="true"/>
+                  <set_value name="$deferNoTradeFound" exact="true"/>
+                  <!-- Do NOT cancel here; we must reach unified cleanup to release queue slots while retaining the lock. -->
                 </do_if>
                 <do_else>
                   <!-- Ship is isolated OR fallback already attempted - signal no trade found -->
@@ -2174,9 +2231,7 @@
               <!-- Exit - SearchFallbackTrades will signal SearchTradeRoutes again when complete -->
               <set_value name="$waitingForLiveSearch" exact="true"/>
               <set_value name="$deferNoTradeFound" exact="true"/>
-              <set_value name="$waitingForLiveSearch" exact="true"/>
-              <set_value name="$deferNoTradeFound" exact="true"/>
-              <cancel_cue cue="this"/>
+              <!-- Do NOT cancel here; we must reach unified cleanup to release queue slots while retaining the lock. -->
             </do_if>
             <do_else>
               <!-- Ship is isolated - signal no trade found (normal behavior for isolated ships) -->

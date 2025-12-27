@@ -512,6 +512,96 @@
             <set_value name="$wareCount" exact="$wareCountTemp"/>
           </do_if>
         </do_if>
+
+        <!-- HARD WALL-TIME CAP (smooth gameplay > perfect search completeness)
+             Problem seen in log.log: one ware can cause very long chunk-continuations (e.g. Refined Metals),
+             keeping the ship "searching" until external stale-lock cleanup triggers.
+             Fix: after a short wall-time budget, force-complete with whatever trades we already found so far. -->
+        <set_value name="$batchHardCap" exact="3s"/> <!-- TODO: make configurable later -->
+        <set_value name="$batchStartTime" exact="@$state.$batchStartTime"/>
+        <do_if value="(not $batchStartTime?) or ($batchStartTime == null)">
+          <set_value name="$batchStartTime" exact="player.age"/>
+          <set_value name="$state.$batchStartTime" exact="$batchStartTime"/>
+          <set_value name="global.$GT_BatchDataList.{$ship}.$batchStartTime" exact="$batchStartTime"/>
+        </do_if>
+        <set_value name="$batchElapsed" exact="player.age - $batchStartTime"/>
+        <do_if value="$batchElapsed gt $batchHardCap">
+          <!-- De-dupe forced completion per ship.
+               Without this, overlapping continuation instances can all hit the hard cap and spam multiple
+               SearchLiveTrades_Resume signals, which races SearchTradeRoutes and can release the search lock
+               before results are consumed (=> hasLock=0, ship appears "stuck searching"). -->
+          <do_if value="not global.$GT_BatchForceComplete?">
+            <set_value name="global.$GT_BatchForceComplete" exact="table[]"/>
+          </do_if>
+          <do_if value="global.$GT_BatchForceComplete.{$ship}?">
+            <!-- Already force-completed for this ship - don't do it again -->
+            <set_value name="$skipBatchProcessing" exact="true"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <set_value name="global.$GT_BatchForceComplete.{$ship}" exact="true"/>
+
+          <!-- Ensure tradeList exists -->
+          <do_if value="not $tradeList?">
+            <set_value name="$tradeList" exact="[]"/>
+          </do_if>
+
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') HARD CAP reached (' + ($batchElapsed / 1s) + 's > ' + ($batchHardCap / 1s) + 's) - forcing completion with ' + $tradeList.count + ' trades'" chance="100"/>
+          </do_if>
+
+          <!-- Release active processor slot and remove from active list -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+          </do_if>
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+          </do_if>
+
+          <!-- Clear per-ship continuation marker so future batches can schedule cleanly -->
+          <do_if value="global.$GT_BatchContinuationScheduled? and global.$GT_BatchContinuationScheduled.{$ship}?">
+            <remove_value name="global.$GT_BatchContinuationScheduled.{$ship}"/>
+          </do_if>
+          <!-- Also clear scheduler marker (in case it was set but not yet cleared) -->
+          <do_if value="global.$GT_BatchContinuationScheduled? and global.$GT_BatchContinuationScheduled.{$ship}?">
+            <remove_value name="global.$GT_BatchContinuationScheduled.{$ship}"/>
+          </do_if>
+          <!-- Remove any remaining queued entries for this ship (defensive; avoids immediate re-processing) -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- Pack results and wake SearchLiveTrades_Resume -->
+          <set_value name="$results" exact="table[
+            $ship = $ship,
+            $tradeList = $tradeList,
+            $crossStationBestTrade = $crossStationBestTrade,
+            $crossStationBestScore = $crossStationBestScore,
+            $nonConflictedBestTrade = $nonConflictedBestTrade,
+            $nonConflictedBestScore = $nonConflictedBestScore,
+            $tradesRejectedProfit = $tradesRejectedProfit,
+            $tradesRejectedDocking = $tradesRejectedDocking,
+            $tradesRejectedAmount = $tradesRejectedAmount,
+            $tradesRejectedDistance = $tradesRejectedDistance,
+            $bestRejectedProfit = $bestRejectedProfit,
+            $bestRejectedTrade = $bestRejectedTrade
+          ]"/>
+          <set_value name="global.$GT_BatchResultsList.{$ship}" exact="$results"/>
+          <signal_cue_instantly cue="md.GT_Trading_Search.SearchLiveTrades_Resume" param="$ship"/>
+
+          <!-- IMPORTANT: Clear batch state so no further continuation instances keep working on stale data -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+
+          <!-- Continue processing other queued batch requests -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+
+          <!-- Prevent further processing in this instance -->
+          <set_value name="$skipBatchProcessing" exact="true"/>
+          <cancel_cue cue="this"/>
+        </do_if>
         
         <!-- DEADLOCK FIX:
              If wareKeysList is EMPTY, the normal processing branch never runs, and the batch processor never reaches
