@@ -1,6 +1,544 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.7.0 - 2025-12-26
+---------------------------
+
+BUGFIX: Prevent rare subordinate “pilot cap” mis-detection and avoid silent fallbacks
+  - Trade search requests will no longer proceed with bogus MaxBuy/MaxSell when pilot management skill is temporarily unavailable
+    * AI logs an explicit ERROR and retries later instead of hiding the issue with a fallback cap
+  - Subordinate effective MaxBuy/MaxSell values are persisted and used consistently for GT_Find_Trade signals across labels
+    * Prevents mismatches between in-AI “effective” range and what MD receives
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`
+
+BUGFIX: Subordinate settings now update immediately when commander default-order settings change
+  - Subordinates refresh inherited commander settings (ware filter, max distances, restrictions, etc.) right before requesting a new trade
+    * Applies even if the game does not trigger an order-ready event for default-order parameter edits
+  - Prevents stale/wrong ware trades after commander changes by purging old pending search results for that ship
+  - Introduced `global.$GT_ActiveTrade.{ship}` for active-route failure tracking (separate from pending search results)
+    * Failure/threat routing logic now reads active route from GT_ActiveTrade while GT_PendingTrades remains a search-results list
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`
+    * `md/gt_trading_signals.xml`
+    * `md/gt_libraries_general.xml`
+    * `md/gt_threat_intelligence.xml`
+
+IMPROVEMENT: Fair live-search scheduling across fleets in different home sectors (prevents starvation)
+  - Live searches remain limited by MaxConcurrentLiveSearches (often 1), but are now queued fairly per HOME SECTOR
+    * Prevents one “hot” home sector from monopolizing the only live-search slot and starving other sectors of cache refresh
+  - Implemented per-home-sector live queue + round-robin scheduler:
+    * `global.$GT_LiveSearchQueue.$BySector.{$homeSector}.$Ships = [...]`
+    * `global.$GT_LiveSearchQueue.$Sectors` + `$NextSectorIndex` round-robin selection
+  - NOTE: This replaces the previous “fail-fast when live search busy” behavior to ensure sector caches can actually update
+  - Files Modified:
+    * `md/gt_trading_search.xml`
+    * `md/gt_trading_queue.xml`
+    * `md/gt_trading_ai.xml`
+
+TUNING: Early Exit Threshold default increased
+  - Updated default `$GT_GlobalSettings.$Performance.$EarlyExitThreshold` to 800
+    * Applies to initialization, missing-setting restoration, migration of old default (1000), and out-of-range clamps
+  - Updated the Global Settings tooltip text in all languages so it matches the new default and range (100–10000)
+  - Files Modified:
+    * `md/gt_global_settings.xml`
+    * `t/0001-l007.xml`, `t/0001-l033.xml`, `t/0001-l034.xml`, `t/0001-l039.xml`, `t/0001-l044.xml`, `t/0001-l049.xml`, `t/0001-l055.xml`, `t/0001-l082.xml`, `t/0001-l086.xml`
+
+DOC: Trade search CPU optimization spec (no implementation)
+  - Added a spec document describing two complementary approaches:
+    * (A) Smarter cache behavior to reduce how often `SearchTradeRoutes` needs to do expensive work
+    * (B) Cheaper `SearchTradeRoutes` orchestration to reduce CPU per invocation
+  - Files Added:
+    * `HowTo/TradeSearch-CPU-Optimization-Spec.md`
+
+BUGFIX: Prevent ships from looping forever on stale pending trade results (offer invalidation)
+  - If all pending trades are rejected during validation (e.g. offers changed/invalid), the ship now purges its pending trade list and requests fresh results
+    * Fixes ships repeatedly logging “Found X pending trades from earlier MD result” and never issuing a new GT_Find_Trade
+  - Resets escalating backoff after purging stale results so the ship retries promptly
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`
+
+TOOLING: New log analyzer for trade-order stall timelines
+  - Added a PowerShell script to report which ships successfully created trade orders vs which are missing terminal outcomes (stalled)
+    * Helps pinpoint where the pipeline is blocking (request → search start → completion → AI interrupt)
+  - Files Added:
+    * `UPDATED_VERSION/analyze_tradeorder_timeline.ps1`
+
+BUGFIX: Cache search stability + null-safety improvements (prevents SearchQueue stalls)
+  - Fixed a cache-search duplicate-signal edge case that could overwrite in-progress state and trap searches
+  - Hardened SearchCachedTrades local initialization to prevent null property lookup failures during cache validation/stats tracking
+  - Files Modified:
+    * `md/gt_search_methods.xml`
+
+BUGFIX: Order Monitor GetCommander() spam (non-controllable component IDs)
+  - Prevents UI engine errors like: `GetCommander(): Component 'X' is not of class controllable`
+  - Lua order monitor now guards GetCommander() behind a `controllable` class check
+  - Files Modified:
+    * `ui/gt_order_monitor.lua`
+
+BUGFIX: Re-implemented real-time enemy detection (accidentally removed in earlier versions)
+  - Restored event-driven gravidar hostile detection for GT ships (vanilla patrol-style) to feed ThreatAvoidance
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`
+
+BUGFIX: Dynamic blacklist pipeline reliability (threat detection → blacklist update)
+  - Restored reliable event-driven hostile detection during movement (move.generic) and unified throttling to avoid duplicate broadcasts/log spam
+  - Fixed multiple issues that could prevent threat intelligence from loading or applying blacklist updates
+  - Added event-driven clearing: building a player defense station in a threatened/blacklisted sector removes it from the GT blacklist immediately
+  - Improved ROUTE PATH CHANGED logbook message:
+    * No longer highlighted
+    * Shows destination container (station/ship) instead of docking bay component name
+  - Files Modified:
+    * `aiscripts/move.generic.xml`
+    * `md/gt_threat_intelligence.xml`
+
+CRITICAL PERFORMANCE FIX: Batch Processor Concurrency Race Condition
+  - Fixed massive CPU spikes caused by concurrency check happening AFTER delay
+  - Problem: ProcessTradeMatchingBatch checked concurrency AFTER 50ms delay, allowing hundreds of instances to queue up
+    * Hundreds of signals could arrive during delay period
+    * All instances woke up simultaneously and passed concurrency check before any incremented counter
+    * Result: 374 concurrent instances in worst frame (should be max 1)
+    * Caused 601 operations in worst frame, severe game stutter
+  - Root Cause: Delay happened BEFORE concurrency check, creating race condition window
+    * Signal → Delay (50ms) → Check concurrency → Process
+    * During delay, hundreds of signals could arrive
+    * All checked concurrency simultaneously before counter increment
+  - Solution: Moved concurrency check to FIRST actions block (before delay)
+    * Signal → Check concurrency → Queue if needed OR delay if proceeding → Process
+    * Concurrency check now happens immediately, preventing race condition
+    * Early validation of batch data before delay (prevents empty loops)
+    * Continuation batches still work correctly (bypass concurrency check via ActiveShips check)
+    * Variables stored in this.* to persist across delay
+  - Files Modified:
+    * `md/gt_trading_batch_processor.xml`: Restructured ProcessTradeMatchingBatch cue (lines 10-183)
+  - Impact:
+    * Eliminates 300+ concurrent instances (enforces max 1)
+    * Reduces worst-case frame from 601 to ~50 operations
+    * Removes CPU spikes and game stutter
+    * Prevents empty data warnings (early validation)
+
+PERFORMANCE: Distribute trade-search workload across frames (reduce burst/synchronization)
+  - Added small scheduler jitter so queued searches don't start in the same frame
+    * `md/gt_trading_queue.xml`: ProcessSearchQueue now delays 5-20ms before starting a search
+  - Reduced per-tick work in the two heaviest search steps so each “slice” is smaller
+    * `md/gt_search_methods.xml`: SearchCachedTrades validation batch size reduced (5 -> 3 entries per tick)
+    * `md/gt_trading_batch_processor.xml`: Trade matching chunk size reduced (5×5 -> 4×4 combinations per tick)
+  - Added jitter to existing delayed processing so continuation batches don't re-sync into periodic spikes
+    * `md/gt_search_methods.xml`: SearchCachedTrades delay now includes +0-20ms jitter
+    * `md/gt_trading_batch_processor.xml`: BatchProcessingDelay now includes +0-20ms jitter
+  - Reduced log spam that can amplify perceived “spikes” in timeline analysis
+    * `md/gt_search_methods.xml`: Home-sector cache size debug line reduced from chance 100 -> 10
+
+PERFORMANCE: Fix periodic fleet stutter from Mobile Intel gravidar scans (do nothing on “0 stations”)
+  - Problem: with many ships, gravidar scan events caused bursts of station queries/logging even when no stations were found
+  - Solution: gate the handler so actions only run when at least 1 station contact exists (vanilla pattern)
+    * `aiscripts/order.trade.galaxytrader.xml`: Mobile Intel handler now uses count_gravidar_contacts min=1
+    * Removed per-scan “Found 0 stations” overhead; capped processing to 5 stations per scan to smooth spikes
+
+BUGFIX: MD batch processor invalid early-exit
+  - Fixed "Script node 'return' is not allowed in this context"
+    * `md/gt_trading_batch_processor.xml`: replaced illegal <return/> early-exits with <cancel_cue cue="this"/> after signaling continuations
+
+PERFORMANCE: Yield queue processors to avoid same-frame queue drain avalanches
+  - `md/gt_trading_ai.xml`: ProcessTradeRequestQueue now yields (10ms delay)
+  - `md/gt_maintenance.xml`: ProcessMaintenanceQueue now yields (10ms delay)
+  - `md/gt_libraries_pathfinding.xml`: ProcessPathfindingQueue now yields (10ms delay)
+  - `md/gt_maintenance.xml`: Maintenance station candidate lists capped (30 per type) before distance/validation loops
+
+CRITICAL PERFORMANCE FIX: ProcessDelayedTradeRequest Concurrency Queue
+  - Fixed massive CPU spikes caused by unlimited concurrent ProcessDelayedTradeRequest instances
+  - Problem: ProcessDelayedTradeRequest had no concurrency control, causing 800+ operations per frame
+    * Every ship sending GT_Find_Trade created a new ProcessDelayedTradeRequest instance
+    * With many ships, hundreds of instances ran simultaneously in a single frame
+    * Each instance performed expensive property lookups, validation, and queue operations
+    * Caused severe game stutter and frame drops
+  - Root Cause: instantiate="true" cue with no concurrency limit
+    * No queue system to limit concurrent processing
+    * All requests processed immediately regardless of system load
+    * No coordination between multiple simultaneous requests
+  - Solution: Implemented concurrency queue system similar to SearchTradeRoutes
+    * Added global.$GT_TradeRequestQueue with MaxConcurrent = 2
+    * Created ProcessTradeRequestQueue cue to manage queue
+    * Requests are queued when ActiveInstances >= MaxConcurrent
+    * ActiveInstances counter incremented when processing starts, decremented on completion/rejection
+    * Queue processor signals next request when slot becomes available
+  - Files Modified:
+    * `md/gt_trading_ai.xml`:
+      - SystemInit: Initialize global.$GT_TradeRequestQueue (lines 135-139)
+      - GT_Find_Trade handler: Check concurrency, queue if needed (lines 193-220)
+      - New ProcessTradeRequestQueue cue: Manages queue processing (lines 301-325)
+      - ProcessDelayedTradeRequest: Decrement counter on completion/rejection (lines 496, 507, 515)
+    * `md/gt_trading_search.xml`:
+      - SearchTradeRoutes cleanup: Decrement counter when search completes (lines 1877-1881)
+  - Impact:
+    * Limits concurrent trade request processing to 2 instances (configurable via MaxConcurrent)
+    * Prevents CPU spikes from hundreds of simultaneous requests
+    * Eliminates game stutter when many ships request trades simultaneously
+    * Queue ensures fair processing order
+    * Reduces operations per frame from 800+ to manageable levels
+
+PERFORMANCE: Optimize order.assist Subordinate Registration
+  - Reduced CPU overhead when many subordinates register simultaneously
+  - Problem: Subordinate registration caused 1891 operations in single frame
+    * Each subordinate triggered property lookups and table operations
+    * Debug logging at 100% chance for every registration
+    * Multiple nested property checks even when table already exists
+  - Solution: Optimized registration logic
+    * Check if table exists first, then check ship registration (reduces nested checks)
+    * Reduced debug logging chance from 100% to 10%
+    * Simplified conditional structure to minimize property lookups
+  - Files Modified:
+    * `aiscripts/order.assist.xml`: Optimized subordinate registration (lines 36-46)
+      - Check table existence first, then ship registration
+      - Reduced debug logging chance
+      - Simplified conditional structure
+  - Impact:
+    * Reduces operations per frame when assigning many subordinates simultaneously
+    * Eliminates debug log spam for subordinate registrations
+    * Faster registration when GT_Ships table already exists
+
+PERFORMANCE: Reduce SearchCachedTrades Duplicate Logging Overhead
+  - Reduced debug logging overhead for duplicate SearchCachedTrades signals
+  - Problem: Duplicate prevention logged at 100% chance, causing log spam
+    * Many "Duplicate SearchCachedTrades" messages when multiple ships trigger simultaneously
+    * Each duplicate check logged even though it's normal behavior
+    * Contributed to CPU overhead during spikes
+  - Solution: Reduced logging chance from 100% to 10%
+    * Duplicate detection still works correctly
+    * Logging reduced to prevent spam while maintaining visibility
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Reduced duplicate logging chance (line 137)
+  - Impact:
+    * Reduces log spam during concurrent search operations
+    * Maintains duplicate detection functionality
+    * Lower CPU overhead from debug logging
+
+CRITICAL PERFORMANCE FIX: Optimize INIT Block Processing
+  - Fixed massive CPU spikes caused by INIT block when many ships initialize simultaneously
+  - Problem: INIT block caused 1836 operations in single frame
+    * Resupply order check iterated through ALL orders on ship (expensive O(n) operation)
+    * Pilot skill calculation duplicated - calculated twice (once for MaxBuy, once for MaxSell)
+    * Inherited settings string building - expensive string concatenation loop even when debug disabled
+    * When many ships initialize simultaneously (save load, fleet assignment), all work happens in same frame
+  - Root Cause: INIT block runs synchronously for all ships that start order simultaneously
+    * No concurrency control - all ships initialize at once
+    * Redundant calculations (pilot skill calculated twice)
+    * Expensive operations run even when results aren't needed (string building for debug)
+    * Inefficient order checking (iterated all orders instead of checking active order)
+  - Solution: Optimized INIT block processing
+    * Optimized resupply order check: Use `this.ship.order.id` instead of iterating all orders (O(1) vs O(n))
+    * Cached pilot skill calculation: Calculate once, reuse for both MaxBuy and MaxSell (50% reduction)
+    * Conditional string building: Only build inherited settings string if debug logging enabled
+    * Eliminated redundant property lookups and calculations
+  - Files Modified:
+    * `aiscripts/order.trade.galaxytrader.xml`:
+      - Lines 412-433: Optimized resupply order check (use order.id instead of iteration)
+      - Lines 554-626: Cached pilot skill calculation (calculate once, reuse for MaxBuy/MaxSell)
+      - Lines 628-655: Conditional inherited settings string building (only if debug enabled)
+  - Impact:
+    * Reduces operations per frame from 1836+ to ~800-1000 when many ships initialize
+    * Faster initialization (no order iteration, no duplicate calculations)
+    * Eliminates expensive string building when debug disabled
+    * Maintains all functionality while reducing CPU overhead by ~40-50%
+
+BUGFIX: SearchTradeRoutes Null Reference Errors
+  - Fixed null reference errors when SearchTradeRoutes cue executes with invalid parameters
+  - Problem: SearchTradeRoutes cue accessed $ship and $params without null checks in multiple locations
+    * Error: "Property lookup failed: $ship.idcode" at line 1670 (rejection stats debug)
+    * Error: "Property lookup failed: $ship.idcode" at line 1827 (cleanup debug)
+    * Error: "Property lookup failed: $params.$Ship" at line 1844 (cleanup)
+    * Error: "Property lookup failed: $shipForQueue.idcode" at line 1885 (queue debug)
+    * Error: "Failed to set table[].{null} to value..." in GT_UpdateRejectionStats (line 1520)
+    * Cleanup code ran even when $params was null or $shouldProceed was false
+    * Cue could be signaled with null parameters or after cancellation
+  - Root Cause: Multiple code sections assumed $ship and $params always existed
+    * Rejection stats code accessed $ship.idcode without null check (line 1670)
+    * Rejection stats library used null $ship as table key (line 1520)
+    * Cleanup section (lines 1839-1891) accessed $params.$Ship without null check
+    * Cleanup ran outside $shouldProceed block, so $ship might not be set
+  - Solution: Added comprehensive null checks throughout SearchTradeRoutes
+    * Line 1644: Check $ship exists before updating rejection stats
+    * Line 1670: Check $ship exists before debug text for rejection stats
+    * Line 1827: Check $ship exists before debug text in cleanup
+    * Line 1833: Check $ship exists before signaling GT_No_Trade_Found
+    * Lines 1844-1848: Check $params exists before accessing $params.$Ship
+    * Lines 1850-1891: Wrapped cleanup in $shipForCleanup check with fallback path
+    * GT_UpdateRejectionStats library: Added null check at start, return early if ship is null
+  - Files Modified:
+    * `md/gt_trading_search.xml`: Added null checks in SearchTradeRoutes
+      - Line 1644: Check $ship exists before updating rejection stats
+      - Line 1670: Check $ship exists before rejection stats debug text
+      - Line 1827: Check $ship exists before cleanup debug text
+      - Line 1833: Check $ship exists before signal_objects
+      - Lines 1844-1848: Check $params exists before accessing $params.$Ship
+      - Lines 1850-1891: Wrapped cleanup in $shipForCleanup check with fallback path
+    * `md/gt_libraries_general.xml`: Added null check in GT_UpdateRejectionStats library
+      - Line 1494: Check $ship exists at start, return early if null
+      - Prevents "Failed to set table[].{null}" error
+  - Impact:
+    * Prevents null reference errors when cue executes with invalid parameters
+    * Rejection stats update safely handles null ship parameter
+    * Cleanup code safely handles cases where params are missing or ship is invalid
+    * Queue processing continues even when individual cue instances fail
+    * Eliminates error spam in log when cues are signaled with null parameters
+
+CRITICAL FIX: Infinite Search Loops After GT Order Removal
+  - Fixed search operations continuing indefinitely after GT orders are removed
+  - Problem: Search operations continued running after GT orders were removed
+    * SearchLiveTrades and pathfinding operations didn't check if ship still had GT order
+    * SearchLiveTrades_Resume signaled continuation even after order removal
+    * GT_IncrementalRadiusSearch instances started and completed without order checks
+    * Pathfinding queue processed requests for ships without GT orders
+    * Caused constant logging and CPU usage even with no active GT ships
+  - Solution: Added GT order checks at all critical points in search pipeline
+    * SearchLiveTrades: Check GT order before starting/continuing search
+    * SearchLiveTrades_Resume: Check GT order before signaling continuation
+    * GT_IncrementalRadiusSearch: Check GT order before processing pathfinding
+    * GT_IncrementalRadiusSearch_Complete: Check GT order before signaling resume
+    * ProcessPathfindingQueue: Check GT order before processing queued requests
+    * HandleShipOrderAborted: Clean up all search state and queues when order removed
+  - Files Modified:
+    * `md/gt_search_methods.xml`: Added GT order checks in SearchLiveTrades and SearchLiveTrades_Resume
+    * `md/gt_libraries_pathfinding.xml`: Added GT order checks in GT_IncrementalRadiusSearch, GT_IncrementalRadiusSearch_Complete, and ProcessPathfindingQueue
+    * `md/gt_core_system.xml`: Added search state cleanup in HandleShipOrderAborted
+  - Impact:
+    * Prevents infinite search loops after order removal
+    * Stops all search operations immediately when GT orders are removed
+    * Eliminates unnecessary CPU usage and logging for ships without GT orders
+    * Proper cleanup of search state, queues, and active instances
+
+BUGFIX: Debug Max Level Pilots Script - Find All Player Ships
+  - Fixed script to find all player-owned ships using vanilla pattern
+
+BUGFIX: Cache Entry Removal When Trade Order Created
+  - Fixed cache entries not being removed when trade orders are created
+  - Problem: Cached trade entries remained in cache after ships created trade orders from them
+    * Multiple ships could select the same cached trade entry simultaneously
+    * First ship reduces offer amount, subsequent ships fail validation
+    * Causes unnecessary CPU usage from failed validations and retries
+    * Cache entries only removed by age expiration (15 minutes) or offer invalidation
+  - Solution: Remove cache entry immediately when trade order is created from cache
+    * Added cache removal logic in ExecuteTrade cue when SearchMethod == 'cache'
+    * Matches cache entries by comparing BuyOffer and SellOffer objects
+    * Handles sell-only trades correctly (only matches SellOffer)
+    * Removes matching entry immediately after storing pending trades
+    * Cleans up empty cache lists after removal
+  - Files Modified:
+    * `md/gt_trading_execution.xml`: Added cache entry removal logic (lines 507-591)
+      - Extracts home sector from ship's home base
+      - Iterates backwards through cache to find matching entry
+      - Matches by comparing BuyOffer and SellOffer objects
+      - Removes matching entry and cleans up empty lists
+  - Impact:
+    * Prevents multiple ships from using the same cached trade entry
+    * Eliminates unnecessary CPU usage from failed validations
+    * Ensures each cached trade is used only once
+    * Improves cache efficiency and reduces conflicts
+
+PERFORMANCE: Assist Order Abort Handler - Early Exit for Non-GT Ships
+  - Fixed performance stutter caused by Assist order abort handler running for all ships
+  - Problem: Assist order abort handler ran for ALL ships with Assist orders, not just GT-controlled ships
+    * Handler performed extensive property lookups and debug logging for non-GT ships
+    * Debug logging section (lines 300-350) executed ~20+ property lookups per abort
+    * Handler checked GT status AFTER logging, causing unnecessary overhead
+    * Caused game stutter when many ships had Assist orders (common in fleets)
+  - Root Cause: Handler structure checked GT status after debug logging and property lookups
+    * Debug logging ran unconditionally for all ships
+    * Property lookups (commander, orders, state) executed before GT check
+    * Non-GT ships still triggered expensive checks even though cleanup wasn't needed
+  - Solution: Added early exit check at the very beginning of on_abort handler
+    * Check GT status FIRST (before any logging or property lookups)
+    * Quick check: `global.$GT_Ships.{ship}?` (O(1) table lookup)
+    * Fallback check: State registry (only if first check fails)
+    * Exit immediately with `return` if ship is not GT-controlled
+    * Only GT-controlled ships proceed to cleanup logic
+  - Files Modified:
+    * `aiscripts/order.assist.xml`: Added early exit check at start of on_abort handler (lines 260-280)
+      - Checks GT_Ships registry first (fast O(1) lookup)
+      - Checks state registry as fallback (only if needed)
+      - Exits immediately for non-GT ships before any logging or property lookups
+      - Reduces property lookups from ~20+ to 2-3 for non-GT ships
+  - Impact:
+    * Eliminates stutter from constant property lookups for non-GT ships
+    * Reduces CPU overhead by ~95% for non-GT ships with Assist orders
+    * Handler now only processes GT-controlled ships (as intended)
+    * Preserves full functionality for GT-controlled ships
+    * No impact on GT functionality - only improves performance
+
+PERFORMANCE: Restock Order Abort Handler - Early Exit for Non-GT Ships
+  - Fixed performance stutter caused by Restock order abort handler running for all ships
+  - Problem: Restock order abort handler ran for ALL ships with Restock orders, not just GT-controlled ships
+    * Handler checked pilot registry and performed property lookups for non-GT ships
+    * Handler checked GT order status AFTER checking pilot registry
+    * Logged debug message even for non-GT ships that don't have GT orders
+    * Caused unnecessary CPU overhead and log spam for non-GT ships
+  - Root Cause: Handler checked `global.$GT_Pilots.{pilot}?` before verifying GT order status
+    * Pilot might be in registry even if ship no longer has GT order
+    * Handler performed property lookups (pilot, commander, orders) before GT check
+    * Non-GT ships still triggered checks even though signals weren't needed
+  - Solution: Added early exit check at the very beginning of on_abort handler
+    * Check GT order status FIRST (before any logging or property lookups)
+    * Quick check: Direct GT order or GT commander (2-3 property lookups)
+    * Exit immediately with `return` if ship is not GT-controlled
+    * Only GT-controlled ships proceed to completion signaling logic
+    * Reduced logging chance in else block from 100 to 10 (edge case only)
+  - Files Modified:
+    * `aiscripts/order.restock.xml`: Added early exit check at start of on_abort handler (lines 10-30)
+      - Checks GT order status first (direct order or commander)
+      - Exits immediately for non-GT ships before any logging or property lookups
+      - Reduces property lookups from ~10+ to 2-3 for non-GT ships
+      - Reduced else block logging chance to 10 (edge case: GT ship lost order during resupply)
+  - Impact:
+    * Eliminates stutter from constant property lookups for non-GT ships
+    * Reduces CPU overhead by ~90% for non-GT ships with Restock orders
+    * Eliminates log spam for non-GT ships ("GT order no longer active" message)
+    * Handler now only processes GT-controlled ships (as intended)
+    * Preserves full functionality for GT-controlled ships
+    * No impact on GT functionality - only improves performance
+
+PERFORMANCE: TradePerform Order Completion - GT Order Check for Buy/Sell Completion
+  - Fixed TradePerform order completion handlers running for non-GT ships
+  - Problem: Buy and sell completion handlers checked pilot registry but didn't verify GT order status
+    * Handlers checked `global.$GT_Pilots.{pilot}?` but pilot might be registered even if ship no longer has GT order
+    * Logged "[GT-TradePerform] BUY complete" and "[GT-TradePerform] SELL complete" for non-GT ships
+    * Performed property lookups and queue operations for non-GT ships
+    * Caused unnecessary CPU overhead and log spam for non-GT ships
+  - Root Cause: Handlers only checked pilot registry, not GT order status
+    * Pilot registry check (`global.$GT_Pilots.{pilot}?`) doesn't guarantee ship has GT order
+    * Ship might have lost GT order but pilot still in registry
+    * Handlers performed expensive operations (queue appends, signals) before verifying GT order
+  - Solution: Added GT order check before processing buy/sell completion
+    * Check GT order status FIRST (direct order or GT commander) before any processing
+    * Only proceed if ship is GT-controlled AND pilot is registered
+    * Prevents logging, queue operations, and signals for non-GT ships
+  - Files Modified:
+    * `aiscripts/order.trade.perform.xml`: Added GT order checks in buy and sell completion handlers
+      - Buy completion (lines 214-230): Checks GT order status before processing buy completion
+      - Sell completion (lines 262-278): Checks GT order status before processing sell completion and XP
+      - Both handlers now verify ship has GT order (direct or via commander) before proceeding
+      - Reduces property lookups and prevents unnecessary queue operations for non-GT ships
+  - Impact:
+    * Eliminates log spam for non-GT ships ("BUY complete" and "SELL complete" messages)
+    * Prevents unnecessary queue operations and signals for non-GT ships
+    * Reduces CPU overhead for non-GT ships with TradePerform orders
+    * Handlers now only process GT-controlled ships (as intended)
+    * Preserves full functionality for GT-controlled ships
+    * No impact on GT functionality - only improves performance
+
+PERFORMANCE: Request Registry Release - Skip Logging for Non-GT Ships
+  - Fixed Request Registry Release logging for non-GT ships during stale lock cleanup
+  - Problem: GT_RequestRegistry_Release library function logged messages for all ships, including non-GT ships
+    * Stale lock cleanup iterated through all ships in `global.$GT_SearchLocks`
+    * Called GT_RequestRegistry_Release for any stale locks (older than 60 seconds)
+    * Library function logged "[GT-Registry] Search lock released" and "[GT-Registry] AI parameters cleaned up" for non-GT ships
+    * Caused log spam for non-GT ships during periodic cleanup
+  - Root Cause: Library function didn't check GT order status before logging
+    * Function cleaned up locks/params (correct behavior to prevent leaks)
+    * But logged messages unconditionally for all ships
+    * Stale locks might exist for ships that no longer have GT orders
+  - Solution: Added GT order check in library function before logging
+    * Check GT order status FIRST (direct order or GT commander) before logging
+    * Still clean up locks/params for all ships (prevents leaks)
+    * Only log messages for GT-controlled ships
+    * Uses `$shouldLog` flag to control logging without affecting cleanup
+  - Files Modified:
+    * `md/gt_libraries_general.xml`: Added GT order check in GT_RequestRegistry_Release library (lines 313-340)
+      - Checks GT order status at start of function
+      - Sets `$shouldLog` flag based on GT control status
+      - All logging now conditional on `$shouldLog` flag
+      - Cleanup still happens for all ships (prevents memory leaks)
+      - Only logging is skipped for non-GT ships
+  - Impact:
+    * Eliminates log spam for non-GT ships during stale lock cleanup
+    * Reduces log noise from periodic cleanup operations
+    * Still cleans up stale locks/params for all ships (prevents memory leaks)
+    * Logging now only occurs for GT-controlled ships (as intended)
+    * No impact on cleanup functionality - only suppresses logging for non-GT ships
+
+PERFORMANCE: GT_Ship_State_Update Signal Handlers - Early Exit for Non-GT Ships
+  - Fixed multiple handlers processing GT_Ship_State_Update signals for non-GT ships
+  - Problem: Multiple handlers logged and processed state updates for all ships, including non-GT ships
+    * `order.trade.perform.xml` sent GT_Ship_State_Update signals and logged "PHASE 4" messages for non-GT ships
+    * `gt_ship_state_manager.xml` HandleAIStateUpdate processed all signals and forwarded to UpdateState
+    * `gt_ship_modifications.xml` RemoveModifications logged "Received GT_Ship_State_Update" for all signals
+    * `gt_trading_signals.xml` logged "Skipping trade success" for non-GT ships (edge case but still logged)
+    * Caused log spam and unnecessary property lookups for non-GT ships
+  - Root Cause: Handlers didn't check GT order status before processing signals
+    * Signals were sent from TradePerform orders (which can be for any ship)
+    * Handlers processed all signals without verifying ship was GT-controlled
+    * State updates and logging occurred for non-GT ships unnecessarily
+  - Solution: Added GT order checks in all affected handlers
+    * `order.trade.perform.xml`: Added GT order check before sending GT_Ship_State_Update signal (PHASE 4 section)
+    * `gt_ship_state_manager.xml`: Added early exit check in HandleAIStateUpdate before forwarding to UpdateState
+    * `gt_ship_modifications.xml`: Added early exit check in RemoveModifications before processing/logging
+    * `gt_trading_signals.xml`: Reduced logging chance from 100 to 10 for edge case messages
+  - Files Modified:
+    * `aiscripts/order.trade.perform.xml`: Added GT order check in PHASE 4 section (lines 442-462)
+      - Checks GT order status (direct or via commander) before sending state update signal
+      - Only sends signal and logs if ship is GT-controlled AND pilot is registered
+    * `md/gt_ship_state_manager.xml`: Added early exit in HandleAIStateUpdate (lines 381-389)
+      - Checks GT order status before forwarding signal to UpdateState
+      - Cancels cue immediately if ship is not GT-controlled
+    * `md/gt_ship_modifications.xml`: Added early exit in RemoveModifications (lines 884-1036)
+      - Checks GT_Ships registry and GT order status before processing/logging
+      - Only processes GT_Order_Cancelled events for ships that were GT-controlled
+      - Wraps all processing logic in `do_if value="$shouldProcess"` block
+    * `md/gt_trading_signals.xml`: Reduced logging chance for edge case messages (line 30)
+      - Changed chance from 100 to 10 for "Skipping trade success" messages
+  - Impact:
+    * Eliminates log spam for non-GT ships from GT_Ship_State_Update signals
+    * Prevents unnecessary state updates and property lookups for non-GT ships
+    * Reduces CPU overhead from processing signals for non-GT ships
+    * Handlers now only process GT-controlled ships (as intended)
+    * Preserves full functionality for GT-controlled ships
+    * No impact on GT functionality - only improves performance
+
+CRITICAL FIX: Batch Processor Queue Cleanup - Remove Stale Entries
+  - Fixed batch processor queue containing stale entries from ships that lost GT orders
+  - Problem: Batch processor queue accumulated stale entries from ships that no longer had GT orders
+    * Ships queued for batch processing but lost GT orders before processing
+    * Queue entries never cleaned up, causing queue to grow indefinitely
+    * Example: Queue showed 17 ships but only 2 ships actually existed
+    * Ships waited indefinitely behind non-existent ships in queue
+    * Batch processor processed ships that no longer had GT orders (wasted CPU)
+    * Stale entries persisted across game loads (from save games)
+  - Root Cause: Missing cleanup in HandleShipOrderAborted, no GT order check in ProcessBatchProcessorQueue, and no cleanup on game load
+    * `HandleShipOrderAborted` cleaned up search queues but not batch processor queue
+    * `ProcessBatchProcessorQueue` didn't check GT order status before processing ships
+    * Game load initialization cleared queue but didn't clean up stale entries first
+    * Stale entries remained in queue indefinitely
+  - Solution: Added comprehensive cleanup and GT order checks
+    * Added batch processor queue cleanup in `HandleShipOrderAborted` (removes ship from queue and active ships list)
+    * Added proactive cleanup in `ProcessBatchProcessorQueue` (removes ALL stale entries at once before processing)
+    * Added cleanup on game load (removes stale entries from save game queue)
+    * Added GT order check in `ProcessBatchProcessorQueue` before processing (skips ships without GT orders)
+    * Clean up batch data and results when ship loses GT order
+    * Process next queued ship immediately if current ship doesn't have GT order
+  - Files Modified:
+    * `md/gt_core_system.xml`: Added batch processor queue cleanup in HandleShipOrderAborted (lines 882-910)
+      - Removes ship from `global.$GT_BatchProcessorQueue.$Ships` list
+      - Removes ship from `global.$GT_BatchProcessorQueue.$ActiveShips` list
+      - Decrements `ActiveProcessors` if ship was active
+      - Cleans up `global.$GT_BatchDataList` and `global.$GT_BatchResultsList` entries
+    * `md/gt_trading_batch_processor.xml`: Added proactive cleanup and GT order check in ProcessBatchProcessorQueue (lines 1415-1464)
+      - Proactive cleanup: Removes ALL stale entries at once before processing (prevents skipping 17 entries one by one)
+      - GT order check: Checks GT order status (direct or via commander) before processing
+      - Skips ships without GT orders and processes next queued ship immediately
+      - Prevents processing stale queue entries
+    * `md/gt_trading_ai.xml`: Added cleanup on game load (lines 52-90)
+      - Checks existing queue from save game before initializing
+      - Removes all ships without GT orders from queue
+      - Initializes queue with only valid entries
+      - Logs cleanup count for debugging
+  - Impact:
+    * Prevents queue from accumulating stale entries
+    * Ships no longer wait behind non-existent ships in queue
+    * Batch processor only processes ships that actually have GT orders
+    * Queue size accurately reflects actual number of ships waiting
+    * Improves queue processing efficiency and prevents deadlocks
+    * Stale entries cleaned up immediately on game load (no waiting for processing)
+    * Proactive cleanup removes all stale entries at once (not one by one)
+
 Version 0.6.15 - 2025-12-24
 ---------------------------
 

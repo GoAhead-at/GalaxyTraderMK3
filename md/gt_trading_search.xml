@@ -73,6 +73,118 @@
         <set_value name="$waitingForBatch" exact="$batchStatus.$IsBatchActive"/>
         <set_value name="$batchShip" exact="$batchStatus.$BatchShip"/>
         <set_value name="$shouldProceed" exact="$batchStatus.$ShouldProceed"/>
+
+        <!-- Concurrency flags MUST be available even if we early-exit before the main $shouldProceed block.
+             Otherwise, pre-gate exits (e.g. "live search already in progress") can leak cache-search queue slots
+             because $useSearchQueueCounter is never set and the cleanup block won't decrement ActiveSearches. -->
+        <set_value name="$useSearchQueueCounter" exact="false"/>
+        <do_if value="$params.$UseSearchQueueCounter?">
+          <set_value name="$useSearchQueueCounter" exact="$params.$UseSearchQueueCounter"/>
+        </do_if>
+        <set_value name="$fromLiveQueue" exact="false"/>
+        <do_if value="$params.$FromLiveQueue? and $params.$FromLiveQueue == true">
+          <set_value name="$fromLiveQueue" exact="true"/>
+        </do_if>
+        <!-- Always have a valid ship reference for early-exit cleanup paths -->
+        <set_value name="$shipForCleanup" exact="$params.$Ship"/>
+
+        <!-- CRITICAL:
+             If a live search is already in progress for this ship, do NOT proceed with a fresh SearchTradeRoutes run.
+             Reason: In MD, cancel_cue does not abort the current actions block immediately; the cue can still fall through
+             and incorrectly signal GT_No_Trade_Found during the cache-miss cooldown window (seen for EDS-278).
+             Live completion runs with explicit SearchState='live'/'fallback' and will not have live-state present. -->
+        <set_value name="$searchStateParam" exact="@$params.$SearchState"/>
+        <do_if value="$shouldProceed and global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$params.$Ship}? and not ($searchStateParam == 'live' or $searchStateParam == 'fallback')">
+          <!-- Distinguish real in-progress live search from stale leftover state.
+               Real in-progress searches can be in multiple phases:
+               - pathfinding queued/running (before batch markers exist),
+               - batch work queued/running,
+               - waiting for batch completion marker.
+               Only clear state if it's OLD and there are no progress markers. -->
+          <set_value name="$hasWaitingForBatchMarker" exact="false"/>
+          <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.{$params.$Ship}? and global.$GT_SearchResult.{$params.$Ship}.$WaitingForBatch? and global.$GT_SearchResult.{$params.$Ship}.$WaitingForBatch == true">
+            <set_value name="$hasWaitingForBatchMarker" exact="true"/>
+          </do_if>
+          <set_value name="$hasBatchData" exact="false"/>
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$params.$Ship}?">
+            <set_value name="$hasBatchData" exact="true"/>
+          </do_if>
+          <set_value name="$hasPathfinding" exact="false"/>
+          <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveShips?">
+            <do_all exact="global.$GT_PathfindingQueue.$ActiveShips.count" counter="$i">
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips.{$i} == $params.$Ship">
+                <set_value name="$hasPathfinding" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="not $hasPathfinding and global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$Requests?">
+            <do_all exact="global.$GT_PathfindingQueue.$Requests.count" counter="$i">
+              <set_value name="$req" exact="global.$GT_PathfindingQueue.$Requests.{$i}"/>
+              <do_if value="$req? and $req.$Ship? and $req.$Ship == $params.$Ship">
+                <set_value name="$hasPathfinding" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+
+          <set_value name="$stateStarted" exact="null"/>
+          <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$params.$Ship}? and global.$GT_SearchLiveTrades_State.{$params.$Ship}.$Started?">
+            <set_value name="$stateStarted" exact="global.$GT_SearchLiveTrades_State.{$params.$Ship}.$Started"/>
+          </do_if>
+          <set_value name="$stateAge" exact="-1"/>
+          <do_if value="$stateStarted?">
+            <set_value name="$stateAge" exact="player.age - $stateStarted"/>
+          </do_if>
+
+          <!-- HARD STALE GUARD:
+               Even if progress markers exist, a live-search state can get stuck (e.g. lost completion signal).
+               If it's too old, clear it so fresh requests don't stall indefinitely. -->
+          <do_if value="$stateAge gt 300s">
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$params.$Ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') Clearing STALE live-search state (pre-gate HARD) - stateAge=' + $stateAge + ' (was blocking new requests)'" chance="100"/>
+            </do_if>
+          </do_if>
+
+          <!-- If no markers: only clear if state is old enough to be genuinely stale. -->
+          <do_if value="not $hasWaitingForBatchMarker and not $hasBatchData and not $hasPathfinding and ($stateAge lt 0 or $stateAge gt 120s)">
+            <!-- Stale: clear and continue normally -->
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$params.$Ship}"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') Clearing STALE live-search state (pre-gate) - no progress markers (pathfinding/batch) and stateAge=' + $stateAge" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Real in-progress: skip this fresh SearchTradeRoutes run -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ') Live search already in progress (pre-gate) - skipping SearchTradeRoutes execution (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+            </do_if>
+
+            <!-- IMPORTANT: If this invocation consumed a cache-search queue slot, release it immediately.
+                 We must NOT delete per-ship params here because live search/batch needs them for continuation. -->
+            <do_if value="$useSearchQueueCounter">
+              <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+                <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+              </do_if>
+              <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+                <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+              </do_if>
+              <!-- Prevent any later cleanup block (if reached) from double-decrementing -->
+              <set_value name="$useSearchQueueCounter" exact="false"/>
+            </do_if>
+
+            <!-- IMPORTANT:
+                 Do NOT stall the AI while another live-search is in progress for this ship.
+                 Fail fast so the AI can retry later (and avoid indefinite "waiting for resume" if the live-search state is stuck). -->
+            <do_if value="$params? and $params.$Ship? and $params.$Ship.exists">
+              <signal_objects object="$params.$Ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
+            </do_if>
+
+            <set_value name="$shouldProceed" exact="false"/>
+            <cancel_cue cue="this"/>
+          </do_else>
+        </do_if>
         
         <!-- Only exit if batch is in progress FOR THIS SHIP -->
         <!-- If batch is for a different ship, proceed normally -->
@@ -80,6 +192,21 @@
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ')    Batch processing in progress FOR THIS SHIP - waiting for completion (will resume when batch completes)'" chance="100"/>
           </do_if>
+
+          <!-- IMPORTANT: If this invocation consumed a cache-search queue slot, release it immediately.
+               This branch can be hit by duplicate signals while the batch processor is working, and without releasing
+               the cache-search slot we can leak ActiveSearches → ProcessSearchQueue pins at max (active: 5) and stalls. -->
+          <do_if value="$useSearchQueueCounter">
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            </do_if>
+            <!-- Prevent any later cleanup (if reached) from double-decrementing -->
+            <set_value name="$useSearchQueueCounter" exact="false"/>
+          </do_if>
+
           <!-- Exit - SearchLiveTrades_Resume will signal this cue again when results are ready -->
           <cancel_cue cue="this"/>
         </do_if>
@@ -95,6 +222,20 @@
         <set_value name="$minROI" exact="@$params.$MinROI"/>
         <set_value name="$minAbsoluteProfit" exact="@$params.$MinAbsoluteProfit"/>
         <set_value name="$factionPriority" exact="@$params.$FactionPriority"/>
+
+        <!-- Concurrency flags -->
+        <!-- Cache concurrency is managed by GT_SearchQueue; live concurrency is managed by GT_LiveSearchQueue -->
+        <set_value name="$useSearchQueueCounter" exact="false"/>
+        <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+          <set_value name="$useSearchQueueCounter" exact="true"/>
+        </do_if>
+        <do_if value="$params.$UseSearchQueueCounter?">
+          <set_value name="$useSearchQueueCounter" exact="$params.$UseSearchQueueCounter"/>
+        </do_if>
+        <set_value name="$fromLiveQueue" exact="false"/>
+        <do_if value="$params.$FromLiveQueue? and $params.$FromLiveQueue == true">
+          <set_value name="$fromLiveQueue" exact="true"/>
+        </do_if>
         
         <!-- Validate maxDistance - must not be null (fail loudly, no fallback) -->
         <do_if value="$maxDistance == null">
@@ -160,11 +301,23 @@
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Search] (' + $ship.idcode + ') SearchState=' + $searchState + ' (originalMaxDistance=' + $originalMaxDistance + ', maxDistance=' + $maxDistance + ')'" chance="100"/>
         </do_if>
+
+        <!-- CRITICAL:
+             If a live search is already in progress for this ship, exit immediately.
+             Otherwise a second SearchTradeRoutes instance can run during the cache-miss cooldown window
+             and incorrectly signal GT_No_Trade_Found while the async live-search/batch pipeline is still running
+             (this is exactly what happens for EDS-278 in the log at 1669.86). -->
+        <do_if value="$searchState == 'fresh' and global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search already in progress - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
         
         <!-- Clear fallback flag at start of new search cycle -->
         <!-- This allows fallback to be attempted again if cache and live search both fail -->
         <!-- BUT: Don't clear if this is a fallback continuation -->
-        <do_if value="global.$GT_FallbackAttempted.{$ship}? and $searchState != 'fallback'">
+          <do_if value="global.$GT_FallbackAttempted.{$ship}? and $searchState != 'fallback'">
           <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting new search cycle - cleared fallback flag'" chance="100"/>
@@ -290,10 +443,18 @@
             </do_if>
           </do_if>
           <set_value name="$liveTradeList" exact="$savedTradeList"/>
+          <!-- SAFETY: ensure list is never null (prevents .count property lookup crash) -->
+          <do_if value="$liveTradeList == null">
+            <set_value name="$liveTradeList" exact="[]"/>
+          </do_if>
           <set_value name="$liveBestTrade" exact="@global.$GT_SearchResult.{$ship}.$BestTrade"/>
           <set_value name="$liveBestScore" exact="@global.$GT_SearchResult.{$ship}.$BestScore"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using live search results (' + $liveTradeList.count + ' trades, state=' + $searchState + ', fallbackTriggered=' + $fallbackSearchTriggered + ')'" chance="100"/>
+            <set_value name="$liveTradeCount" exact="0"/>
+            <do_if value="$liveTradeList != null">
+              <set_value name="$liveTradeCount" exact="$liveTradeList.count"/>
+            </do_if>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Using live search results (' + $liveTradeCount + ' trades, state=' + $searchState + ', fallbackTriggered=' + $fallbackSearchTriggered + ')'" chance="100"/>
           </do_if>
         </do_if>
         
@@ -408,6 +569,10 @@
           <set_value name="$bestScore" exact="$cacheBestScore"/>
           <set_value name="$tradeList" exact="$cacheTradeList"/>
         </do_else>
+        <!-- SAFETY: ensure list is never null (prevents .count property lookup crash) -->
+        <do_if value="$tradeList == null">
+          <set_value name="$tradeList" exact="[]"/>
+        </do_if>
         
         <!-- Validate bestTrade IMMEDIATELY after setting from cache/live sources -->
         <!-- Use strict validation to catch invalid trades before execution validation -->
@@ -610,7 +775,7 @@
         <!-- Check cache diversity: Count unique wares in trade list -->
         <set_value name="$cacheWareCount" exact="0"/>
         <set_value name="$cacheWares" exact="table[]"/>
-        <do_if value="$tradeList.count gt 0">
+        <do_if value="$tradeList != null and $tradeList.count gt 0">
           <do_all exact="$tradeList.count" counter="$i">
             <set_value name="$trade" exact="$tradeList.{$i}"/>
             <set_value name="$ware" exact="@$trade.$BuyOffer.ware"/>
@@ -630,7 +795,7 @@
              3. Previous live search did NOT return 0 trades (to prevent infinite loops when all trades are blacklisted) -->
         <set_value name="$shouldDoLiveSearch" exact="false"/>
         <set_value name="$previousLiveSearchReturnedZeroTrades" exact="false"/>
-        <do_if value="($searchState == 'live' or $searchState == 'fallback') and $liveTradeList.count == 0">
+        <do_if value="($searchState == 'live' or $searchState == 'fallback') and ($liveTradeList == null or $liveTradeList.count == 0)">
           <!-- Previous live search returned 0 trades -->
           <!-- Apply cooldown to prevent infinite loop when ship is stuck -->
           <!-- If ship is in blacklisted sector and all trades filtered, cooldown prevents immediate re-search -->
@@ -761,84 +926,212 @@
           </do_else>
           
           <do_if value="$canDoLiveSearch">
-            <!-- Log when live search starts (debug mode only) -->
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$cacheTradeCountForLog" exact="0"/>
-              <do_if value="$cacheTradeList?">
-                <set_value name="$cacheTradeCountForLog" exact="@$cacheTradeList.count"/>
+            <!-- Separate live-search concurrency:
+                 - Let cache searches run with cache concurrency (SearchQueue)
+                 - Queue LIVE searches into GT_LiveSearchQueue so only MaxConcurrentLiveSearches run at once -->
+            <do_if value="$searchState == 'fresh' and not $fromLiveQueue">
+              <!-- FAIRNESS: If live-search concurrency is saturated, STILL enqueue this ship for live search.
+                   Live search is responsible for warming the per-home-sector cache. If we fail fast here, fleets in different
+                   home sectors can starve each other (one sector gets all live slots, the other never refreshes its cache).
+                   We keep MaxConcurrentLiveSearches low (often 1) but queue fairly (round-robin per home sector). -->
+              <set_value name="$liveQueueSaturated" exact="false"/>
+              <set_value name="$maxConcurrentLiveNow" exact="1"/>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
+                <set_value name="$maxConcurrentLiveNow" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
               </do_if>
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting LIVE market search (cache had ' + $cacheTradeCountForLog + ' trades, none suitable)'" chance="100"/>
-            </do_if>
-            
-            <!-- Initialize cooldown tracking if not exists -->
-            <!-- Defensive check for race condition (initialization might not have completed yet) -->
-            <do_if value="not global.$GT_CacheMissCooldowns?">
-              <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
-            </do_if>
-            
-            <!-- Update cooldown for cache miss triggers -->
-            <do_if value="not $hasCooldown">
-              <!-- First live search trigger for this ship - start at 10 seconds -->
-              <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                $LastLiveSearch = player.age,
-                $CooldownDuration = 10s
-              ]"/>
-            </do_if>
-            <do_else>
-              <!-- Increase cooldown (double, max 60s) - cooldownData exists since hasCooldown is true -->
-              <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
-              <do_if value="$newCooldown gt 60s">
-                <set_value name="$newCooldown" exact="60s"/>
+              <do_if value="$maxConcurrentLiveNow lt 1">
+                <set_value name="$maxConcurrentLiveNow" exact="1"/>
               </do_if>
-              <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                $LastLiveSearch = player.age,
-                $CooldownDuration = $newCooldown
-              ]"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss   live search cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
+              <do_if value="not global.$GT_LiveSearchQueue?">
+                <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
               </do_if>
-            </do_else>
-            
-            <!-- FIX: Check if a search is already in progress before starting a new one -->
-            <!-- This prevents race conditions where multiple searches overwrite each other's state -->
-            <set_value name="$searchInProgress" exact="false"/>
-            <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
-              <set_value name="$searchInProgress" exact="true"/>
-            </do_if>
-            
-            <do_if value="$searchInProgress">
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Search] (' + $ship.idcode + ')    Search already in progress - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+              <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+                <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
               </do_if>
-              <!-- Exit - SearchLiveTrades_Resume will signal this cue again when search completes -->
+              <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches ge $maxConcurrentLiveNow">
+                <set_value name="$liveQueueSaturated" exact="true"/>
+              </do_if>
+
+              <do_if value="$liveQueueSaturated">
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search busy (active: ' + global.$GT_LiveSearchQueue.$ActiveLiveSearches + '/' + $maxConcurrentLiveNow + ') - QUEUING for live search (fair per-home-sector round-robin)'" chance="100"/>
+                </do_if>
+              </do_if>
+
+              <do_if value="$shouldDoLiveSearch">
+              <!-- Initialize live search queue -->
+              <do_if value="not global.$GT_LiveSearchQueue?">
+                <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$Params?">
+                <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+                <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+              </do_if>
+              <!-- Per-home-sector fairness queue (round-robin across home sectors) -->
+              <do_if value="not global.$GT_LiveSearchQueue.$BySector?">
+                <set_value name="global.$GT_LiveSearchQueue.$BySector" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$Sectors?">
+                <set_value name="global.$GT_LiveSearchQueue.$Sectors" exact="[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$NextSectorIndex?">
+                <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
+              </do_if>
+
+              <!-- Store params for resume + ensure cache is skipped when live slot starts -->
+              <set_value name="$params.$ForceLiveSearch" exact="true"/>
+              <set_value name="$params.$UseSearchQueueCounter" exact="false"/>
+              <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
+
+              <!-- Determine home sector (queue key) -->
+              <set_value name="$homeSectorForLiveQueue" exact="null"/>
+              <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSectorForLiveQueue">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <!-- Store on params (debug + later recovery) -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$params.$HomeSector" exact="$homeSectorForLiveQueue"/>
+                <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
+              </do_if>
+
+              <!-- Ensure sector queue exists -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists and not global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}?">
+                <set_value name="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}" exact="table[
+                  $Ships = []
+                ]"/>
+              </do_if>
+
+              <!-- Register sector in round-robin list (if new) -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$sectorAlreadyListed" exact="false"/>
+                <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$s">
+                  <do_if value="global.$GT_LiveSearchQueue.$Sectors.{$s} == $homeSectorForLiveQueue">
+                    <set_value name="$sectorAlreadyListed" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="not $sectorAlreadyListed">
+                  <append_to_list name="global.$GT_LiveSearchQueue.$Sectors" exact="$homeSectorForLiveQueue"/>
+                </do_if>
+              </do_if>
+
+              <!-- Add ship to the HOME-SECTOR live queue if not already present -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$alreadyQueuedForLive" exact="false"/>
+                <do_if value="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}?">
+                  <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships.count" counter="$q">
+                    <do_if value="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships.{$q} == $ship">
+                      <set_value name="$alreadyQueuedForLive" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $alreadyQueuedForLive">
+                    <append_to_list name="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships" exact="$ship"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+
+              <!-- Release cache-search queue slot immediately so other ships can run cache checks -->
+              <do_if value="$useSearchQueueCounter">
+                <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+                  <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+                </do_if>
+                <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+                  <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+                </do_if>
+                <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+                  <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+                </do_if>
+              </do_if>
+
+              <!-- Kick live queue and exit; live queue will signal SearchTradeRoutes when slot available -->
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
               <cancel_cue cue="this"/>
+              </do_if>
             </do_if>
-            
-            <!-- Perform live search -->
-            <set_value name="$waitingForLiveSearch" exact="true"/>
-            <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="table[
-            $Ship = $ship,
-            $MaxDistance = $maxDistance,
-            $MinROI = $minROI,
-            $MinAbsoluteProfit = $minAbsoluteProfit,
-            $FactionPriority = $factionPriority,
-            $FactionPriorityText = $factionPriorityText,
-            $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
-            $SkillLevel = $skillLevel,
-            $ThreatIntel = $gt_ThreatIntel,
-            $FleetCoord = $gt_FleetCoord,
-            $AdvancedAnalytics = $gt_AdvancedAnalytics
-            ]"/>
-            
-            <!-- Exit immediately after signaling SearchLiveTrades -->
-            <!-- SearchLiveTrades_Resume will signal this cue again when search completes -->
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ')    SearchLiveTrades signaled - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+
+            <!-- IMPORTANT:
+                 For fresh searches, we either enqueue to GT_LiveSearchQueue (normal), or intentionally skip (busy).
+                 In BOTH cases we must NOT start a direct live search here.
+                 Direct live search is only allowed when this cue is running from the live queue ($fromLiveQueue) or in non-fresh continuations. -->
+            <do_if value="not ($searchState == 'fresh' and not $fromLiveQueue)">
+              <!-- Log when live search starts (debug mode only) -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$cacheTradeCountForLog" exact="0"/>
+                <do_if value="$cacheTradeList?">
+                  <set_value name="$cacheTradeCountForLog" exact="@$cacheTradeList.count"/>
+                </do_if>
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting LIVE market search (cache had ' + $cacheTradeCountForLog + ' trades, none suitable)'" chance="100"/>
+              </do_if>
+              
+              <!-- Initialize cooldown tracking if not exists -->
+              <!-- Defensive check for race condition (initialization might not have completed yet) -->
+              <do_if value="not global.$GT_CacheMissCooldowns?">
+                <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
+              </do_if>
+              
+              <!-- Update cooldown for cache miss triggers -->
+              <do_if value="not $hasCooldown">
+                <!-- First live search trigger for this ship - start at 10 seconds -->
+                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+                  $LastLiveSearch = player.age,
+                  $CooldownDuration = 10s
+                ]"/>
+              </do_if>
+              <do_else>
+                <!-- Increase cooldown (double, max 60s) - cooldownData exists since hasCooldown is true -->
+                <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
+                <do_if value="$newCooldown gt 60s">
+                  <set_value name="$newCooldown" exact="60s"/>
+                </do_if>
+                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+                  $LastLiveSearch = player.age,
+                  $CooldownDuration = $newCooldown
+                ]"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss   live search cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
+                </do_if>
+              </do_else>
+              
+              <!-- FIX: Check if a search is already in progress before starting a new one -->
+              <set_value name="$searchInProgress" exact="false"/>
+              <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+                <set_value name="$searchInProgress" exact="true"/>
+              </do_if>
+              
+              <do_if value="$searchInProgress">
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ')    Search already in progress - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+                </do_if>
+                <cancel_cue cue="this"/>
+              </do_if>
+              
+              <!-- Perform live search -->
+              <set_value name="$waitingForLiveSearch" exact="true"/>
+              <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="table[
+              $Ship = $ship,
+              $MaxDistance = $maxDistance,
+              $MinROI = $minROI,
+              $MinAbsoluteProfit = $minAbsoluteProfit,
+              $FactionPriority = $factionPriority,
+              $FactionPriorityText = $factionPriorityText,
+              $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
+              $SkillLevel = $skillLevel,
+              $ThreatIntel = $gt_ThreatIntel,
+              $FleetCoord = $gt_FleetCoord,
+              $AdvancedAnalytics = $gt_AdvancedAnalytics
+              ]"/>
+              
+              <!-- Exit immediately after signaling SearchLiveTrades -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ')    SearchLiveTrades signaled - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+              </do_if>
+              <cancel_cue cue="this"/>
+              
+              <set_value name="$searchMethod" exact="'live'"/>
             </do_if>
-            <cancel_cue cue="this"/>
-            
-            <!-- Track that live search was performed -->
-            <set_value name="$searchMethod" exact="'live'"/>
           </do_if>
           <do_else>
             <!-- Cooldown active - skip live search -->
@@ -1062,8 +1355,10 @@
                 </run_actions>
                 <set_value name="$shipIsIsolated" exact="$isolationResult.$IsIsolated"/>
                 
-                <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted -->
-                <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted">
+                <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted.
+                     ALSO respect live-search availability: if we intentionally skipped live-search due to saturation/cooldown,
+                     do NOT trigger fallback (it would enqueue a live/batch search anyway and recreate fleet-wide stalls). -->
+                <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch">
                   <!-- Ensure table exists before accessing -->
                   <do_if value="not global.$GT_FallbackAttempted?">
                     <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
@@ -1349,29 +1644,96 @@
             </do_if>
           </do_if>
           
-          <!-- Reserve trade route for fleet coordination (inline conflict resolution done during search) -->
+          <!-- Fleet coordination: final claim check (closes race between "select best trade" and "reserve") -->
+          <!-- If the chosen route is already reserved by another ship, pick the next-best non-conflicted trade. -->
           <do_if value="global.$GT_GlobalSettings.$Fleet.$EnableFleetCoordination">
             <!-- Initialize global.$GT_ActiveTradeReservations if it doesn't exist -->
             <do_if value="not global.$GT_ActiveTradeReservations?">
               <set_value name="global.$GT_ActiveTradeReservations" exact="table[]"/>
             </do_if>
             
-            <!-- Use safe operators to access bestTrade properties -->
+            <!-- Build reserved route keys (excluding this ship) -->
+            <set_value name="$reservedRoutes" exact="[]"/>
+            <do_if value="global.$GT_ActiveTradeReservations?">
+              <do_all exact="global.$GT_ActiveTradeReservations.keys.count" counter="$resIdx">
+                <set_value name="$otherShip" exact="global.$GT_ActiveTradeReservations.keys.{$resIdx}"/>
+                <do_if value="$otherShip != $ship and $otherShip.exists">
+                  <set_value name="$otherRoute" exact="global.$GT_ActiveTradeReservations.{$otherShip}"/>
+                  <do_if value="$otherRoute.$BuyStation? and $otherRoute.$SellStation? and $otherRoute.$Ware?">
+                    <do_if value="$otherRoute.$BuyStation.idcode? and $otherRoute.$SellStation.idcode?">
+                      <set_value name="$cacheKey" exact="$otherRoute.$BuyStation.idcode + '_' + $otherRoute.$SellStation.idcode + '_' + $otherRoute.$Ware"/>
+                      <append_to_list name="$reservedRoutes" exact="$cacheKey"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Check current bestTrade -->
             <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
             <set_value name="$fleetSellStation" exact="@$bestTrade.$SellOffer.owner"/>
             <set_value name="$fleetWare" exact="@$bestTrade.$BuyOffer.ware"/>
-            <do_if value="$fleetBuyStation? and $fleetSellStation? and $fleetWare?">
-              <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
-                $BuyStation = $fleetBuyStation,
-                $SellStation = $fleetSellStation,
-                $Ware = $fleetWare,
-                $Timestamp = player.age
-              ]"/>
+            <set_value name="$routeConflicted" exact="false"/>
+            <do_if value="$reservedRoutes.count gt 0 and $fleetBuyStation? and $fleetSellStation? and $fleetWare?">
+              <run_actions ref="md.GT_Libraries_General.GT_CheckRouteConflict" result="$routeConflicted">
+                <param name="sellStation" value="$fleetBuyStation"/>
+                <param name="buyStation" value="$fleetSellStation"/>
+                <param name="ware" value="$fleetWare"/>
+                <param name="reservedRoutes" value="$reservedRoutes"/>
+              </run_actions>
+            </do_if>
+            
+            <do_if value="$routeConflicted">
+              <set_value name="$replacementTrade" exact="null"/>
+              <do_all exact="$tradeList.count" counter="$i">
+                <set_value name="$candidate" exact="$tradeList.{$i}"/>
+                <set_value name="$candBuyStation" exact="@$candidate.$BuyOffer.owner"/>
+                <set_value name="$candSellStation" exact="@$candidate.$SellOffer.owner"/>
+                <set_value name="$candWare" exact="@$candidate.$BuyOffer.ware"/>
+                <do_if value="$candBuyStation? and $candSellStation? and $candWare?">
+                  <run_actions ref="md.GT_Libraries_General.GT_CheckRouteConflict" result="$candConflicted">
+                    <param name="sellStation" value="$candBuyStation"/>
+                    <param name="buyStation" value="$candSellStation"/>
+                    <param name="ware" value="$candWare"/>
+                    <param name="reservedRoutes" value="$reservedRoutes"/>
+                  </run_actions>
+                  <do_if value="not $candConflicted">
+                    <set_value name="$replacementTrade" exact="$candidate"/>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <do_if value="$replacementTrade != null">
+                <set_value name="$bestTrade" exact="$replacementTrade"/>
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Fleet] (' + $ship.idcode + ') Best trade was already reserved - switched to next non-conflicted trade'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- No non-conflicted trade available -->
+                <set_value name="$bestTrade" exact="null"/>
+              </do_else>
+            </do_if>
+            
+            <!-- Reserve trade route for fleet coordination (after claim check) -->
+            <do_if value="$bestTrade != null">
+              <set_value name="$fleetBuyStation" exact="@$bestTrade.$BuyOffer.owner"/>
+              <set_value name="$fleetSellStation" exact="@$bestTrade.$SellOffer.owner"/>
+              <set_value name="$fleetWare" exact="@$bestTrade.$BuyOffer.ware"/>
+              <do_if value="$fleetBuyStation? and $fleetSellStation? and $fleetWare?">
+                <set_value name="global.$GT_ActiveTradeReservations.{$ship}" exact="table[
+                  $BuyStation = $fleetBuyStation,
+                  $SellStation = $fleetSellStation,
+                  $Ware = $fleetWare,
+                  $Timestamp = player.age
+                ]"/>
+              </do_if>
             </do_if>
           </do_if>
           
-          <!-- Execute trade -->
-          <do_if value="true">
+          <!-- Execute trade (only if still valid after claim check) -->
+          <do_if value="$bestTrade != null">
             <!-- DEBUG: Log exact trade list being sent to trading AI -->
             <!-- COMMENTED OUT: Reduces log spam - uncomment if needed for debugging -->
             <!-- <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -1403,6 +1765,10 @@
             
             <!-- GT_Trade_Found signal now sent FROM ExecuteTrade cue after storing pending trade -->
           </do_if>
+          <do_else>
+            <!-- No non-conflicted trade remained after fleet claim check -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
+          </do_else>
         </do_if>
         
         <do_else>
@@ -1641,7 +2007,8 @@
           
           <!-- Only store if: new stats are meaningful (TotalEvaluated > 0) OR no existing meaningful stats -->
           <!-- This prevents overwriting real stats with zeros, but allows storing zeros if no stats exist yet -->
-          <do_if value="$totalEvaluated gt 0 or not $hasExistingStats">
+          <!-- CRITICAL: Check $ship exists before updating stats -->
+          <do_if value="$ship? and ($totalEvaluated gt 0 or not $hasExistingStats)">
             <!-- SIMPLIFIED: Extract, build new structure atomically, set back (initialization guarantees base structure) -->
             <!-- Extract existing data (preserve other properties and other ships' stats) -->
             <set_value name="$existingSearchResult" exact="@global.$GT_SearchResult"/>
@@ -1658,13 +2025,15 @@
               $MinAbsoluteProfit = $minAbsoluteProfit
             ]"/>
             <!-- Use library function to update rejection stats -->
+            <!-- CRITICAL: $ship is validated above, safe to pass to library -->
             <run_actions ref="md.GT_Libraries_General.GT_UpdateRejectionStats">
               <param name="ship" value="$ship"/>
               <param name="stats" value="$newShipStats"/>
             </run_actions>
             
             <!-- DEBUG: Verify storage succeeded (only if debug logging enabled) -->
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- CRITICAL: Check $ship exists before using it -->
+            <do_if value="$ship? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$verifyStats" exact="@global.$GT_SearchResult.$LastRejectionStats.{$ship}"/>
               <set_value name="$verifyTotal" exact="@$verifyStats.$Total"/>
               <debug_text text="'[GT-Search] (' + $ship.idcode + ') STORED LastRejectionStats - Verification:' +
@@ -1698,7 +2067,7 @@
             <set_value name="$shipIsIsolated" exact="$isolationResult.$IsIsolated"/>
             
             <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted -->
-            <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted">
+            <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch">
               <!-- Ensure table exists before accessing -->
               <do_if value="not global.$GT_FallbackAttempted?">
                 <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
@@ -1823,14 +2192,18 @@
             </do_if>
             
             <!-- ENHANCED: Log before signaling no trade found (debug mode only) -->
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- CRITICAL: Check $ship exists before using it -->
+            <do_if value="$ship? and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Search] (' + $ship.idcode + ') Search complete - signaling GT_No_Trade_Found (TotalRejected=' + $totalRejected + ', TotalEvaluated=' + $totalEvaluated + ', OffersFound=' + $offersFound + ')'" chance="100"/>
             </do_if>
             <!-- Signal back to AI script: No Trade Found -->
             <!-- CRITICAL: Always send 'blacklist' param to prevent idle timeout escalation -->
             <!-- Reason: With blacklist-aware pre-filtering, we can't distinguish "filtered" from "genuinely empty" -->
             <!-- Better UX: Don't escalate to 60s timeout when ship might just need blacklist adjustment -->
-            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
+            <!-- CRITICAL: Check $ship exists before signaling -->
+            <do_if value="$ship?">
+              <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'blacklist'"/>
+            </do_if>
           </do_else>
           </do_else>
         </do_else>
@@ -1840,55 +2213,122 @@
         <!-- If waiting for batch, SearchLiveTrades_Resume will signal SearchTradeRoutes again -->
         <!-- and we'll release the lock after processing live search results -->
         <!-- If we're continuing from live search, this IS the final completion, so release the lock -->
-        <!-- Use $params.$Ship instead of $ship (available even if $shouldProceed was false) -->
-        <set_value name="$shipForCleanup" exact="$params.$Ship"/>
+        <!-- CRITICAL: Check $params exists before accessing $params.$Ship -->
+        <set_value name="$shipForCleanup" exact="null"/>
+        <do_if value="$params? and $params.$Ship?">
+          <set_value name="$shipForCleanup" exact="$params.$Ship"/>
+        </do_if>
         <do_if value="$shouldProceed and $ship?">
           <!-- If we proceeded, use the processed $ship (might have been modified) -->
           <set_value name="$shipForCleanup" exact="$ship"/>
         </do_if>
         
-        <set_value name="$isWaitingForThisShipBatch" exact="false"/>
-        <do_if value="$waitingForBatch and $batchShip == $params.$Ship">
-          <set_value name="$isWaitingForThisShipBatch" exact="true"/>
-        </do_if>
+        <!-- CRITICAL: Only proceed with cleanup if we have a valid ship -->
+        <do_if value="$shipForCleanup?">
+          <set_value name="$isWaitingForThisShipBatch" exact="false"/>
+          <do_if value="$waitingForBatch and $params? and $params.$Ship? and $batchShip == $params.$Ship">
+            <set_value name="$isWaitingForThisShipBatch" exact="true"/>
+          </do_if>
+
+          <!-- ALSO treat "live search started in this invocation" as an async continuation that must retain the lock.
+               Otherwise we release the request registry immediately, and the next SearchTradeRoutes run (cooldown path)
+               will incorrectly signal GT_No_Trade_Found while the live/batch pipeline is still running. -->
+          <set_value name="$isWaitingForContinuation" exact="$isWaitingForThisShipBatch"/>
+          <do_if value="$waitingForLiveSearch">
+            <set_value name="$isWaitingForContinuation" exact="true"/>
+          </do_if>
         
-        <!-- Release lock and parameters using Request Registry -->
-        <!-- Only release if NOT waiting for batch processing FOR THIS SHIP -->
-        <!-- If waiting for batch, we'll need these parameters when processing live search results -->
-        <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
-        <do_if value="not $isWaitingForThisShipBatch or $searchState == 'live' or $searchState == 'fallback'">
-          <set_value name="$releaseReason" exact="if ($searchState == 'live' or $searchState == 'fallback') then 'live search continuation complete' else 'search complete'"/>
-          <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-            <param name="ship" value="$shipForCleanup"/>
-            <param name="reason" value="$releaseReason"/>
-          </run_actions>
+          <!-- Release lock and parameters using Request Registry -->
+          <!-- Only release if NOT waiting for async continuation (live search + batch) FOR THIS SHIP -->
+          <!-- If waiting for batch, we'll need these parameters when processing live search results -->
+          <!-- If we're continuing from live search, this IS the final completion, so clean up parameters -->
+          <do_if value="not $isWaitingForContinuation or $searchState == 'live' or $searchState == 'fallback'">
+            <set_value name="$releaseReason" exact="if ($searchState == 'live' or $searchState == 'fallback') then 'live search continuation complete' else 'search complete'"/>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$shipForCleanup"/>
+              <param name="reason" value="$releaseReason"/>
+            </run_actions>
+            
+            <!-- Decrement trade request queue active instances counter -->
+            <!-- This allows ProcessTradeRequestQueue to process next queued request -->
+            <do_if value="global.$GT_TradeRequestQueue? and global.$GT_TradeRequestQueue.$ActiveInstances? and global.$GT_TradeRequestQueue.$ActiveInstances gt 0">
+              <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
+              <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Async continuation in progress FOR THIS SHIP - keep lock until live search/batch completes -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock retained (waiting for live search/batch to complete)'" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <!-- Mark search complete and process next ship in queue -->
+          <!-- Use $shipForCleanup instead of $ship (available even if $shouldProceed was false) -->
+          <set_value name="$shipForQueue" exact="$shipForCleanup"/>
+
+          <!-- If this run used a cache-search queue slot, release it -->
+          <do_if value="$useSearchQueueCounter">
+            <!-- IMPORTANT:
+                 When we defer to LIVE search, SearchLiveTrades_Resume needs the ORIGINAL params to signal SearchTradeRoutes again.
+                 So: release the cache-search slot, but DO NOT delete $Params while live-search is in progress for this ship. -->
+            <set_value name="$keepSearchQueueParams" exact="false"/>
+            <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$shipForQueue}?">
+              <set_value name="$keepSearchQueueParams" exact="true"/>
+            </do_if>
+            <do_if value="not $keepSearchQueueParams">
+              <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$shipForQueue}?">
+                <remove_value name="global.$GT_SearchQueue.$Params.{$shipForQueue}"/>
+              </do_if>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForQueue.idcode + ') SEARCH COMPLETE (active: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + global.$GT_SearchQueue.$MaxConcurrent + ', queued: ' + global.$GT_SearchQueue.$Ships.count + ')'" chance="100"/>
+            </do_if>
+            <!-- Continue processing cache-search queue if there are ships waiting -->
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            </do_if>
+          </do_if>
+
+          <!-- If this run acquired a live-search slot, release it and continue live queue -->
+          <do_if value="$fromLiveQueue and $params.$LiveSlotAcquired? and $params.$LiveSlotAcquired == true">
+            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
+              <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$shipForQueue}?">
+              <remove_value name="global.$GT_LiveSearchQueue.$Params.{$shipForQueue}"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
+          </do_if>
         </do_if>
         <do_else>
-          <!-- Batch processing in progress FOR THIS SHIP - keep lock until live search completes -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForCleanup.idcode + ') Search lock retained (waiting for live search batch to complete)'" chance="100"/>
+          <!-- No valid ship for cleanup - skip cleanup but still process queue -->
+          <!-- This can happen if params were invalid and cue should have been cancelled earlier -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] SearchTradeRoutes: Skipping cleanup - no valid ship (params invalid or cue cancelled)'" chance="100"/>
+          </do_if>
+          
+          <!-- Still decrement cache-search queue counter (only if this run used it) -->
+          <do_if value="$useSearchQueueCounter">
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            </do_if>
+          </do_if>
+
+          <!-- Release live-search slot if we had one -->
+          <do_if value="$fromLiveQueue and $params.$LiveSlotAcquired? and $params.$LiveSlotAcquired == true">
+            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
+              <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
           </do_if>
         </do_else>
-        
-        <!-- Mark search complete and process next ship in queue -->
-        <!-- Use $shipForCleanup instead of $ship (available even if $shouldProceed was false) -->
-        <set_value name="$shipForQueue" exact="$shipForCleanup"/>
-        
-        <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$shipForQueue}?">
-          <remove_value name="global.$GT_SearchQueue.$Params.{$shipForQueue}"/>
-        </do_if>
-        
-        <!-- Decrement active search counter -->
-        <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
-        
-        <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForQueue.idcode + ') SEARCH COMPLETE (active: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + global.$GT_SearchQueue.$MaxConcurrent + ', queued: ' + global.$GT_SearchQueue.$Ships.count + ')'" chance="100"/>
-        </do_if>
-        
-        <!-- Continue processing search queue if there are ships waiting -->
-        <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
-          <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
-        </do_if>
         
         <!-- Close live-search wait guard -->
         </do_if>
@@ -2121,12 +2561,32 @@
           </do_if>
         </do_if>
         <do_if value="not $filterStateValid">
+          <!-- Filter state missing/invalid (race): recover by returning 0 trades and resuming. -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] WARNING: FilterTradeList_Batch missing/invalid filterState for ship ' + $ship.idcode + ' - returning 0 trades (race/cleanup).'" chance="100"/>
+          </do_if>
+          <set_value name="global.$GT_FilterState.{$ship}" exact="table[
+            $ship = $ship,
+            $tradeList = [],
+            $filteredTradeList = [],
+            $filteredByWareBasket = 0,
+            $filteredByIllegal = 0,
+            $filteredByBlacklist = 0,
+            $filteredByPathBlocked = 0,
+            $tradesByWareStats = table[],
+            $intraSectorTradesTotal = 0,
+            $intraSectorTradesFiltered = 0,
+            $intraSectorTradesValid = 0,
+            $filterIndex = 0,
+            $filterBatchSize = 10
+          ]"/>
+          <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
           <cancel_cue cue="this"/>
         </do_if>
-        
+        <do_else>
         <!-- Extract state variables -->
         <set_value name="$tradeList" exact="@$filterState.$tradeList"/>
-          <!-- Validate critical variables exist before use - wrap all processing in conditional -->
+        <!-- Validate critical variables exist before use - wrap all processing in conditional -->
         <do_if value="$tradeList? and $tradeList != null">
           <set_value name="$wareBasket" exact="@$filterState.$wareBasket"/>
           <set_value name="$allowIllegal" exact="@$filterState.$allowIllegal"/>
@@ -2148,7 +2608,7 @@
           
           <!-- Get mutable lists/stats from state (or initialize if first batch) -->
           <set_value name="$filteredTradeList" exact="@$filterState.$filteredTradeList"/>
-          <do_if value="not $filteredTradeList?">
+          <do_if value="not $filteredTradeList? or $filteredTradeList == null">
             <set_value name="$filteredTradeList" exact="[]"/>
           </do_if>
           <set_value name="$filteredByWareBasket" exact="@$filterState.$filteredByWareBasket"/>
@@ -2168,7 +2628,7 @@
             <set_value name="$filteredByPathBlocked" exact="0"/>
           </do_if>
           <set_value name="$tradesByWareStats" exact="@$filterState.$tradesByWareStats"/>
-          <do_if value="not $tradesByWareStats?">
+          <do_if value="not $tradesByWareStats? or $tradesByWareStats == null">
             <set_value name="$tradesByWareStats" exact="table[]"/>
           </do_if>
           <set_value name="$intraSectorTradesTotal" exact="@$filterState.$intraSectorTradesTotal"/>
@@ -2185,7 +2645,7 @@
           </do_if>
           
           <!-- Ensure $filterState is not null before setting properties -->
-          <do_if value="not $filterState?">
+          <do_if value="$filterState == null">
             <set_value name="$filterState" exact="table[]"/>
           </do_if>
           
@@ -2276,7 +2736,7 @@
           
           <!-- Update state for next batch or completion -->
           <!-- Re-validate $filterState before setting properties (might have become null) -->
-          <do_if value="not $filterState?">
+          <do_if value="$filterState == null">
             <debug_text text="'[GT-Batch] ERROR: $filterState became null for ship ' + $ship.idcode + ' - cannot update state'" chance="100"/>
             <cancel_cue cue="this"/>
           </do_if>
@@ -2305,9 +2765,47 @@
           </do_else>
         </do_if>
         <do_else>
-          <!-- $tradeList is null - cancel processing -->
-          <debug_text text="'[GT-Batch] ERROR: $tradeList is null for ship ' + $ship.idcode + ' - cancelling batch processing'" chance="100"/>
-          <cancel_cue cue="this"/>
+          <!-- $tradeList is null:
+               This can happen due to a rare race (delayed batch wakes after state was partially overwritten/cleaned).
+               Treat as recoverable ONLY if the ship is still waiting (search lock held).
+               If the ship is no longer locked, this is a stale delayed batch wakeup and must be cancelled silently. -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] WARNING: $tradeList is null for ship ' + $ship.idcode + ' - aborting filtering and returning 0 trades (race/cleanup).'" chance="100"/>
+          </do_if>
+          
+          <!-- Check if ship is still waiting for this pipeline (search lock held) -->
+          <set_value name="$lockTime" exact="null"/>
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <set_value name="$lockTime" exact="global.$GT_SearchLocks.{$ship}"/>
+          </do_if>
+          <do_if value="$lockTime == null">
+            <!-- Stale delayed batch wakeup (ship already completed/cleaned); cancel without signalling continuation -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] INFO: Stale FilterTradeList_Batch wakeup for ' + $ship.idcode + ' (no search lock) - cancelling.'" chance="100"/>
+            </do_if>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <!-- Recreate minimal state so Resume can complete safely -->
+            <set_value name="global.$GT_FilterState.{$ship}" exact="table[
+              $ship = $ship,
+              $tradeList = [],
+              $filteredTradeList = [],
+              $filteredByWareBasket = 0,
+              $filteredByIllegal = 0,
+              $filteredByBlacklist = 0,
+              $filteredByPathBlocked = 0,
+              $tradesByWareStats = table[],
+              $intraSectorTradesTotal = 0,
+              $intraSectorTradesFiltered = 0,
+              $intraSectorTradesValid = 0,
+              $filterIndex = 0,
+              $filterBatchSize = 10
+            ]"/>
+            <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
+            <cancel_cue cue="this"/>
+          </do_else>
+        </do_else>
         </do_else>
       </actions>
     </cue>
@@ -2317,6 +2815,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
+      <!-- Jitter resume to avoid same-frame bursts when many batch filters complete at once -->
+      <delay min="10ms" max="120ms"/>
       <actions>
         <set_value name="$ship" exact="event.param"/>
         
@@ -2338,10 +2838,11 @@
         <do_if value="not $filterStateValid">
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <!-- Extract all filtered results and statistics -->
         <set_value name="$filteredTradeList" exact="@$filterState.$filteredTradeList"/>
-        <do_if value="not $filteredTradeList?">
+        <do_if value="not $filteredTradeList? or $filteredTradeList == null">
           <set_value name="$filteredTradeList" exact="[]"/>
         </do_if>
         <set_value name="$filteredByWareBasket" exact="@$filterState.$filteredByWareBasket"/>
@@ -2361,7 +2862,7 @@
           <set_value name="$filteredByPathBlocked" exact="0"/>
         </do_if>
         <set_value name="$tradesByWareStats" exact="@$filterState.$tradesByWareStats"/>
-        <do_if value="not $tradesByWareStats?">
+        <do_if value="not $tradesByWareStats? or $tradesByWareStats == null">
           <set_value name="$tradesByWareStats" exact="table[]"/>
         </do_if>
         <set_value name="$intraSectorTradesTotal" exact="@$filterState.$intraSectorTradesTotal"/>
@@ -2377,7 +2878,7 @@
           <set_value name="$intraSectorTradesValid" exact="0"/>
         </do_if>
         <set_value name="$tradeList" exact="@$filterState.$tradeList"/>
-        <do_if value="not $tradeList?">
+        <do_if value="not $tradeList? or $tradeList == null">
           <set_value name="$tradeList" exact="[]"/>
         </do_if>
         <set_value name="$maxDistance" exact="@$filterState.$maxDistance"/>
@@ -2436,11 +2937,11 @@
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <!-- Extract counts safely (ternary operator evaluates both sides, so we need separate checks) -->
           <set_value name="$tradeListCountSafe" exact="0"/>
-          <do_if value="$tradeList?">
+          <do_if value="$tradeList? and $tradeList != null">
             <set_value name="$tradeListCountSafe" exact="$tradeList.count"/>
           </do_if>
           <set_value name="$filteredTradeListCountSafe" exact="0"/>
-          <do_if value="$filteredTradeList?">
+          <do_if value="$filteredTradeList? and $filteredTradeList != null">
             <set_value name="$filteredTradeListCountSafe" exact="$filteredTradeList.count"/>
           </do_if>
           <set_value name="$filteringStats" exact="'[GT-Resume] (' + $ship.idcode + ') Filtering statistics:' +
@@ -2478,11 +2979,11 @@
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <!-- Extract counts safely (ternary operator evaluates both sides) -->
           <set_value name="$filteredTradeListCountSafe" exact="0"/>
-          <do_if value="$filteredTradeList?">
+          <do_if value="$filteredTradeList? and $filteredTradeList != null">
             <set_value name="$filteredTradeListCountSafe" exact="$filteredTradeList.count"/>
           </do_if>
           <set_value name="$tradeListCountSafe" exact="0"/>
-          <do_if value="$tradeList?">
+          <do_if value="$tradeList? and $tradeList != null">
             <set_value name="$tradeListCountSafe" exact="$tradeList.count"/>
           </do_if>
           <debug_text text="'[GT-Resume] (' + $ship.idcode + ') After ship-specific filtering: ' + $filteredTradeListCountSafe + ' trades (from ' + $tradeListCountSafe + ')'" chance="100"/>
@@ -2493,7 +2994,7 @@
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <!-- Extract count safely (ternary operator evaluates both sides) -->
           <set_value name="$filteredTradeListCountSafe" exact="0"/>
-          <do_if value="$filteredTradeList?">
+          <do_if value="$filteredTradeList? and $filteredTradeList != null">
             <set_value name="$filteredTradeListCountSafe" exact="$filteredTradeList.count"/>
           </do_if>
           <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Building diverse list from ' + $filteredTradeListCountSafe + ' filtered trades'" chance="100"/>
@@ -2502,7 +3003,7 @@
         <set_value name="$tradesByWare" exact="table[]"/>
         <!-- Extract count safely before loop (ternary operator evaluates both sides) -->
         <set_value name="$filteredTradeListCountSafe" exact="0"/>
-        <do_if value="$filteredTradeList?">
+        <do_if value="$filteredTradeList? and $filteredTradeList != null">
           <set_value name="$filteredTradeListCountSafe" exact="$filteredTradeList.count"/>
         </do_if>
         <do_if value="$filteredTradeListCountSafe gt 0">
@@ -2881,7 +3382,7 @@
           </do_if>
         </do_if>
         <do_else>
-          <!-- Normal search - try queue first, then batch data -->
+          <!-- Normal search - try queue params first (cache queue), then live queue params, then batch data -->
           <do_if value="global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
             <!-- Parameters are stored in search queue when search was initiated -->
             <set_value name="$originalParams" exact="global.$GT_SearchQueue.$Params.{$ship}"/>
@@ -2890,6 +3391,12 @@
               <set_value name="$originalParams.$OriginalMaxDistance" exact="$batchDataOriginalMaxDistance"/>
             </do_if>
           </do_if>
+          <do_elseif value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
+            <set_value name="$originalParams" exact="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
+            <do_if value="not $originalParams.$OriginalMaxDistance? and $batchDataOriginalMaxDistance?">
+              <set_value name="$originalParams.$OriginalMaxDistance" exact="$batchDataOriginalMaxDistance"/>
+            </do_if>
+          </do_elseif>
           <do_else>
             <!-- Fallback: Reconstruct parameters from batch data (before cleanup) -->
             <do_if value="$batchData?">
@@ -2901,7 +3408,10 @@
                 $MinROI = @$batchData.$minROI,
                 $MinAbsoluteProfit = @$batchData.$minAbsoluteProfit,
                 $FactionPriority = @$batchData.$factionPriority,
-                $AllowIllegal = $allowIllegalDefault
+                $AllowIllegal = $allowIllegalDefault,
+                $FromLiveQueue = false,
+                $LiveSlotAcquired = false,
+                $UseSearchQueueCounter = false
               ]"/>
             </do_if>
           </do_else>
@@ -2955,24 +3465,40 @@
         </do_if>
         
         <!-- 10. Signal SearchTradeRoutes again with original parameters so it can read the live search results -->
-        <do_if value="$originalParams?">
+        <!-- IMPORTANT: In MD, $var? can be true even if $var == null. Also guard against stale continuation (no search lock). -->
+        <set_value name="$canSignalContinuation" exact="false"/>
+        <set_value name="$hasSearchLock" exact="false"/>
+        <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+          <set_value name="$hasSearchLock" exact="true"/>
+        </do_if>
+        <do_if value="$hasSearchLock and $originalParams? and $originalParams != null">
+          <do_if value="$originalParams.$MaxDistance? and $originalParams.$MaxDistance != null">
+            <set_value name="$canSignalContinuation" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$canSignalContinuation">
           <!-- Set explicit SearchState based on whether this is a fallback search -->
           <set_value name="$searchState" exact="'live'"/>
           <do_if value="$isFallbackSearchFromBatch">
             <set_value name="$searchState" exact="'fallback'"/>
           </do_if>
           <set_value name="$originalParams.$SearchState" exact="$searchState"/>
-          <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$originalParams"/>
+          <!-- Route through central scheduler to avoid same-frame bursts -->
+          <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$originalParams"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Signaled SearchTradeRoutes to continue with live search results (' + $finalTradeCount + ' trades, state=' + $searchState + ')'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
-          <!-- Fallback: Could not find original parameters, but results are already in global.$GT_SearchResult -->
-          <!-- SearchTradeRoutes will be signaled by another mechanism or will read results on next check -->
+          <!-- Could not (or should not) signal continuation.
+               Common causes:
+               - stale delayed resume (no search lock anymore)
+               - missing/invalid MaxDistance in params table -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Could not find original parameters to signal SearchTradeRoutes - results stored in global.$GT_SearchResult'" chance="100"/>
+            <debug_text text="'[GT-Resume] (' + $ship.idcode + ') Not signaling SearchTradeRoutes continuation (hasLock=' + $hasSearchLock + ', params=' + (if $originalParams? then 'exists' else 'missing') + ', maxDist=' + (if $originalParams? and $originalParams != null and $originalParams.$MaxDistance? then $originalParams.$MaxDistance else 'null') + ') - results stored in global.$GT_SearchResult'" chance="100"/>
           </do_if>
+        </do_else>
+        <!-- Close filterStateValid do_else guard -->
         </do_else>
       </actions>
     </cue>

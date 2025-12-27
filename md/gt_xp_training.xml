@@ -1169,6 +1169,19 @@
           <!-- Handle both old and new parameter formats -->
           <set_value name="$pilot" exact="event.param.$pilot"/>
           <set_value name="$ship" exact="event.param.$ship"/>
+          
+          <!-- Backwards/variant compatibility: some callers may use $Ship/$Pilot keys -->
+          <do_if value="not $ship? and event.param.$Ship?">
+            <set_value name="$ship" exact="event.param.$Ship"/>
+          </do_if>
+          <do_if value="not $pilot? and event.param.$Pilot?">
+            <set_value name="$pilot" exact="event.param.$Pilot"/>
+          </do_if>
+          
+          <!-- Robustness: if pilot not provided, derive from ship (subordinates often signal without pilot payload) -->
+          <do_if value="not $pilot?">
+            <set_value name="$pilot" exact="@$ship.pilot"/>
+          </do_if>
         
         <!-- Check which parameter format we're using -->
         <set_value name="$useNewFormat" exact="event.param.$nameType?"/>
@@ -1387,22 +1400,68 @@
           <set_value name="$operationalState" exact="''"/>
           
           <!-- Check for repair/resupply state -->
+          <!-- IMPORTANT: Do not depend on GT_Ships entry existing (subordinates can temporarily drop out of GT_Ships). -->
+          <!-- Resupply state is tracked via GT_ResupplyOrders, so we can show [RESUPPLY] even if GT_Ships entry is missing. -->
+          <set_value name="$hasRepair" exact="false"/>
+          <set_value name="$hasResupply" exact="false"/>
+          
+          <!-- Check if ship has active resupply order (GT maintenance tracking) -->
+          <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+            <set_value name="$hasResupply" exact="true"/>
+          </do_if>
+
+          <!-- Fleet resupply / "Change Equipment" orders on subordinates may not be tracked in GT_ResupplyOrders.
+               Use vanilla active order IDs as a fallback, but only for GT ships or subordinates of GT ships. -->
+          <set_value name="$isGTRelated" exact="false"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="$isGTRelated" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$commander" exact="@$ship.commander"/>
+            <do_if value="$commander? and global.$GT_Ships? and global.$GT_Ships.{$commander}?">
+              <set_value name="$isGTRelated" exact="true"/>
+            </do_if>
+          </do_else>
+
+          <do_if value="$isGTRelated">
+            <set_value name="$activeOrderId" exact="@$ship.order.id"/>
+            <do_if value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
+              <set_value name="$hasResupply" exact="true"/>
+            </do_if>
+            <do_elseif value="$activeOrderId == 'Repair'">
+              <set_value name="$hasRepair" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <!-- GT_Ships-derived states (repair/reroute/clearance) are only available if ship is registered -->
+          <set_value name="$shipData" exact="null"/>
           <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
             <set_value name="$shipData" exact="global.$GT_Ships.{$ship}"/>
-            <set_value name="$hasRepair" exact="false"/>
-            <set_value name="$hasResupply" exact="false"/>
             
             <!-- Check if ship has active repair order -->
             <do_if value="$shipData.$NeedsRepair? and $shipData.$NeedsRepair">
               <set_value name="$hasRepair" exact="true"/>
             </do_if>
             
-            <!-- Check if ship has active resupply order -->
-            <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
-              <set_value name="$hasResupply" exact="true"/>
+            <!-- Check for reroute state (destination threatened/blacklisted) -->
+            <do_if value="$shipData.$Rerouting? and $shipData.$Rerouting">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Reroute'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
             </do_if>
             
-            <!-- Determine operational state text using abbreviations -->
+            <!-- Check for cargo safety disposal state -->
+            <do_if value="$shipData.$CargoDisposal? and $shipData.$CargoDisposal">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Clearance'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Determine operational state text using abbreviations (only if not overridden by reroute/clearance above) -->
+          <do_if value="$operationalState == ''">
             <do_if value="$hasRepair and $hasResupply">
               <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
                 <param name="stateType" value="'Maintenance'"/>
@@ -1421,22 +1480,6 @@
               </run_actions>
               <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
             </do_elseif>
-            
-            <!-- Check for reroute state (destination threatened/blacklisted) -->
-            <do_if value="$shipData.$Rerouting? and $shipData.$Rerouting">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Reroute'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-            
-            <!-- Check for cargo safety disposal state -->
-            <do_if value="$shipData.$CargoDisposal? and $shipData.$CargoDisposal">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Clearance'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
           </do_if>
           
           <!-- Add operational state to appropriate list based on user config -->

@@ -90,7 +90,12 @@ function L.UpdateShipList(eventName, shipListString)
         local pilot = GetComponentData(ship, "assignedpilot")
         L.previousPilots[ship] = pilot and tostring(pilot) or "NONE"
         
-        local commander = GetCommander(ship)
+        -- Some UniverseIDs can exist in the list but not be "controllable" (e.g. stale IDs / non-ship components).
+        -- Calling GetCommander() on those throws engine errors, so guard it like vanilla UI code does elsewhere.
+        local commander = nil
+        if C.IsComponentClass(ship, "controllable") then
+            commander = GetCommander(ship)
+        end
         if commander then
             local commanderNum = ConvertIDTo64Bit(commander)
             L.previousCommanders[ship] = (commanderNum and commanderNum ~= 0) and tostring(commanderNum) or "NONE"
@@ -150,7 +155,12 @@ function L.OnUpdate()
     local currentPilot = GetComponentData(ship, "assignedpilot")
     local currentPilotID = currentPilot and tostring(currentPilot) or "NONE"
     
-    local currentCommander = GetCommander(ship)
+    -- Guard against non-controllable / stale IDs to avoid engine spam:
+    -- "[=ERROR=] ... GetCommander(): Component 'X' is not of class controllable"
+    local currentCommander = nil
+    if C.IsComponentClass(ship, "controllable") then
+        currentCommander = GetCommander(ship)
+    end
     local currentCommanderID = "NONE"
     local currentCommanderNum = nil
     
