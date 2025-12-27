@@ -852,6 +852,7 @@
             <!-- Mark that this invocation uses the cache-search queue counter -->
             <set_value name="$params.$UseSearchQueueCounter" exact="true"/>
             <set_value name="$params.$FromSearchQueue" exact="true"/>
+            <!-- Start the search now; ProcessSearchQueue already applies jitter and manages concurrency. -->
             <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
@@ -899,11 +900,18 @@
         <do_if value="not global.$GT_LiveSearchQueue?">
           <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
         </do_if>
-        <do_if value="not global.$GT_LiveSearchQueue.$Ships?">
-          <set_value name="global.$GT_LiveSearchQueue.$Ships" exact="[]"/>
-        </do_if>
         <do_if value="not global.$GT_LiveSearchQueue.$Params?">
           <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
+        </do_if>
+        <!-- Per-home-sector fairness queue (round-robin across home sectors) -->
+        <do_if value="not global.$GT_LiveSearchQueue.$BySector?">
+          <set_value name="global.$GT_LiveSearchQueue.$BySector" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_LiveSearchQueue.$Sectors?">
+          <set_value name="global.$GT_LiveSearchQueue.$Sectors" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_LiveSearchQueue.$NextSectorIndex?">
+          <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
         </do_if>
         <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
           <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
@@ -929,9 +937,30 @@
         <set_value name="global.$GT_LiveSearchQueue.$MaxConcurrent" exact="$maxConcurrentLive"/>
 
         <!-- Start ONE live search if we have capacity -->
-        <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and global.$GT_LiveSearchQueue.$Ships.count gt 0">
-          <set_value name="$ship" exact="global.$GT_LiveSearchQueue.$Ships.{1}"/>
-          <remove_from_list name="global.$GT_LiveSearchQueue.$Ships" exact="$ship"/>
+        <!-- Fair scheduler: select next HOME SECTOR with queued ships (round-robin) -->
+        <set_value name="$selectedShip" exact="null"/>
+        <set_value name="$selectedSector" exact="null"/>
+        <set_value name="$sectorCount" exact="global.$GT_LiveSearchQueue.$Sectors.count"/>
+        <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and $sectorCount gt 0">
+          <set_value name="$attempts" exact="$sectorCount"/>
+          <do_all exact="$attempts" counter="$try">
+            <!-- Wrap index -->
+            <do_if value="global.$GT_LiveSearchQueue.$NextSectorIndex gt global.$GT_LiveSearchQueue.$Sectors.count">
+              <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
+            </do_if>
+            <set_value name="$sector" exact="global.$GT_LiveSearchQueue.$Sectors.{global.$GT_LiveSearchQueue.$NextSectorIndex}"/>
+            <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" operation="add"/>
+            <do_if value="$sector? and global.$GT_LiveSearchQueue.$BySector.{$sector}? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count gt 0">
+              <set_value name="$selectedSector" exact="$sector"/>
+              <set_value name="$selectedShip" exact="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.{1}"/>
+              <remove_from_list name="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships" exact="$selectedShip"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="$selectedShip != null">
+          <set_value name="$ship" exact="$selectedShip"/>
           <set_value name="$params" exact="@global.$GT_LiveSearchQueue.$Params.{$ship}"/>
 
           <do_if value="$ship? and $ship.exists and $params?">
@@ -947,6 +976,7 @@
             <!-- Persist updated params so SearchLiveTrades_Resume can recover them reliably -->
             <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
 
+            <!-- Start the search now; live concurrency is handled by ProcessLiveSearchQueue. -->
             <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
@@ -956,8 +986,16 @@
             </do_if>
           </do_else>
 
-          <!-- If we still have capacity and queued ships, continue immediately -->
-          <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and global.$GT_LiveSearchQueue.$Ships.count gt 0">
+          <!-- If we still have capacity and ANY sector has queued ships, continue immediately -->
+          <set_value name="$hasAnyQueued" exact="false"/>
+          <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$i">
+            <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$i}"/>
+            <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
+              <set_value name="$hasAnyQueued" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and $hasAnyQueued">
             <!-- IMPORTANT: Use fully-qualified cue reference here.
                  Using an unqualified name can resolve to the current cue instance, which has no new event listener,
                  causing "Signalled cue ... has no corresponding listeners". -->
@@ -974,8 +1012,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <!-- Jitter resumption a bit so thousands of completions don't wake in the same frame -->
-      <delay min="5ms" max="25ms"/>
+      <!-- Jitter resumption so large fleets don't wake in the same frame (reduces SearchTradeRoutes bursts) -->
+      <delay min="10ms" max="120ms"/>
       <actions>
         <set_value name="$params" exact="event.param"/>
         <set_value name="$ship" exact="@$params.$Ship"/>
@@ -1015,6 +1053,7 @@
         <do_if value="$isContinuation">
           <!-- Still persist params so SearchTradeRoutes can recover/validate against per-ship storage if needed -->
           <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
+          <!-- Continuations must not re-enter the queue gate; run SearchTradeRoutes directly. -->
           <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
           <cancel_cue cue="this"/>
         </do_if>

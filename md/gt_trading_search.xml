@@ -317,7 +317,7 @@
         <!-- Clear fallback flag at start of new search cycle -->
         <!-- This allows fallback to be attempted again if cache and live search both fail -->
         <!-- BUT: Don't clear if this is a fallback continuation -->
-        <do_if value="global.$GT_FallbackAttempted.{$ship}? and $searchState != 'fallback'">
+          <do_if value="global.$GT_FallbackAttempted.{$ship}? and $searchState != 'fallback'">
           <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') Starting new search cycle - cleared fallback flag'" chance="100"/>
@@ -930,9 +930,10 @@
                  - Let cache searches run with cache concurrency (SearchQueue)
                  - Queue LIVE searches into GT_LiveSearchQueue so only MaxConcurrentLiveSearches run at once -->
             <do_if value="$searchState == 'fresh' and not $fromLiveQueue">
-              <!-- OPTIMIZATION: If live-search concurrency is saturated, do NOT enqueue more ships to wait in line.
-                   Instead, fail fast so the AI retries soon and will likely hit the cache warmed by the live search already running.
-                   This avoids “burst → stall → one-by-one” under large fleets when MaxConcurrentLiveSearches is low (often 1). -->
+              <!-- FAIRNESS: If live-search concurrency is saturated, STILL enqueue this ship for live search.
+                   Live search is responsible for warming the per-home-sector cache. If we fail fast here, fleets in different
+                   home sectors can starve each other (one sector gets all live slots, the other never refreshes its cache).
+                   We keep MaxConcurrentLiveSearches low (often 1) but queue fairly (round-robin per home sector). -->
               <set_value name="$liveQueueSaturated" exact="false"/>
               <set_value name="$maxConcurrentLiveNow" exact="1"/>
               <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
@@ -952,22 +953,9 @@
               </do_if>
 
               <do_if value="$liveQueueSaturated">
-                <!-- Apply a short cooldown so we don't spam retries every tick while live is busy -->
-                <do_if value="not global.$GT_CacheMissCooldowns?">
-                  <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
-                </do_if>
-                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                  $LastLiveSearch = player.age,
-                  $CooldownDuration = 5s
-                ]"/>
-
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search busy (active: ' + global.$GT_LiveSearchQueue.$ActiveLiveSearches + '/' + $maxConcurrentLiveNow + ') - skipping enqueue and returning no-trade-found so ship retries against warmed cache'" chance="100"/>
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search busy (active: ' + global.$GT_LiveSearchQueue.$ActiveLiveSearches + '/' + $maxConcurrentLiveNow + ') - QUEUING for live search (fair per-home-sector round-robin)'" chance="100"/>
                 </do_if>
-
-                <!-- Skip live search; fall through to normal completion logic (will signal GT_No_Trade_Found for cache miss). -->
-                <set_value name="$shouldDoLiveSearch" exact="false"/>
-                <set_value name="$waitingForLiveSearch" exact="false"/>
               </do_if>
 
               <do_if value="$shouldDoLiveSearch">
@@ -975,14 +963,21 @@
               <do_if value="not global.$GT_LiveSearchQueue?">
                 <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
               </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$Ships?">
-                <set_value name="global.$GT_LiveSearchQueue.$Ships" exact="[]"/>
-              </do_if>
               <do_if value="not global.$GT_LiveSearchQueue.$Params?">
                 <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
               </do_if>
               <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
                 <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+              </do_if>
+              <!-- Per-home-sector fairness queue (round-robin across home sectors) -->
+              <do_if value="not global.$GT_LiveSearchQueue.$BySector?">
+                <set_value name="global.$GT_LiveSearchQueue.$BySector" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$Sectors?">
+                <set_value name="global.$GT_LiveSearchQueue.$Sectors" exact="[]"/>
+              </do_if>
+              <do_if value="not global.$GT_LiveSearchQueue.$NextSectorIndex?">
+                <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
               </do_if>
 
               <!-- Store params for resume + ensure cache is skipped when live slot starts -->
@@ -990,16 +985,52 @@
               <set_value name="$params.$UseSearchQueueCounter" exact="false"/>
               <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
 
-              <!-- Add ship to live queue if not already present -->
-              <set_value name="$alreadyQueuedForLive" exact="false"/>
-              <do_all exact="global.$GT_LiveSearchQueue.$Ships.count" counter="$q">
-                <do_if value="global.$GT_LiveSearchQueue.$Ships.{$q} == $ship">
-                  <set_value name="$alreadyQueuedForLive" exact="true"/>
-                  <break/>
+              <!-- Determine home sector (queue key) -->
+              <set_value name="$homeSectorForLiveQueue" exact="null"/>
+              <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSectorForLiveQueue">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <!-- Store on params (debug + later recovery) -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$params.$HomeSector" exact="$homeSectorForLiveQueue"/>
+                <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
+              </do_if>
+
+              <!-- Ensure sector queue exists -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists and not global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}?">
+                <set_value name="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}" exact="table[
+                  $Ships = []
+                ]"/>
+              </do_if>
+
+              <!-- Register sector in round-robin list (if new) -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$sectorAlreadyListed" exact="false"/>
+                <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$s">
+                  <do_if value="global.$GT_LiveSearchQueue.$Sectors.{$s} == $homeSectorForLiveQueue">
+                    <set_value name="$sectorAlreadyListed" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="not $sectorAlreadyListed">
+                  <append_to_list name="global.$GT_LiveSearchQueue.$Sectors" exact="$homeSectorForLiveQueue"/>
                 </do_if>
-              </do_all>
-              <do_if value="not $alreadyQueuedForLive">
-                <append_to_list name="global.$GT_LiveSearchQueue.$Ships" exact="$ship"/>
+              </do_if>
+
+              <!-- Add ship to the HOME-SECTOR live queue if not already present -->
+              <do_if value="$homeSectorForLiveQueue? and $homeSectorForLiveQueue.exists">
+                <set_value name="$alreadyQueuedForLive" exact="false"/>
+                <do_if value="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}?">
+                  <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships.count" counter="$q">
+                    <do_if value="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships.{$q} == $ship">
+                      <set_value name="$alreadyQueuedForLive" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $alreadyQueuedForLive">
+                    <append_to_list name="global.$GT_LiveSearchQueue.$BySector.{$homeSectorForLiveQueue}.$Ships" exact="$ship"/>
+                  </do_if>
+                </do_if>
               </do_if>
 
               <!-- Release cache-search queue slot immediately so other ships can run cache checks -->
@@ -2784,6 +2815,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
+      <!-- Jitter resume to avoid same-frame bursts when many batch filters complete at once -->
+      <delay min="10ms" max="120ms"/>
       <actions>
         <set_value name="$ship" exact="event.param"/>
         
