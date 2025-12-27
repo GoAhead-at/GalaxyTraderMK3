@@ -354,6 +354,33 @@
           
           <!-- Check if cache exists, is not null, and has entries -->
           <do_if value="$homeSectorCache? and $homeSectorCache != null and $homeSectorCache.count? and $homeSectorCache.count gt 0">
+
+          <!-- Optional optimization: per-ware cache index to avoid scanning the full home-sector cache. -->
+          <!-- Use only when ware basket is small enough to benefit. -->
+          <set_value name="$usedByWareIndex" exact="false"/>
+          <do_if value="$wareBasket? and $wareBasket != null and $wareBasket.count gt 0 and $wareBasket.count le 25 and global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
+            <set_value name="$candidates" exact="[]"/>
+            <!-- Limit per ware to keep candidate list bounded: max(1, floor(maxTradesToReturn / wareCount)) capped at 10 -->
+            <set_value name="$maxPerWare" exact="[[$maxTradesToReturn / $wareBasket.count, 1].max, 10].min"/>
+            <do_all exact="$wareBasket.count" counter="$wi">
+              <set_value name="$w" exact="$wareBasket.{$wi}"/>
+              <!-- IMPORTANT: By-ware index uses WARE OBJECT as key (not ware.id string). -->
+              <do_if value="$w? and global.$GT_TradeCacheByWare.{$homeSector}.{$w}?">
+                <set_value name="$wl" exact="global.$GT_TradeCacheByWare.{$homeSector}.{$w}"/>
+                <set_value name="$take" exact="[$wl.count, $maxPerWare].min"/>
+                <do_all exact="$take" counter="$j">
+                  <append_to_list name="$candidates" exact="$wl.{$j}"/>
+                </do_all>
+              </do_if>
+            </do_all>
+            <do_if value="$candidates.count gt 0">
+              <set_value name="$homeSectorCache" exact="$candidates"/>
+              <set_value name="$usedByWareIndex" exact="true"/>
+              <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Cache-DEBUG] Using per-ware cache index for ' + $ship.idcode + ' (wares=' + $wareBasket.count + ', maxPerWare=' + $maxPerWare + ', candidates=' + $homeSectorCache.count + ')'" chance="10"/>
+              </do_if>
+            </do_if>
+          </do_if>
           
           <!-- DEBUG: Log cache status -->
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$LogLevel ge 2 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -371,8 +398,10 @@
           <set_value name="$entriesToProcess" exact="if $homeSectorCache.count lt $maxCacheEntries then $homeSectorCache.count else $maxCacheEntries"/>
           <do_all exact="$entriesToProcess" counter="$i">
             <set_value name="$entry" exact="$homeSectorCache.{$i}"/>
-            <!-- Store original index for proper cache removal -->
-            <set_value name="$entry.$OriginalIndex" exact="$i"/>
+            <!-- Store original index for proper cache removal (only valid for main cache list, not per-ware candidate lists) -->
+            <do_if value="not $usedByWareIndex">
+              <set_value name="$entry.$OriginalIndex" exact="$i"/>
+            </do_if>
             <append_to_list name="$limitedCache" exact="$entry"/>
           </do_all>
           
@@ -518,8 +547,15 @@
               <!-- Remove from per-home-sector cache -->
               <!-- Use $cacheEntryIndex (stored at loop start) instead of $i -->
               <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe -->
-              <do_if value="$cacheEntryIndex?">
-                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+              <!-- Remove from main cache + per-ware index by object reference (safe even when using per-ware candidate lists) -->
+              <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+                <remove_from_list name="global.$GT_TradeCache.{$homeSector}" exact="$cacheEntry"/>
+              </do_if>
+              <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
+                <set_value name="$entryWare" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <do_if value="$entryWare? and global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
+                  <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$cacheEntry"/>
+                </do_if>
               </do_if>
               <continue/>
             </do_if>
@@ -536,8 +572,14 @@
                 <set_value name="$tradesByWareBeforeFiltering.{$ware}" exact="$wareStats"/>
               </do_if>
               <!-- Objectively stale for everyone: remove from cache immediately -->
-              <do_if value="$cacheEntryIndex?">
-                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+              <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+                <remove_from_list name="global.$GT_TradeCache.{$homeSector}" exact="$cacheEntry"/>
+              </do_if>
+              <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
+                <set_value name="$entryWare" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <do_if value="$entryWare? and global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
+                  <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$cacheEntry"/>
+                </do_if>
               </do_if>
               <continue/>
             </do_if>
@@ -1321,8 +1363,14 @@
                       <!-- Note: $cacheEntry is from $homeSectorCache, so it's already from the correct home sector -->
                       <!-- Use $cacheEntryIndex (stored at loop start) to remove from the correct home sector's cache -->
                       <!-- Since we iterate backwards, removing entry $cacheEntryIndex is safe (already processed entries remain at same indices) -->
-                      <do_if value="$cacheEntryIndex?">
-                        <remove_value name="global.$GT_TradeCache.{$homeSector}.{$cacheEntryIndex}"/>
+                      <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+                        <remove_from_list name="global.$GT_TradeCache.{$homeSector}" exact="$cacheEntry"/>
+                      </do_if>
+                      <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
+                        <set_value name="$entryWare" exact="@$cacheEntry.$BuyOffer.ware"/>
+                        <do_if value="$entryWare? and global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
+                          <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$cacheEntry"/>
+                        </do_if>
                       </do_if>
                       <!-- Skip to next entry -->
                       <continue/>
