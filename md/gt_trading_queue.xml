@@ -477,92 +477,46 @@
             $ForceLiveSearch = $forceLiveSearch
           ]"/>
 
-          <!-- Queue for search processing (cache + live) -->
-          <do_if value="not global.$GT_SearchQueue?">
-            <set_value name="global.$GT_SearchQueue" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$Ships?">
-            <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
-            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$MaxConcurrent?">
-            <!-- Cache searches are cheap: use separate cache concurrency setting (fallback to legacy MaxConcurrentSearches) -->
-            <!-- TODO: keep hardcoded default for now. Higher default reduces 'busy' churn under big fleets. -->
-            <set_value name="$maxConcurrent" exact="10"/>
-            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
-              <set_value name="$maxConcurrent" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
-            </do_if>
-            <do_elseif value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches?">
-              <set_value name="$maxConcurrent" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches"/>
-            </do_elseif>
-            <do_if value="$maxConcurrent lt 1">
-              <set_value name="$maxConcurrent" exact="1"/>
-            </do_if>
-            <do_if value="$maxConcurrent gt 20">
-              <set_value name="$maxConcurrent" exact="20"/>
-            </do_if>
-            <set_value name="global.$GT_SearchQueue.$MaxConcurrent" exact="$maxConcurrent"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$Params?">
-            <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
-          </do_if>
-          <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$searchParams"/>
-
-          <!-- PERF: O(1) queue membership marker (avoid list scans + redundant signals under big fleets) -->
-          <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
-            <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
-            <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
-            <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
-          </do_if>
-
-          <!-- Avoid thundering herd: only signal queue processor if it's not already processing -->
-          <do_if value="not global.$GT_SearchQueue.$Processing?">
-            <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$Processing">
-            <signal_cue_instantly cue="ProcessSearchQueue"/>
-          </do_if>
-         </do_if>
-         <do_else>
-           <do_if value="$isBusy">
-             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-               <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping trade search; ship is busy'" chance="100"/>
-             </do_if>
-             
-             <!-- CRITICAL FIX: Signal AI script that no new trade is available (ship is busy) -->
-             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-             
-             <!-- Release lock and parameters using Request Registry -->
-             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-               <param name="ship" value="$ship"/>
-               <param name="reason" value="'ship_busy'"/>
-             </run_actions>
-           </do_if>
-           <!-- Note: Invalid ship cleanup now happens immediately after validation (above), so this else only handles busy ships -->
-         </do_else>
+          <!-- Start trade search via centralized scheduler.
+               We do NOT use the legacy global.$GT_SearchQueue gate here: it can pin at max and cause "no trades generated".
+               The scheduler already spreads starts across frames, and SearchTradeRoutes handles cache/live internally. -->
+          <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$searchParams"/>
         </do_if>
         <do_else>
-          <!-- Parameters missing - cleanup and exit immediately -->
-          <!-- Nothing after this point executes when parameters are missing -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-TradingQueue] (' + $ship.idcode + ') AI parameters missing at FindBestTrade entry - may have been cleaned up between queue check and processing'" chance="100"/>
+          <!-- Ship is busy (orders/training/maintenance) - release lock and let AI retry later -->
+          <do_if value="$isBusy">
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'ship_busy'"/>
+            </run_actions>
           </do_if>
-          <!-- Signal AI that no trade is available -->
+          <do_else>
+            <!-- Fallback: if we got here, do not hold the lock indefinitely -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'findbesttrade_skipped'"/>
+            </run_actions>
+          </do_else>
+        </do_else>
+        
+        <!-- Close outer AI-parameter guard -->
+        </do_if>
+        <do_else>
+          <!-- AI parameters missing - cleanup and exit immediately -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradingQueue] (' + $ship.idcode + ') AI parameters missing at FindBestTrade entry - cannot compute search params'" chance="100"/>
+          </do_if>
           <do_if value="$ship.exists">
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
           </do_if>
-          <!-- Release any stale lock if it exists -->
           <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
               <param name="ship" value="$ship"/>
               <param name="reason" value="'parameters_missing_at_findbesttrade'"/>
             </run_actions>
           </do_if>
-          <!-- Exit immediately - don't process without parameters -->
           <cancel_cue cue="this"/>
         </do_else>
       </actions>

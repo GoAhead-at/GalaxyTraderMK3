@@ -406,34 +406,34 @@
       <params>
         <param name="skillLevel" comment="Pilot skill level (1-15+)"/>
         <param name="shipCargoCapacity" comment="Ship's max cargo capacity (for scaling threshold)"/>
-        <param name="configBaseProfit" default="10000" comment="Base profit from config (deprecated - kept for compatibility but not used)"/>
+        <param name="configBaseProfit" default="10000" comment="Base profit at Level 15 for reference cargo (RAW centicredits). Example: 100Cr = 10000."/>
       </params>
       <actions>
         <!-- Returns profit threshold in raw format (centicredits) based on pilot level:
-             Non-linear (quadratic) progression from Level 1 (0 Cr) to Level 15 (10000 Cr)
-             Formula: 1000000 * ((skillLevel - 1) / 14)^2
+             Non-linear (quadratic) progression from Level 1 (0 Cr) to Level 15 (configBaseProfit).
+             Formula: configBaseProfit * ((skillLevel - 1) / 14)^2
              This creates a quadratic curve that starts at 0 Cr and accelerates to 10000 Cr:
              Level 1: 0 Cr (0 raw)
-             Level 2: ~51 Cr (5,102 raw)
-             Level 3: ~204 Cr (20,408 raw)
-             Level 4: ~459 Cr (45,918 raw)
-             Level 5: ~816 Cr (81,633 raw)
-             Level 10: ~3,673 Cr (367,347 raw)
-             Level 15: 10,000 Cr (1,000,000 raw)
+             Level 15: configBaseProfit (raw)
              
              NEW: Threshold is scaled by ship cargo capacity
-             - Reference cargo: 8200 (Merkur - baseline for Level 15 = 10,000 Cr)
+             - Reference cargo: 8200 (Merkur - baseline for Level 15 = configBaseProfit)
              - Small ships (2200 cargo) get proportionally lower thresholds
              - Minimum floor: 25% of base threshold (prevents thresholds from being too low)
         -->
-        <!-- Level 1-15+: Non-linear (quadratic) progression from 0 Cr to 10000 Cr -->
-        <!-- Avoid integer division by rearranging formula -->
-        <!-- Original: 1000000 * ((skillLevel - 1) / 14)^2 -->
-        <!-- Rearranged: ((skillLevel - 1)^2 * 1000000) / 196 -->
+        <!-- Level 1-15+: Non-linear (quadratic) progression from 0 Cr to configBaseProfit -->
+        <!-- Avoid integer division by rearranging formula:
+             Original: configBaseProfit * ((skillLevel - 1) / 14)^2
+             Rearranged: ((skillLevel - 1)^2 * configBaseProfit) / 196
+        -->
         <!-- This avoids floating-point division issues in MD by doing integer math -->
         <!-- This creates an accelerating curve - lower levels have lower thresholds, -->
         <!-- higher levels require much more profit (more selective traders) -->
-        <set_value name="$numerator" exact="($skillLevel - 1) * ($skillLevel - 1) * 1000000"/>
+        <set_value name="$baseMax" exact="$configBaseProfit"/>
+        <do_if value="not $baseMax? or $baseMax == null or $baseMax lt 0">
+          <set_value name="$baseMax" exact="10000"/>
+        </do_if>
+        <set_value name="$numerator" exact="($skillLevel - 1) * ($skillLevel - 1) * $baseMax"/>
         <set_value name="$baseThreshold" exact="$numerator / 196"/>
         
         <!-- Scale threshold by ship cargo capacity -->
@@ -1409,8 +1409,21 @@
         <!-- Returns total count of all trades across all home sector caches -->
         <set_value name="$totalCount" exact="0"/>
         <do_if value="global.$GT_TradeCache?">
-          <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
-            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$sectorIdx}}"/>
+          <!-- Prefer explicit home registry (more reliable than .keys in some saves) -->
+          <set_value name="$homes" exact="[]"/>
+          <do_if value="global.$GT_TradeCacheHomes?">
+            <set_value name="$homes" exact="@global.$GT_TradeCacheHomes"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homes" exact="@global.$GT_TradeCache.keys"/>
+            <do_if value="$homes == null">
+              <set_value name="$homes" exact="[]"/>
+            </do_if>
+          </do_else>
+          
+          <do_all exact="$homes.count" counter="$sectorIdx">
+            <set_value name="$home" exact="$homes.{$sectorIdx}"/>
+            <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
             <do_if value="$sectorCache != null">
               <set_value name="$totalCount" exact="$totalCount + $sectorCache.count"/>
             </do_if>
@@ -1493,6 +1506,9 @@
           <set_value name="$allowIllegal" exact="false"/>
         </do_if>
 
+        <!-- Prefer entries with the lowest FailCount; skip entries already failed by this ship. -->
+        <set_value name="$minFailCount" exact="999999"/>
+
         <!-- Determine blacklist group once (used for reachability check) -->
         <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
           <param name="ship" value="$ship"/>
@@ -1526,6 +1542,27 @@
             <do_if value="$ware != null and @$ware.illegal">
               <continue/>
             </do_if>
+          </do_if>
+
+          <!-- Failure-distribution filter: skip if this ship already failed this entry. -->
+          <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+          <do_if value="$failedShips == null">
+            <set_value name="$failedShips" exact="[]"/>
+          </do_if>
+          <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
+          <do_all exact="$failedShips.count" counter="$f">
+            <do_if value="$failedShips.{$f} == $ship">
+              <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="$shipAlreadyFailedThisEntry">
+            <continue/>
+          </do_if>
+
+          <set_value name="$failCount" exact="@$entry.$FailCount"/>
+          <do_if value="$failCount == null">
+            <set_value name="$failCount" exact="0"/>
           </do_if>
 
           <!-- Range validation (prefer precomputed distances) -->
@@ -1604,18 +1641,21 @@
             $Score = $entry.$Profit
           ]"/>
 
-          <!-- Collect candidate -->
-          <append_to_list name="$validTrades" exact="$trade"/>
-
-          <!-- First valid trade becomes best -->
-          <do_if value="not $result.$Found">
+          <!-- Collect candidate(s) with the LOWEST failcount only (tie-breaker keeps profit order from cache). -->
+          <do_if value="$failCount lt $minFailCount">
+            <set_value name="$minFailCount" exact="$failCount"/>
+            <set_value name="$validTrades" exact="[]"/>
+            <append_to_list name="$validTrades" exact="$trade"/>
             <set_value name="$result.$Found" exact="true"/>
             <set_value name="$result.$Trade" exact="$trade"/>
             <set_value name="$result.$BestScore" exact="$trade.$Score"/>
           </do_if>
+          <do_elseif value="$failCount == $minFailCount and $validTrades.count lt $maxReturnTrades">
+            <append_to_list name="$validTrades" exact="$trade"/>
+          </do_elseif>
 
-          <!-- Stop early once we have enough candidates -->
-          <do_if value="$validTrades.count ge $maxReturnTrades">
+          <!-- Stop early once we have enough candidates at the optimal failcount (0 is best possible). -->
+          <do_if value="$minFailCount == 0 and $validTrades.count ge $maxReturnTrades">
             <break/>
           </do_if>
         </do_all>

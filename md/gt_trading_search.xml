@@ -295,11 +295,31 @@
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] ERROR: (' + $ship.idcode + ') MaxDistance is null or invalid (' + $maxDistance + ') - cannot proceed without valid distance parameter!'" chance="100"/>
           </do_if>
+          <!-- CRITICAL: If this run consumed a cache-search queue slot, release it now (prevents ActiveSearches leaks). -->
+          <do_if value="$useSearchQueueCounter">
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            </do_if>
+            <set_value name="$useSearchQueueCounter" exact="false"/>
+          </do_if>
           <cancel_cue cue="this"/>
         </do_if>
         <do_elseif value="$maxDistance lt 0">
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] ERROR: (' + $ship.idcode + ') MaxDistance is null or invalid (' + $maxDistance + ') - cannot proceed without valid distance parameter!'" chance="100"/>
+          </do_if>
+          <!-- CRITICAL: If this run consumed a cache-search queue slot, release it now (prevents ActiveSearches leaks). -->
+          <do_if value="$useSearchQueueCounter">
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+              <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+            </do_if>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+            </do_if>
+            <set_value name="$useSearchQueueCounter" exact="false"/>
           </do_if>
           <cancel_cue cue="this"/>
         </do_elseif>
@@ -311,7 +331,12 @@
         
         <!-- EXPLICIT STATE ENUM: Determine search state from params or infer from context -->
         <!-- SearchState values: 'fresh' (new search), 'cache' (cache results), 'live' (live search continuation), 'fallback' (fallback continuation) -->
+        <!-- IMPORTANT: In MD, "var?" can behave as true even when the value is null (it means "is defined"),
+             so explicitly normalize null → treat as missing and infer state. -->
         <set_value name="$searchState" exact="@$params.$SearchState"/>
+        <do_if value="$searchState == null">
+          <remove_value name="$searchState"/>
+        </do_if>
         <set_value name="$originalMaxDistance" exact="$maxDistance"/>  <!-- Default: same as maxDistance -->
         <do_if value="$params.$OriginalMaxDistance?">
           <set_value name="$originalMaxDistance" exact="$params.$OriginalMaxDistance"/>
@@ -1062,68 +1087,66 @@
                 <cancel_cue cue="this"/>
               </do_if>
 
-              <!-- Mark this ship as the leader for this home-sector refresh (may still be queued behind global live slots). -->
-              <do_if value="not $denyHomeRefresh and $homeSector? and $homeSector.exists">
-                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
-                  $Active = true,
-                  $Initiator = $ship,
-                  $LastStarted = player.age
-                ]"/>
-              </do_if>
-
-              <!-- FAIRNESS: If live-search concurrency is saturated, STILL enqueue this ship for live search.
-                   Live search is responsible for warming the per-home-sector cache. If we fail fast here, fleets in different
-                   home sectors can starve each other (one sector gets all live slots, the other never refreshes its cache).
-                   We keep MaxConcurrentLiveSearches low (often 1) but queue fairly (round-robin per home sector). -->
-              <do_if value="$denyHomeRefresh">
-                <cancel_cue cue="this"/>
-              </do_if>
-
-              <set_value name="$liveQueueSaturated" exact="false"/>
-              <set_value name="$maxConcurrentLiveNow" exact="1"/>
-              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
-                <set_value name="$maxConcurrentLiveNow" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
-              </do_if>
-              <do_if value="$maxConcurrentLiveNow lt 1">
-                <set_value name="$maxConcurrentLiveNow" exact="1"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue?">
-                <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-                <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-              </do_if>
-              <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches ge $maxConcurrentLiveNow">
-                <set_value name="$liveQueueSaturated" exact="true"/>
-              </do_if>
-
-              <do_if value="$liveQueueSaturated">
-                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search busy (active: ' + global.$GT_LiveSearchQueue.$ActiveLiveSearches + '/' + $maxConcurrentLiveNow + ') - QUEUING for live search (fair per-home-sector round-robin)'" chance="100"/>
+              <!-- IMPORTANT:
+                   cancel_cue does NOT stop the current actions block immediately.
+                   After we DENY with home_refresh we must NOT fall through into leader marking or live-queue enqueue,
+                   otherwise we can enqueue a ship whose lock was just released, creating "stale wakeups" and stalls. -->
+              <!-- If denied, do nothing else in this invocation (gated; cancel_cue alone is not sufficient). -->
+              <do_if value="not $denyHomeRefresh">
+                <!-- Mark this ship as the initiator for this home-sector refresh (may still be queued behind global live slots). -->
+                <do_if value="$homeSector? and $homeSector.exists">
+                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
+                    $Active = true,
+                    $Initiator = $ship,
+                    $LastStarted = player.age
+                  ]"/>
                 </do_if>
-              </do_if>
 
-              <do_if value="$shouldDoLiveSearch">
-              <!-- Initialize live search queue -->
-              <do_if value="not global.$GT_LiveSearchQueue?">
-                <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$Params?">
-                <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-                <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-              </do_if>
-              <!-- Per-home-sector fairness queue (round-robin across home sectors) -->
-              <do_if value="not global.$GT_LiveSearchQueue.$BySector?">
-                <set_value name="global.$GT_LiveSearchQueue.$BySector" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$Sectors?">
-                <set_value name="global.$GT_LiveSearchQueue.$Sectors" exact="[]"/>
-              </do_if>
-              <do_if value="not global.$GT_LiveSearchQueue.$NextSectorIndex?">
-                <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
-              </do_if>
+                <set_value name="$liveQueueSaturated" exact="false"/>
+                <set_value name="$maxConcurrentLiveNow" exact="1"/>
+                <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
+                  <set_value name="$maxConcurrentLiveNow" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
+                </do_if>
+                <do_if value="$maxConcurrentLiveNow lt 1">
+                  <set_value name="$maxConcurrentLiveNow" exact="1"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue?">
+                  <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+                  <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+                </do_if>
+                <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches ge $maxConcurrentLiveNow">
+                  <set_value name="$liveQueueSaturated" exact="true"/>
+                </do_if>
+
+                <do_if value="$liveQueueSaturated">
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search busy (active: ' + global.$GT_LiveSearchQueue.$ActiveLiveSearches + '/' + $maxConcurrentLiveNow + ') - QUEUING for live search (fair per-home-sector round-robin)'" chance="100"/>
+                  </do_if>
+                </do_if>
+
+                <do_if value="$shouldDoLiveSearch">
+                <!-- Initialize live search queue -->
+                <do_if value="not global.$GT_LiveSearchQueue?">
+                  <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue.$Params?">
+                  <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+                  <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+                </do_if>
+                <!-- Per-home-sector fairness queue (round-robin across home sectors) -->
+                <do_if value="not global.$GT_LiveSearchQueue.$BySector?">
+                  <set_value name="global.$GT_LiveSearchQueue.$BySector" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue.$Sectors?">
+                  <set_value name="global.$GT_LiveSearchQueue.$Sectors" exact="[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveSearchQueue.$NextSectorIndex?">
+                  <set_value name="global.$GT_LiveSearchQueue.$NextSectorIndex" exact="1"/>
+                </do_if>
 
               <!-- Store params for resume + ensure cache is skipped when live slot starts -->
               <set_value name="$params.$ForceLiveSearch" exact="true"/>
@@ -1201,6 +1224,7 @@
               <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
               <cancel_cue cue="this"/>
               </do_if>
+            </do_if>
             </do_if>
 
             <!-- IMPORTANT:
@@ -1515,7 +1539,9 @@
                 <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted.
                      ALSO respect live-search availability: if we intentionally skipped live-search due to saturation/cooldown,
                      do NOT trigger fallback (it would enqueue a live/batch search anyway and recreate fleet-wide stalls). -->
-                <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch">
+                <!-- CRITICAL: Prevent fallback from starting while we're already waiting for an async live/batch pipeline,
+                     and never trigger fallback for ships denied by home_refresh (cancel_cue fallthrough can reach here). -->
+                <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch and not $waitingForLiveSearch and not $denyHomeRefresh">
                   <!-- Ensure table exists before accessing -->
                   <do_if value="not global.$GT_FallbackAttempted?">
                     <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
@@ -2311,7 +2337,9 @@
             <set_value name="$shipIsIsolated" exact="$isolationResult.$IsIsolated"/>
             
             <!-- Only trigger fallback search if ship is NOT isolated AND fallback not already attempted -->
-            <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch">
+            <!-- CRITICAL: Prevent fallback from starting while we're already waiting for an async live/batch pipeline,
+                 and never trigger fallback for ships denied by home_refresh (cancel_cue fallthrough can reach here). -->
+            <do_if value="not $shipIsIsolated and not $fallbackAlreadyAttempted and $shouldDoLiveSearch and not $waitingForLiveSearch and not $denyHomeRefresh">
               <!-- Ensure table exists before accessing -->
               <do_if value="not global.$GT_FallbackAttempted?">
                 <set_value name="global.$GT_FallbackAttempted" exact="table[]"/>
@@ -2534,7 +2562,22 @@
               <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
             </do_if>
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForQueue.idcode + ') SEARCH COMPLETE (active: ' + global.$GT_SearchQueue.$ActiveSearches + '/' + global.$GT_SearchQueue.$MaxConcurrent + ', queued: ' + global.$GT_SearchQueue.$Ships.count + ')'" chance="100"/>
+              <!-- Null-safe: we no longer guarantee global.$GT_SearchQueue.$Ships exists when bypassing legacy cache queue. -->
+              <set_value name="$sqActive" exact="0"/>
+              <set_value name="$sqMax" exact="0"/>
+              <set_value name="$sqQueued" exact="0"/>
+              <do_if value="global.$GT_SearchQueue?">
+                <do_if value="global.$GT_SearchQueue.$ActiveSearches?">
+                  <set_value name="$sqActive" exact="global.$GT_SearchQueue.$ActiveSearches"/>
+                </do_if>
+                <do_if value="global.$GT_SearchQueue.$MaxConcurrent?">
+                  <set_value name="$sqMax" exact="global.$GT_SearchQueue.$MaxConcurrent"/>
+                </do_if>
+                <do_if value="global.$GT_SearchQueue.$Ships?">
+                  <set_value name="$sqQueued" exact="global.$GT_SearchQueue.$Ships.count"/>
+                </do_if>
+              </do_if>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $shipForQueue.idcode + ') SEARCH COMPLETE (active: ' + $sqActive + '/' + $sqMax + ', queued: ' + $sqQueued + ')'" chance="100"/>
             </do_if>
             <!-- Continue processing cache-search queue if there are ships waiting -->
             <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
@@ -4152,6 +4195,227 @@
           <param name="ship" value="$ship"/>
           <param name="reason" value="'search_aborted'"/>
         </run_actions>
+      </actions>
+    </cue>
+
+    <!-- Debug: Periodic cache snapshot (heavy). Runs only when debug logging is enabled. -->
+    <!-- Purpose: Diagnose cache composition (missing wares, low diversity, unexpected evictions). -->
+    <cue name="CacheSnapshotLogger" instantiate="true" checkinterval="2min">
+      <conditions>
+        <check_value value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging"/>
+      </conditions>
+      <actions>
+        <set_value name="$total" exact="0"/>
+        <run_actions ref="md.GT_Libraries_General.GT_CalculateTotalCacheCount" result="$total"/>
+        <debug_text text="'[GT-Cache-Snapshot] BEGIN t=' + (player.age / 1) + 's total=' + $total" chance="100"/>
+
+        <do_if value="not global.$GT_TradeCache?">
+          <debug_text text="'[GT-Cache-Snapshot] No global.$GT_TradeCache table yet.'" chance="100"/>
+        </do_if>
+        <do_else>
+          <!-- IMPORTANT: Some saves may still have a legacy list-shaped GT_TradeCache (no .keys property).
+               Use safe reads and support both shapes so we can always dump what exists. -->
+          <set_value name="$cacheObj" exact="@global.$GT_TradeCache"/>
+          
+          <!-- Prefer an explicit home-sector registry (populated during caching) -->
+          <set_value name="$keys" exact="[]"/>
+          <do_if value="global.$GT_TradeCacheHomes?">
+            <set_value name="$keys" exact="@global.$GT_TradeCacheHomes"/>
+          </do_if>
+          <do_else>
+            <set_value name="$keys" exact="@$cacheObj.keys"/>
+            <do_if value="$keys == null">
+              <set_value name="$keys" exact="[]"/>
+            </do_if>
+          </do_else>
+          
+          <debug_text text="'[GT-Cache-Snapshot] homeKeys=' + $keys.count + ' (homesRegistry=' + (global.$GT_TradeCacheHomes? and 'true' or 'false') + ', cacheHasKeys=' + ($cacheObj.keys? and 'true' or 'false') + ')'" chance="100"/>
+
+          <!-- Normal shape: table keyed by home sector -->
+          <do_if value="$keys.count gt 0">
+            <do_all exact="$keys.count" counter="$k">
+              <set_value name="$home" exact="$keys.{$k}"/>
+              <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
+              <do_if value="$sectorCache == null">
+                <continue/>
+              </do_if>
+
+              <set_value name="$homeName" exact="@$home.knownname"/>
+              <do_if value="not $homeName?">
+                <set_value name="$homeName" exact="'[unknown home sector]'"/>
+              </do_if>
+
+              <debug_text text="'[GT-Cache-Snapshot] HOME ' + $homeName + ' entries=' + $sectorCache.count" chance="100"/>
+
+              <!-- Per-ware counts for this home sector (avoid table.keys; some saves/types make .keys unreliable) -->
+              <set_value name="$wareSummary" exact="[]"/>
+
+              <!-- Full dump (bounded to prevent runaway logs) -->
+              <set_value name="$dumpLimit" exact="5000"/>
+              <set_value name="$dumpCount" exact="[$sectorCache.count, $dumpLimit].min"/>
+              <do_all exact="$dumpCount" counter="$i">
+                <set_value name="$e" exact="$sectorCache.{$i}"/>
+                <do_if value="$e == null">
+                  <continue/>
+                </do_if>
+
+                <set_value name="$wareObj" exact="@$e.$BuyOffer.ware"/>
+                <set_value name="$wareName" exact="if $e.$WareName? then $e.$WareName else @$wareObj.name"/>
+                <do_if value="not $wareName?">
+                  <set_value name="$wareName" exact="'[unknown ware]'"/>
+                </do_if>
+
+                <!-- Update per-ware counts by name -->
+                <set_value name="$wsFound" exact="false"/>
+                <do_all exact="$wareSummary.count" counter="$wsi">
+                  <do_if value="$wareSummary.{$wsi}.$WareName == $wareName">
+                    <set_value name="$wareSummary.{$wsi}.$Count" exact="$wareSummary.{$wsi}.$Count + 1"/>
+                    <set_value name="$wsFound" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="not $wsFound">
+                  <append_to_list name="$wareSummary" exact="table[$WareName = $wareName, $Count = 1]"/>
+                </do_if>
+
+                <set_value name="$roi" exact="@$e.$ROI"/>
+                <do_if value="$roi == null">
+                  <set_value name="$roi" exact="-1"/>
+                </do_if>
+
+                <set_value name="$profit" exact="@$e.$Profit"/>
+                <do_if value="$profit == null">
+                  <set_value name="$profit" exact="0"/>
+                </do_if>
+
+                <set_value name="$dist" exact="@$e.$Distance"/>
+                <do_if value="$dist == null">
+                  <set_value name="$dist" exact="-1"/>
+                </do_if>
+
+                <set_value name="$age" exact="-1"/>
+                <do_if value="$e.$Timestamp? and $e.$Timestamp != null">
+                  <set_value name="$age" exact="(player.age - $e.$Timestamp) / 1"/>
+                </do_if>
+
+                <set_value name="$buyName" exact="@$e.$BuyOffer.owner.knownname"/>
+                <do_if value="not $buyName?">
+                  <set_value name="$buyName" exact="'[unknown buy]'"/>
+                </do_if>
+                <set_value name="$sellName" exact="@$e.$SellOffer.owner.knownname"/>
+                <do_if value="not $sellName?">
+                  <set_value name="$sellName" exact="'[unknown sell]'"/>
+                </do_if>
+
+                <debug_text text="'[GT-Cache-Snapshot]  ' + $i +
+                  ' ware=' + $wareName +
+                  ' roi=' + ($roi / 1) + '%' +
+                  ' profit=' + ($profit / 100) + 'Cr' +
+                  ' dist=' + $dist +
+                  ' age=' + $age + 's' +
+                  ' buy=' + $buyName +
+                  ' sell=' + $sellName" chance="100"/>
+              </do_all>
+
+              <do_if value="$sectorCache.count gt $dumpLimit">
+                <debug_text text="'[GT-Cache-Snapshot] HOME ' + $homeName + ': dump truncated at ' + $dumpLimit + ' / ' + $sectorCache.count + ' entries.'" chance="100"/>
+              </do_if>
+
+              <!-- Per-ware summary at end of each home sector -->
+              <debug_text text="'[GT-Cache-Snapshot] HOME ' + $homeName + ' distinctWares=' + $wareSummary.count" chance="100"/>
+              <do_all exact="$wareSummary.count" counter="$wi">
+                <set_value name="$row" exact="$wareSummary.{$wi}"/>
+                <debug_text text="'[GT-Cache-Snapshot]   WARE ' + $row.$WareName + ' count=' + $row.$Count" chance="100"/>
+              </do_all>
+            </do_all>
+          </do_if>
+          <do_else>
+            <!-- Legacy shape: GT_TradeCache is a flat list (no home-sector keys). Dump as one "home". -->
+            <do_if value="$cacheObj.count? and $cacheObj.count ge 0">
+              <set_value name="$sectorCache" exact="$cacheObj"/>
+              <set_value name="$homeName" exact="'[GT_TradeCache legacy list]'"/>
+              <debug_text text="'[GT-Cache-Snapshot] HOME ' + $homeName + ' entries=' + $sectorCache.count" chance="100"/>
+
+              <set_value name="$wareSummary" exact="[]"/>
+              <set_value name="$dumpLimit" exact="5000"/>
+              <set_value name="$dumpCount" exact="[$sectorCache.count, $dumpLimit].min"/>
+              <do_all exact="$dumpCount" counter="$i">
+                <set_value name="$e" exact="$sectorCache.{$i}"/>
+                <do_if value="$e == null">
+                  <continue/>
+                </do_if>
+
+                <set_value name="$wareObj" exact="@$e.$BuyOffer.ware"/>
+                <set_value name="$wareName" exact="if $e.$WareName? then $e.$WareName else @$wareObj.name"/>
+                <do_if value="not $wareName?">
+                  <set_value name="$wareName" exact="'[unknown ware]'"/>
+                </do_if>
+
+                <!-- Update per-ware counts by name -->
+                <set_value name="$wsFound" exact="false"/>
+                <do_all exact="$wareSummary.count" counter="$wsi">
+                  <do_if value="$wareSummary.{$wsi}.$WareName == $wareName">
+                    <set_value name="$wareSummary.{$wsi}.$Count" exact="$wareSummary.{$wsi}.$Count + 1"/>
+                    <set_value name="$wsFound" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="not $wsFound">
+                  <append_to_list name="$wareSummary" exact="table[$WareName = $wareName, $Count = 1]"/>
+                </do_if>
+
+                <set_value name="$roi" exact="@$e.$ROI"/>
+                <do_if value="$roi == null">
+                  <set_value name="$roi" exact="-1"/>
+                </do_if>
+
+                <set_value name="$profit" exact="@$e.$Profit"/>
+                <do_if value="$profit == null">
+                  <set_value name="$profit" exact="0"/>
+                </do_if>
+
+                <set_value name="$dist" exact="@$e.$Distance"/>
+                <do_if value="$dist == null">
+                  <set_value name="$dist" exact="-1"/>
+                </do_if>
+
+                <set_value name="$age" exact="-1"/>
+                <do_if value="$e.$Timestamp? and $e.$Timestamp != null">
+                  <set_value name="$age" exact="(player.age - $e.$Timestamp) / 1"/>
+                </do_if>
+
+                <set_value name="$buyName" exact="@$e.$BuyOffer.owner.knownname"/>
+                <do_if value="not $buyName?">
+                  <set_value name="$buyName" exact="'[unknown buy]'"/>
+                </do_if>
+                <set_value name="$sellName" exact="@$e.$SellOffer.owner.knownname"/>
+                <do_if value="not $sellName?">
+                  <set_value name="$sellName" exact="'[unknown sell]'"/>
+                </do_if>
+
+                <debug_text text="'[GT-Cache-Snapshot]  ' + $i +
+                  ' ware=' + $wareName +
+                  ' roi=' + ($roi / 1) + '%' +
+                  ' profit=' + ($profit / 100) + 'Cr' +
+                  ' dist=' + $dist +
+                  ' age=' + $age + 's' +
+                  ' buy=' + $buyName +
+                  ' sell=' + $sellName" chance="100"/>
+              </do_all>
+
+              <debug_text text="'[GT-Cache-Snapshot] HOME ' + $homeName + ' distinctWares=' + $wareSummary.count" chance="100"/>
+              <do_all exact="$wareSummary.count" counter="$wi">
+                <set_value name="$row" exact="$wareSummary.{$wi}"/>
+                <debug_text text="'[GT-Cache-Snapshot]   WARE ' + $row.$WareName + ' count=' + $row.$Count" chance="100"/>
+              </do_all>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Cache-Snapshot] ERROR: GT_TradeCache has no keys and no count - cannot dump.'" chance="100"/>
+            </do_else>
+          </do_else>
+        </do_else>
+
+        <debug_text text="'[GT-Cache-Snapshot] END'" chance="100"/>
       </actions>
     </cue>
   </cues>

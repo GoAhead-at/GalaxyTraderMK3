@@ -142,6 +142,45 @@
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Execution] ⚠ Selected trade offer(s) no longer valid for ' + $ship.idcode + ' - trying fallback trades'" chance="100"/>
             </do_if>
+
+            <!-- Objective invalidation: if the chosen offers are no longer available/valid, purge the matching cache entry.
+                 This prevents other ships from repeatedly picking the same stale entry. -->
+            <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <set_value name="$homeSectorObj" exact="$homeSector"/>
+            <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
+              <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
+              <set_value name="$purged" exact="false"/>
+              <do_all exact="$sectorCache.count" counter="$pi" reverse="true">
+                <do_if value="not $purged">
+                  <set_value name="$entry" exact="$sectorCache.{$pi}"/>
+                  <do_if value="$entry != null and $entry.$BuyOffer? and $entry.$SellOffer? and $entry.$BuyOffer == $buyOffer and $entry.$SellOffer == $sellOffer">
+                    <!-- Remove from main cache -->
+                    <remove_value name="global.$GT_TradeCache.{$homeSectorObj}.{$pi}"/>
+                    <!-- Remove from per-ware index (best-effort) -->
+                    <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSectorObj}?">
+                      <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
+                      <do_if value="$entryWare? and global.$GT_TradeCacheByWare.{$homeSectorObj}.{$entryWare}?">
+                        <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSectorObj}.{$entryWare}" exact="$entry"/>
+                      </do_if>
+                    </do_if>
+                    <set_value name="$purged" exact="true"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Execution] Purged stale cache entry after invalid offers for ' + $ship.idcode + ' (home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                    </do_if>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              <!-- Clean up empty cache lists -->
+              <do_if value="global.$GT_TradeCache.{$homeSectorObj}? and global.$GT_TradeCache.{$homeSectorObj}.count == 0">
+                <remove_value name="global.$GT_TradeCache.{$homeSectorObj}"/>
+                <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSectorObj}?">
+                  <remove_value name="global.$GT_TradeCacheByWare.{$homeSectorObj}"/>
+                </do_if>
+              </do_if>
+            </do_if>
             
             <!-- Try fallback trades from tradeList -->
             <set_value name="$foundValidTrade" exact="false"/>
@@ -273,6 +312,44 @@
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                     <debug_text text="'[GalaxyTrader MK3] ⚠ Ship ' + $ship.knownname + ' cannot carry ware ' + @$ware.name + ' - aborting trade'" chance="100"/>
                   </do_if>
+                  <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
+                  <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+                    <param name="ship" value="$ship"/>
+                  </run_actions>
+                  <set_value name="$homeSectorObj" exact="$homeSector"/>
+                  <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
+                    <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
+                    <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
+                      <set_value name="$entry" exact="$sectorCache.{$fi}"/>
+                      <do_if value="$entry != null and $entry.$BuyOffer? and $entry.$SellOffer? and $entry.$BuyOffer == $buyOffer and $entry.$SellOffer == $sellOffer">
+                        <set_value name="$failCount" exact="@$entry.$FailCount"/>
+                        <do_if value="$failCount == null">
+                          <set_value name="$failCount" exact="0"/>
+                        </do_if>
+                        <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                        <do_if value="$failedShips == null">
+                          <set_value name="$failedShips" exact="[]"/>
+                        </do_if>
+                        <set_value name="$already" exact="false"/>
+                        <do_all exact="$failedShips.count" counter="$f">
+                          <do_if value="$failedShips.{$f} == $ship">
+                            <set_value name="$already" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                        <do_if value="not $already">
+                          <append_to_list name="$failedShips" exact="$ship"/>
+                          <set_value name="$entry.$FailedShips" exact="$failedShips"/>
+                          <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
+                          <set_value name="global.$GT_TradeCache.{$homeSectorObj}.{$fi}" exact="$entry"/>
+                          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                            <debug_text text="'[GT-Execution] Flagged cache entry (cannot carry ware) for ' + $ship.idcode + ' (FailCount=' + ($failCount + 1) + ', home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                          </do_if>
+                        </do_if>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
                   <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
                   <set_value name="$canExecute" exact="false"/>
                 </do_if>
@@ -288,6 +365,44 @@
             <do_if value="$ware != null and @$ware.illegal">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Execution]   ILLEGAL WARE BLOCKED: ' + $ship.knownname + ' attempted to trade ' + @$ware.name + ' (ware type is illegal, AllowIllegal: ' + @$params.$AllowIllegal + ')'" chance="100"/>
+              </do_if>
+              <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
+              <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <set_value name="$homeSectorObj" exact="$homeSector"/>
+              <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
+                <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
+                <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
+                  <set_value name="$entry" exact="$sectorCache.{$fi}"/>
+                  <do_if value="$entry != null and $entry.$BuyOffer? and $entry.$SellOffer? and $entry.$BuyOffer == $buyOffer and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$failCount" exact="@$entry.$FailCount"/>
+                    <do_if value="$failCount == null">
+                      <set_value name="$failCount" exact="0"/>
+                    </do_if>
+                    <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                    <do_if value="$failedShips == null">
+                      <set_value name="$failedShips" exact="[]"/>
+                    </do_if>
+                    <set_value name="$already" exact="false"/>
+                    <do_all exact="$failedShips.count" counter="$f">
+                      <do_if value="$failedShips.{$f} == $ship">
+                        <set_value name="$already" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <do_if value="not $already">
+                      <append_to_list name="$failedShips" exact="$ship"/>
+                      <set_value name="$entry.$FailedShips" exact="$failedShips"/>
+                      <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
+                      <set_value name="global.$GT_TradeCache.{$homeSectorObj}.{$fi}" exact="$entry"/>
+                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <debug_text text="'[GT-Execution] Flagged cache entry (illegal ware blocked) for ' + $ship.idcode + ' (FailCount=' + ($failCount + 1) + ', home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                      </do_if>
+                    </do_if>
+                    <break/>
+                  </do_if>
+                </do_all>
               </do_if>
               <!-- <debug_text text="'[GT-Execution] Sending GT_No_Trade_Found signal to ' + $ship.idcode" chance="100"/> -->
               <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
@@ -463,6 +578,44 @@
                 '\n  Trade execution aborted, ship will search again with updated connectivity'"
                 chance="100"/>
             </do_if>
+            <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
+            <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <set_value name="$homeSectorObj" exact="$homeSector"/>
+            <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
+              <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
+              <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
+                <set_value name="$entry" exact="$sectorCache.{$fi}"/>
+                <do_if value="$entry != null and $entry.$BuyOffer? and $entry.$SellOffer? and $entry.$BuyOffer == $buyOffer and $entry.$SellOffer == $sellOffer">
+                  <set_value name="$failCount" exact="@$entry.$FailCount"/>
+                  <do_if value="$failCount == null">
+                    <set_value name="$failCount" exact="0"/>
+                  </do_if>
+                  <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                  <do_if value="$failedShips == null">
+                    <set_value name="$failedShips" exact="[]"/>
+                  </do_if>
+                  <set_value name="$already" exact="false"/>
+                  <do_all exact="$failedShips.count" counter="$f">
+                    <do_if value="$failedShips.{$f} == $ship">
+                      <set_value name="$already" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $already">
+                    <append_to_list name="$failedShips" exact="$ship"/>
+                    <set_value name="$entry.$FailedShips" exact="$failedShips"/>
+                    <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
+                    <set_value name="global.$GT_TradeCache.{$homeSectorObj}.{$fi}" exact="$entry"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Execution] Flagged cache entry (path blocked) for ' + $ship.idcode + ' (FailCount=' + ($failCount + 1) + ', home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             <set_value name="$canExecute" exact="false"/>
           </do_if>
@@ -497,6 +650,44 @@
           <do_if value="$availableMoney lt $tradeCost">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GalaxyTrader MK3] ⚠ INSUFFICIENT FUNDS: ' + $ship.knownname + ' needs ' + ($tradeCost / 100) + ' Cr but only has ' + ($availableMoney / 100) + ' Cr'" chance="100"/>
+            </do_if>
+            <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
+            <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <set_value name="$homeSectorObj" exact="$homeSector"/>
+            <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
+              <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
+              <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
+                <set_value name="$entry" exact="$sectorCache.{$fi}"/>
+                <do_if value="$entry != null and $entry.$BuyOffer? and $entry.$SellOffer? and $entry.$BuyOffer == $buyOffer and $entry.$SellOffer == $sellOffer">
+                  <set_value name="$failCount" exact="@$entry.$FailCount"/>
+                  <do_if value="$failCount == null">
+                    <set_value name="$failCount" exact="0"/>
+                  </do_if>
+                  <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                  <do_if value="$failedShips == null">
+                    <set_value name="$failedShips" exact="[]"/>
+                  </do_if>
+                  <set_value name="$already" exact="false"/>
+                  <do_all exact="$failedShips.count" counter="$f">
+                    <do_if value="$failedShips.{$f} == $ship">
+                      <set_value name="$already" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $already">
+                    <append_to_list name="$failedShips" exact="$ship"/>
+                    <set_value name="$entry.$FailedShips" exact="$failedShips"/>
+                    <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
+                    <set_value name="global.$GT_TradeCache.{$homeSectorObj}.{$fi}" exact="$entry"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Execution] Flagged cache entry (insufficient funds) for ' + $ship.idcode + ' (FailCount=' + ($failCount + 1) + ', home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  <break/>
+                </do_if>
+              </do_all>
             </do_if>
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             <set_value name="$canExecute" exact="false"/>
