@@ -1,6 +1,128 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
+Version 0.7.3 - 2025-12-27
+
+BUGFIX: Prevent ships getting stuck behind “live search already in progress” forever (missing Started timestamp)
+  - Root cause: stale `global.$GT_SearchLiveTrades_State.{ship}` entries could exist without `.$Started`, making `$stateAge` invalid so stale guards never fired
+  - Fix:
+    * `md/gt_trading_search.xml`: clear live-search state if `.$Started` is missing (treat as stale) so ships can start a fresh search
+
+BUGFIX: Fix AI error when commander sector whitelist is null (`$_cmdSectorWhitelist.count`)
+  - Root cause: sector whitelist could be `null`, and `?` checks existence (not null) so `.count` could still be evaluated on null
+  - Fix:
+    * `aiscripts/order.trade.galaxytrader.xml`: normalize null sector whitelist to `[]` before using `.count`
+
+BUGFIX: Allow ships far away from home to still find trades in the home-sector radius (home-centered live search)
+  - Symptom: ship is 5+ jumps away from home (max=3) and finds no trades despite many available in the home area
+  - Root cause: incremental radius search built sector lists around CURRENT sector, then filtered by “distance from home <= max”
+    * When current sector is far away, all candidates fail the home-distance filter ⇒ BuySpaces/SellSpaces become empty ⇒ 0 offers
+  - Fix:
+    * `md/gt_libraries_pathfinding.xml`: center TRADE-sector radius search on `HomeSector` (fallback to current only if missing)
+
+BUGFIX: Prevent ships getting stuck “searching trades forever” due to batch processor never completing (Refined Metals loop)
+  - Root cause: per-ware chunk continuations could keep a ship monopolized in `ProcessTradeMatchingBatch`, never reaching completion
+    * Under load, this manifests as repeated `Phase 1 ... for <ware>` with no `Complete. Total ...` and eventual stale-lock cleanup
+  - Fix:
+    * `md/gt_trading_batch_processor.xml`: add a hard wall-time cap (3s, TODO-configurable) to force completion with partial results
+    * `md/gt_trading_batch_processor.xml`: de-dupe forced completion per ship + clear per-ship batch state/continuation markers to prevent
+      overlapping completions racing SearchTradeRoutes (avoids `hasLock=0` / dropped continuations)
+
+BUGFIX: Prevent premature `GT_No_Trade_Found` / lock release while async fallback-live pipeline is running
+  - Root cause: SearchTradeRoutes could signal async fallback (SearchFallbackTrades → SearchLiveTrades) but still proceed to completion logic
+    * This releases the request lock before `SearchLiveTrades_Resume` can signal continuation, causing ships to retry/loop unnecessarily
+  - Fix:
+    * `md/gt_trading_search.xml`: when signaling fallback-live, set `$waitingForLiveSearch=true` + `$deferNoTradeFound=true` and do not
+      early-cancel before unified cleanup retains the search lock for continuation
+
+BUGFIX: Save/load recovery for pathfinding queue deadlock (fixes stuck Argon Prime fleet live-search)
+  - Symptom: ships queue live search (`Queued request …`), `ProcessPathfindingQueue` runs, but `GT_IncrementalRadiusSearch` never starts
+    * Ships remain stuck behind “live search already in progress” forever, even after restarting the GT order
+  - Root cause: transient `global.$GT_PathfindingQueue` state (ActiveInstances/ActiveShips) could persist from older saves/crashes and block the
+    queue’s concurrency gate indefinitely
+  - Fix:
+    * `md/gt_libraries_pathfinding.xml`: reset `global.$GT_PathfindingQueue` on game load + add sanity normalization of counters
+    * `md/gt_libraries_pathfinding.xml`: add targeted debug logs (throttled queue blocked + once-per-ship worker start/incremental start)
+
+BUGFIX: Fix broken MD load due to XML structure errors (no trades / scripts not running)
+  - Fixed `LIBXML2` parse errors that prevented scripts from loading:
+    * `md/gt_trading_batch_processor.xml`: removed invalid unescaped `<` / inline comments inside attribute values
+    * `md/gt_trading_queue.xml`: fixed tag mismatch / missing `</do_if>` closure in `FindBestTrade`
+
+BUGFIX: Fix “MaxDistance is null or invalid” pipeline stall (no trades generated)
+  - Root cause: raw AI requests were being scheduled without normalization (missing `MaxDistance` in params)
+  - Fix:
+    * `md/gt_trading_ai.xml`: route through `ProcessDelayedTradeRequest` before enqueueing
+    * `md/gt_trading_queue.xml`: enqueue fully computed `searchParams` into the scheduler
+
+BUGFIX: Fix live search not triggering when `SearchState` was null
+  - Root cause: `SearchTradeRoutes` treated null `SearchState` as non-fresh and skipped live-search path
+  - Fix:
+    * `md/gt_trading_search.xml`: normalize `$searchState` to `'fresh'` when null
+
+BUGFIX: Fix SearchQueue counter leaks causing global search stall
+  - Root cause: `ActiveSearches` could be incremented but not decremented on early exits (e.g. invalid params)
+  - Fix:
+    * `md/gt_trading_search.xml`: guarded decrement + kick `ProcessSearchQueue` on early-exit paths
+
+BUGFIX: Fix stale wakeups / “home_refresh” denial fallthrough causing ships to incorrectly hit no-trade-found
+  - Root cause: `home_refresh` denial could release locks but still fall through into live enqueue / no-trade-found logic
+  - Fix:
+    * `md/gt_trading_search.xml`: gate initiator marking + live queue enqueue, and stop fallthrough on deny
+
+BUGFIX: Fix live-search offer slicing continuation losing state (stalled slices)
+  - Root cause: `$params` passed between slice enqueue/dequeue could lose `ContinueFromSectorLists=true`
+  - Fix:
+    * `md/gt_search_methods.xml`: force `ContinueFromSectorLists=true` at all slice enqueue sites + before signalling continuation
+    * `md/gt_search_methods.xml`: log error when slice queue dequeues a ship with null params
+
+TUNING: Live search offer queries no longer filter out low-volume wares
+  - Fix:
+    * `md/gt_search_methods.xml`: relaxed `find_sell_offer` / `find_buy_offer` filters to `amount min="1"` and `totalvolume min="1"`
+
+IMPROVEMENT: Cache is ship-agnostic again (prevents “missing ware” cache starvation)
+  - Root cause: caching was effectively blocked by the live-searching ship’s cargo/money constraints (`maxAmount <= 0` gate)
+  - Fix:
+    * `md/gt_trading_batch_processor.xml`: cache insertion happens BEFORE ship-specific max-amount checks
+
+IMPROVEMENT: Prevent “ping-pong” cache pulls of unfulfillable entries (per-ship failure flags)
+  - Added per-cache-entry metadata:
+    * `$FailCount` and `$FailedShips` (ships that failed validation for that entry)
+  - Behavior:
+    * Cache picker prefers lower `FailCount` and skips entries already failed by the requesting ship
+    * Objectively invalid offers (unavailable/amount dropped/station not operational) immediately purge the cache entry
+  - Files Modified:
+    * `md/gt_libraries_general.xml`
+    * `md/gt_trading_execution.xml`
+    * `md/gt_trading_batch_processor.xml`
+
+DEBUG: Added cache snapshot + live-search/caching comparison logs for diagnosing missing wares
+  - `md/gt_trading_search.xml`: `CacheSnapshotLogger` dumps cache details every 2 minutes (debug-gated) + resilient to cache shape changes
+  - `md/gt_search_methods.xml`: `[GT-LiveOffers]` per-ware live-search offer counts (matchable wares) + illegal-to-police sample
+  - `md/gt_trading_batch_processor.xml`: `[GT-Batch-Watch]` / `[GT-Cache-Watch]` watchlist logs (Quantum Tubes / Spaceweed / Spacefuel / Stimulants)
+  - `md/gt_trading_search.xml`: logs explicit “why invalid” reasons when `bestTrade` fails validation
+
+TOOLING: Log analyzer updated for cache-entry flagging
+  - `UPDATED_VERSION/analyze_cache_reservations.ps1`: parse and summarize `[GT-Execution] Flagged cache entry (...)` events
+
+UI: Profit Threshold Base added to global config menu (0–500 Cr)
+  - Adds a slider + tooltip explaining the pilot-skill formula
+  - Files Modified:
+    * `md/gt_global_settings.xml`
+    * `t/0001-l007.xml`, `t/0001-l033.xml`, `t/0001-l034.xml`, `t/0001-l039.xml`, `t/0001-l044.xml`, `t/0001-l049.xml`, `t/0001-l055.xml`, `t/0001-l082.xml`, `t/0001-l086.xml`
+
+CHANGE: Trade cache is mandatory (removed “Enable Trade Cache” toggle)
+  - `md/gt_global_settings.xml`: removed the toggle row
+  - `md/gt_configuration.xml`: `$config.$TradeCache` is forced to `true`
+  - `md/gt_search_methods.xml`: removed “cache disabled” branch in cache-size diagnostics (cache always enabled)
+
+CHANGE: Illegal ware handling moved to cache pick (simple + deterministic)
+  - Cache can contain illegal wares (ship-agnostic); ships that disallow illegal wares will not pick them from cache
+  - Removed redundant/overengineered execution-time illegal-ware guard
+  - Files Modified:
+    * `md/gt_libraries_general.xml`
+    * `md/gt_trading_execution.xml`
+
 Version 0.7.2 - 2025-12-27
 
 BUGFIX: Fix batch-processor deadlock when `wareKeysList` is empty (0 wares)

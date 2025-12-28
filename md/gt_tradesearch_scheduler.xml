@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_TradeSearch_Scheduler" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
+  <cues>
+    <!-- =====================================================================
+         Trade-search Scheduler (Hard Frame Budget)
+
+         Purpose:
+         - Single entrypoint for starting new trade searches.
+         - Enforces a hard minimum interval between starting expensive searches.
+         - Avoids same-frame stampedes: only one search start per tick.
+
+         External contract:
+         - Accepts canonical request tables from GT_TradingAI (Ship + parameters).
+         - Starts the existing search engine by signalling md.GT_Trading_Search.SearchTradeRoutes.
+         - AI still receives GT_Trade_Found / GT_No_Trade_Found via existing execution/signals.
+
+         NOTE: This is step 1 of the full rewrite. It strictly limits *starts*.
+               Later steps will convert cache/live/match into true work-unit steppers.
+         ===================================================================== -->
+
+    <cue name="Init" instantiate="true">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+        </check_any>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_TS?">
+          <set_value name="global.$GT_TS" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Queue? or global.$GT_TS.$Queue == null">
+          <set_value name="global.$GT_TS.$Queue" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Queued? or global.$GT_TS.$Queued == null">
+          <set_value name="global.$GT_TS.$Queued" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Requests? or global.$GT_TS.$Requests == null">
+          <set_value name="global.$GT_TS.$Requests" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Processing?">
+          <set_value name="global.$GT_TS.$Processing" exact="false"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$NextStartTime?">
+          <set_value name="global.$GT_TS.$NextStartTime" exact="0s"/>
+        </do_if>
+
+        <!-- Reset transient coalescing / output queues on load (not safe to resume across save/load) -->
+        <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
+        <do_if value="global.$GT_TS_OutputQueue?">
+          <set_value name="global.$GT_TS_OutputQueue" exact="table[
+            $TradeFoundQueue = [],
+            $TradeFoundQueued = table[],
+            $TradeFoundProcessing = false
+          ]"/>
+        </do_if>
+
+        <!-- Legacy queue cleanup (safe): SearchQueue is no longer used for scheduling starts -->
+        <do_if value="global.$GT_SearchQueue?">
+          <remove_value name="global.$GT_SearchQueue.$Ships"/>
+          <remove_value name="global.$GT_SearchQueue.$QueuedShips"/>
+          <remove_value name="global.$GT_SearchQueue.$Processing"/>
+          <remove_value name="global.$GT_SearchQueue.$NextSearchStartTime"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Enqueue a trade-search request (canonical request table) -->
+    <cue name="Enqueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$req" exact="event.param"/>
+        <set_value name="$ship" exact="$req.$Ship"/>
+
+        <do_if value="not $ship? or not $ship.exists">
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Ensure global structures exist -->
+        <do_if value="not global.$GT_TS?">
+          <set_value name="global.$GT_TS" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Queue? or global.$GT_TS.$Queue == null">
+          <set_value name="global.$GT_TS.$Queue" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Queued? or global.$GT_TS.$Queued == null">
+          <set_value name="global.$GT_TS.$Queued" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS.$Requests? or global.$GT_TS.$Requests == null">
+          <set_value name="global.$GT_TS.$Requests" exact="table[]"/>
+        </do_if>
+
+        <!-- Overwrite latest request for ship (idempotent) -->
+        <set_value name="global.$GT_TS.$Requests.{$ship}" exact="$req"/>
+
+        <!-- O(1) de-dupe -->
+        <do_if value="not global.$GT_TS.$Queued.{$ship}?">
+          <set_value name="global.$GT_TS.$Queued.{$ship}" exact="true"/>
+          <append_to_list name="global.$GT_TS.$Queue" exact="$ship"/>
+        </do_if>
+
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TS] Enqueue: ' + $ship.idcode + ' (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
+        </do_if>
+
+        <!-- Kick scheduler -->
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+      </actions>
+    </cue>
+
+    <!-- Single-threaded scheduler tick -->
+    <cue name="Tick" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_TS? or not global.$GT_TS.$Queue?">
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Prevent stampede -->
+        <do_if value="global.$GT_TS.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <set_value name="global.$GT_TS.$Processing" exact="true"/>
+
+        <!-- If no pending ships, stop -->
+        <do_if value="global.$GT_TS.$Queue.count le 0">
+          <set_value name="global.$GT_TS.$Processing" exact="false"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Hard budget: enforce min interval between starting searches -->
+        <set_value name="this.$DelayTime" exact="0ms"/>
+        <set_value name="$nextStart" exact="@global.$GT_TS.$NextStartTime"/>
+        <do_if value="$nextStart? and $nextStart != null and player.age lt $nextStart">
+          <set_value name="this.$DelayTime" exact="$nextStart - player.age"/>
+        </do_if>
+
+        <do_if value="this.$DelayTime gt 0ms and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TS] Budget: delaying next start by ' + (this.$DelayTime / 1ms) + 'ms (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
+        </do_if>
+      </actions>
+      <delay exact="this.$DelayTime"/>
+      <actions>
+        <!-- Hardcoded for now (TODO: expose later) -->
+        <set_value name="$startIntervalMs" exact="150"/>
+        <set_value name="global.$GT_TS.$NextStartTime" exact="player.age + ($startIntervalMs * 1ms)"/>
+
+        <!-- Dequeue one ship -->
+        <set_value name="$ship" exact="global.$GT_TS.$Queue.{1}"/>
+        <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
+        <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
+
+        <!-- Ship may have been destroyed -->
+        <do_if value="not $ship? or not $ship.exists">
+          <set_value name="global.$GT_TS.$Processing" exact="false"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Load latest request -->
+        <set_value name="$req" exact="@global.$GT_TS.$Requests.{$ship}"/>
+        <do_if value="$req == null">
+          <set_value name="global.$GT_TS.$Processing" exact="false"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Start the search engine (one ship per tick) -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TS] Start: ' + $ship.idcode + ' (queue_remaining=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$req"/>
+
+        <!-- Continue if more work exists -->
+        <set_value name="global.$GT_TS.$Processing" exact="false"/>
+        <do_if value="global.$GT_TS.$Queue.count gt 0">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+        </do_if>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>

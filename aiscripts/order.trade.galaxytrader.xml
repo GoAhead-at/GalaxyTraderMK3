@@ -2166,6 +2166,13 @@
           <set_value name="$_cmdMaxBuy" exact="if $_commanderOrderNow.$maxbuy? then $_commanderOrderNow.$maxbuy else $effectiveMaxBuy"/>
           <set_value name="$_cmdMaxSell" exact="if $_commanderOrderNow.$maxsell? then $_commanderOrderNow.$maxsell else $effectiveMaxSell"/>
           <set_value name="$_cmdSectorWhitelist" exact="if $_commanderOrderNow.$sectorwhitelist? then $_commanderOrderNow.$sectorwhitelist else $effectiveSectorWhitelist"/>
+          
+          <!-- IMPORTANT:
+               In X4 AI script expressions, `?` checks existence, NOT null, and boolean `and` is not safe to rely on for short-circuiting.
+               Normalize a null sectorwhitelist to an empty list so we can safely use `.count`. -->
+          <do_if value="not $_cmdSectorWhitelist? or $_cmdSectorWhitelist == null">
+            <set_value name="$_cmdSectorWhitelist" exact="[]"/>
+          </do_if>
 
           <set_value name="$_cmdHomeName" exact="if $_cmdHome? then @$_cmdHome.knownname else 'NULL'"/>
 
@@ -2186,7 +2193,7 @@
             + '|SW='"/>
 
           <!-- Include sector whitelist content -->
-          <do_if value="$_cmdSectorWhitelist? and $_cmdSectorWhitelist.count gt 0">
+          <do_if value="$_cmdSectorWhitelist.count gt 0">
             <do_all exact="$_cmdSectorWhitelist.count" counter="$_sw_i">
               <set_value name="$_sw" exact="$_cmdSectorWhitelist.{$_sw_i}"/>
               <set_value name="$_swName" exact="if $_sw? then @$_sw.knownname else 'NULL'"/>
@@ -4262,13 +4269,18 @@
       <!-- ========================================= -->
       <label name="no_trade_retry"/>
 
-      <!-- SPECIAL CASE: cache-search slots busy → short fixed retry, do NOT escalate cooldown -->
+      <!-- SPECIAL CASE: system busy / home refresh in progress (MD queues are saturated OR a home-sector cache refresh is running)
+           → fixed retry, do NOT escalate cooldown.
+           Smooth gameplay > throughput: wait longer here to reduce request churn and let the scheduler/queues drain.
+           TODO: keep hardcoded for now; consider exposing as tuning later. -->
       <set_value name="$noTradeReason" exact="if this.$lastNoTradeReason? then this.$lastNoTradeReason else ''"/>
-      <do_if value="$noTradeReason == 'busy' or $noTradeReason == 'busy_batch'">
+      <do_if value="$noTradeReason == 'busy' or $noTradeReason == 'busy_batch' or $noTradeReason == 'home_refresh'">
         <set_value name="this.$lastNoTradeReason" exact="''"/>
+        <!-- TODO: keep hardcoded for now. Balance between throughput and request churn. -->
+        <!-- Fixed retry for all busy-style reasons (do NOT use escalating cooldown). -->
         <set_value name="$waitTime" exact="10s"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy - waiting 10s then retrying (reason: ' + $noTradeReason + ')'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh - waiting ' + ($waitTime/1s) + 's then retrying (reason: ' + $noTradeReason + ')'" chance="100"/>
         </do_if>
         <set_command command="command.wait"/>
         <set_command_action commandaction="commandaction.standingby"/>
@@ -4296,7 +4308,9 @@
       <!-- Calculate escalating wait time: 10s, 20s, 30s, 40s, 50s, 60s (max) -->
       <!-- Use cargo disposal counter if this is cargo disposal, otherwise use normal counter -->
       <set_value name="$failureCount" exact="if $isCargoDisposal then this.$cargoDisposalFailed else this.$searchFailed"/>
-      <set_value name="$waitTime" exact="[$failureCount * 10s, 60s].min"/>
+      <!-- TESTING: disable escalating cooldown to reduce stalling during pipeline validation -->
+      <!-- TODO: revert to escalating backoff after testing -->
+      <set_value name="$waitTime" exact="10s"/>
       
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No ' + (if $isCargoDisposal then 'cargo buyer' else 'profitable trades') + ' found (attempt ' + $failureCount + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>

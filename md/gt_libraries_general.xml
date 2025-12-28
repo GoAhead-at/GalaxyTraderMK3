@@ -406,34 +406,34 @@
       <params>
         <param name="skillLevel" comment="Pilot skill level (1-15+)"/>
         <param name="shipCargoCapacity" comment="Ship's max cargo capacity (for scaling threshold)"/>
-        <param name="configBaseProfit" default="10000" comment="Base profit from config (deprecated - kept for compatibility but not used)"/>
+        <param name="configBaseProfit" default="10000" comment="Base profit at Level 15 for reference cargo (RAW centicredits). Example: 100Cr = 10000."/>
       </params>
       <actions>
         <!-- Returns profit threshold in raw format (centicredits) based on pilot level:
-             Non-linear (quadratic) progression from Level 1 (0 Cr) to Level 15 (10000 Cr)
-             Formula: 1000000 * ((skillLevel - 1) / 14)^2
+             Non-linear (quadratic) progression from Level 1 (0 Cr) to Level 15 (configBaseProfit).
+             Formula: configBaseProfit * ((skillLevel - 1) / 14)^2
              This creates a quadratic curve that starts at 0 Cr and accelerates to 10000 Cr:
              Level 1: 0 Cr (0 raw)
-             Level 2: ~51 Cr (5,102 raw)
-             Level 3: ~204 Cr (20,408 raw)
-             Level 4: ~459 Cr (45,918 raw)
-             Level 5: ~816 Cr (81,633 raw)
-             Level 10: ~3,673 Cr (367,347 raw)
-             Level 15: 10,000 Cr (1,000,000 raw)
+             Level 15: configBaseProfit (raw)
              
              NEW: Threshold is scaled by ship cargo capacity
-             - Reference cargo: 8200 (Merkur - baseline for Level 15 = 10,000 Cr)
+             - Reference cargo: 8200 (Merkur - baseline for Level 15 = configBaseProfit)
              - Small ships (2200 cargo) get proportionally lower thresholds
              - Minimum floor: 25% of base threshold (prevents thresholds from being too low)
         -->
-        <!-- Level 1-15+: Non-linear (quadratic) progression from 0 Cr to 10000 Cr -->
-        <!-- Avoid integer division by rearranging formula -->
-        <!-- Original: 1000000 * ((skillLevel - 1) / 14)^2 -->
-        <!-- Rearranged: ((skillLevel - 1)^2 * 1000000) / 196 -->
+        <!-- Level 1-15+: Non-linear (quadratic) progression from 0 Cr to configBaseProfit -->
+        <!-- Avoid integer division by rearranging formula:
+             Original: configBaseProfit * ((skillLevel - 1) / 14)^2
+             Rearranged: ((skillLevel - 1)^2 * configBaseProfit) / 196
+        -->
         <!-- This avoids floating-point division issues in MD by doing integer math -->
         <!-- This creates an accelerating curve - lower levels have lower thresholds, -->
         <!-- higher levels require much more profit (more selective traders) -->
-        <set_value name="$numerator" exact="($skillLevel - 1) * ($skillLevel - 1) * 1000000"/>
+        <set_value name="$baseMax" exact="$configBaseProfit"/>
+        <do_if value="not $baseMax? or $baseMax == null or $baseMax lt 0">
+          <set_value name="$baseMax" exact="10000"/>
+        </do_if>
+        <set_value name="$numerator" exact="($skillLevel - 1) * ($skillLevel - 1) * $baseMax"/>
         <set_value name="$baseThreshold" exact="$numerator / 196"/>
         
         <!-- Scale threshold by ship cargo capacity -->
@@ -510,12 +510,25 @@
       </params>
       <actions>
         <set_value name="$offersByWare" exact="table[]"/>
+        
+        <!-- Defensive: list may be null/invalid -->
+        <do_if value="not $offersList? or $offersList == null">
+          <return value="$offersByWare"/>
+        </do_if>
+        
         <do_all exact="$offersList.count" counter="$i">
           <set_value name="$offer" exact="$offersList.{$i}"/>
-          <do_if value="not $offersByWare.{$offer.ware}?">
-            <set_value name="$offersByWare.{$offer.ware}" exact="[]"/>
+          
+          <!-- Null-safety: offer handles can be invalid; ware can be null -->
+          <set_value name="$ware" exact="@$offer.ware"/>
+          <do_if value="not $ware? or $ware == null">
+            <continue/>
           </do_if>
-          <append_to_list name="$offersByWare.{$offer.ware}" exact="$offer"/>
+          
+          <do_if value="not $offersByWare.{$ware}? or $offersByWare.{$ware} == null">
+            <set_value name="$offersByWare.{$ware}" exact="[]"/>
+          </do_if>
+          <append_to_list name="$offersByWare.{$ware}" exact="$offer"/>
         </do_all>
         <return value="$offersByWare"/>
       </actions>
@@ -531,9 +544,25 @@
       <actions>
         <set_value name="$filteredOffers" exact="[]"/>
         <set_value name="$filteredCount" exact="0"/>
+        
+        <!-- Defensive: list may be null/invalid -->
+        <do_if value="not $offersList? or $offersList == null">
+          <set_value name="$result" exact="table[]"/>
+          <set_value name="$result.$FilteredOffers" exact="$filteredOffers"/>
+          <set_value name="$result.$FilteredCount" exact="$filteredCount"/>
+          <return value="$result"/>
+        </do_if>
+        
         <do_all exact="$offersList.count" counter="$i">
           <set_value name="$offer" exact="$offersList.{$i}"/>
-          <set_value name="$targetSector" exact="$offer.owner.sector"/>
+          
+          <!-- Null-safety: offer.owner can be invalid -->
+          <set_value name="$owner" exact="@$offer.owner"/>
+          <set_value name="$targetSector" exact="@$owner.sector"/>
+          <do_if value="not $targetSector? or $targetSector == null">
+            <set_value name="$filteredCount" exact="$filteredCount + 1"/>
+            <continue/>
+          </do_if>
           
           <!-- Calculate range-only distance (using library function) -->
           <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculateRangeOnlyDistance" result="$distance">
@@ -1380,8 +1409,21 @@
         <!-- Returns total count of all trades across all home sector caches -->
         <set_value name="$totalCount" exact="0"/>
         <do_if value="global.$GT_TradeCache?">
-          <do_all exact="global.$GT_TradeCache.keys.count" counter="$sectorIdx">
-            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{global.$GT_TradeCache.keys.{$sectorIdx}}"/>
+          <!-- Prefer explicit home registry (more reliable than .keys in some saves) -->
+          <set_value name="$homes" exact="[]"/>
+          <do_if value="global.$GT_TradeCacheHomes?">
+            <set_value name="$homes" exact="@global.$GT_TradeCacheHomes"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homes" exact="@global.$GT_TradeCache.keys"/>
+            <do_if value="$homes == null">
+              <set_value name="$homes" exact="[]"/>
+            </do_if>
+          </do_else>
+          
+          <do_all exact="$homes.count" counter="$sectorIdx">
+            <set_value name="$home" exact="$homes.{$sectorIdx}"/>
+            <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
             <do_if value="$sectorCache != null">
               <set_value name="$totalCount" exact="$totalCount + $sectorCache.count"/>
             </do_if>
@@ -1400,10 +1442,226 @@
         <!-- Returns the cache list for a specific home sector, or null if not found -->
         <!-- PERFORMANCE OPTIMIZATION v5: Per-home-sector cache -->
         <set_value name="$cache" exact="null"/>
-        <do_if value="@$homeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
-          <set_value name="$cache" exact="global.$GT_TradeCache.{$homeSector}"/>
+        <!-- IMPORTANT: don't use @ with .exists in boolean expressions -->
+        <set_value name="$homeSectorObj" exact="$homeSector"/>
+        <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}?">
+          <set_value name="$cache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
         </do_if>
         <return value="$cache"/>
+      </actions>
+    </library>
+
+    <!-- Pick Best Cached Trade (lightweight, hard-budget friendly) -->
+    <!-- Design:
+         - Cache list is already sorted by Profit desc (insertion sort at write time).
+         - Validate only the top N entries (default 5) and return the first valid one.
+         - This is intentionally much cheaper than SearchCachedTrades' deep diagnostics/statistics.
+         - Blacklist/route failures are still handled by AI feedback (ForceLiveSearch) + failed sector pairs. -->
+    <library name="GT_TS_CachePickBest" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship requesting a trade"/>
+        <param name="homeSector" comment="Home sector anchor for range validation"/>
+        <param name="maxDistance" comment="Max allowed distance from home sector (jumps)"/>
+        <param name="minROI" default="0" comment="Minimum ROI percent"/>
+        <param name="minAbsoluteProfit" default="0Cr" comment="Minimum absolute profit"/>
+        <param name="ignoreBuildStorage" default="false" comment="Skip build storage targets"/>
+        <param name="ignoreCarrierAux" default="false" comment="Skip carrier/aux targets"/>
+        <param name="maxEntries" default="5" comment="How many top cache entries to validate"/>
+        <param name="cacheMaxAge" default="600s" comment="TTL for cache entries"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[
+          $Found = false,
+          $Trade = null,
+          $BestScore = 0,
+          $Trades = []
+        ]"/>
+
+        <!-- Return up to a few valid candidates (kept small for performance).
+             This prevents fleet-coordination claim-check from stalling when the best trade is already reserved. -->
+        <set_value name="$validTrades" exact="[]"/>
+        <set_value name="$maxReturnTrades" exact="3" comment="TODO(perf): tune / make configurable"/>
+
+        <!-- IMPORTANT: don't use @ with .exists in boolean expressions; split into safe object + exists check -->
+        <set_value name="$homeSectorObj" exact="$homeSector"/>
+        <do_if value="not $ship? or not $ship.exists or not $homeSectorObj? or not $homeSectorObj.exists">
+          <return value="$result"/>
+        </do_if>
+
+        <do_if value="not global.$GT_TradeCache? or not global.$GT_TradeCache.{$homeSector}?">
+          <return value="$result"/>
+        </do_if>
+
+        <set_value name="$cache" exact="global.$GT_TradeCache.{$homeSector}"/>
+        <do_if value="$cache == null or $cache.count le 0">
+          <return value="$result"/>
+        </do_if>
+
+        <set_value name="$limit" exact="[$cache.count, $maxEntries].min"/>
+        <set_value name="$shipDockSize" exact="$ship.docksize"/>
+
+        <!-- Respect illegal-wares setting: if not allowed, skip illegal cache entries entirely (no execution-time rejection). -->
+        <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
+        <do_if value="$allowIllegal == null">
+          <set_value name="$allowIllegal" exact="false"/>
+        </do_if>
+
+        <!-- Prefer entries with the lowest FailCount; skip entries already failed by this ship. -->
+        <set_value name="$minFailCount" exact="999999"/>
+
+        <!-- Determine blacklist group once (used for reachability check) -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+
+        <do_all exact="$limit" counter="$i">
+          <set_value name="$entry" exact="$cache.{$i}"/>
+
+          <!-- Structure + TTL -->
+          <do_if value="$entry == null or not $entry.$BuyOffer? or not $entry.$SellOffer? or not $entry.$Timestamp?">
+            <continue/>
+          </do_if>
+          <do_if value="player.age - $entry.$Timestamp gt $cacheMaxAge">
+            <continue/>
+          </do_if>
+
+          <!-- Offers + stations still valid -->
+          <do_if value="not $entry.$BuyOffer.exists or not $entry.$SellOffer.exists">
+            <continue/>
+          </do_if>
+          <do_if value="not $entry.$BuyOffer.available or not $entry.$SellOffer.available">
+            <continue/>
+          </do_if>
+          <do_if value="not @$entry.$BuyOffer.owner.isoperational or not @$entry.$SellOffer.owner.isoperational">
+            <continue/>
+          </do_if>
+
+          <!-- Illegal-ware filter (ship setting). -->
+          <do_if value="not $allowIllegal">
+            <set_value name="$ware" exact="@$entry.$BuyOffer.ware"/>
+            <do_if value="$ware != null and @$ware.illegal">
+              <continue/>
+            </do_if>
+          </do_if>
+
+          <!-- Failure-distribution filter: skip if this ship already failed this entry. -->
+          <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+          <do_if value="$failedShips == null">
+            <set_value name="$failedShips" exact="[]"/>
+          </do_if>
+          <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
+          <do_all exact="$failedShips.count" counter="$f">
+            <do_if value="$failedShips.{$f} == $ship">
+              <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="$shipAlreadyFailedThisEntry">
+            <continue/>
+          </do_if>
+
+          <set_value name="$failCount" exact="@$entry.$FailCount"/>
+          <do_if value="$failCount == null">
+            <set_value name="$failCount" exact="0"/>
+          </do_if>
+
+          <!-- Range validation (prefer precomputed distances) -->
+          <set_value name="$homeToBuy" exact="@$entry.$HomeToBuyDistance"/>
+          <set_value name="$homeToSell" exact="@$entry.$HomeToSellDistance"/>
+          <do_if value="not $homeToBuy? or not $homeToSell?">
+            <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$entry.$BuyOffer.owner.sector}"/>
+            <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$entry.$SellOffer.owner.sector}"/>
+          </do_if>
+          <set_value name="$maxHomeDist" exact="[$homeToBuy, $homeToSell].max"/>
+          <do_if value="$homeToBuy lt 0 or $homeToSell lt 0 or $maxHomeDist gt $maxDistance">
+            <continue/>
+          </do_if>
+
+          <!-- Target-type filters -->
+          <do_if value="$ignoreBuildStorage or $ignoreCarrierAux">
+            <set_value name="$buyType" exact="@$entry.$BuyTargetType"/>
+            <set_value name="$sellType" exact="@$entry.$SellTargetType"/>
+            <do_if value="$ignoreBuildStorage and ($buyType == 'Buildstorage' or $sellType == 'Buildstorage')">
+              <continue/>
+            </do_if>
+            <do_elseif value="$ignoreCarrierAux and (($buyType == 'Aux' or $buyType == 'Carrier') or ($sellType == 'Aux' or $sellType == 'Carrier'))">
+              <continue/>
+            </do_elseif>
+          </do_if>
+
+          <!-- Dock size compatibility (use cached caps if present) -->
+          <set_value name="$buyCaps" exact="@$entry.$BuyDockCaps"/>
+          <set_value name="$sellCaps" exact="@$entry.$SellDockCaps"/>
+          <do_if value="$buyCaps == null or $sellCaps == null">
+            <continue/>
+          </do_if>
+          <do_if value="$shipDockSize == tag.dock_s and (not $buyCaps.$S or not $sellCaps.$S)">
+            <continue/>
+          </do_if>
+          <do_elseif value="$shipDockSize == tag.dock_m and (not $buyCaps.$M or not $sellCaps.$M)">
+            <continue/>
+          </do_elseif>
+          <do_elseif value="$shipDockSize == tag.dock_l and (not $buyCaps.$L or not $sellCaps.$L)">
+            <continue/>
+          </do_elseif>
+          <do_elseif value="$shipDockSize == tag.dock_xl and (not $buyCaps.$XL or not $sellCaps.$XL)">
+            <continue/>
+          </do_elseif>
+
+          <!-- Profit thresholds -->
+          <set_value name="$profit" exact="@$entry.$Profit"/>
+          <set_value name="$roi" exact="@$entry.$ROI"/>
+          <do_if value="$profit == null">
+            <set_value name="$profit" exact="0Cr"/>
+          </do_if>
+          <do_if value="$roi == null">
+            <set_value name="$roi" exact="0"/>
+          </do_if>
+          <do_if value="$profit lt $minAbsoluteProfit or $roi lt $minROI">
+            <continue/>
+          </do_if>
+
+          <!-- Reachability (cheap sanity): ship to buy-sector must have a path (blacklist-aware) -->
+          <set_value name="$buySector" exact="$entry.$BuyOffer.owner.sector"/>
+          <set_value name="$shipToBuy" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+          <do_if value="$shipToBuy lt 0">
+            <continue/>
+          </do_if>
+
+          <!-- Build canonical trade object for execution -->
+          <set_value name="$trade" exact="table[
+            $BuyOffer = $entry.$BuyOffer,
+            $SellOffer = $entry.$SellOffer,
+            $Amount = $entry.$Amount,
+            $BuyPrice = $entry.$BuyPrice,
+            $SellPrice = $entry.$SellPrice,
+            $Profit = $entry.$Profit,
+            $ROI = $entry.$ROI,
+            $Distance = $entry.$Distance,
+            $Score = $entry.$Profit
+          ]"/>
+
+          <!-- Collect candidate(s) with the LOWEST failcount only (tie-breaker keeps profit order from cache). -->
+          <do_if value="$failCount lt $minFailCount">
+            <set_value name="$minFailCount" exact="$failCount"/>
+            <set_value name="$validTrades" exact="[]"/>
+            <append_to_list name="$validTrades" exact="$trade"/>
+            <set_value name="$result.$Found" exact="true"/>
+            <set_value name="$result.$Trade" exact="$trade"/>
+            <set_value name="$result.$BestScore" exact="$trade.$Score"/>
+          </do_if>
+          <do_elseif value="$failCount == $minFailCount and $validTrades.count lt $maxReturnTrades">
+            <append_to_list name="$validTrades" exact="$trade"/>
+          </do_elseif>
+
+          <!-- Stop early once we have enough candidates at the optimal failcount (0 is best possible). -->
+          <do_if value="$minFailCount == 0 and $validTrades.count ge $maxReturnTrades">
+            <break/>
+          </do_if>
+        </do_all>
+
+        <set_value name="$result.$Trades" exact="$validTrades"/>
+        <return value="$result"/>
       </actions>
     </library>
     

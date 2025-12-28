@@ -512,6 +512,96 @@
             <set_value name="$wareCount" exact="$wareCountTemp"/>
           </do_if>
         </do_if>
+
+        <!-- HARD WALL-TIME CAP (smooth gameplay > perfect search completeness)
+             Problem seen in log.log: one ware can cause very long chunk-continuations (e.g. Refined Metals),
+             keeping the ship "searching" until external stale-lock cleanup triggers.
+             Fix: after a short wall-time budget, force-complete with whatever trades we already found so far. -->
+        <set_value name="$batchHardCap" exact="3s"/> <!-- TODO: make configurable later -->
+        <set_value name="$batchStartTime" exact="@$state.$batchStartTime"/>
+        <do_if value="(not $batchStartTime?) or ($batchStartTime == null)">
+          <set_value name="$batchStartTime" exact="player.age"/>
+          <set_value name="$state.$batchStartTime" exact="$batchStartTime"/>
+          <set_value name="global.$GT_BatchDataList.{$ship}.$batchStartTime" exact="$batchStartTime"/>
+        </do_if>
+        <set_value name="$batchElapsed" exact="player.age - $batchStartTime"/>
+        <do_if value="$batchElapsed gt $batchHardCap">
+          <!-- De-dupe forced completion per ship.
+               Without this, overlapping continuation instances can all hit the hard cap and spam multiple
+               SearchLiveTrades_Resume signals, which races SearchTradeRoutes and can release the search lock
+               before results are consumed (=> hasLock=0, ship appears "stuck searching"). -->
+          <do_if value="not global.$GT_BatchForceComplete?">
+            <set_value name="global.$GT_BatchForceComplete" exact="table[]"/>
+          </do_if>
+          <do_if value="global.$GT_BatchForceComplete.{$ship}?">
+            <!-- Already force-completed for this ship - don't do it again -->
+            <set_value name="$skipBatchProcessing" exact="true"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <set_value name="global.$GT_BatchForceComplete.{$ship}" exact="true"/>
+
+          <!-- Ensure tradeList exists -->
+          <do_if value="not $tradeList?">
+            <set_value name="$tradeList" exact="[]"/>
+          </do_if>
+
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') HARD CAP reached (' + ($batchElapsed / 1s) + 's > ' + ($batchHardCap / 1s) + 's) - forcing completion with ' + $tradeList.count + ' trades'" chance="100"/>
+          </do_if>
+
+          <!-- Release active processor slot and remove from active list -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+          </do_if>
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips?">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+          </do_if>
+
+          <!-- Clear per-ship continuation marker so future batches can schedule cleanly -->
+          <do_if value="global.$GT_BatchContinuationScheduled? and global.$GT_BatchContinuationScheduled.{$ship}?">
+            <remove_value name="global.$GT_BatchContinuationScheduled.{$ship}"/>
+          </do_if>
+          <!-- Also clear scheduler marker (in case it was set but not yet cleared) -->
+          <do_if value="global.$GT_BatchContinuationScheduled? and global.$GT_BatchContinuationScheduled.{$ship}?">
+            <remove_value name="global.$GT_BatchContinuationScheduled.{$ship}"/>
+          </do_if>
+          <!-- Remove any remaining queued entries for this ship (defensive; avoids immediate re-processing) -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- Pack results and wake SearchLiveTrades_Resume -->
+          <set_value name="$results" exact="table[
+            $ship = $ship,
+            $tradeList = $tradeList,
+            $crossStationBestTrade = $crossStationBestTrade,
+            $crossStationBestScore = $crossStationBestScore,
+            $nonConflictedBestTrade = $nonConflictedBestTrade,
+            $nonConflictedBestScore = $nonConflictedBestScore,
+            $tradesRejectedProfit = $tradesRejectedProfit,
+            $tradesRejectedDocking = $tradesRejectedDocking,
+            $tradesRejectedAmount = $tradesRejectedAmount,
+            $tradesRejectedDistance = $tradesRejectedDistance,
+            $bestRejectedProfit = $bestRejectedProfit,
+            $bestRejectedTrade = $bestRejectedTrade
+          ]"/>
+          <set_value name="global.$GT_BatchResultsList.{$ship}" exact="$results"/>
+          <signal_cue_instantly cue="md.GT_Trading_Search.SearchLiveTrades_Resume" param="$ship"/>
+
+          <!-- IMPORTANT: Clear batch state so no further continuation instances keep working on stale data -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+
+          <!-- Continue processing other queued batch requests -->
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+
+          <!-- Prevent further processing in this instance -->
+          <set_value name="$skipBatchProcessing" exact="true"/>
+          <cancel_cue cue="this"/>
+        </do_if>
         
         <!-- DEADLOCK FIX:
              If wareKeysList is EMPTY, the normal processing branch never runs, and the batch processor never reaches
@@ -588,6 +678,19 @@
             
             <!-- Get ware from list -->
             <set_value name="$ware" exact="$wareKeysList.{$wareIdx}"/>
+            <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+
+            <!-- DEBUG WATCHLIST: Help compare live-search wares vs cache contents -->
+            <!-- NOTE: We use ware name strings because ware IDs/macros vary by DLC/mods. -->
+            <set_value name="$watchWare" exact="false"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="$wareName == 'Quantum Tubes' or $wareName == 'Spaceweed' or $wareName == 'Spacefuel' or $wareName == 'Stimulants'">
+                <set_value name="$watchWare" exact="true"/>
+              </do_if>
+            </do_if>
+            <set_value name="$watchPairsChecked" exact="0"/>
+            <set_value name="$watchPairsCached" exact="0"/>
+            <set_value name="$watchFailLogged" exact="0"/>
             
             <!-- PERFORMANCE: Reset chunk positions when moving to a new ware -->
             <do_if value="$wareIdx != $currentWareChunkStart">
@@ -618,7 +721,7 @@
             
             <!-- PERF: This line can execute on every chunk continuation. Only log once per ware (first chunk) and at low chance. -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $wareIdx lt 2 and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
-              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Processing ware #' + $wareIdx + ': ' + (if $ware? then @$ware.name else 'NULL') + ' (quota: ' + $tradesForThisWare + '/' + $maxTradesPerWare + ')'" chance="10"/>
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Processing ware #' + $wareIdx + ': ' + $wareName + ' (quota: ' + $tradesForThisWare + '/' + $maxTradesPerWare + ')'" chance="10"/>
             </do_if>
             
             <!-- Find sell offers for this ware in list -->
@@ -652,7 +755,12 @@
             </do_if>
             
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $wareIdx lt 2 and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
-              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + (if $ware? then @$ware.name else 'NULL')" chance="10"/>
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + $wareName" chance="10"/>
+            </do_if>
+
+            <!-- WATCH: Log whether batch processor is actually seeing the same offers per ware that live search reported -->
+            <do_if value="$watchWare and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
+              <debug_text text="'[GT-Batch-Watch] (' + $ship.idcode + ') Ware=' + $wareName + ' offersForMatching: sell=' + $sellOffersForWare.count + ' buy=' + $buyOffersForWare.count + ' maxOffersPerWareForMatching=' + $maxOffersPerWareForMatching + ' cacheThreshold=' + (global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold? and global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold or 20) + '%'" chance="100"/>
             </do_if>
             
             <!-- Process this ware if both sell and buy offers exist -->
@@ -836,6 +944,11 @@
                   </run_actions>
                   <do_if value="not $isValidPair">
                     <continue/>
+                  </do_if>
+
+                  <!-- WATCH: Count how many valid offer pairs we actually consider for this ware -->
+                  <do_if value="$watchWare">
+                    <set_value name="$watchPairsChecked" exact="$watchPairsChecked + 1"/>
                   </do_if>
                   
                   <!-- Extract offer properties after validation -->
@@ -1187,30 +1300,6 @@
                     <do_if value="not $sellOfferWare? or not $sellOfferAmount? or not $buyOfferAmount?">
                       <continue/>
                     </do_if>
-                    <run_actions ref="md.GT_Libraries_General.GT_CalculateMaxTradeableAmount" result="$maxAmount">
-                      <param name="ship" value="$ship"/>
-                      <param name="ware" value="$sellOfferWare"/>
-                      <param name="buyOfferAmount" value="$buyOfferAmount"/>
-                      <param name="sellOfferAmount" value="$sellOfferAmount"/>
-                      <param name="availableMoney" value="$availableMoney"/>
-                      <param name="buyPrice" value="$buyPrice"/>
-                    </run_actions>
-                    
-                    <do_if value="$maxAmount le 0">
-                      <set_value name="$tradesRejectedAmount" operation="add"/>
-                      <continue/>
-                    </do_if>
-                    
-                    <!-- OPTIMIZATION: Use library functions to calculate profit and ROI -->
-                    <run_actions ref="md.GT_Libraries_General.GT_CalculateProfit" result="$profit">
-                      <param name="buyPrice" value="$buyPrice"/>
-                      <param name="sellPrice" value="$sellPrice"/>
-                      <param name="amount" value="$maxAmount"/>
-                    </run_actions>
-                    <run_actions ref="md.GT_Libraries_General.GT_CalculateROI" result="$roi">
-                      <param name="investment" value="$buyPrice * $maxAmount"/>
-                      <param name="profit" value="$profit"/>
-                    </run_actions>
                     
                     <!-- ═══════════════════════════════════════════════════════════════════════════ -->
                     <!-- CACHE FIRST: Cache ALL profitable trades BEFORE any filtering -->
@@ -1225,20 +1314,6 @@
                       <set_value name="$cacheThreshold" exact="20"/>
                       <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold?">
                         <set_value name="$cacheThreshold" exact="global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold"/>
-                      </do_if>
-                      
-                      <!-- DIAGNOSTIC: Log why trades aren't being cached (only if cache is empty) -->
-                      <!-- PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
-                      <!-- Use library function for cache count calculation -->
-                      <run_actions ref="md.GT_Libraries_General.GT_CalculateTotalCacheCount" result="$currentCacheCount"/>
-                      <do_if value="$currentCacheCount == 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                        <!-- Cache is empty - log why trades aren't meeting cache requirements -->
-                        <do_if value="$profit le 0">
-                          <debug_text text="'[GT-Cache-DIAG] Trade NOT cached: Profit le 0 (Profit=' + ($profit/100) + ' Cr, ROI=' + ($roi/1) + '%)'" chance="10"/>
-                        </do_if>
-                        <do_elseif value="$roi lt $cacheThreshold">
-                          <debug_text text="'[GT-Cache-DIAG] Trade NOT cached: ROI below threshold (ROI=' + ($roi/1) + '% lt Threshold=' + ($cacheThreshold/1) + '%, Profit=' + ($profit/100) + ' Cr)'" chance="10"/>
-                        </do_elseif>
                       </do_if>
                       
                       <!-- Only cache trades that meet global cache profit threshold -->
@@ -1256,11 +1331,40 @@
                         <param name="buyPrice" value="$buyPrice"/>
                         <param name="sellPrice" value="$sellPrice"/>
                       </run_actions>
+
+                      <!-- WATCH: If a watched ware isn't ending up in cache, log the first few skip reasons -->
+                      <do_if value="$watchWare and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $watchFailLogged lt 3 and not ($cacheOfferMaxAmount gt 0 and $cacheProfitPerUnit gt 0 and $cacheROI ge $cacheThreshold)">
+                        <set_value name="$reason" exact="'UNKNOWN'"/>
+                        <do_if value="$cacheOfferMaxAmount le 0">
+                          <set_value name="$reason" exact="'offerMaxAmount le 0'"/>
+                        </do_if>
+                        <do_elseif value="$cacheProfitPerUnit le 0">
+                          <set_value name="$reason" exact="'profitPerUnit le 0'"/>
+                        </do_elseif>
+                        <do_elseif value="$cacheROI lt $cacheThreshold">
+                          <set_value name="$reason" exact="'roi lt threshold'"/>
+                        </do_elseif>
+                        <debug_text text="'[GT-Cache-Watch] (' + $ship.idcode + ') NOT cached: ware=' + $wareName + ' reason=' + $reason + ' | offerMaxAmount=' + $cacheOfferMaxAmount + ' ppu=' + ($cacheProfitPerUnit/100) + 'Cr roi=' + ($cacheROI/1) + '% threshold=' + ($cacheThreshold/1) + '%'" chance="100"/>
+                        <set_value name="$watchFailLogged" exact="$watchFailLogged + 1"/>
+                      </do_if>
+
+                      <!-- DIAGNOSTIC: Log why trades aren't being cached (only if cache is empty) -->
+                      <!-- IMPORTANT: Diagnostics must use SHIP-AGNOSTIC values (cacheProfit/cacheROI), not per-ship maxAmount. -->
+                      <run_actions ref="md.GT_Libraries_General.GT_CalculateTotalCacheCount" result="$currentCacheCount"/>
+                      <do_if value="$currentCacheCount == 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <do_if value="$cacheProfitPerUnit le 0">
+                          <debug_text text="'[GT-Cache-DIAG] Trade NOT cached: ProfitPerUnit le 0 (PPU=' + ($cacheProfitPerUnit/100) + ' Cr, ROI=' + ($cacheROI/1) + '%)'" chance="10"/>
+                        </do_if>
+                        <do_elseif value="$cacheROI lt $cacheThreshold">
+                          <debug_text text="'[GT-Cache-DIAG] Trade NOT cached: ROI below threshold (ROI=' + ($cacheROI/1) + '% lt Threshold=' + ($cacheThreshold/1) + '%, Profit=' + ($cacheProfit/100) + ' Cr)'" chance="10"/>
+                        </do_elseif>
+                      </do_if>
+
                       <do_if value="$cacheOfferMaxAmount gt 0 and $cacheProfitPerUnit gt 0 and $cacheROI ge $cacheThreshold">
                         <!-- Validate required data exists before caching -->
                         <!-- Debug: Log why trades aren't cached -->
                         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and not ($sellOfferWare? and $sellOfferOwner? and $buyOfferOwner?)">
-                          <debug_text text="'[GT-Cache-DEBUG] ⚠ Trade NOT cached (validation failed): ROI=' + ($roi/1) + '%, Profit=' + ($profit/100) + ' Cr, sellOfferWare=' + ($sellOfferWare? and 'OK' or 'NULL') + ', sellOfferOwner=' + ($sellOfferOwner? and 'OK' or 'NULL') + ', buyOfferOwner=' + ($buyOfferOwner? and 'OK' or 'NULL')" chance="20"/>
+                          <debug_text text="'[GT-Cache-DEBUG] ⚠ Trade NOT cached (validation failed): ROI=' + ($cacheROI/1) + '%, Profit=' + ($cacheProfit/100) + ' Cr, sellOfferWare=' + ($sellOfferWare? and 'OK' or 'NULL') + ', sellOfferOwner=' + ($sellOfferOwner? and 'OK' or 'NULL') + ', buyOfferOwner=' + ($buyOfferOwner? and 'OK' or 'NULL')" chance="20"/>
                         </do_if>
                         <do_if value="$sellOfferWare? and $sellOfferOwner? and $buyOfferOwner?">
                           <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradeCache exists -->
@@ -1302,8 +1406,27 @@
                             <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}?">
                               <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}" exact="[]"/>
                             </do_if>
+
+                            <!-- Track known home sectors for diagnostics (avoids relying on GT_TradeCache.keys, which can be unreliable in some saves) -->
+                            <do_if value="not global.$GT_TradeCacheHomes?">
+                              <set_value name="global.$GT_TradeCacheHomes" exact="[]"/>
+                            </do_if>
+                            <set_value name="$homeAlreadyTracked" exact="false"/>
+                            <do_all exact="global.$GT_TradeCacheHomes.count" counter="$h">
+                              <do_if value="global.$GT_TradeCacheHomes.{$h} == $homeSector">
+                                <set_value name="$homeAlreadyTracked" exact="true"/>
+                                <break/>
+                              </do_if>
+                            </do_all>
+                            <do_if value="not $homeAlreadyTracked">
+                              <append_to_list name="global.$GT_TradeCacheHomes" exact="$homeSector"/>
+                            </do_if>
                             
-                            <!-- CACHE DIVERSITY: Per-ware limit of 50 entries (per home sector) -->
+                            <!-- CACHE DIVERSITY: Per-ware limit (per home sector). Uses global setting MaxCachedRoutes. -->
+                            <set_value name="$maxCachedRoutesPerWare" exact="50"/>
+                            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MaxCachedRoutes?">
+                              <set_value name="$maxCachedRoutesPerWare" exact="global.$GT_GlobalSettings.$Fleet.$MaxCachedRoutes"/>
+                            </do_if>
                             <!-- Count existing entries for this ware in THIS home sector's cache -->
                             <set_value name="$wareEntryCount" exact="0"/>
                             <set_value name="$oldestWareEntryIdx" exact="-1"/>
@@ -1321,8 +1444,8 @@
                               </do_if>
                             </do_all>
                             
-                            <!-- If this ware already has 50 entries in this home sector, replace the oldest one -->
-                            <do_if value="$wareEntryCount ge 50">
+                            <!-- If this ware already has max entries in this home sector, replace the oldest one -->
+                            <do_if value="$wareEntryCount ge $maxCachedRoutesPerWare">
                               <do_if value="$oldestWareEntryIdx ge 0">
                                 <!-- Keep per-ware index in sync: capture removed entry then remove from both structures -->
                                 <set_value name="$removedEntry" exact="global.$GT_TradeCache.{$homeSector}.{$oldestWareEntryIdx}"/>
@@ -1497,7 +1620,9 @@
                               $Timestamp = player.age,
                               $HomeSector = $homeSector,
                               $HomeToBuyDistance = $homeToBuyDistance,
-                              $HomeToSellDistance = $homeToSellDistance
+                              $HomeToSellDistance = $homeToSellDistance,
+                              $FailCount = 0,
+                              $FailedShips = []
                             ]"/>
                             
                             <!-- Find insertion position: insert where profit > existing profit (maintain descending order) -->
@@ -1569,10 +1694,42 @@
                             <do_if value="$shouldLog">
                               <debug_text text="'[GT-Cache] Trade cached: ' + $sellOfferWare.name + ', ROI=' + ($cacheROI/1) + '%, Profit=' + ($cacheProfit/100) + ' Cr, Distance=' + $routeDistance + ' jumps (cache now: ' + $cacheCount + ' entries)'" chance="100"/>
                             </do_if>
+
+                            <!-- WATCH: Always log cache insertions for watched wares (avoids sampling/shouldLog missing them) -->
+                            <do_if value="$watchWare and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                              <set_value name="$watchPairsCached" exact="$watchPairsCached + 1"/>
+                              <debug_text text="'[GT-Cache-Watch] (' + $ship.idcode + ') CACHED: ware=' + $wareName + ' roi=' + ($cacheROI/1) + '% profit=' + ($cacheProfit/100) + 'Cr distance=' + $routeDistance + ' offers: sell=' + $cacheSellOfferAmount + ' buy=' + $cacheBuyOfferAmount" chance="100"/>
+                            </do_if>
                           </do_if>
                         </do_if>
                       </do_if>
                     </do_if>
+
+                    <!-- AFTER caching: evaluate this trade for THIS ship (money/capacity dependent) -->
+                    <run_actions ref="md.GT_Libraries_General.GT_CalculateMaxTradeableAmount" result="$maxAmount">
+                      <param name="ship" value="$ship"/>
+                      <param name="ware" value="$sellOfferWare"/>
+                      <param name="buyOfferAmount" value="$buyOfferAmount"/>
+                      <param name="sellOfferAmount" value="$sellOfferAmount"/>
+                      <param name="availableMoney" value="$availableMoney"/>
+                      <param name="buyPrice" value="$buyPrice"/>
+                    </run_actions>
+                    
+                    <do_if value="$maxAmount le 0">
+                      <set_value name="$tradesRejectedAmount" operation="add"/>
+                      <continue/>
+                    </do_if>
+                    
+                    <!-- OPTIMIZATION: Use library functions to calculate profit and ROI -->
+                    <run_actions ref="md.GT_Libraries_General.GT_CalculateProfit" result="$profit">
+                      <param name="buyPrice" value="$buyPrice"/>
+                      <param name="sellPrice" value="$sellPrice"/>
+                      <param name="amount" value="$maxAmount"/>
+                    </run_actions>
+                    <run_actions ref="md.GT_Libraries_General.GT_CalculateROI" result="$roi">
+                      <param name="investment" value="$buyPrice * $maxAmount"/>
+                      <param name="profit" value="$profit"/>
+                    </run_actions>
                     
                     <!-- OPTIMIZATION: Use library function to calculate trade thresholds -->
                     <run_actions ref="md.GT_Libraries_General.GT_CalculateTradeThresholds" result="$thresholds">

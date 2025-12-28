@@ -477,88 +477,46 @@
             $ForceLiveSearch = $forceLiveSearch
           ]"/>
 
-          <!-- Queue for search processing (cache + live) -->
-          <do_if value="not global.$GT_SearchQueue?">
-            <set_value name="global.$GT_SearchQueue" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$Ships?">
-            <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
-            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$MaxConcurrent?">
-            <!-- Cache searches are cheap: use separate cache concurrency setting (fallback to legacy MaxConcurrentSearches) -->
-            <set_value name="$maxConcurrent" exact="5"/>
-            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
-              <set_value name="$maxConcurrent" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
-            </do_if>
-            <do_elseif value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches?">
-              <set_value name="$maxConcurrent" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches"/>
-            </do_elseif>
-            <do_if value="$maxConcurrent lt 1">
-              <set_value name="$maxConcurrent" exact="1"/>
-            </do_if>
-            <do_if value="$maxConcurrent gt 20">
-              <set_value name="$maxConcurrent" exact="20"/>
-            </do_if>
-            <set_value name="global.$GT_SearchQueue.$MaxConcurrent" exact="$maxConcurrent"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchQueue.$Params?">
-            <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
-          </do_if>
-          <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$searchParams"/>
-
-          <set_value name="$alreadyInSearchQueue" exact="false"/>
-          <do_if value="global.$GT_SearchQueue.$Ships?">
-            <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInSearchQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          <do_if value="not $alreadyInSearchQueue">
-            <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
-          </do_if>
-          <signal_cue_instantly cue="ProcessSearchQueue"/>
-         </do_if>
-         <do_else>
-           <do_if value="$isBusy">
-             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-               <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Skipping trade search; ship is busy'" chance="100"/>
-             </do_if>
-             
-             <!-- CRITICAL FIX: Signal AI script that no new trade is available (ship is busy) -->
-             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-             
-             <!-- Release lock and parameters using Request Registry -->
-             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-               <param name="ship" value="$ship"/>
-               <param name="reason" value="'ship_busy'"/>
-             </run_actions>
-           </do_if>
-           <!-- Note: Invalid ship cleanup now happens immediately after validation (above), so this else only handles busy ships -->
-         </do_else>
+          <!-- Start trade search via centralized scheduler.
+               We do NOT use the legacy global.$GT_SearchQueue gate here: it can pin at max and cause "no trades generated".
+               The scheduler already spreads starts across frames, and SearchTradeRoutes handles cache/live internally. -->
+          <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$searchParams"/>
         </do_if>
         <do_else>
-          <!-- Parameters missing - cleanup and exit immediately -->
-          <!-- Nothing after this point executes when parameters are missing -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-TradingQueue] (' + $ship.idcode + ') AI parameters missing at FindBestTrade entry - may have been cleaned up between queue check and processing'" chance="100"/>
+          <!-- Ship is busy (orders/training/maintenance) - release lock and let AI retry later -->
+          <do_if value="$isBusy">
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'ship_busy'"/>
+            </run_actions>
           </do_if>
-          <!-- Signal AI that no trade is available -->
+          <do_else>
+            <!-- Fallback: if we got here, do not hold the lock indefinitely -->
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'findbesttrade_skipped'"/>
+            </run_actions>
+          </do_else>
+        </do_else>
+        
+        <!-- Close outer AI-parameter guard -->
+        </do_if>
+        <do_else>
+          <!-- AI parameters missing - cleanup and exit immediately -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradingQueue] (' + $ship.idcode + ') AI parameters missing at FindBestTrade entry - cannot compute search params'" chance="100"/>
+          </do_if>
           <do_if value="$ship.exists">
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
           </do_if>
-          <!-- Release any stale lock if it exists -->
           <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
               <param name="ship" value="$ship"/>
               <param name="reason" value="'parameters_missing_at_findbesttrade'"/>
             </run_actions>
           </do_if>
-          <!-- Exit immediately - don't process without parameters -->
           <cancel_cue cue="this"/>
         </do_else>
       </actions>
@@ -618,18 +576,21 @@
             <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
           </do_if>
           <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
-          
-          <set_value name="$alreadyInSearchQueue" exact="false"/>
-          <do_if value="global.$GT_SearchQueue.$Ships?">
-            <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInSearchQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
+
+          <!-- PERF: O(1) queue membership marker (avoid list scans + redundant signals under big fleets) -->
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
           </do_if>
-          <do_if value="not $alreadyInSearchQueue">
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
             <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- Avoid thundering herd: only signal queue processor if it's not already processing -->
+          <do_if value="not global.$GT_SearchQueue.$Processing?">
+            <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchQueue.$Processing">
             <signal_cue_instantly cue="ProcessSearchQueue"/>
           </do_if>
         </do_if>
@@ -754,17 +715,13 @@
               <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
             </do_if>
             <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
-            
-            <set_value name="$alreadyInSearchQueue" exact="false"/>
-            <do_if value="global.$GT_SearchQueue.$Ships?">
-              <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-                <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                  <set_value name="$alreadyInSearchQueue" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
+
+            <!-- PERF: O(1) queue membership marker to avoid list scans under big fleets -->
+            <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
+              <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
             </do_if>
-            <do_if value="not $alreadyInSearchQueue">
+            <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
+              <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
               <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
               <signal_cue_instantly cue="ProcessSearchQueue"/>
             </do_if>
@@ -786,6 +743,17 @@
         <do_if value="not global.$GT_SearchQueue?">
           <set_value name="global.$GT_SearchQueue" exact="table[]"/>
         </do_if>
+
+        <!-- CRITICAL: Ensure this queue processor is single-threaded.
+             Without this, hundreds of ProcessSearchQueue instances can run in the same frame (thundering herd),
+             popping many ships and/or signalling busy repeatedly → spikes/stutter. -->
+        <do_if value="not global.$GT_SearchQueue.$Processing?">
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+        </do_if>
+        <do_if value="global.$GT_SearchQueue.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <set_value name="global.$GT_SearchQueue.$Processing" exact="true"/>
         
         <do_if value="not global.$GT_SearchQueue.$Ships?">
           <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
@@ -840,6 +808,7 @@
         <do_if value="player.age lt global.$GT_SearchQueue.$NextStartTime">
           <!-- Too soon since last start; reschedule -->
           <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
 
@@ -876,6 +845,7 @@
           <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
             <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
           </do_if>
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
         
@@ -911,8 +881,9 @@
             <!-- Mark that this invocation uses the cache-search queue counter -->
             <set_value name="$params.$UseSearchQueueCounter" exact="true"/>
             <set_value name="$params.$FromSearchQueue" exact="true"/>
-            <!-- Start the search now; ProcessSearchQueue already applies jitter and manages concurrency. -->
-            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
+            <!-- V2: Never start SearchTradeRoutes directly from ProcessSearchQueue.
+                 Route through EnqueueSearchTradeRoutes which feeds the hard-budget scheduler (prevents stampedes). -->
+            <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
             <!-- Params missing - log error and skip this ship -->
@@ -952,6 +923,12 @@
             </do_if>
           </do_else>
         </do_else>
+
+        <!-- Release single-thread lock and keep draining the queue (one action per invocation; jitter spreads load). -->
+        <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+        <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
+          <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+        </do_if>
       </actions>
     </cue>
 
@@ -967,6 +944,16 @@
         <do_if value="not global.$GT_LiveSearchQueue?">
           <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
         </do_if>
+        <!-- Single-thread this queue processor to avoid double start/finish sound bursts and racey selection. -->
+        <do_if value="not global.$GT_LiveSearchQueue.$Processing?">
+          <set_value name="global.$GT_LiveSearchQueue.$Processing" exact="false"/>
+        </do_if>
+        <do_if value="global.$GT_LiveSearchQueue.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <set_value name="global.$GT_LiveSearchQueue.$Processing" exact="true"/>
+        <set_value name="$kickAgain" exact="false"/>
+
         <do_if value="not global.$GT_LiveSearchQueue.$Params?">
           <set_value name="global.$GT_LiveSearchQueue.$Params" exact="table[]"/>
         </do_if>
@@ -1034,6 +1021,24 @@
             <!-- Acquire live slot -->
             <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
 
+            <!-- Debug audio: play ONE "session start" sound when live-search transitions from idle -> active.
+                 This avoids spamming a sound for every single ship's live search start. -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="not global.$GT_DebugLiveSearchSound?">
+                <set_value name="global.$GT_DebugLiveSearchSound" exact="table[$SessionActive = false, $FinishPending = false]"/>
+              </do_if>
+            <do_if value="global.$GT_DebugLiveSearchSound.$FinishPending? and global.$GT_DebugLiveSearchSound.$FinishPending">
+              <!-- Cancel any pending finish debounce if we are starting new work -->
+              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
+            </do_if>
+              <do_if value="not global.$GT_DebugLiveSearchSound.$SessionActive">
+                <set_value name="global.$GT_DebugLiveSearchSound.$SessionActive" exact="true"/>
+                <!-- Vanilla pattern: scenario_spacesuit_1.xml / scenario_spacesuit_3.xml -->
+                <debug_text text="'[GT-Audio] Live search SESSION START (ui_notification_player_alert_13)'" chance="100"/>
+                <play_sound object="player.entity" sound="'ui_notification_player_alert_13'" type="ui" comment="Live search SESSION START"/>
+              </do_if>
+            </do_if>
+
             <!-- Ensure we skip cache and do live search immediately -->
             <set_value name="$params.$ForceLiveSearch" exact="true"/>
             <set_value name="$params.$SearchState" exact="'fresh'"/>
@@ -1044,7 +1049,7 @@
             <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
 
             <!-- Start the search now; live concurrency is handled by ProcessLiveSearchQueue. -->
-            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
+            <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
             <!-- Invalid ship/params - clean up entry -->
@@ -1063,10 +1068,78 @@
             </do_if>
           </do_all>
           <do_if value="global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and $hasAnyQueued">
-            <!-- IMPORTANT: Use fully-qualified cue reference here.
-                 Using an unqualified name can resolve to the current cue instance, which has no new event listener,
-                 causing "Signalled cue ... has no corresponding listeners". -->
-            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
+            <set_value name="$kickAgain" exact="true"/>
+          </do_if>
+        </do_if>
+
+        <!-- If we did not select a ship, we might still need to finish the session sound (idle) or retry selection (stale sectors list). -->
+        <set_value name="$hasAnyQueuedNow" exact="false"/>
+        <do_if value="global.$GT_LiveSearchQueue.$Sectors?">
+          <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$i">
+            <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$i}"/>
+            <do_if value="$sec? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
+              <set_value name="$hasAnyQueuedNow" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <!-- Debug audio: play ONE "session finish" sound when live-search becomes idle AND queue is drained. -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches == 0 and not $hasAnyQueuedNow">
+            <!-- Debounce FINISH: avoid START/FINISH/START chatter when queue flickers empty for a few ms. -->
+            <do_if value="global.$GT_DebugLiveSearchSound? and global.$GT_DebugLiveSearchSound.$SessionActive and (not global.$GT_DebugLiveSearchSound.$FinishPending? or not global.$GT_DebugLiveSearchSound.$FinishPending)">
+              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="true"/>
+              <signal_cue_instantly cue="md.GT_Trading_Queue.LiveSearchFinishSound_Delayed"/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- If we can still start more live searches, schedule another pass. -->
+        <do_if value="not $kickAgain and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and $hasAnyQueuedNow">
+          <set_value name="$kickAgain" exact="true"/>
+        </do_if>
+
+        <set_value name="global.$GT_LiveSearchQueue.$Processing" exact="false"/>
+        <do_if value="$kickAgain">
+          <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Debounced live-search FINISH sound: only play if we're still idle after a short delay. -->
+    <cue name="LiveSearchFinishSound_Delayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="500ms"/>
+      <actions>
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <do_if value="global.$GT_DebugLiveSearchSound? and global.$GT_DebugLiveSearchSound.$FinishPending? and global.$GT_DebugLiveSearchSound.$FinishPending">
+            <set_value name="$hasAnyQueuedNow" exact="false"/>
+            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Sectors?">
+              <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$i">
+                <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$i}"/>
+                <do_if value="$sec? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
+                  <set_value name="$hasAnyQueuedNow" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+
+            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches == 0 and not $hasAnyQueuedNow">
+              <do_if value="global.$GT_DebugLiveSearchSound.$SessionActive">
+                <set_value name="global.$GT_DebugLiveSearchSound.$SessionActive" exact="false"/>
+                <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
+                <!-- Vanilla example: scenario_waveattack_antigone.xml -->
+                <debug_text text="'[GT-Audio] Live search SESSION FINISH (cockpit_proximity_alert)'" chance="100"/>
+                <play_sound object="player.entity" sound="'cockpit_proximity_alert'" type="ui" comment="Live search SESSION FINISH"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- Not idle anymore; cancel pending finish. -->
+              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
+            </do_else>
           </do_if>
         </do_if>
       </actions>
@@ -1079,8 +1152,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <!-- Jitter resumption so large fleets don't wake in the same frame (reduces SearchTradeRoutes bursts) -->
-      <delay min="10ms" max="120ms"/>
+      <!-- Small jitter so large fleets don't wake in the same frame (reduces bursts). -->
+      <delay min="0ms" max="30ms"/>
       <actions>
         <set_value name="$params" exact="event.param"/>
         <set_value name="$ship" exact="@$params.$Ship"/>
@@ -1089,55 +1162,17 @@
           <cancel_cue cue="this"/>
         </do_if>
 
-        <!-- Ensure SearchQueue exists -->
+        <!-- Persist params so SearchTradeRoutes can recover/validate against per-ship storage if needed -->
         <do_if value="not global.$GT_SearchQueue?">
           <set_value name="global.$GT_SearchQueue" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$Ships?">
-          <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
         </do_if>
         <do_if value="not global.$GT_SearchQueue.$Params?">
           <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
         </do_if>
-        <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
-          <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
-          <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$MaxConcurrent?">
-          <set_value name="global.$GT_SearchQueue.$MaxConcurrent" exact="1"/>
-        </do_if>
-
-        <!-- IMPORTANT: Continuations must NOT re-enter the cache-search concurrency gate.
-             If the queue is saturated with "waiting for cache continuation" searches, routing continuations back into
-             ProcessSearchQueue deadlocks: no continuation can run to release a slot.
-             Continuations are already jittered by this cue and do not consume additional cache-search slots. -->
-        <set_value name="$isContinuation" exact="false"/>
-        <do_if value="$params.$CacheContinuation? and $params.$CacheContinuation == true">
-          <set_value name="$isContinuation" exact="true"/>
-        </do_if>
-        <do_elseif value="$params.$SearchState? and ($params.$SearchState == 'live' or $params.$SearchState == 'fallback')">
-          <set_value name="$isContinuation" exact="true"/>
-        </do_elseif>
-        <do_if value="$isContinuation">
-          <!-- Still persist params so SearchTradeRoutes can recover/validate against per-ship storage if needed -->
-          <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
-          <!-- Continuations must not re-enter the queue gate; run SearchTradeRoutes directly. -->
-          <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <!-- Store/overwrite params for this ship -->
         <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
 
-        <!-- De-dupe ship in queue (O(1) marker) -->
-        <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
-          <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
-          <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
-        </do_if>
-
-        <signal_cue_instantly cue="ProcessSearchQueue"/>
+        <!-- V2: Start searches through the hard-budget scheduler (one start per tick). -->
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Enqueue" param="$params"/>
       </actions>
     </cue>
   </cues>
