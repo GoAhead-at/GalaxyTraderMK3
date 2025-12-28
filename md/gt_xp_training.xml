@@ -1162,7 +1162,12 @@
       </conditions>
       <actions>
         <!-- Forward to UpdateShipName cue -->
-        <signal_cue_instantly cue="UpdateShipName" param="event.param2"/>
+        <set_value name="$signalParam" exact="event.param2"/>
+        <set_value name="$signalShip" exact="@$signalParam.$ship"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-XP] ListenForShipNameUpdate: Received signal for ship=' + (if $signalShip? then $signalShip.idcode else 'NULL') + ', nameType=' + (if $signalParam.$nameType? then $signalParam.$nameType else 'NULL')" chance="100"/>
+        </do_if>
+        <signal_cue_instantly cue="UpdateShipName" param="$signalParam"/>
       </actions>
     </cue>
     
@@ -1194,6 +1199,10 @@
           <!-- Robustness: if pilot not provided, derive from ship (subordinates often signal without pilot payload) -->
           <do_if value="not $pilot?">
             <set_value name="$pilot" exact="@$ship.pilot"/>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-XP] UpdateShipName: ship=' + (if $ship? then $ship.idcode else 'NULL') + ', pilot=' + (if $pilot? then $pilot.name else 'NULL') + ', ship.exists=' + (if $ship.exists then 'yes' else 'no')" chance="100"/>
           </do_if>
         
         <!-- Check which parameter format we're using -->
@@ -1272,6 +1281,33 @@
           </do_if>
           <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
         </do_else>
+
+        <!-- AUTHORITATIVE STATUS OVERRIDE (no parsing):
+             The caller-provided $nameType can be stale due to async signals (e.g. trade completion triggers 'trader' rename
+             while the ship is still isolated). Ensure the displayed status reflects the authoritative global flags. -->
+        <do_if value="$ship? and $ship.exists">
+          <set_value name="$isolatedFlagSet" exact="false"/>
+          <set_value name="$fallbackFlagSet" exact="false"/>
+          <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+            <set_value name="$isolatedFlagSet" exact="true"/>
+            <set_value name="$nameType" exact="'isolated'"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-XP] (' + $ship.idcode + ') AUTHORITATIVE OVERRIDE: Setting nameType=isolated (global flag is set)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{$ship}?">
+            <set_value name="$fallbackFlagSet" exact="true"/>
+            <set_value name="$nameType" exact="'fallback'"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-XP] (' + $ship.idcode + ') AUTHORITATIVE OVERRIDE: Setting nameType=fallback (global flag is set)'" chance="100"/>
+            </do_if>
+          </do_elseif>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-XP] (' + $ship.idcode + ') No authoritative override: isolatedFlag=' + $isolatedFlagSet + ', fallbackFlag=' + $fallbackFlagSet + ', using nameType=' + $nameType" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
         
         <!-- Get ship's base name based on user setting -->
         <!-- Options: 'macro.name' (default), 'typename', 'macro.name.base' -->
@@ -1280,46 +1316,40 @@
           <set_value name="$nameSource" exact="global.$GT_GlobalSettings.$ShipNaming.$DefaultNameSource"/>
         </do_if>
         
-        <!-- Resolve original name based on selected source -->
+        <!-- Resolve original name (CLEAN MODEL):
+             Always prefer the stored GT original ship name from the ship registry, then build the full name string from scratch.
+             This avoids any parsing of the current ship name and guarantees deterministic renames on state transitions.
+             
+             SIMPLIFIED APPROACH: Trust that OriginalShipName is stored cleanly (it's stripped during registration/promotion).
+             If missing or invalid, fall back to ship.macro.name (the authoritative source). -->
         <set_value name="$originalName" exact="''"/>
-        <do_if value="$nameSource == 'basename'">
-          <!-- Use stored GT original ship name directly (no stripping or special handling) -->
-          <do_if value="global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
-            <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
-          </do_if>
-          <do_else>
-            <!-- Fallback: If no stored original name, use macro.name -->
-            <set_value name="$originalName" exact="$ship.macro.name"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-XP]  Basename mode: No stored OriginalShipName found for pilot ' + $pilot.name + ', using macro.name as fallback'" chance="100"/>
-            </do_if>
-          </do_else>
-        </do_if>
-        <do_elseif value="$nameSource == 'macro.name'">
-          <!-- Use full model name with variant (e.g., "Mercury Sentinel", "Shuyaku Vanguard") -->
-          <set_value name="$originalName" exact="$ship.macro.name"/>
-        </do_elseif>
-        <do_elseif value="$nameSource == 'typename'">
-          <!-- Use generic type name (e.g., "Transporter", "Fighter") -->
-          <set_value name="$originalName" exact="$ship.typename"/>
-        </do_elseif>
-        <do_elseif value="$nameSource == 'macro.name.base'">
-          <!-- Use base model name without variant (e.g., "Mercury", "Shuyaku") -->
-          <!-- Extract base name by removing Sentinel/Vanguard variants from macro.name -->
-          <run_actions ref="md.GT_Ship_Management.Extract_Base_Ship_Name" result="$originalName">
-            <param name="macroName" value="$ship.macro.name"/>
-          </run_actions>
-        </do_elseif>
-        <do_else>
-          <!-- Fallback to macro.name if invalid setting -->
-          <set_value name="$originalName" exact="$ship.macro.name"/>
-        </do_else>
         
-        <!-- Fallback: If originalName still empty (should never happen), use current name -->
-        <do_if value="not $originalName? or $originalName == ''">
-          <set_value name="$originalName" exact="$ship.knownname"/>
+        <!-- Try to get OriginalShipName from ship registry (preferred) -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+          <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          <!-- Validate it's a string (safety check for corrupted save data) -->
+          <set_value name="$nameLength" exact="@$originalName.length"/>
+          <do_if value="not $nameLength? or $nameLength == 0">
+            <!-- Not a valid string, fall back to macro.name -->
+            <set_value name="$originalName" exact="''"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Fallback to pilot registry if ship registry doesn't have it -->
+        <do_if value="$originalName == '' and global.$GT_Pilots? and $pilot? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+          <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+          <!-- Validate it's a string -->
+          <set_value name="$nameLength" exact="@$originalName.length"/>
+          <do_if value="not $nameLength? or $nameLength == 0">
+            <set_value name="$originalName" exact="''"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Final fallback: use ship.macro.name (authoritative source, always clean) -->
+        <do_if value="$originalName == ''">
+          <set_value name="$originalName" exact="@$ship.macro.name"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-XP]  Using ship.knownname as fallback (name source unavailable)'" chance="100"/>
+            <debug_text text="'[GT-XP] (' + $ship.idcode + ') Using ship.macro.name as OriginalShipName (registry missing): ' + $originalName" chance="100"/>
           </do_if>
         </do_if>
         
@@ -1364,38 +1394,8 @@
           </do_elseif>
           
           <do_if value="$statusText != ''">
-            <!-- Pattern-based duplicate detection -->
-            <!-- CRITICAL: Check CURRENT ship name for prefix, not stored original! -->
-            <!-- (Stored original might be from different ship if pilot switched ships) -->
-            <set_value name="$statusAlreadyExists" exact="false"/>
-            <set_value name="$currentShipName" exact="$ship.knownname"/>
-            
-            <!-- Check for bracketed prefix like [ANYTHING] in CURRENT name -->
-            <do_if value="$currentShipName? and $currentShipName != '' and $currentShipName.indexof.{'['}? and $currentShipName.indexof.{'['} == 0">
-              <set_value name="$statusAlreadyExists" exact="true"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-XP] Skipping status prefix - current name already has bracketed prefix: ' + $currentShipName" chance="100"/>
-              </do_if>
-            </do_if>
-            
-            <!-- Check for ALL-CAPS first word (in any language) in CURRENT name -->
-            <!-- CRITICAL: Must check if indexof.{' '}? exists BEFORE using it! -->
-            <do_if value="$currentShipName? and $currentShipName != '' and not $statusAlreadyExists and $currentShipName.indexof.{' '}?">
-              <set_value name="$firstSpace" exact="$currentShipName.indexof.{' '}"/>
-              <do_if value="$firstSpace gt 2 and $firstSpace lt 20">
-                <!-- Use pattern check: compare position of text after first space in current vs uppercase -->
-                <set_value name="$afterFirstSpace" exact="$currentShipName.substring.{$firstSpace + 1}"/>
-                <set_value name="$currentShipNameUpper" exact="$currentShipName.toupper"/>
-                <do_if value="$afterFirstSpace? and $currentShipNameUpper.indexof.{$afterFirstSpace}? and $currentShipName.indexof.{$afterFirstSpace}? and $currentShipNameUpper.indexof.{$afterFirstSpace} == $currentShipName.indexof.{$afterFirstSpace}">
-                  <set_value name="$statusAlreadyExists" exact="true"/>
-                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <debug_text text="'[GT-XP] Skipping status prefix - current name already has ALL-CAPS prefix: ' + $currentShipName" chance="100"/>
-                  </do_if>
-                </do_if>
-              </do_if>
-            </do_if>
-            
-            <do_if value="not $statusAlreadyExists">
+            <!-- No name parsing: always rebuild name from $OriginalShipName and apply desired status. -->
+            <do_if value="true">
               <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$StatusPosition == 'prefix'">
                 <append_to_list name="$prefixElements" exact="$statusText"/>
               </do_if>
@@ -1604,29 +1604,17 @@
           <set_value name="$newShipName" exact="$prefixString + ' ' + $newShipName"/>
         </do_if>
         
-        <!-- Add suffix elements (only if not already present in CURRENT ship name) -->
+        <!-- Add suffix elements -->
         <do_if value="$suffixElements.count gt 0">
-          <!-- CRITICAL: Check CURRENT ship name for suffix, not new name being built! -->
-          <!-- (After language switch, current name has suffix but new name doesn't yet) -->
-          <set_value name="$alreadyHasSuffix" exact="false"/>
-          <set_value name="$currentShipName" exact="$ship.knownname"/>
-          <do_if value="$currentShipName? and $currentShipName != '' and $currentShipName.indexof.{' ('}?">
-            <set_value name="$alreadyHasSuffix" exact="true"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-XP] Skipping suffix - current name already has parenthetical: ' + $currentShipName" chance="100"/>
+          <!-- No parsing: always rebuild the complete suffix from scratch. -->
+          <set_value name="$suffixString" exact="''"/>
+          <do_all exact="$suffixElements.count" counter="$j">
+            <do_if value="$j gt 1">
+              <set_value name="$suffixString" exact="$suffixString + ' '"/>
             </do_if>
-          </do_if>
-          
-          <do_if value="not $alreadyHasSuffix">
-            <set_value name="$suffixString" exact="''"/>
-            <do_all exact="$suffixElements.count" counter="$j">
-              <do_if value="$j gt 1">
-                <set_value name="$suffixString" exact="$suffixString + ' '"/>
-              </do_if>
-              <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
-            </do_all>
-            <set_value name="$newShipName" exact="$newShipName + ' (' + $suffixString + ')'"/>
-          </do_if>
+            <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
+          </do_all>
+          <set_value name="$newShipName" exact="$newShipName + ' (' + $suffixString + ')'"/>
         </do_if>
         
         <!-- Update ship name -->

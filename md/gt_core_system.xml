@@ -1103,6 +1103,10 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$force" exact="false"/>
+        <do_if value="event.param2? and event.param2.$Force? and event.param2.$Force">
+          <set_value name="$force" exact="true"/>
+        </do_if>
         
         <!-- Skip if ship doesn't exist -->
         <do_if value="not $ship.exists">
@@ -1119,6 +1123,42 @@
           </do_if>
           <do_else>
             <!-- Ship is in registry - continue with orphaned check -->
+            
+            <!-- PROMOTION / TRANSITION GUARD:
+                 During commander destruction + promotion, ships can briefly have no default order.
+                 Do NOT purge registry on the first observation; schedule a delayed verify once. -->
+            <set_value name="$exitEarly" exact="false"/>
+            <set_value name="$defaultOrderId" exact="@$ship.defaultorder.id"/>
+            <set_value name="$commander" exact="@$ship.commander"/>
+            <set_value name="$commanderExists" exact="false"/>
+            <set_value name="$commanderDefaultNull" exact="false"/>
+            <do_if value="$commander? and $commander.exists and $commander != $ship">
+              <set_value name="$commanderExists" exact="true"/>
+              <!-- Commander exists but has no default order yet (promotion window) -->
+              <do_if value="(not @$commander.defaultorder) or (@$commander.defaultorder == null)">
+                <set_value name="$commanderDefaultNull" exact="true"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Defer cleanup if:
+                 - ship has no default order id yet, OR
+                 - ship has no commander yet (transition), OR
+                 - commander exists but default order is null (promotion window) -->
+            <do_if value="not $force and ((not $defaultOrderId or $defaultOrderId == null) or (not $commanderExists) or $commanderDefaultNull)">
+              <set_value name="$exitEarly" exact="true"/>
+              <do_if value="not global.$GT_OrphanVerifyPending?">
+                <set_value name="global.$GT_OrphanVerifyPending" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_OrphanVerifyPending.{$ship}?">
+                <set_value name="global.$GT_OrphanVerifyPending.{$ship}" exact="player.age"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Cleanup] Deferring orphan cleanup (promotion window): ' + $ship.idcode + ' (defaultOrder=' + (if $defaultOrderId then $defaultOrderId else 'null') + ', commanderExists=' + $commanderExists + ', commanderDefaultNull=' + $commanderDefaultNull + ')'" chance="100"/>
+                </do_if>
+                <signal_cue_instantly cue="md.GT_CoreSystem.VerifyShipOrphaned" param="table[$Ship=$ship]"/>
+              </do_if>
+            </do_if>
+            
+            <do_if value="not $exitEarly">
         
         <!-- Check if ship still has active GT order -->
         <set_value name="$hasGTOrder" exact="false"/>
@@ -1208,8 +1248,27 @@
             $OriginalName = $originalName
           ]"/>
         </do_elseif>
+        
+            </do_if>
           </do_else>
         </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Delayed verify for transient "no default order" states (promotion window). -->
+    <cue name="VerifyShipOrphaned" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.VerifyShipOrphaned"/>
+      </conditions>
+      <delay exact="3s"/>
+      <actions>
+        <set_value name="$ship" exact="event.param.$Ship"/>
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="global.$GT_OrphanVerifyPending? and global.$GT_OrphanVerifyPending.{$ship}?">
+            <remove_value name="global.$GT_OrphanVerifyPending.{$ship}"/>
+          </do_if>
+          <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship=$ship, $Force=true]"/>
+        </do_if>
       </actions>
     </cue>
     
@@ -1884,6 +1943,43 @@
           </do_else>
           
         </do_elseif>
+      </actions>
+    </cue>
+
+    <!-- Debug: Dump Global Variables on Save Load -->
+    <!-- Automatically dumps all GT globals when a save game is loaded (only if debug logging is enabled) -->
+    <cue name="DumpGlobalsOnLoad" instantiate="true">
+      <conditions>
+        <event_game_loaded/>
+        <check_value value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging"/>
+      </conditions>
+      <actions>
+        <run_actions ref="md.GT_Libraries_General.GT_DumpGlobalVariables">
+          <param name="prefix" value="'GT_'"/>
+          <param name="maxDepth" value="3"/>
+          <param name="maxKeysPerTable" value="100"/>
+        </run_actions>
+      </actions>
+    </cue>
+
+    <!-- Debug: Dump Global Variables (Manual Trigger)
+         Trigger via: signal_objects object="player.galaxy" param="'GT_Dump_Globals'" param2="table[$prefix='GT_', $maxDepth=3, $maxKeysPerTable=100]"
+         Or dump all globals: signal_objects object="player.galaxy" param="'GT_Dump_Globals'" param2="table[$prefix='', $maxDepth=2, $maxKeysPerTable=50]" -->
+    <cue name="DumpGlobalVariables" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Dump_Globals'"/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param2"/>
+        <set_value name="$prefix" exact="if $params.$prefix? then $params.$prefix else 'GT_'"/>
+        <set_value name="$maxDepth" exact="if $params.$maxDepth? then $params.$maxDepth else 3"/>
+        <set_value name="$maxKeysPerTable" exact="if $params.$maxKeysPerTable? then $params.$maxKeysPerTable else 100"/>
+        
+        <run_actions ref="md.GT_Libraries_General.GT_DumpGlobalVariables">
+          <param name="prefix" value="$prefix"/>
+          <param name="maxDepth" value="$maxDepth"/>
+          <param name="maxKeysPerTable" value="$maxKeysPerTable"/>
+        </run_actions>
       </actions>
     </cue>
 

@@ -565,15 +565,102 @@
         
         <!-- Check if ForceLiveSearch flag is set (AI rejected all cached trades) -->
         <set_value name="$forceLiveSearch" exact="@$params.$ForceLiveSearch"/>
+
+        <!-- ISOLATED POLICY:
+             Isolated ships should do their own cheap 1-sector live search and must NOT rely on cached data.
+             Rationale: isolated-mode relaxed profit filtering should not “poison” the global cache and the isolated search scope is tiny. -->
+        <set_value name="$skipCacheBecauseIsolated" exact="false"/>
+        <set_value name="$shipIsIsolatedForCachePolicy" exact="false"/>
+        <set_value name="$blacklistgroupForCachePolicy" exact="null"/>
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroupForCachePolicy">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="$ship.sector? and $blacklistgroupForCachePolicy?">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheckForCachePolicy">
+            <param name="sector" value="$ship.sector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$blacklistgroupForCachePolicy"/>
+            <param name="returnDetails" value="false"/>
+          </run_actions>
+          <set_value name="$isolatedValue" exact="@$isolationCheckForCachePolicy.$IsIsolated"/>
+          <do_if value="$isolatedValue? and ($isolatedValue == true or $isolatedValue == 1)">
+            <set_value name="$shipIsIsolatedForCachePolicy" exact="true"/>
+            
+            <!-- CRITICAL: Immediately set the global flag and trigger name update -->
+            <!-- We already know the ship is isolated from GT_CheckConnectedSectorsBlacklisted, so set flag directly -->
+            <do_if value="not global.$GT_IsolatedTradeActive?">
+              <set_value name="global.$GT_IsolatedTradeActive" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_IsolatedTradeActive.{$ship}" exact="true"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') ISOLATION DETECTED EARLY: Set global.$GT_IsolatedTradeActive.{$ship} = true'" chance="100"/>
+            </do_if>
+            
+            <!-- Trigger ship name update immediately -->
+            <set_value name="$pilot" exact="@$ship.pilot"/>
+            <do_if value="$pilot? and $pilot.exists">
+              <set_value name="$pilotXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+              <do_if value="not $pilotXP?">
+                <set_value name="$pilotXP" exact="0"/>
+              </do_if>
+              <set_value name="$skillLevel" exact="1"/>
+              <do_all exact="15" counter="$lvl">
+                <do_if value="$pilotXP ge global.$GT_Config.$XP.$SkillThresholds.{$lvl}">
+                  <set_value name="$skillLevel" exact="$lvl"/>
+                </do_if>
+              </do_all>
+              <set_value name="$rankTitle" exact="'Lehrling'"/>
+              <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
+                <set_value name="$rankIndex" exact="($skillLevel / 3)i + 1"/>
+                <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+                  <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+                </do_if>
+                <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+                  <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Signal ship name update with isolated nameType -->
+              <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                $ship = $ship,
+                $pilot = $pilot,
+                $xp = $pilotXP,
+                $level = $skillLevel,
+                $rank = $rankTitle,
+                $nameType = 'isolated'
+              ]"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ') ISOLATION DETECTED EARLY: Triggered ship name update with nameType=isolated'" chance="100"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ') ISOLATION DETECTED EARLY: Cannot trigger name update - pilot missing (pilot=' + (if $pilot? then 'exists' else 'null') + ', exists=' + (if $pilot.exists then 'yes' else 'no') + ')'" chance="100"/>
+              </do_if>
+            </do_else>
+          </do_if>
+        </do_if>
+        <do_if value="$shipIsIsolatedForCachePolicy and $searchState == 'fresh'">
+          <set_value name="$skipCacheBecauseIsolated" exact="true"/>
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') ISOLATED: bypassing cache and running own live search (1-sector scope)'" chance="100"/>
+          </do_if>
+        </do_if>
         
         <!-- Cache continuation: SearchCachedTrades already completed and signalled us -->
         <set_value name="$cacheContinuation" exact="false"/>
         <do_if value="$params.$CacheContinuation? and $params.$CacheContinuation == true">
           <set_value name="$cacheContinuation" exact="true"/>
         </do_if>
+        <!-- If we intentionally bypass cache (isolated policy), treat cache phase as complete so the cue can proceed. -->
+        <do_if value="$skipCacheBecauseIsolated and $searchState == 'fresh'">
+          <set_value name="$cacheContinuation" exact="true"/>
+        </do_if>
         
         <!-- Only check cache if this is a fresh search (not live/fallback continuation) -->
-        <do_if value="$searchState == 'fresh' and not $forceLiveSearch">
+        <do_if value="$searchState == 'fresh' and not $forceLiveSearch and not $skipCacheBecauseIsolated">
           <!-- Track search method for diagnostics -->
           <set_value name="$searchMethod" exact="'cache'"/>
           <set_value name="$cacheChecked" exact="true"/>
@@ -1092,8 +1179,9 @@
                 </do_if>
               </do_if>
 
-              <!-- If another ship is already refreshing this home sector, deny and let the ship retry cache later. -->
-              <do_if value="$refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
+              <!-- If another ship is already refreshing this home sector, deny and let the ship retry cache later.
+                   EXCEPTION: isolated ships must not be denied by home_refresh; they run their own cheap 1-sector live search. -->
+              <do_if value="not $shipIsIsolatedForCachePolicy and $refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Search] (' + $ship.idcode + ') Home-sector live refresh already active (home=' + @$homeSector.knownname + ', initiator=' + @$refreshEntry.$Initiator.idcode + ') - denying live search, retry cache later (home_refresh)'" chance="100"/>
                 </do_if>
@@ -1135,8 +1223,9 @@
                    otherwise we can enqueue a ship whose lock was just released, creating "stale wakeups" and stalls. -->
               <!-- If denied, do nothing else in this invocation (gated; cancel_cue alone is not sufficient). -->
               <do_if value="not $denyHomeRefresh">
-                <!-- Mark this ship as the initiator for this home-sector refresh (may still be queued behind global live slots). -->
-                <do_if value="$homeSector? and $homeSector.exists">
+                <!-- Mark this ship as the initiator for this home-sector refresh (may still be queued behind global live slots).
+                     EXCEPTION: isolated ships must not participate in home-sector coalescing (they do not refresh the home cache). -->
+                <do_if value="not $shipIsIsolatedForCachePolicy and $homeSector? and $homeSector.exists">
                   <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
                     $Active = true,
                     $Initiator = $ship,
@@ -1734,6 +1823,46 @@
                   <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
                     <debug_text text="'[GT-Search] (' + $ship.idcode + ') Ship is isolated or fallback already attempted - signaling no trade found'" chance="100"/>
                   </do_if>
+                  
+                  <!-- If the ship is isolated, set the [ISOLATED] ship-name flag even when no trade is found.
+                       Naming logic in GT_XP_Training.UpdateShipName is responsible for safely replacing GT-owned prefixes
+                       (e.g. [TD]/[ID] -> [IS]) without clobbering user-defined custom prefixes. -->
+                  <do_if value="$shipIsIsolated and $searchState != 'fallback'">
+                    <do_if value="not global.$GT_IsolatedTradeActive?">
+                      <set_value name="global.$GT_IsolatedTradeActive" exact="table[]"/>
+                    </do_if>
+                    <set_value name="global.$GT_IsolatedTradeActive.{$ship}" exact="true"/>
+
+                    <!-- Calculate rank title from skill level for ship name update -->
+                    <set_value name="$pilotXP" exact="@global.$GT_Pilots.{$ship.pilot}.$XP"/>
+                    <do_if value="not $pilotXP?">
+                      <set_value name="$pilotXP" exact="0"/>
+                    </do_if>
+                    <set_value name="$rankTitle" exact="'Lehrling'"/>
+                    <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
+                      <set_value name="$rankIndex" exact="($skillLevel / 3)i + 1"/>
+                      <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+                        <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+                      </do_if>
+                      <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+                        <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+                      </do_if>
+                    </do_if>
+                    
+                    <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                      $ship = $ship,
+                      $pilot = $ship.pilot,
+                      $xp = $pilotXP,
+                      $level = $skillLevel,
+                      $rank = $rankTitle,
+                      $nameType = 'isolated'
+                    ]"/>
+                    
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Set [ISOLATED] flag - ship is isolated (no trade found)'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                  
                   <!-- IMPORTANT: We're finalizing this attempt with GT_No_Trade_Found.
                        Ensure we do NOT leave stale live-search state behind (otherwise future requests hit the pre-gate
                        "Live search already in progress" and the ship can get stuck indefinitely; seen with EDS-278). -->
