@@ -663,16 +663,52 @@
         
         <!-- Validate bestTrade IMMEDIATELY after setting from cache/live sources -->
         <!-- Use strict validation to catch invalid trades before execution validation -->
+        <set_value name="$bestTradePreSourceCheck" exact="$bestTrade"/>
         <run_actions ref="md.GT_Libraries_General.GT_IsTradeValid" result="$bestTradeValidFromSource">
           <param name="trade" value="$bestTrade"/>
           <param name="minScore" value="0"/>
         </run_actions>
         <do_if value="not $bestTradeValidFromSource">
+          <!-- Explain WHY it's invalid (debug-only, safe lookups) -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$invalidReason" exact="'unknown'"/>
+            <do_if value="$bestTradePreSourceCheck == null">
+              <set_value name="$invalidReason" exact="'null (cache miss / no live result yet)'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$rBuyOffer" exact="@$bestTradePreSourceCheck.$BuyOffer"/>
+              <set_value name="$rSellOffer" exact="@$bestTradePreSourceCheck.$SellOffer"/>
+              <set_value name="$rScore" exact="@$bestTradePreSourceCheck.$Score"/>
+              <do_if value="$rBuyOffer == null">
+                <set_value name="$invalidReason" exact="'missing BuyOffer'"/>
+              </do_if>
+              <do_elseif value="$rSellOffer == null">
+                <set_value name="$invalidReason" exact="'missing SellOffer'"/>
+              </do_elseif>
+              <do_elseif value="$rScore == null">
+                <set_value name="$invalidReason" exact="'missing Score'"/>
+              </do_elseif>
+              <do_elseif value="$rScore le 0">
+                <set_value name="$invalidReason" exact="'Score le 0'"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$rWare" exact="@$rBuyOffer.ware"/>
+                <do_if value="$rWare == null">
+                  <set_value name="$invalidReason" exact="'missing BuyOffer.ware'"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$invalidReason" exact="'failed GT_IsTradeValid (unexpected field/state)'" />
+                </do_else>
+              </do_else>
+            </do_else>
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') bestTrade invalid (source cache/live): ' + $invalidReason" chance="100"/>
+          </do_if>
+
           <!-- bestTrade from source is invalid - clear it so fallback can fix it -->
           <set_value name="$bestTrade" exact="null"/>
           <set_value name="$bestScore" exact="0"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') bestTrade from source (cache/live) is INVALID - cleared for fallback fix'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') bestTrade from source cleared for fallback (invalid)'" chance="100"/>
           </do_if>
         </do_if>
         
@@ -1067,6 +1103,11 @@
                   <param name="reason" value="'home_refresh'"/>
                 </run_actions>
                 <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'home_refresh'"/>
+
+                <!-- CRITICAL: Stop THIS SearchTradeRoutes invocation from falling through into execution/no-trade-found logic.
+                     We already responded to the AI with home_refresh and want the ship to retry later after the home refresh finishes. -->
+                <set_value name="$waitingForLiveSearch" exact="true"/>
+                <set_value name="$deferNoTradeFound" exact="true"/>
 
                 <!-- IMPORTANT: If this invocation used a cache-search queue slot, release it and continue the cache queue. -->
                 <do_if value="$useSearchQueueCounter">
@@ -1492,7 +1533,35 @@
             <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') bestTrade is VALID - proceeding with execution'" chance="100"/>
           </do_if>
           <do_else>
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') bestTrade is INVALID (null or missing properties) - cannot execute'" chance="100"/>
+            <!-- Explain WHY invalid (execution-time view) -->
+            <set_value name="$execInvalidReason" exact="'unknown'"/>
+            <do_if value="$bestTrade == null">
+              <set_value name="$execInvalidReason" exact="'null (no best trade selected)'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$eBuyOffer" exact="@$bestTrade.$BuyOffer"/>
+              <set_value name="$eSellOffer" exact="@$bestTrade.$SellOffer"/>
+              <set_value name="$eScore" exact="@$bestTrade.$Score"/>
+              <do_if value="$eBuyOffer == null">
+                <set_value name="$execInvalidReason" exact="'missing BuyOffer'"/>
+              </do_if>
+              <do_elseif value="$eSellOffer == null">
+                <set_value name="$execInvalidReason" exact="'missing SellOffer'"/>
+              </do_elseif>
+              <do_elseif value="$eScore == null">
+                <set_value name="$execInvalidReason" exact="'missing Score'"/>
+              </do_elseif>
+              <do_elseif value="$eScore le 0">
+                <set_value name="$execInvalidReason" exact="'Score le 0'"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$eWare" exact="@$eBuyOffer.ware"/>
+                <do_if value="$eWare == null">
+                  <set_value name="$execInvalidReason" exact="'missing BuyOffer.ware'"/>
+                </do_if>
+              </do_else>
+            </do_else>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') bestTrade is INVALID - cannot execute (reason: ' + $execInvalidReason + ')'" chance="100"/>
             <!-- If bestTrade is invalid but tradeList has trades, select first valid trade from list -->
             <do_if value="$tradeList != null and @$tradeList.count gt 0">
               <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Attempting to select valid trade from tradeList (' + @$tradeList.count + ' trades available)'" chance="100"/>

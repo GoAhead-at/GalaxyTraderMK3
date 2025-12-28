@@ -678,6 +678,19 @@
             
             <!-- Get ware from list -->
             <set_value name="$ware" exact="$wareKeysList.{$wareIdx}"/>
+            <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+
+            <!-- DEBUG WATCHLIST: Help compare live-search wares vs cache contents -->
+            <!-- NOTE: We use ware name strings because ware IDs/macros vary by DLC/mods. -->
+            <set_value name="$watchWare" exact="false"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="$wareName == 'Quantum Tubes' or $wareName == 'Spaceweed' or $wareName == 'Spacefuel' or $wareName == 'Stimulants'">
+                <set_value name="$watchWare" exact="true"/>
+              </do_if>
+            </do_if>
+            <set_value name="$watchPairsChecked" exact="0"/>
+            <set_value name="$watchPairsCached" exact="0"/>
+            <set_value name="$watchFailLogged" exact="0"/>
             
             <!-- PERFORMANCE: Reset chunk positions when moving to a new ware -->
             <do_if value="$wareIdx != $currentWareChunkStart">
@@ -708,7 +721,7 @@
             
             <!-- PERF: This line can execute on every chunk continuation. Only log once per ware (first chunk) and at low chance. -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $wareIdx lt 2 and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
-              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Processing ware #' + $wareIdx + ': ' + (if $ware? then @$ware.name else 'NULL') + ' (quota: ' + $tradesForThisWare + '/' + $maxTradesPerWare + ')'" chance="10"/>
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Processing ware #' + $wareIdx + ': ' + $wareName + ' (quota: ' + $tradesForThisWare + '/' + $maxTradesPerWare + ')'" chance="10"/>
             </do_if>
             
             <!-- Find sell offers for this ware in list -->
@@ -742,7 +755,12 @@
             </do_if>
             
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $wareIdx lt 2 and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
-              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + (if $ware? then @$ware.name else 'NULL')" chance="10"/>
+              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + $wareName" chance="10"/>
+            </do_if>
+
+            <!-- WATCH: Log whether batch processor is actually seeing the same offers per ware that live search reported -->
+            <do_if value="$watchWare and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
+              <debug_text text="'[GT-Batch-Watch] (' + $ship.idcode + ') Ware=' + $wareName + ' offersForMatching: sell=' + $sellOffersForWare.count + ' buy=' + $buyOffersForWare.count + ' maxOffersPerWareForMatching=' + $maxOffersPerWareForMatching + ' cacheThreshold=' + (global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold? and global.$GT_GlobalSettings.$Fleet.$CacheProfitThreshold or 20) + '%'" chance="100"/>
             </do_if>
             
             <!-- Process this ware if both sell and buy offers exist -->
@@ -926,6 +944,11 @@
                   </run_actions>
                   <do_if value="not $isValidPair">
                     <continue/>
+                  </do_if>
+
+                  <!-- WATCH: Count how many valid offer pairs we actually consider for this ware -->
+                  <do_if value="$watchWare">
+                    <set_value name="$watchPairsChecked" exact="$watchPairsChecked + 1"/>
                   </do_if>
                   
                   <!-- Extract offer properties after validation -->
@@ -1309,6 +1332,22 @@
                         <param name="sellPrice" value="$sellPrice"/>
                       </run_actions>
 
+                      <!-- WATCH: If a watched ware isn't ending up in cache, log the first few skip reasons -->
+                      <do_if value="$watchWare and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $watchFailLogged lt 3 and not ($cacheOfferMaxAmount gt 0 and $cacheProfitPerUnit gt 0 and $cacheROI ge $cacheThreshold)">
+                        <set_value name="$reason" exact="'UNKNOWN'"/>
+                        <do_if value="$cacheOfferMaxAmount le 0">
+                          <set_value name="$reason" exact="'offerMaxAmount le 0'"/>
+                        </do_if>
+                        <do_elseif value="$cacheProfitPerUnit le 0">
+                          <set_value name="$reason" exact="'profitPerUnit le 0'"/>
+                        </do_elseif>
+                        <do_elseif value="$cacheROI lt $cacheThreshold">
+                          <set_value name="$reason" exact="'roi lt threshold'"/>
+                        </do_elseif>
+                        <debug_text text="'[GT-Cache-Watch] (' + $ship.idcode + ') NOT cached: ware=' + $wareName + ' reason=' + $reason + ' | offerMaxAmount=' + $cacheOfferMaxAmount + ' ppu=' + ($cacheProfitPerUnit/100) + 'Cr roi=' + ($cacheROI/1) + '% threshold=' + ($cacheThreshold/1) + '%'" chance="100"/>
+                        <set_value name="$watchFailLogged" exact="$watchFailLogged + 1"/>
+                      </do_if>
+
                       <!-- DIAGNOSTIC: Log why trades aren't being cached (only if cache is empty) -->
                       <!-- IMPORTANT: Diagnostics must use SHIP-AGNOSTIC values (cacheProfit/cacheROI), not per-ship maxAmount. -->
                       <run_actions ref="md.GT_Libraries_General.GT_CalculateTotalCacheCount" result="$currentCacheCount"/>
@@ -1654,6 +1693,12 @@
                             </do_else>
                             <do_if value="$shouldLog">
                               <debug_text text="'[GT-Cache] Trade cached: ' + $sellOfferWare.name + ', ROI=' + ($cacheROI/1) + '%, Profit=' + ($cacheProfit/100) + ' Cr, Distance=' + $routeDistance + ' jumps (cache now: ' + $cacheCount + ' entries)'" chance="100"/>
+                            </do_if>
+
+                            <!-- WATCH: Always log cache insertions for watched wares (avoids sampling/shouldLog missing them) -->
+                            <do_if value="$watchWare and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                              <set_value name="$watchPairsCached" exact="$watchPairsCached + 1"/>
+                              <debug_text text="'[GT-Cache-Watch] (' + $ship.idcode + ') CACHED: ware=' + $wareName + ' roi=' + ($cacheROI/1) + '% profit=' + ($cacheProfit/100) + 'Cr distance=' + $routeDistance + ' offers: sell=' + $cacheSellOfferAmount + ' buy=' + $cacheBuyOfferAmount" chance="100"/>
                             </do_if>
                           </do_if>
                         </do_if>
