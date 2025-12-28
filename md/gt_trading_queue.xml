@@ -489,7 +489,8 @@
           </do_if>
           <do_if value="not global.$GT_SearchQueue.$MaxConcurrent?">
             <!-- Cache searches are cheap: use separate cache concurrency setting (fallback to legacy MaxConcurrentSearches) -->
-            <set_value name="$maxConcurrent" exact="5"/>
+            <!-- TODO: keep hardcoded default for now. Higher default reduces 'busy' churn under big fleets. -->
+            <set_value name="$maxConcurrent" exact="10"/>
             <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
               <set_value name="$maxConcurrent" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
             </do_if>
@@ -509,19 +510,22 @@
           </do_if>
           <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$searchParams"/>
 
-          <set_value name="$alreadyInSearchQueue" exact="false"/>
-          <do_if value="global.$GT_SearchQueue.$Ships?">
-            <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInSearchQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
+          <!-- PERF: O(1) queue membership marker (avoid list scans + redundant signals under big fleets) -->
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
           </do_if>
-          <do_if value="not $alreadyInSearchQueue">
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
             <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
           </do_if>
-          <signal_cue_instantly cue="ProcessSearchQueue"/>
+
+          <!-- Avoid thundering herd: only signal queue processor if it's not already processing -->
+          <do_if value="not global.$GT_SearchQueue.$Processing?">
+            <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchQueue.$Processing">
+            <signal_cue_instantly cue="ProcessSearchQueue"/>
+          </do_if>
          </do_if>
          <do_else>
            <do_if value="$isBusy">
@@ -618,18 +622,21 @@
             <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
           </do_if>
           <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
-          
-          <set_value name="$alreadyInSearchQueue" exact="false"/>
-          <do_if value="global.$GT_SearchQueue.$Ships?">
-            <do_all exact="global.$GT_SearchQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_SearchQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInSearchQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
+
+          <!-- PERF: O(1) queue membership marker (avoid list scans + redundant signals under big fleets) -->
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
           </do_if>
-          <do_if value="not $alreadyInSearchQueue">
+          <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
+            <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
             <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- Avoid thundering herd: only signal queue processor if it's not already processing -->
+          <do_if value="not global.$GT_SearchQueue.$Processing?">
+            <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchQueue.$Processing">
             <signal_cue_instantly cue="ProcessSearchQueue"/>
           </do_if>
         </do_if>
@@ -786,6 +793,22 @@
         <do_if value="not global.$GT_SearchQueue?">
           <set_value name="global.$GT_SearchQueue" exact="table[]"/>
         </do_if>
+
+        <!-- FAST-PATH: If another instance is already processing, exit immediately (avoid stampede overhead) -->
+        <do_if value="global.$GT_SearchQueue.$Processing? and global.$GT_SearchQueue.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- CRITICAL: Ensure this queue processor is single-threaded.
+             Without this, hundreds of ProcessSearchQueue instances can run in the same frame (thundering herd),
+             popping many ships and/or signalling busy repeatedly → spikes/stutter. -->
+        <do_if value="not global.$GT_SearchQueue.$Processing?">
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+        </do_if>
+        <do_if value="global.$GT_SearchQueue.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <set_value name="global.$GT_SearchQueue.$Processing" exact="true"/>
         
         <do_if value="not global.$GT_SearchQueue.$Ships?">
           <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
@@ -840,6 +863,7 @@
         <do_if value="player.age lt global.$GT_SearchQueue.$NextStartTime">
           <!-- Too soon since last start; reschedule -->
           <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
 
@@ -876,6 +900,7 @@
           <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
             <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
           </do_if>
+          <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
         
@@ -911,8 +936,9 @@
             <!-- Mark that this invocation uses the cache-search queue counter -->
             <set_value name="$params.$UseSearchQueueCounter" exact="true"/>
             <set_value name="$params.$FromSearchQueue" exact="true"/>
-            <!-- Start the search now; ProcessSearchQueue already applies jitter and manages concurrency. -->
-            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
+            <!-- V2: Never start SearchTradeRoutes directly from ProcessSearchQueue.
+                 Route through EnqueueSearchTradeRoutes which feeds the hard-budget scheduler (prevents stampedes). -->
+            <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
             <!-- Params missing - log error and skip this ship -->
@@ -952,6 +978,12 @@
             </do_if>
           </do_else>
         </do_else>
+
+        <!-- Release single-thread lock and keep draining the queue (one action per invocation; jitter spreads load). -->
+        <set_value name="global.$GT_SearchQueue.$Processing" exact="false"/>
+        <do_if value="global.$GT_SearchQueue.$Ships.count gt 0">
+          <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+        </do_if>
       </actions>
     </cue>
 
@@ -1044,7 +1076,7 @@
             <set_value name="global.$GT_LiveSearchQueue.$Params.{$ship}" exact="$params"/>
 
             <!-- Start the search now; live concurrency is handled by ProcessLiveSearchQueue. -->
-            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
+            <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
           </do_if>
           <do_else>
             <!-- Invalid ship/params - clean up entry -->
@@ -1079,8 +1111,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <!-- Jitter resumption so large fleets don't wake in the same frame (reduces SearchTradeRoutes bursts) -->
-      <delay min="10ms" max="120ms"/>
+      <!-- Small jitter so large fleets don't wake in the same frame (reduces bursts). -->
+      <delay min="0ms" max="30ms"/>
       <actions>
         <set_value name="$params" exact="event.param"/>
         <set_value name="$ship" exact="@$params.$Ship"/>
@@ -1089,55 +1121,17 @@
           <cancel_cue cue="this"/>
         </do_if>
 
-        <!-- Ensure SearchQueue exists -->
+        <!-- Persist params so SearchTradeRoutes can recover/validate against per-ship storage if needed -->
         <do_if value="not global.$GT_SearchQueue?">
           <set_value name="global.$GT_SearchQueue" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$Ships?">
-          <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
         </do_if>
         <do_if value="not global.$GT_SearchQueue.$Params?">
           <set_value name="global.$GT_SearchQueue.$Params" exact="table[]"/>
         </do_if>
-        <do_if value="not global.$GT_SearchQueue.$QueuedShips?">
-          <set_value name="global.$GT_SearchQueue.$QueuedShips" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
-          <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchQueue.$MaxConcurrent?">
-          <set_value name="global.$GT_SearchQueue.$MaxConcurrent" exact="1"/>
-        </do_if>
-
-        <!-- IMPORTANT: Continuations must NOT re-enter the cache-search concurrency gate.
-             If the queue is saturated with "waiting for cache continuation" searches, routing continuations back into
-             ProcessSearchQueue deadlocks: no continuation can run to release a slot.
-             Continuations are already jittered by this cue and do not consume additional cache-search slots. -->
-        <set_value name="$isContinuation" exact="false"/>
-        <do_if value="$params.$CacheContinuation? and $params.$CacheContinuation == true">
-          <set_value name="$isContinuation" exact="true"/>
-        </do_if>
-        <do_elseif value="$params.$SearchState? and ($params.$SearchState == 'live' or $params.$SearchState == 'fallback')">
-          <set_value name="$isContinuation" exact="true"/>
-        </do_elseif>
-        <do_if value="$isContinuation">
-          <!-- Still persist params so SearchTradeRoutes can recover/validate against per-ship storage if needed -->
-          <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
-          <!-- Continuations must not re-enter the queue gate; run SearchTradeRoutes directly. -->
-          <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <!-- Store/overwrite params for this ship -->
         <set_value name="global.$GT_SearchQueue.$Params.{$ship}" exact="$params"/>
 
-        <!-- De-dupe ship in queue (O(1) marker) -->
-        <do_if value="not global.$GT_SearchQueue.$QueuedShips.{$ship}?">
-          <set_value name="global.$GT_SearchQueue.$QueuedShips.{$ship}" exact="true"/>
-          <append_to_list name="global.$GT_SearchQueue.$Ships" exact="$ship"/>
-        </do_if>
-
-        <signal_cue_instantly cue="ProcessSearchQueue"/>
+        <!-- V2: Start searches through the hard-budget scheduler (one start per tick). -->
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Enqueue" param="$params"/>
       </actions>
     </cue>
   </cues>
