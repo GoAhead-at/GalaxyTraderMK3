@@ -1466,7 +1466,7 @@
         <param name="minAbsoluteProfit" default="0Cr" comment="Minimum absolute profit"/>
         <param name="ignoreBuildStorage" default="false" comment="Skip build storage targets"/>
         <param name="ignoreCarrierAux" default="false" comment="Skip carrier/aux targets"/>
-        <param name="maxEntries" default="5" comment="How many top cache entries to validate"/>
+        <param name="maxEntries" default="5" comment="Minimum number of top cache entries to validate. Will be increased automatically if maxReturnTrades requires more entries (to account for filtered invalid entries)."/>
         <param name="cacheMaxAge" default="600s" comment="TTL for cache entries"/>
       </params>
       <actions>
@@ -1477,10 +1477,20 @@
           $Trades = []
         ]"/>
 
-        <!-- Return up to a few valid candidates (kept small for performance).
+        <!-- Return up to MaxTradesToReturn valid candidates (configurable via global settings).
              This prevents fleet-coordination claim-check from stalling when the best trade is already reserved. -->
         <set_value name="$validTrades" exact="[]"/>
-        <set_value name="$maxReturnTrades" exact="3" comment="TODO(perf): tune / make configurable"/>
+        <set_value name="$maxReturnTrades" exact="20"/> <!-- Default fallback -->
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+          <set_value name="$maxReturnTrades" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        </do_if>
+        <!-- Clamp to valid range (1-100) -->
+        <do_if value="$maxReturnTrades lt 1">
+          <set_value name="$maxReturnTrades" exact="1"/>
+        </do_if>
+        <do_if value="$maxReturnTrades gt 100">
+          <set_value name="$maxReturnTrades" exact="100"/>
+        </do_if>
 
         <!-- IMPORTANT: don't use @ with .exists in boolean expressions; split into safe object + exists check -->
         <set_value name="$homeSectorObj" exact="$homeSector"/>
@@ -1497,7 +1507,11 @@
           <return value="$result"/>
         </do_if>
 
-        <set_value name="$limit" exact="[$cache.count, $maxEntries].min"/>
+        <!-- CRITICAL: maxEntries must be at least maxReturnTrades to allow returning multiple trades.
+             If maxEntries < maxReturnTrades, we can only return as many trades as entries validated.
+             Add buffer (2x) to account for invalid entries that get filtered out. -->
+        <set_value name="$effectiveMaxEntries" exact="[$maxEntries, $maxReturnTrades * 2].max"/>
+        <set_value name="$limit" exact="[$cache.count, $effectiveMaxEntries].min"/>
         <set_value name="$shipDockSize" exact="$ship.docksize"/>
 
         <!-- Respect illegal-wares setting: if not allowed, skip illegal cache entries entirely (no execution-time rejection). -->
@@ -3815,6 +3829,190 @@
       </actions>
     </cue>
 
+    <!-- ========================================= -->
+    
+    <!-- Counter Management Library Functions -->
+    <!-- Centralized counter management to prevent leaks and ensure consistency -->
+    
+    <!-- Increment Counter (with initialization check) -->
+    <library name="GT_IncrementCounter" purpose="run_actions">
+      <params>
+        <param name="counterPath" comment="Path to counter (e.g., 'global.$GT_SearchQueue.$ActiveSearches')"/>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Extract counter object and property name -->
+        <!-- For now, we'll use a simpler approach: pass the counter object and property name separately -->
+        <!-- Actually, MD doesn't support dynamic property access, so we need a different approach -->
+        <!-- We'll create specific functions for each counter type -->
+      </actions>
+    </library>
+    
+    <!-- Decrement Counter (with negative clamp) -->
+    <library name="GT_DecrementCounter" purpose="run_actions">
+      <params>
+        <param name="counterPath" comment="Path to counter"/>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+      </params>
+      <actions>
+        <!-- Similar limitation - MD doesn't support dynamic property access -->
+        <!-- We'll create specific functions for each counter type -->
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveSearches Counter -->
+    <library name="GT_IncrementActiveSearches" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_SearchQueue?">
+            <set_value name="global.$GT_SearchQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+          <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveSearches Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveSearches" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessSearchQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+          <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveSearches must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches lt 0">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveLiveSearches Counter -->
+    <library name="GT_IncrementActiveLiveSearches" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_LiveSearchQueue?">
+            <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveLiveSearches Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveLiveSearches" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessLiveSearchQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
+          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveLiveSearches must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt 0">
+            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Ships? and global.$GT_LiveSearchQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveProcessors Counter -->
+    <library name="GT_IncrementActiveProcessors" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_BatchProcessorQueue?">
+            <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveProcessors Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveProcessors" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessBatchProcessorQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveProcessors must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors lt 0">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
     <!-- ========================================= -->
   </cues>
 </mdscript>
