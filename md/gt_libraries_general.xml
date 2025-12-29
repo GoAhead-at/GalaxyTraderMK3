@@ -1528,6 +1528,45 @@
           <param name="ship" value="$ship"/>
         </run_actions>
 
+        <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
+        <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
+        <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+        <!-- Ships in different sectors may still try (different path might exist) -->
+        <set_value name="$currentSector" exact="$ship.sector"/>
+        <set_value name="$failedTrades" exact="[]"/>
+        <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
+          <set_value name="$failedTradesRaw" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
+          <set_value name="$failedTradesExpired" exact="[]"/>
+          <set_value name="$expirationTime" exact="1800s"/> <!-- 30 minutes -->
+          
+          <!-- Filter out expired entries -->
+          <do_all exact="$failedTradesRaw.count" counter="$f">
+            <set_value name="$failedTrade" exact="$failedTradesRaw.{$f}"/>
+            <set_value name="$tradeAge" exact="player.age - $failedTrade.$Timestamp"/>
+            <do_if value="$tradeAge le $expirationTime">
+              <!-- Entry still valid - keep it -->
+              <append_to_list name="$failedTrades" exact="$failedTrade"/>
+            </do_if>
+            <do_else>
+              <!-- Entry expired - mark for removal -->
+              <append_to_list name="$failedTradesExpired" exact="$f"/>
+            </do_else>
+          </do_all>
+          
+          <!-- Update global storage with cleaned list -->
+          <do_if value="$failedTradesExpired.count gt 0">
+            <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="$failedTrades"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Cache] Cleaned ' + $failedTradesExpired.count + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (older than 30 minutes)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$failedTrades.count == 0">
+            <!-- All entries expired - clear the list entirely -->
+            <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
+          </do_elseif>
+        </do_if>
+
         <do_all exact="$limit" counter="$i">
           <set_value name="$entry" exact="$cache.{$i}"/>
 
@@ -1572,6 +1611,40 @@
           </do_all>
           <do_if value="$shipAlreadyFailedThisEntry">
             <continue/>
+          </do_if>
+
+          <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - skip sector pairs that previously failed from this sector -->
+          <!-- This prevents revalidating entries that will fail due to blacklisted routes -->
+          <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+          <!-- One failure in a sector pair blocks ALL station combinations in that route for ships in this sector -->
+          <set_value name="$skipFailedSectorPair" exact="false"/>
+          <do_if value="$failedTrades.count gt 0">
+            <set_value name="$entryBuySector" exact="$entry.$BuyOffer.owner.sector"/>
+            <set_value name="$entrySellSector" exact="$entry.$SellOffer.owner.sector"/>
+            <do_all exact="$failedTrades.count" counter="$failIdx">
+              <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+              <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
+              <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
+                  <set_value name="$skipFailedSectorPair" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$skipFailedSectorPair">
+            <!-- Debug logging: cache entry skipped due to failed sector pair -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$entryBuySectorName" exact="@$entryBuySector.knownname"/>
+              <set_value name="$entrySellSectorName" exact="@$entrySellSector.knownname"/>
+              <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Cache] Skipped cache entry (failed sector pair): ' + $ship.idcode + 
+                ' | Sector: ' + (if $currentSectorName? then $currentSectorName else 'Unknown') + 
+                ' | Route: ' + (if $entryBuySectorName? then $entryBuySectorName else 'Unknown') + ' → ' + (if $entrySellSectorName? then $entrySellSectorName else 'Unknown') + 
+                ' | Previously failed from this sector (blacklisted route)'" 
+                chance="100"/>
+            </do_if>
+            <continue/> <!-- Skip this entry - sector pair previously failed due to blacklisted route -->
           </do_if>
 
           <set_value name="$failCount" exact="@$entry.$FailCount"/>
