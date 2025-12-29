@@ -1356,21 +1356,53 @@
                               <set_value name="$maxCachedRoutesPerWare" exact="global.$GT_GlobalSettings.$Fleet.$MaxCachedRoutes"/>
                             </do_if>
                             <!-- Count existing entries for this ware in THIS home sector's cache -->
+                            <!-- Also filter out expired entries (TTL validation during write) -->
                             <set_value name="$wareEntryCount" exact="0"/>
                             <set_value name="$oldestWareEntryIdx" exact="-1"/>
                             <set_value name="$oldestWareEntryTimestamp" exact="player.age"/>
+                            <set_value name="$cacheMaxAge" exact="600s"/> <!-- Default 10 minutes TTL -->
+                            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheMaxAge?">
+                              <set_value name="$cacheMaxAge" exact="global.$GT_GlobalSettings.$Fleet.$CacheMaxAge"/>
+                            </do_if>
                             <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
-                            <do_all exact="$homeSectorCache.count" counter="$cacheIdx">
+                            <set_value name="$expiredEntriesToRemove" exact="[]"/>
+                            <do_all exact="$homeSectorCache.count" counter="$cacheIdx" reverse="true">
                               <set_value name="$cachedEntry" exact="$homeSectorCache.{$cacheIdx}"/>
-                              <do_if value="$cachedEntry? and $cachedEntry.$WareId == $sellOfferWare.id">
-                                <set_value name="$wareEntryCount" exact="$wareEntryCount + 1"/>
-                                <!-- Track oldest entry for this ware (for replacement if at limit) -->
-                                <do_if value="$cachedEntry.$Timestamp? and $cachedEntry.$Timestamp lt $oldestWareEntryTimestamp">
-                                  <set_value name="$oldestWareEntryTimestamp" exact="$cachedEntry.$Timestamp"/>
-                                  <set_value name="$oldestWareEntryIdx" exact="$cacheIdx"/>
+                              <do_if value="$cachedEntry?">
+                                <!-- Check if entry is expired (TTL validation) -->
+                                <set_value name="$entryAge" exact="player.age - (if $cachedEntry.$Timestamp? then $cachedEntry.$Timestamp else 0)"/>
+                                <do_if value="$entryAge gt $cacheMaxAge">
+                                  <!-- Entry expired - mark for removal -->
+                                  <append_to_list name="$expiredEntriesToRemove" exact="$cacheIdx"/>
                                 </do_if>
+                                <do_elseif value="$cachedEntry.$WareId == $sellOfferWare.id">
+                                  <!-- Entry is for this ware and not expired - count it -->
+                                  <set_value name="$wareEntryCount" exact="$wareEntryCount + 1"/>
+                                  <!-- Track oldest entry for this ware (for replacement if at limit) -->
+                                  <do_if value="$cachedEntry.$Timestamp? and $cachedEntry.$Timestamp lt $oldestWareEntryTimestamp">
+                                    <set_value name="$oldestWareEntryTimestamp" exact="$cachedEntry.$Timestamp"/>
+                                    <set_value name="$oldestWareEntryIdx" exact="$cacheIdx"/>
+                                  </do_if>
+                                </do_elseif>
                               </do_if>
                             </do_all>
+                            
+                            <!-- Remove expired entries (cleanup during write) -->
+                            <do_if value="$expiredEntriesToRemove.count gt 0">
+                              <do_all exact="$expiredEntriesToRemove.count" counter="$expIdx">
+                                <set_value name="$expiredIdx" exact="$expiredEntriesToRemove.{$expIdx}"/>
+                                <set_value name="$expiredEntry" exact="global.$GT_TradeCache.{$homeSector}.{$expiredIdx}"/>
+                                <!-- Remove from per-ware index if present -->
+                                <do_if value="$expiredEntry? and $expiredEntry.$WareId? and global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}? and global.$GT_TradeCacheByWare.{$homeSector}.{$expiredEntry.$WareId}?">
+                                  <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$expiredEntry.$WareId}" exact="$expiredEntry"/>
+                                </do_if>
+                                <!-- Remove from cache -->
+                                <remove_value name="global.$GT_TradeCache.{$homeSector}.{$expiredIdx}"/>
+                              </do_all>
+                              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                                <debug_text text="'[GT-Batch] Removed ' + $expiredEntriesToRemove.count + ' expired cache entries during write (TTL: ' + ($cacheMaxAge / 60) + ' minutes)'" chance="100"/>
+                              </do_if>
+                            </do_if>
                             
                             <!-- If this ware already has max entries in this home sector, replace the oldest one -->
                             <do_if value="$wareEntryCount ge $maxCachedRoutesPerWare">

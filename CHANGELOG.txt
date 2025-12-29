@@ -89,6 +89,134 @@ BUGFIX: Fix promoted commander ship name concatenation (destroyed commander name
       and automatically fixes it by extracting clean name from `ship.macro.name`, then updates registry entries to prevent future corruption
     * `md/gt_xp_training.xml`: fallback name extraction now strips GT formatting before using `ship.knownname` to prevent concatenation
 
+TRADE SEARCH PIPELINE IMPROVEMENTS (Major Refactoring):
+  - Comprehensive analysis and fixes to trade search pipeline for better performance, reliability, and maintainability
+
+BUGFIX: Counter Leak in Early Exit Paths
+  - Symptom: `ActiveSearches` counter could leak when `SearchTradeRoutes` received invalid parameters or early exits
+  - Root cause: Counter was incremented before parameter validation, but decrement only happened in success paths
+  - Fix:
+    * `md/gt_trading_search.xml`: Moved counter flag extraction before parameter validation
+    * `md/gt_trading_search.xml`: Added cleanup in all early exit paths (invalid params, null maxDistance, negative maxDistance)
+    * `md/gt_trading_search.xml`: Added defensive negative counter clamping to prevent counter going below 0
+
+IMPROVEMENT: Consolidate Cache Search - Replace Async with Synchronous
+  - Symptom: Race condition where cache search results weren't available immediately
+  - Root cause: `CheckTradeCache` called async `SearchCachedTrades` but tried to read results synchronously
+  - Fix:
+    * `md/gt_trading_queue.xml`: Replaced async `signal_cue_instantly` call with synchronous `run_actions` to `GT_TS_CachePickBest`
+    * `md/gt_search_methods.xml`: Marked `SearchCachedTrades` as deprecated (kept for savegame compatibility)
+    * Eliminates race condition and consolidates cache search to single implementation
+
+IMPROVEMENT: Cache Population vs. Ship-Specific Filtering Mismatch
+  - Symptom: Low-skill pilots would populate cache with limited trades, high-skill pilots didn't benefit
+  - Root cause: Cache was populated using requesting ship's pilot skill distance cap, limiting cache diversity
+  - Fix:
+    * `md/gt_trading_search.xml`: Use original `maxDistance` (commander's skill) for sector list building and cache population
+    * `md/gt_trading_search.xml`: Use `PilotSkillMaxDistance` (requesting ship's pilot skill) for result filtering
+    * `md/gt_search_methods.xml`: Store pilot skill cap in batch data for use during result filtering
+    * Ensures cache is populated broadly while ships only receive trades they can execute
+
+IMPROVEMENT: Live Search Distance Capping by Pilot Skill
+  - Symptom: Level 1 pilot ships triggering live searches with 25-jump radius (commander's skill) instead of 1 jump
+  - Root cause: Live search used order definition's `skill.max()` (commander's skill) instead of requesting pilot's actual skill
+  - Fix:
+    * `md/gt_trading_search.xml`: Calculate pilot skill-based max distance and cap live search `maxDistance` before signaling `SearchLiveTrades`
+    * Each ship now searches within its own skill range, not commander's range
+    * Higher-level pilots trigger their own live search if cache doesn't have suitable trades
+
+IMPROVEMENT: Centralize Counter Management
+  - Symptom: Counter management logic scattered across many files with inconsistent cleanup
+  - Root cause: Manual increment/decrement operations with complex cleanup logic in multiple places
+  - Fix:
+    * `md/gt_libraries_general.xml`: Created 6 new library functions for centralized counter management:
+      * `GT_IncrementActiveSearches` / `GT_DecrementActiveSearches`
+      * `GT_IncrementActiveLiveSearches` / `GT_DecrementActiveLiveSearches`
+      * `GT_IncrementActiveProcessors` / `GT_DecrementActiveProcessors`
+    * All counter operations now use centralized functions with proper cleanup, negative clamping, and queue processor triggering
+    * Refactored all counter operations across `gt_trading_search.xml`, `gt_trading_queue.xml`, `gt_trading_batch_processor.xml`, `gt_core_system.xml`
+
+IMPROVEMENT: Prefilter Cache Entries by Failed Sector Pairs (Per-Sector Tracking)
+  - Symptom: Cache entries that previously failed due to blacklisted routes were revalidated repeatedly, wasting CPU
+  - Root cause: `GT_TS_CachePickBest` didn't check failed sector pairs before validation
+  - Fix:
+    * Changed from per-ship tracking (`GT_FailedTrades.{$ship}`) to per-sector tracking (`GT_FailedSectorPairs.{$currentSector}`)
+    * Ships in the same sector now share failed sector pair knowledge (fleet-wide benefit)
+    * `md/gt_libraries_general.xml`: Added prefilter in `GT_TS_CachePickBest` to skip entries matching failed sector pairs
+    * `md/gt_trading_signals.xml`, `md/gt_trading_ai.xml`: Store failed sector pairs per-sector instead of per-ship
+    * `md/gt_search_methods.xml`, `md/gt_trading_search.xml`: Load failed sector pairs from ship's current sector
+    * Expired entries (30 minutes TTL) are automatically cleaned up
+
+BUGFIX: TotalTradesEvaluated Missing Batch Processor Rejections
+  - Symptom: "NO TRADES FOUND ANALYSIS" showed `TotalEvaluated: 0` even when trades were evaluated and rejected
+  - Root cause: `FilterTradeList_Resume` didn't include batch processor rejection stats in `$totalTradesEvaluated` calculation
+  - Fix:
+    * `md/gt_trading_search.xml`: Updated `$totalTradesEvaluated` to include batch processor rejections (profit, docking, amount, distance)
+    * `md/gt_trading_batch_processor.xml`: Added detailed diagnostic logging when hard cap is reached (shows rejection breakdown)
+    * Ensures accurate statistics for debugging trade search issues
+
+IMPROVEMENT: Hard Cap Removal and Batch Processor Optimizations
+  - Symptom: Batch processor would terminate after 3 seconds even if not finished, causing ships to miss valid trades
+  - Root cause: Hardcoded 3-second timeout forced premature completion
+  - Fix:
+    * `md/gt_trading_batch_processor.xml`: Removed hard cap entirely - batch processor now completes all evaluation work
+    * Performance optimizations to prevent stalls:
+      * Increased chunk size from 4×4 (16 combinations) to 8×8 (64 combinations) per chunk
+      * Reduced batch delay from 50ms to 10ms base delay, jitter from 20ms to 5ms
+      * Increased yield threshold from 1 slice to 5 slices before yielding
+    * Ships no longer miss valid trades due to timeout
+
+IMPROVEMENT: Home Refresh Wait Time Optimization
+  - Symptom: Ships blocked by `home_refresh` waited 10 seconds before retrying cache, missing fresh cache entries
+  - Root cause: Fixed 10-second wait didn't allow ships to catch cache populated by home refresh
+  - Fix:
+    * `aiscripts/order.trade.galaxytrader.xml`: Reduced wait time for `home_refresh` from 10s to 3s
+    * Ships blocked by `home_refresh` now retry cache every 3 seconds instead of 10 seconds
+    * Ships blocked by `busy`/`busy_batch` still wait 10 seconds (queues need time to drain)
+    * Allows ships to catch trades as soon as home refresh populates the cache
+
+BUGFIX: AI Script Wait Time Fix (Random Wait Bug)
+  - Symptom: Ships stuck in prolonged wait states, retrying prematurely while home refresh still active
+  - Root cause: `wait` statement used `max="$waitTime"` without `min`, causing random wait (0-max) instead of fixed wait
+  - Fix:
+    * `aiscripts/order.trade.galaxytrader.xml`: Changed to `<wait min="$waitTime" max="$waitTime"/>` for fixed wait time
+    * Ensures ships wait the full intended time before retrying (not random)
+    * Prevents premature retries while home refresh is still active
+
+BUGFIX: Stale State Not Cleared on Ship Removal
+  - Symptom: State variables persisted indefinitely when ships were removed/destroyed
+  - Root cause: Ship removal handlers didn't clean up all state variables
+  - Fix:
+    * `md/gt_core_system.xml`: Added cleanup for `GT_LiveSearchQueue.$Params`, `GT_SearchResult`, `GT_FallbackAttempted`, `GT_FallbackLogbookWritten`
+    * Removes ship from `GT_LiveSearchQueue.$BySector` queues
+    * All cleanup operations include debug logging
+
+BUGFIX: Cache Entry TTL Not Validated During Write
+  - Symptom: Expired cache entries accumulated over time
+  - Root cause: TTL validation only happened during cache read, not during write
+  - Fix:
+    * `md/gt_trading_batch_processor.xml`: Added TTL validation during cache write
+    * Checks entry age against `$cacheMaxAge` (default 600s, configurable)
+    * Removes expired entries proactively during write operation
+    * Updates per-ware index when removing expired entries
+
+BUGFIX: Fallback Flag Not Cleared on Successful Trade
+  - Symptom: `GT_FallbackAttempted` flag persisted after successful trade, preventing fallback from being attempted again
+  - Root cause: Fallback flags weren't cleared when trade completed successfully
+  - Fix:
+    * `md/gt_libraries_general.xml`: Added cleanup in `GT_ClearPendingTradeData` library
+    * Clears both `GT_FallbackAttempted` and `GT_FallbackLogbookWritten` flags on trade completion
+    * Ensures fallback can be attempted again if needed in future searches
+
+IMPROVEMENT: Max Trades to Return Setting
+  - Symptom: Hardcoded limit of trades returned from cache search
+  - Root cause: `GT_TS_CachePickBest` used hardcoded value instead of global setting
+  - Fix:
+    * `md/gt_libraries_general.xml`: Updated `GT_TS_CachePickBest` to use `global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn`
+    * `md/gt_global_settings.xml`: Updated UI slider range from 1-100 (default: 20)
+    * `md/gt_libraries_general.xml`: Made `maxEntries` (validation limit) dynamic based on `maxReturnTrades` (ensures enough entries validated)
+    * Ships can now receive up to 100 trades from cache search (configurable)
+
 Version 0.7.3 - 2025-12-27
 
 BUGFIX: Prevent ships getting stuck behind “live search already in progress” forever (missing Started timestamp)
