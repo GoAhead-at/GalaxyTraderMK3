@@ -724,10 +724,13 @@
               <debug_text text="'[GT-Search] (' + $ship.idcode + ') ForceLiveSearch flag set - skipping cache, going straight to live search'" chance="100"/>
             </do_if>
             <!-- Clear ForceLiveSearch flag after use -->
+            <!-- FIX: Clear from both storage locations (params and global) to prevent persistence -->
             <!-- Initialization guarantees global.$GT_AIParameters exists -->
             <do_if value="global.$GT_AIParameters.{$ship}?">
               <remove_value name="global.$GT_AIParameters.{$ship}.$ForceLiveSearch"/>
             </do_if>
+            <!-- Also clear from params to prevent it from being carried forward -->
+            <set_value name="$params.$ForceLiveSearch" exact="false"/>
           </do_if>
         </do_else>
         
@@ -1049,13 +1052,18 @@
           <do_if value="not $needsEscape">
             <!-- Initialization guarantees global.$GT_CacheMissCooldowns exists -->
             <!-- Use same cooldown system as cache misses, but mark it as zero-trade cooldown -->
+            <!-- FIX: Use configurable cooldown duration (default: 30s, was hardcoded 60s) -->
+            <set_value name="$zeroTradeCooldown" exact="30s"/> <!-- Default fallback -->
+            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown?">
+              <set_value name="$zeroTradeCooldown" exact="global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown"/>
+            </do_if>
             <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
               $LastLiveSearch = player.age,
-              $CooldownDuration = 60s
+              $CooldownDuration = $zeroTradeCooldown
             ]"/>
             
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ')    Applied 60s cooldown after zero-trade live search - ship may be stuck, will retry later'" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ')    Applied ' + ($zeroTradeCooldown / 1) + 's cooldown after zero-trade live search - ship may be stuck, will retry later'" chance="100"/>
             </do_if>
           </do_if>
           <do_else>
@@ -2296,13 +2304,16 @@
                 <set_value name="$diverseListCount" exact="global.$GT_SearchResult.{$ship}.$DiverseListCount"/>
               </do_if>
               
+              <!-- FIX: Always log counters even if 0 or missing to avoid misleading diagnostics -->
+              <set_value name="$stationsEvaluatedDisplay" exact="if $stationsEvaluated? then $stationsEvaluated else 0"/>
+              <set_value name="$offersFoundDisplay" exact="if $offersFound? then $offersFound else 0"/>
               <set_value name="$diagnosticInfo" exact="'\n\nSEARCH CONTEXT:' +
                 '\n  Search method: ' + $searchMethod +
                 (if $cacheChecked then '\n  Cache checked: Yes (' + $cacheCount + ' entries)' else '\n  Cache checked: No') +
-                (if $searchMethod == 'live' and $stationsEvaluated? then '\n  Stations evaluated: ' + $stationsEvaluated else '') +
-                (if $searchMethod == 'live' and $offersFound? then '\n  Offers found: ' + $offersFound else '') +
+                (if $searchMethod == 'live' then '\n  Stations evaluated: ' + $stationsEvaluatedDisplay else '') +
+                (if $searchMethod == 'live' then '\n  Offers found: ' + $offersFoundDisplay else '') +
                 (if $searchMethod == 'cache' and $validEntries gt 0 then '\n  Valid cached trades found: ' + $validEntries + ' (diverse list: ' + $diverseListCount + ')' else '') +
-                (if $totalRejected == 0 and $validEntries == 0 and ($offersFound == 0 or not $offersFound?) then '\n  No trades were evaluated (cache empty or no offers found)' else '') +
+                (if $totalRejected == 0 and $validEntries == 0 and $offersFoundDisplay == 0 then '\n  No trades were evaluated (cache empty or no offers found)' else '') +
                 (if $validEntries gt 0 and $diverseListCount == 0 then '\n  All valid trades filtered out during diverse list building (need unique station pairs)' else '')"/>
               
               <!-- Build best rejected trade info safely (extract properties first, then check) -->
@@ -2340,7 +2351,7 @@
                 '\n' +
                 '\n  TOTAL REJECTED: ' + $totalRejected +
                 '\n  TOTAL EVALUATED: ' + $totalEvaluated +
-                '\n  OFFERS FOUND: ' + $offersFound +
+                '\n  OFFERS FOUND: ' + $offersFoundDisplay +
                 $bestRejectedInfo" 
                 chance="100"/>
             </do_if>
@@ -2962,6 +2973,7 @@
         </do_if>
         
         <!-- Get maxDistance and originalMaxDistance from batch data (still stored for reference) -->
+        <!-- FIX: Also check live search state if batch data doesn't have it -->
         <set_value name="$maxDistance" exact="null"/>
         <set_value name="$originalMaxDistance" exact="null"/>
         <set_value name="$pilotSkillMaxDistance" exact="null"/>
@@ -2978,6 +2990,18 @@
             <set_value name="$pilotSkillMaxDistance" exact="$batchData.$PilotSkillMaxDistance"/>
             <!-- Override maxDistance for filtering (sector list was built with original maxDistance for cache population) -->
             <set_value name="$maxDistance" exact="$pilotSkillMaxDistance"/>
+          </do_if>
+        </do_if>
+        <!-- FIX: Fallback to live search state if batch data doesn't have maxDistance -->
+        <do_if value="$maxDistance == null">
+          <set_value name="$liveState" exact="@global.$GT_SearchLiveTrades_State.{$ship}"/>
+          <do_if value="$liveState?">
+            <do_if value="$liveState.$MaxDistance?">
+              <set_value name="$maxDistance" exact="$liveState.$MaxDistance"/>
+            </do_if>
+            <do_if value="$liveState.$OriginalMaxDistance?">
+              <set_value name="$originalMaxDistance" exact="$liveState.$OriginalMaxDistance"/>
+            </do_if>
           </do_if>
         </do_if>
         
@@ -4462,6 +4486,7 @@
           <debug_text text="'[GT-Cache-Snapshot] homeKeys=' + $keys.count + ' (homesRegistry=' + (global.$GT_TradeCacheHomes? and 'true' or 'false') + ', cacheHasKeys=' + ($cacheObj.keys? and 'true' or 'false') + ')'" chance="100"/>
 
           <!-- Normal shape: table keyed by home sector -->
+          <!-- FIX: Handle empty keys list (valid state - just means no cached home sectors yet) -->
           <do_if value="$keys.count gt 0">
             <do_all exact="$keys.count" counter="$k">
               <set_value name="$home" exact="$keys.{$k}"/>
@@ -4559,6 +4584,10 @@
               </do_all>
             </do_all>
           </do_if>
+          <do_elseif value="$keys.count == 0">
+            <!-- FIX: Empty keys list is valid - just means no cached home sectors yet -->
+            <debug_text text="'[GT-Cache-Snapshot] Cache is empty (no home sectors cached yet) - this is normal for new saves or after cache clear'" chance="100"/>
+          </do_elseif>
           <do_else>
             <!-- Legacy shape: GT_TradeCache is a flat list (no home-sector keys). Dump as one "home". -->
             <do_if value="$cacheObj.count? and $cacheObj.count ge 0">
