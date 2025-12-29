@@ -1392,6 +1392,14 @@
         <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}?">
           <remove_value name="global.$GT_ActiveTrade.{$ship}"/>
         </do_if>
+        
+        <!-- Clear fallback flags (trade completed successfully, reset fallback state) -->
+        <do_if value="global.$GT_FallbackAttempted? and global.$GT_FallbackAttempted.{$ship}?">
+          <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
+        </do_if>
+        <do_if value="global.$GT_FallbackLogbookWritten? and global.$GT_FallbackLogbookWritten.{$ship}?">
+          <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
+        </do_if>
       </actions>
     </library>
     
@@ -1466,7 +1474,7 @@
         <param name="minAbsoluteProfit" default="0Cr" comment="Minimum absolute profit"/>
         <param name="ignoreBuildStorage" default="false" comment="Skip build storage targets"/>
         <param name="ignoreCarrierAux" default="false" comment="Skip carrier/aux targets"/>
-        <param name="maxEntries" default="5" comment="How many top cache entries to validate"/>
+        <param name="maxEntries" default="5" comment="Minimum number of top cache entries to validate. Will be increased automatically if maxReturnTrades requires more entries (to account for filtered invalid entries)."/>
         <param name="cacheMaxAge" default="600s" comment="TTL for cache entries"/>
       </params>
       <actions>
@@ -1477,10 +1485,20 @@
           $Trades = []
         ]"/>
 
-        <!-- Return up to a few valid candidates (kept small for performance).
+        <!-- Return up to MaxTradesToReturn valid candidates (configurable via global settings).
              This prevents fleet-coordination claim-check from stalling when the best trade is already reserved. -->
         <set_value name="$validTrades" exact="[]"/>
-        <set_value name="$maxReturnTrades" exact="3" comment="TODO(perf): tune / make configurable"/>
+        <set_value name="$maxReturnTrades" exact="20"/> <!-- Default fallback -->
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+          <set_value name="$maxReturnTrades" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        </do_if>
+        <!-- Clamp to valid range (1-100) -->
+        <do_if value="$maxReturnTrades lt 1">
+          <set_value name="$maxReturnTrades" exact="1"/>
+        </do_if>
+        <do_if value="$maxReturnTrades gt 100">
+          <set_value name="$maxReturnTrades" exact="100"/>
+        </do_if>
 
         <!-- IMPORTANT: don't use @ with .exists in boolean expressions; split into safe object + exists check -->
         <set_value name="$homeSectorObj" exact="$homeSector"/>
@@ -1497,7 +1515,11 @@
           <return value="$result"/>
         </do_if>
 
-        <set_value name="$limit" exact="[$cache.count, $maxEntries].min"/>
+        <!-- CRITICAL: maxEntries must be at least maxReturnTrades to allow returning multiple trades.
+             If maxEntries < maxReturnTrades, we can only return as many trades as entries validated.
+             Add buffer (2x) to account for invalid entries that get filtered out. -->
+        <set_value name="$effectiveMaxEntries" exact="[$maxEntries, $maxReturnTrades * 2].max"/>
+        <set_value name="$limit" exact="[$cache.count, $effectiveMaxEntries].min"/>
         <set_value name="$shipDockSize" exact="$ship.docksize"/>
 
         <!-- Respect illegal-wares setting: if not allowed, skip illegal cache entries entirely (no execution-time rejection). -->
@@ -1513,6 +1535,45 @@
         <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
           <param name="ship" value="$ship"/>
         </run_actions>
+
+        <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
+        <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
+        <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+        <!-- Ships in different sectors may still try (different path might exist) -->
+        <set_value name="$currentSector" exact="$ship.sector"/>
+        <set_value name="$failedTrades" exact="[]"/>
+        <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
+          <set_value name="$failedTradesRaw" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
+          <set_value name="$failedTradesExpired" exact="[]"/>
+          <set_value name="$expirationTime" exact="1800s"/> <!-- 30 minutes -->
+          
+          <!-- Filter out expired entries -->
+          <do_all exact="$failedTradesRaw.count" counter="$f">
+            <set_value name="$failedTrade" exact="$failedTradesRaw.{$f}"/>
+            <set_value name="$tradeAge" exact="player.age - $failedTrade.$Timestamp"/>
+            <do_if value="$tradeAge le $expirationTime">
+              <!-- Entry still valid - keep it -->
+              <append_to_list name="$failedTrades" exact="$failedTrade"/>
+            </do_if>
+            <do_else>
+              <!-- Entry expired - mark for removal -->
+              <append_to_list name="$failedTradesExpired" exact="$f"/>
+            </do_else>
+          </do_all>
+          
+          <!-- Update global storage with cleaned list -->
+          <do_if value="$failedTradesExpired.count gt 0">
+            <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="$failedTrades"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Cache] Cleaned ' + $failedTradesExpired.count + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (older than 30 minutes)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$failedTrades.count == 0">
+            <!-- All entries expired - clear the list entirely -->
+            <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
+          </do_elseif>
+        </do_if>
 
         <do_all exact="$limit" counter="$i">
           <set_value name="$entry" exact="$cache.{$i}"/>
@@ -1558,6 +1619,40 @@
           </do_all>
           <do_if value="$shipAlreadyFailedThisEntry">
             <continue/>
+          </do_if>
+
+          <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - skip sector pairs that previously failed from this sector -->
+          <!-- This prevents revalidating entries that will fail due to blacklisted routes -->
+          <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+          <!-- One failure in a sector pair blocks ALL station combinations in that route for ships in this sector -->
+          <set_value name="$skipFailedSectorPair" exact="false"/>
+          <do_if value="$failedTrades.count gt 0">
+            <set_value name="$entryBuySector" exact="$entry.$BuyOffer.owner.sector"/>
+            <set_value name="$entrySellSector" exact="$entry.$SellOffer.owner.sector"/>
+            <do_all exact="$failedTrades.count" counter="$failIdx">
+              <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+              <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
+              <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
+                  <set_value name="$skipFailedSectorPair" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$skipFailedSectorPair">
+            <!-- Debug logging: cache entry skipped due to failed sector pair -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$entryBuySectorName" exact="@$entryBuySector.knownname"/>
+              <set_value name="$entrySellSectorName" exact="@$entrySellSector.knownname"/>
+              <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Cache] Skipped cache entry (failed sector pair): ' + $ship.idcode + 
+                ' | Sector: ' + (if $currentSectorName? then $currentSectorName else 'Unknown') + 
+                ' | Route: ' + (if $entryBuySectorName? then $entryBuySectorName else 'Unknown') + ' → ' + (if $entrySellSectorName? then $entrySellSectorName else 'Unknown') + 
+                ' | Previously failed from this sector (blacklisted route)'" 
+                chance="100"/>
+            </do_if>
+            <continue/> <!-- Skip this entry - sector pair previously failed due to blacklisted route -->
           </do_if>
 
           <set_value name="$failCount" exact="@$entry.$FailCount"/>
@@ -3496,12 +3591,17 @@
           <do_if value="$Object? and $Object != null">
             <set_value name="$objectValue" exact="$Object"/>
           </do_if>
+        <set_value name="$hasObject" exact="$objectValue? and $objectValue != null"/>
           
           <!-- Check if interaction is 'showonmap' -->
           <set_value name="$hasInteraction" exact="false"/>
           <do_if value="$Interaction? and $Interaction != null and $Interaction == 'showonmap'">
             <set_value name="$hasInteraction" exact="true"/>
           </do_if>
+        <!-- If no object is provided, do not use interaction (vanilla player logbook entries omit object/interaction). -->
+        <do_if value="not $hasObject">
+          <set_value name="$hasInteraction" exact="false"/>
+        </do_if>
           
           <!-- Debug: Log before writing logbook -->
           <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -3514,10 +3614,97 @@
             </do_if>
           </do_if>
           
-          <!-- Write logbook entry with conditional blocks for interaction, category, and money/bonus -->
-          <!-- XSD requires literal values for category and interaction attributes -->
-          <!-- Structure: interaction (with/without) -> category -> money/bonus -->
-          <do_if value="$hasInteraction">
+        <!-- Write logbook entry with conditional blocks for: hasObject -> interaction -> category -> money/bonus -->
+        <!-- XSD requires literal values for category and interaction attributes -->
+        <do_if value="not $hasObject">
+          <!-- Player logbook only: omit object attribute entirely (vanilla pattern: write_to_logbook without object=...) -->
+          <do_if value="$Category == 'alerts'">
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="alerts" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="alerts" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="alerts" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="alerts" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_if>
+          <do_elseif value="$Category == 'upkeep'">
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="upkeep" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="upkeep" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="upkeep" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="upkeep" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_elseif>
+          <do_elseif value="$Category == 'news'">
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="news" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="news" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="news" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="news" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_elseif>
+          <do_elseif value="$Category == 'general'">
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_elseif>
+          <do_elseif value="$Category == 'tips'">
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="tips" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="tips" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="tips" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="tips" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_elseif>
+          <do_else>
+            <!-- Default to 'general' if category not recognized -->
+            <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money" bonus="$Bonus"/>
+            </do_if>
+            <do_elseif value="$Money? and $Money != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" money="$Money"/>
+            </do_elseif>
+            <do_elseif value="$Bonus? and $Bonus != null">
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted" bonus="$Bonus"/>
+            </do_elseif>
+            <do_else>
+              <write_to_logbook category="general" title="$Title" text="$Message" highlighted="$Highlighted"/>
+            </do_else>
+          </do_else>
+        </do_if>
+        <do_elseif value="$hasInteraction">
             <!-- WITH interaction="showonmap" -->
             <do_if value="$Category == 'alerts'">
               <do_if value="$Money? and $Money != null and $Bonus? and $Bonus != null">
@@ -3604,7 +3791,7 @@
                 <write_to_logbook category="general" title="$Title" text="$Message" interaction="showonmap" object="$objectValue" highlighted="$Highlighted"/>
               </do_else>
             </do_else>
-          </do_if>
+          </do_elseif>
           <do_else>
             <!-- WITHOUT interaction attribute -->
             <do_if value="$Category == 'alerts'">
@@ -3723,5 +3910,190 @@
       </actions>
     </cue>
 
+    <!-- ========================================= -->
+    
+    <!-- Counter Management Library Functions -->
+    <!-- Centralized counter management to prevent leaks and ensure consistency -->
+    
+    <!-- Increment Counter (with initialization check) -->
+    <library name="GT_IncrementCounter" purpose="run_actions">
+      <params>
+        <param name="counterPath" comment="Path to counter (e.g., 'global.$GT_SearchQueue.$ActiveSearches')"/>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Extract counter object and property name -->
+        <!-- For now, we'll use a simpler approach: pass the counter object and property name separately -->
+        <!-- Actually, MD doesn't support dynamic property access, so we need a different approach -->
+        <!-- We'll create specific functions for each counter type -->
+      </actions>
+    </library>
+    
+    <!-- Decrement Counter (with negative clamp) -->
+    <library name="GT_DecrementCounter" purpose="run_actions">
+      <params>
+        <param name="counterPath" comment="Path to counter"/>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+      </params>
+      <actions>
+        <!-- Similar limitation - MD doesn't support dynamic property access -->
+        <!-- We'll create specific functions for each counter type -->
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveSearches Counter -->
+    <library name="GT_IncrementActiveSearches" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_SearchQueue?">
+            <set_value name="global.$GT_SearchQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchQueue.$ActiveSearches?">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches?">
+          <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveSearches Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveSearches" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessSearchQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches gt 0">
+          <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveSearches must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$ActiveSearches? and global.$GT_SearchQueue.$ActiveSearches lt 0">
+            <set_value name="global.$GT_SearchQueue.$ActiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Ships? and global.$GT_SearchQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessSearchQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveLiveSearches Counter -->
+    <library name="GT_IncrementActiveLiveSearches" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_LiveSearchQueue?">
+            <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
+          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveLiveSearches Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveLiveSearches" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessLiveSearchQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
+          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveLiveSearches must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt 0">
+            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Ships? and global.$GT_LiveSearchQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Increment ActiveProcessors Counter -->
+    <library name="GT_IncrementActiveProcessors" purpose="run_actions">
+      <params>
+        <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
+      </params>
+      <actions>
+        <!-- Initialize counter if missing -->
+        <do_if value="$initializeIfMissing">
+          <do_if value="not global.$GT_BatchProcessorQueue?">
+            <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Increment counter -->
+        <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors?">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="add"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Decrement ActiveProcessors Counter (with negative clamp) -->
+    <library name="GT_DecrementActiveProcessors" purpose="run_actions">
+      <params>
+        <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
+        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessBatchProcessorQueue after decrement if ships are waiting"/>
+      </params>
+      <actions>
+        <!-- Decrement counter -->
+        <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
+          <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
+        </do_if>
+        
+        <!-- Hard clamp: ActiveProcessors must never go negative -->
+        <do_if value="$clampToZero">
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors lt 0">
+            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Trigger queue processor if requested and ships are waiting -->
+        <do_if value="$triggerQueueProcessor">
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
   </cues>
 </mdscript>

@@ -71,6 +71,28 @@
         <set_value name="global.$GT_SessionStats.$TradesCompleted" exact="0"/>
         <set_value name="global.$GT_SessionStats.$XPGained" exact="0"/>
         
+        <!-- Cleanup: Remove incorrect legacy globals (these were local variables incorrectly saved as globals) -->
+        <set_value name="$cleanupCount" exact="0"/>
+        <do_if value="global.$gt_AdvancedAnalytics?">
+          <remove_value name="global.$gt_AdvancedAnalytics"/>
+          <set_value name="$cleanupCount" exact="$cleanupCount + 1"/>
+        </do_if>
+        <do_if value="global.$gt_FleetCoord?">
+          <remove_value name="global.$gt_FleetCoord"/>
+          <set_value name="$cleanupCount" exact="$cleanupCount + 1"/>
+        </do_if>
+        <do_if value="global.$gt_SatelliteIntel?">
+          <remove_value name="global.$gt_SatelliteIntel"/>
+          <set_value name="$cleanupCount" exact="$cleanupCount + 1"/>
+        </do_if>
+        <do_if value="global.$gt_ThreatIntel?">
+          <remove_value name="global.$gt_ThreatIntel"/>
+          <set_value name="$cleanupCount" exact="$cleanupCount + 1"/>
+        </do_if>
+        <do_if value="$cleanupCount gt 0 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Core] Cleaned up ' + $cleanupCount + ' incorrect legacy globals (gt_AdvancedAnalytics, gt_FleetCoord, gt_SatelliteIntel, gt_ThreatIntel)'" chance="100"/>
+        </do_if>
+        
         <!-- Set initialization complete flag -->
         <set_value name="global.$GT_Initialized" exact="true"/>
         
@@ -907,9 +929,10 @@
               <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
                 <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
                 <!-- Decrement active processors if ship was active -->
-                <do_if value="global.$GT_BatchProcessorQueue.$ActiveProcessors? and global.$GT_BatchProcessorQueue.$ActiveProcessors gt 0">
-                  <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" operation="subtract"/>
-                </do_if>
+                <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveProcessors">
+                  <param name="clampToZero" value="true"/>
+                  <param name="triggerQueueProcessor" value="false"/>
+                </run_actions>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Cleanup] Removed ship from batch processor active ships: ' + $ship.idcode" chance="100"/>
                 </do_if>
@@ -923,6 +946,48 @@
           </do_if>
           <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
             <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+          
+          <!-- Remove from live search queue if present -->
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Cleared live search queue params for ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$BySector?">
+            <do_all exact="global.$GT_LiveSearchQueue.$BySector.keys.count" counter="$sectorIdx">
+              <set_value name="$sector" exact="global.$GT_LiveSearchQueue.$BySector.keys.{$sectorIdx}"/>
+              <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sector}? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships?">
+                <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count" counter="$i" reverse="true">
+                  <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.{$i} == $ship">
+                    <remove_from_list name="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships" exact="$ship"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Cleanup] Removed ship from live search queue sector ' + @$sector.knownname + ': ' + $ship.idcode" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- Clear search results -->
+          <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.{$ship}?">
+            <remove_value name="global.$GT_SearchResult.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Cleared search results for ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Clear fallback flags -->
+          <do_if value="global.$GT_FallbackAttempted? and global.$GT_FallbackAttempted.{$ship}?">
+            <remove_value name="global.$GT_FallbackAttempted.{$ship}"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Cleared fallback attempted flag for ' + $ship.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="global.$GT_FallbackLogbookWritten? and global.$GT_FallbackLogbookWritten.{$ship}?">
+            <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
           </do_if>
           
           <!-- ============================================= -->
@@ -1103,6 +1168,10 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$force" exact="false"/>
+        <do_if value="event.param2? and event.param2.$Force? and event.param2.$Force">
+          <set_value name="$force" exact="true"/>
+        </do_if>
         
         <!-- Skip if ship doesn't exist -->
         <do_if value="not $ship.exists">
@@ -1119,6 +1188,42 @@
           </do_if>
           <do_else>
             <!-- Ship is in registry - continue with orphaned check -->
+            
+            <!-- PROMOTION / TRANSITION GUARD:
+                 During commander destruction + promotion, ships can briefly have no default order.
+                 Do NOT purge registry on the first observation; schedule a delayed verify once. -->
+            <set_value name="$exitEarly" exact="false"/>
+            <set_value name="$defaultOrderId" exact="@$ship.defaultorder.id"/>
+            <set_value name="$commander" exact="@$ship.commander"/>
+            <set_value name="$commanderExists" exact="false"/>
+            <set_value name="$commanderDefaultNull" exact="false"/>
+            <do_if value="$commander? and $commander.exists and $commander != $ship">
+              <set_value name="$commanderExists" exact="true"/>
+              <!-- Commander exists but has no default order yet (promotion window) -->
+              <do_if value="(not @$commander.defaultorder) or (@$commander.defaultorder == null)">
+                <set_value name="$commanderDefaultNull" exact="true"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Defer cleanup if:
+                 - ship has no default order id yet, OR
+                 - ship has no commander yet (transition), OR
+                 - commander exists but default order is null (promotion window) -->
+            <do_if value="not $force and ((not $defaultOrderId or $defaultOrderId == null) or (not $commanderExists) or $commanderDefaultNull)">
+              <set_value name="$exitEarly" exact="true"/>
+              <do_if value="not global.$GT_OrphanVerifyPending?">
+                <set_value name="global.$GT_OrphanVerifyPending" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_OrphanVerifyPending.{$ship}?">
+                <set_value name="global.$GT_OrphanVerifyPending.{$ship}" exact="player.age"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Cleanup] Deferring orphan cleanup (promotion window): ' + $ship.idcode + ' (defaultOrder=' + (if $defaultOrderId then $defaultOrderId else 'null') + ', commanderExists=' + $commanderExists + ', commanderDefaultNull=' + $commanderDefaultNull + ')'" chance="100"/>
+                </do_if>
+                <signal_cue_instantly cue="md.GT_CoreSystem.VerifyShipOrphaned" param="table[$Ship=$ship]"/>
+              </do_if>
+            </do_if>
+            
+            <do_if value="not $exitEarly">
         
         <!-- Check if ship still has active GT order -->
         <set_value name="$hasGTOrder" exact="false"/>
@@ -1208,8 +1313,27 @@
             $OriginalName = $originalName
           ]"/>
         </do_elseif>
+        
+            </do_if>
           </do_else>
         </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Delayed verify for transient "no default order" states (promotion window). -->
+    <cue name="VerifyShipOrphaned" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.VerifyShipOrphaned"/>
+      </conditions>
+      <delay exact="3s"/>
+      <actions>
+        <set_value name="$ship" exact="event.param.$Ship"/>
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="global.$GT_OrphanVerifyPending? and global.$GT_OrphanVerifyPending.{$ship}?">
+            <remove_value name="global.$GT_OrphanVerifyPending.{$ship}"/>
+          </do_if>
+          <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship=$ship, $Force=true]"/>
+        </do_if>
       </actions>
     </cue>
     

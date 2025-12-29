@@ -595,9 +595,11 @@
           </do_if>
         </do_if>
         <do_else>
-          <!-- FIX: Actually check the cache synchronously -->
+          <!-- FIX #2: Use synchronous GT_TS_CachePickBest instead of async SearchCachedTrades -->
+          <!-- This matches the modern cache search path used by SearchTradeRoutes -->
+          <!-- SearchCachedTrades is async with delays, but CheckTradeCache reads results synchronously - this was a bug! -->
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Checking trade cache...'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Checking trade cache synchronously...'" chance="100"/>
           </do_if>
           
           <!-- Calculate derived parameters needed for cache search -->
@@ -616,25 +618,48 @@
           </run_actions>
           <set_value name="$minROI" exact="$minROI * $roiMultiplier"/>
           
-          <!-- Call cache search -->
-          <signal_cue_instantly cue="md.GT_Search_Methods.SearchCachedTrades" param="table[
-            $Ship = $ship,
-            $MaxDistance = $maxDistance,
-            $MinROI = $minROI,
-            $MinAbsoluteProfit = $minAbsoluteProfit,
-            $FactionPriority = $factionPriority,
-            $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
-            $SkillLevel = $skillLevel,
-            $AllowIllegal = $allowIllegal
-          ]"/>
+          <!-- Get home sector for cache lookup -->
+          <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
-          <!-- Extract cache results from per-ship storage (no race conditions) -->
+          <!-- Get ship-specific cache filters -->
+          <set_value name="$ignoreBuildStorage" exact="false"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreBuildStorage?">
+            <set_value name="$ignoreBuildStorage" exact="global.$GT_AIParameters.{$ship}.$IgnoreBuildStorage"/>
+          </do_if>
+          <set_value name="$ignoreCarrierAux" exact="false"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreCarrierAux?">
+            <set_value name="$ignoreCarrierAux" exact="global.$GT_AIParameters.{$ship}.$IgnoreCarrierAux"/>
+          </do_if>
+          
+          <!-- Call synchronous cache search (same as SearchTradeRoutes) -->
+          <run_actions ref="md.GT_Libraries_General.GT_TS_CachePickBest" result="$cachePick">
+            <param name="ship" value="$ship"/>
+            <param name="homeSector" value="$homeSector"/>
+            <param name="maxDistance" value="$maxDistance"/>
+            <param name="minROI" value="$minROI"/>
+            <param name="minAbsoluteProfit" value="$minAbsoluteProfit"/>
+            <param name="ignoreBuildStorage" value="$ignoreBuildStorage"/>
+            <param name="ignoreCarrierAux" value="$ignoreCarrierAux"/>
+          </run_actions>
+          
+          <!-- Extract cache results directly from library function (synchronous) -->
           <set_value name="$foundCachedTrade" exact="false"/>
           <set_value name="$cacheTradeList" exact="[]"/>
-          <do_if value="global.$GT_SearchResult.{$ship}?">
-            <set_value name="$shipResults" exact="global.$GT_SearchResult.{$ship}"/>
-            <set_value name="$foundCachedTrade" exact="@$shipResults.$Found"/>
-            <set_value name="$cacheTradeList" exact="@$shipResults.$TradeList"/>
+          <set_value name="$cacheBestTrade" exact="null"/>
+          <do_if value="$cachePick? and $cachePick.$Found">
+            <set_value name="$foundCachedTrade" exact="true"/>
+            <set_value name="$cacheBestTrade" exact="$cachePick.$Trade"/>
+            <!-- Prefer candidate list if available, otherwise use single trade -->
+            <do_if value="$cachePick.$Trades? and $cachePick.$Trades != null and $cachePick.$Trades.count gt 0">
+              <set_value name="$cacheTradeList" exact="$cachePick.$Trades"/>
+            </do_if>
+            <do_else>
+              <do_if value="$cacheBestTrade != null">
+                <set_value name="$cacheTradeList" exact="[$cacheBestTrade]"/>
+              </do_if>
+            </do_else>
           </do_if>
           
           <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch">
@@ -647,13 +672,13 @@
           <!-- If cache hit, send directly to execution pipeline (bypass queue) -->
           <do_if value="$foundCachedTrade and ((if $cacheTradeList != null then $cacheTradeList.count else 0) gt 0)">
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') CACHE HIT: ' + $cacheTradeList.count + ' trades found - sending to execution pipeline'" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') CACHE HIT: ' + (if $cacheTradeList != null then $cacheTradeList.count else 0) + ' trades found - sending to execution pipeline'" chance="100"/>
             </do_if>
             
             <!-- Send directly to execution pipeline (same as SearchTradeRoutes does) -->
-            <!-- FIX: Extract first trade and send both $Trade and $TradeList for compatibility -->
-            <set_value name="$firstTrade" exact="null"/>
-            <do_if value="(if $cacheTradeList != null then $cacheTradeList.count else 0) gt 0">
+            <!-- Use cacheBestTrade if available, otherwise extract first from list -->
+            <set_value name="$firstTrade" exact="$cacheBestTrade"/>
+            <do_if value="$firstTrade == null and (if $cacheTradeList != null then $cacheTradeList.count else 0) gt 0">
               <set_value name="$firstTrade" exact="$cacheTradeList.{1}"/>
             </do_if>
             
@@ -865,7 +890,9 @@
           <!-- CRITICAL FIX: Skip if params don't exist (shouldn't happen, but handle gracefully) -->
           <do_if value="$params?">
             <!-- Increment active search counter (atomic lock) -->
-            <set_value name="global.$GT_SearchQueue.$ActiveSearches" operation="add"/>
+            <run_actions ref="md.GT_Libraries_General.GT_IncrementActiveSearches">
+              <param name="initializeIfMissing" value="true"/>
+            </run_actions>
             <!-- Frame budget: record next allowed start time -->
             <set_value name="global.$GT_SearchQueue.$NextStartTime" exact="player.age + $startInterval"/>
             
@@ -1019,25 +1046,11 @@
 
           <do_if value="$ship? and $ship.exists and $params?">
             <!-- Acquire live slot -->
-            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
+            <run_actions ref="md.GT_Libraries_General.GT_IncrementActiveLiveSearches">
+              <param name="initializeIfMissing" value="true"/>
+            </run_actions>
 
-            <!-- Debug audio: play ONE "session start" sound when live-search transitions from idle -> active.
-                 This avoids spamming a sound for every single ship's live search start. -->
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <do_if value="not global.$GT_DebugLiveSearchSound?">
-                <set_value name="global.$GT_DebugLiveSearchSound" exact="table[$SessionActive = false, $FinishPending = false]"/>
-              </do_if>
-            <do_if value="global.$GT_DebugLiveSearchSound.$FinishPending? and global.$GT_DebugLiveSearchSound.$FinishPending">
-              <!-- Cancel any pending finish debounce if we are starting new work -->
-              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
-            </do_if>
-              <do_if value="not global.$GT_DebugLiveSearchSound.$SessionActive">
-                <set_value name="global.$GT_DebugLiveSearchSound.$SessionActive" exact="true"/>
-                <!-- Vanilla pattern: scenario_spacesuit_1.xml / scenario_spacesuit_3.xml -->
-                <debug_text text="'[GT-Audio] Live search SESSION START (ui_notification_player_alert_13)'" chance="100"/>
-                <play_sound object="player.entity" sound="'ui_notification_player_alert_13'" type="ui" comment="Live search SESSION START"/>
-              </do_if>
-            </do_if>
+            <!-- Live-search sounds removed (keep live search silent) -->
 
             <!-- Ensure we skip cache and do live search immediately -->
             <set_value name="$params.$ForceLiveSearch" exact="true"/>
@@ -1084,16 +1097,7 @@
           </do_all>
         </do_if>
 
-        <!-- Debug audio: play ONE "session finish" sound when live-search becomes idle AND queue is drained. -->
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches == 0 and not $hasAnyQueuedNow">
-            <!-- Debounce FINISH: avoid START/FINISH/START chatter when queue flickers empty for a few ms. -->
-            <do_if value="global.$GT_DebugLiveSearchSound? and global.$GT_DebugLiveSearchSound.$SessionActive and (not global.$GT_DebugLiveSearchSound.$FinishPending? or not global.$GT_DebugLiveSearchSound.$FinishPending)">
-              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="true"/>
-              <signal_cue_instantly cue="md.GT_Trading_Queue.LiveSearchFinishSound_Delayed"/>
-            </do_if>
-          </do_if>
-        </do_if>
+        <!-- Live-search sounds removed (keep live search silent) -->
 
         <!-- If we can still start more live searches, schedule another pass. -->
         <do_if value="not $kickAgain and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt global.$GT_LiveSearchQueue.$MaxConcurrent and $hasAnyQueuedNow">
@@ -1107,43 +1111,7 @@
       </actions>
     </cue>
 
-    <!-- Debounced live-search FINISH sound: only play if we're still idle after a short delay. -->
-    <cue name="LiveSearchFinishSound_Delayed" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <delay exact="500ms"/>
-      <actions>
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <do_if value="global.$GT_DebugLiveSearchSound? and global.$GT_DebugLiveSearchSound.$FinishPending? and global.$GT_DebugLiveSearchSound.$FinishPending">
-            <set_value name="$hasAnyQueuedNow" exact="false"/>
-            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Sectors?">
-              <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$i">
-                <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$i}"/>
-                <do_if value="$sec? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
-                  <set_value name="$hasAnyQueuedNow" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
-            </do_if>
-
-            <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches == 0 and not $hasAnyQueuedNow">
-              <do_if value="global.$GT_DebugLiveSearchSound.$SessionActive">
-                <set_value name="global.$GT_DebugLiveSearchSound.$SessionActive" exact="false"/>
-                <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
-                <!-- Vanilla example: scenario_waveattack_antigone.xml -->
-                <debug_text text="'[GT-Audio] Live search SESSION FINISH (cockpit_proximity_alert)'" chance="100"/>
-                <play_sound object="player.entity" sound="'cockpit_proximity_alert'" type="ui" comment="Live search SESSION FINISH"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <!-- Not idle anymore; cancel pending finish. -->
-              <set_value name="global.$GT_DebugLiveSearchSound.$FinishPending" exact="false"/>
-            </do_else>
-          </do_if>
-        </do_if>
-      </actions>
-    </cue>
+    <!-- LiveSearchFinishSound_Delayed removed (live search should remain silent). -->
 
     <!-- Centralized scheduling gate for SearchTradeRoutes.
          Use this instead of signalling SearchTradeRoutes directly from cache/live continuation cues.

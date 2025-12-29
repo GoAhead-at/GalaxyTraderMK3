@@ -19,6 +19,29 @@
           <param name="debuglevel" value="$orderdef.$debuglevel"/>
           <param name="tradeeval" value="$orderdef.$tradeeval"/>
         </create_order>
+        <!-- SAFEST: Persist inherited GT params for PLAYER ships only (used to restore default order if promoted commander loses it) -->
+        <do_if value="this.assignedcontrolled.isplayerowned">
+          <do_if value="not global.$GT_Ships?">
+            <set_value name="global.$GT_Ships" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_Ships.{this.assignedcontrolled}?">
+            <set_value name="global.$GT_Ships.{this.assignedcontrolled}" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_Ships.{this.assignedcontrolled}.$InheritedGTDefaultOrderParams" exact="table[
+            $Home = $orderdef.$home,
+            $MaxBuy = $orderdef.$maxbuy,
+            $MaxSell = $orderdef.$maxsell,
+            $AutoWares = $orderdef.$autowares,
+            $WareBasket = $orderdef.$warebasket,
+            $AllowIllegal = $orderdef.$allowillegal,
+            $DistancePenalty = $orderdef.$distancepenalty,
+            $Notifications = $orderdef.$notifications,
+            $CargoTarget = $orderdef.$cargotarget,
+            $MarketUpdateFreq = $orderdef.$marketupdatefreq,
+            $DebugLevel = $orderdef.$debuglevel,
+            $TradeEval = $orderdef.$tradeeval
+          ]"/>
+        </do_if>
       </do_if>
       <do_else>
         <set_value name="$orderdef.$home" exact="$order.$home"/>
@@ -53,6 +76,24 @@
             <debug_text text="'[GT-Assist] ' + this.assignedcontrolled.idcode + ' - Registered subordinate in GT_Ships registry (inheriting GT order from commander)'" chance="10"/>
           </do_if>
         </do_else>
+
+        <!-- SAFEST: Persist inherited GT params for PLAYER ships only (used to restore default order if promoted commander loses it) -->
+        <do_if value="this.assignedcontrolled.isplayerowned and global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?">
+          <set_value name="global.$GT_Ships.{this.assignedcontrolled}.$InheritedGTDefaultOrderParams" exact="table[
+            $Home = $order.$home,
+            $MaxBuy = $order.$maxbuy,
+            $MaxSell = $order.$maxsell,
+            $AutoWares = $order.$autowares,
+            $WareBasket = $order.$warebasket,
+            $AllowIllegal = $order.$allowillegal,
+            $DistancePenalty = $order.$distancepenalty,
+            $Notifications = $order.$notifications,
+            $CargoTarget = $order.$cargotarget,
+            $MarketUpdateFreq = $order.$marketupdatefreq,
+            $DebugLevel = $order.$debuglevel,
+            $TradeEval = $order.$tradeeval
+          ]"/>
+        </do_if>
         
         <run_script name="$scriptname">
           <param name="home" value="$order.$home"/>
@@ -70,6 +111,147 @@
         </run_script>
       </do_else>
     </do_elseif>
+  </add>
+
+  <!-- SAFEST: If a GT-managed PLAYER ship is promoted to commander but loses its default order,
+       restore it from cached inherited params so subordinates can inherit again. -->
+  <add sel="//aiscript[@name='order.assist']/attention/actions/do_if[@value='not $added?']/debug_text[@filter='error' and contains(@text, 'default order not inherited from commander.')]" pos="before">
+    <!-- IMPORTANT: Do NOT rely on a local $commander variable existing in this scope.
+         Always derive the commander from the subordinate ship (this matches the vanilla error case). -->
+    <set_value name="$gtCommander" exact="@this.assignedcontrolled.commander"/>
+    <do_if value="$gtCommander? and $gtCommander.exists and $gtCommander.isplayerowned">
+      <!-- Commander has no actionable default order (promotion window) -->
+      <do_if value="(not @$gtCommander.defaultorder) or (@$gtCommander.defaultorder == null)">
+        <!-- SAFEST: Restore from cached GT params with multiple fallbacks.
+             Fallback chain:
+             1. Promoted commander's own cached params (it was a subordinate moments ago)
+             2. THIS subordinate's cached params
+             3. ANY other subordinate's cached params (they all inherited from destroyed commander)
+             4. GT_AIParameters for commander (if available)
+             5. Default values derived from commander's properties -->
+        <set_value name="$gtParams" exact="null"/>
+        <set_value name="$paramsSource" exact="'none'"/>
+        
+        <!-- Fallback 1: Commander's own cached params -->
+        <do_if value="not $gtParams? and global.$GT_Ships? and global.$GT_Ships.{$gtCommander}? and global.$GT_Ships.{$gtCommander}.$InheritedGTDefaultOrderParams?">
+          <set_value name="$gtParams" exact="global.$GT_Ships.{$gtCommander}.$InheritedGTDefaultOrderParams"/>
+          <set_value name="$paramsSource" exact="'commander_own'"/>
+        </do_if>
+        
+        <!-- Fallback 2: THIS subordinate's cached params -->
+        <do_if value="not $gtParams? and global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}? and global.$GT_Ships.{this.assignedcontrolled}.$InheritedGTDefaultOrderParams?">
+          <set_value name="$gtParams" exact="global.$GT_Ships.{this.assignedcontrolled}.$InheritedGTDefaultOrderParams"/>
+          <set_value name="$paramsSource" exact="'this_subordinate'"/>
+        </do_if>
+        
+        <!-- Fallback 3: Check commander's OTHER subordinates for cached params (they all inherited from destroyed commander) -->
+        <do_if value="not $gtParams? and $gtCommander.allsubordinates?">
+          <set_value name="$commanderSubordinates" exact="@$gtCommander.allsubordinates"/>
+          <do_if value="(if $commanderSubordinates != null then $commanderSubordinates.count else 0) gt 0">
+            <do_all exact="$commanderSubordinates.count" counter="$subIdx">
+              <set_value name="$otherSubordinate" exact="$commanderSubordinates.{$subIdx}"/>
+              <do_if value="not $gtParams? and $otherSubordinate.exists and global.$GT_Ships? and global.$GT_Ships.{$otherSubordinate}? and global.$GT_Ships.{$otherSubordinate}.$InheritedGTDefaultOrderParams?">
+                <set_value name="$gtParams" exact="global.$GT_Ships.{$otherSubordinate}.$InheritedGTDefaultOrderParams"/>
+                <set_value name="$paramsSource" exact="'other_subordinate'"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        
+        <!-- Fallback 4: Check GT_AIParameters for commander (if it has a HomeBase, we can derive params) -->
+        <do_if value="not $gtParams? and global.$GT_AIParameters? and global.$GT_AIParameters.{$gtCommander}? and global.$GT_AIParameters.{$gtCommander}.$HomeBase?">
+          <set_value name="$homeBase" exact="global.$GT_AIParameters.{$gtCommander}.$HomeBase"/>
+          <set_value name="$homeSector" exact="null"/>
+          <do_if value="$homeBase.exists">
+            <do_if value="$homeBase.isclass.station">
+              <set_value name="$homeSector" exact="$homeBase.sector"/>
+            </do_if>
+            <do_elseif value="$homeBase.isclass.sector">
+              <set_value name="$homeSector" exact="$homeBase"/>
+            </do_elseif>
+          </do_if>
+          <do_if value="$homeSector? and $homeSector.exists">
+            <!-- Build minimal params from GT_AIParameters -->
+            <set_value name="$gtParams" exact="table[
+              $Home = $homeSector,
+              $MaxBuy = if global.$GT_AIParameters.{$gtCommander}.$MaxBuy? then global.$GT_AIParameters.{$gtCommander}.$MaxBuy else 100,
+              $MaxSell = if global.$GT_AIParameters.{$gtCommander}.$MaxSell? then global.$GT_AIParameters.{$gtCommander}.$MaxSell else 100,
+              $AutoWares = if global.$GT_AIParameters.{$gtCommander}.$AutoWares? then global.$GT_AIParameters.{$gtCommander}.$AutoWares else true,
+              $WareBasket = if global.$GT_AIParameters.{$gtCommander}.$WareBasket? then global.$GT_AIParameters.{$gtCommander}.$WareBasket else [],
+              $AllowIllegal = if global.$GT_AIParameters.{$gtCommander}.$AllowIllegal? then global.$GT_AIParameters.{$gtCommander}.$AllowIllegal else false,
+              $DistancePenalty = if global.$GT_AIParameters.{$gtCommander}.$DistancePenalty? then global.$GT_AIParameters.{$gtCommander}.$DistancePenalty else 0.1,
+              $Notifications = if global.$GT_AIParameters.{$gtCommander}.$Notifications? then global.$GT_AIParameters.{$gtCommander}.$Notifications else true,
+              $CargoTarget = if global.$GT_AIParameters.{$gtCommander}.$CargoTarget? then global.$GT_AIParameters.{$gtCommander}.$CargoTarget else 0.9,
+              $MarketUpdateFreq = if global.$GT_AIParameters.{$gtCommander}.$MarketUpdateFreq? then global.$GT_AIParameters.{$gtCommander}.$MarketUpdateFreq else 300,
+              $DebugLevel = if global.$GT_AIParameters.{$gtCommander}.$DebugLevel? then global.$GT_AIParameters.{$gtCommander}.$DebugLevel else 1,
+              $TradeEval = if global.$GT_AIParameters.{$gtCommander}.$TradeEval? then global.$GT_AIParameters.{$gtCommander}.$TradeEval else 'profit'
+            ]"/>
+            <set_value name="$paramsSource" exact="'gt_aiparameters'"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Fallback 5: Use default values derived from commander's properties -->
+        <do_if value="not $gtParams?">
+          <set_value name="$defaultHome" exact="null"/>
+          <!-- Use commander's current sector as last resort (defaultorder is null, so can't use it) -->
+          <do_if value="$gtCommander.sector?">
+            <set_value name="$defaultHome" exact="$gtCommander.sector"/>
+          </do_if>
+          <do_if value="$defaultHome? and $defaultHome.exists">
+            <set_value name="$gtParams" exact="table[
+              $Home = $defaultHome,
+              $MaxBuy = 100,
+              $MaxSell = 100,
+              $AutoWares = true,
+              $WareBasket = [],
+              $AllowIllegal = false,
+              $DistancePenalty = 0.1,
+              $Notifications = true,
+              $CargoTarget = 0.9,
+              $MarketUpdateFreq = 300,
+              $DebugLevel = 1,
+              $TradeEval = 'profit'
+            ]"/>
+            <set_value name="$paramsSource" exact="'defaults'"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Create order if we found params -->
+        <do_if value="$gtParams? and $gtParams != null and $gtParams.$Home?">
+            <create_order id="'GalaxyTraderMK3'" object="$gtCommander" default="true">
+              <param name="home" value="$gtParams.$Home"/>
+              <param name="maxbuy" value="$gtParams.$MaxBuy"/>
+              <param name="maxsell" value="$gtParams.$MaxSell"/>
+              <param name="autowares" value="$gtParams.$AutoWares"/>
+              <param name="warebasket" value="$gtParams.$WareBasket"/>
+              <param name="allowillegal" value="$gtParams.$AllowIllegal"/>
+              <param name="distancepenalty" value="$gtParams.$DistancePenalty"/>
+              <param name="notifications" value="$gtParams.$Notifications"/>
+              <param name="cargotarget" value="$gtParams.$CargoTarget"/>
+              <param name="marketupdatefreq" value="$gtParams.$MarketUpdateFreq"/>
+              <param name="debuglevel" value="$gtParams.$DebugLevel"/>
+              <param name="tradeeval" value="$gtParams.$TradeEval"/>
+            </create_order>
+            <!-- Optional: ensure commander is registered (doesn't change behavior, just preserves data) -->
+            <do_if value="not global.$GT_Ships.{$gtCommander}?">
+              <set_value name="global.$GT_Ships.{$gtCommander}" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_Ships.{$gtCommander}.$InheritedGTDefaultOrderParams" exact="$gtParams"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Assist] ' + this.assignedcontrolled.idcode + ': Restored missing default GT order on promoted commander ' + $gtCommander.idcode + ' (promotion window; source: ' + $paramsSource + ')'" chance="100"/>
+            </do_if>
+            <!-- Restart assist evaluation now that commander has an actionable default order -->
+            <resume label="init"/>
+        </do_if>
+        <do_else>
+          <!-- Log if we couldn't restore order -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Assist] WARNING: ' + this.assignedcontrolled.idcode + ': Could not restore default GT order on promoted commander ' + $gtCommander.idcode + ' (no cached params found)'" chance="100"/>
+          </do_if>
+        </do_else>
+      </do_if>
+    </do_if>
   </add>
   
   <!-- PHASE 7: Detect when subordinate is removed (no commander detected) -->

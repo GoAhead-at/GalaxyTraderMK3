@@ -96,13 +96,123 @@
             <set_value name="$originalName" exact="@$ship.macro.name"/>
           </do_elseif>
           
-          <!-- Trigger cleanup directly (bypasses CheckShipOrphaned since Lua already validated) -->
-          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-            $Ship = $ship,
-            $Pilot = $ship.pilot,
-            $Reason = 'GT order removed (Lua detection)',
-            $OriginalName = $originalName
-          ]"/>
+          <!-- SAFETY: Lua order monitor can briefly report GT order removal during fleet commander promotion.
+               Defer cleanup and verify after a short delay to avoid purging GT registry during transient states. -->
+          <set_value name="$deferCleanup" exact="false"/>
+          <set_value name="$hasDirectGT" exact="false"/>
+          <set_value name="$hasGTCommander" exact="false"/>
+          <set_value name="$commanderDefaultOrderNull" exact="false"/>
+          
+          <!-- Direct GT order still present? -->
+          <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasDirectGT" exact="true"/>
+          </do_if>
+          
+          <!-- GT via commander still present? -->
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <do_if value="$ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$hasGTCommander" exact="true"/>
+            </do_if>
+            <do_elseif value="(not @$ship.commander.defaultorder) or (@$ship.commander.defaultorder == null)">
+              <set_value name="$commanderDefaultOrderNull" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <!-- Defer if this looks like a transient/null-order transition (promotion), or if GT is still present. -->
+          <do_if value="$hasDirectGT or $hasGTCommander or $commanderDefaultOrderNull or ($oldOrder == 'GalaxyTraderMK3' and ((not $newOrder?) or $newOrder == null or $newOrder == ''))">
+            <set_value name="$deferCleanup" exact="true"/>
+          </do_if>
+          
+          <do_if value="$deferCleanup">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Deferring GTOrderRemoved cleanup for ' + $shipID + ' (old=' + (if $oldOrder? then $oldOrder else 'null') + ', new=' + (if $newOrder? then $newOrder else 'null') + ', directGT=' + $hasDirectGT + ', viaCommander=' + $hasGTCommander + ', commanderDefaultNull=' + $commanderDefaultOrderNull + ')'" chance="100"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Order_Monitor_Bridge.VerifyGTOrderRemoved" param="table[
+              $ShipID = $shipID,
+              $OldOrder = $oldOrder,
+              $NewOrder = $newOrder,
+              $OriginalName = $originalName
+            ]"/>
+          </do_if>
+          
+          <!-- Trigger cleanup only if not deferred -->
+          <do_if value="not $deferCleanup">
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $ship.pilot,
+              $Reason = 'GT order removed (Lua detection)',
+              $OriginalName = $originalName
+            ]"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Verify a GT order removal after a short delay (guards against transient null default orders during promotion) -->
+    <cue name="VerifyGTOrderRemoved" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_Order_Monitor_Bridge.VerifyGTOrderRemoved"/>
+      </conditions>
+      <delay exact="3s"/>
+      <actions>
+        <set_value name="$p" exact="event.param"/>
+        <set_value name="$shipID" exact="$p.$ShipID"/>
+        <set_value name="$oldOrder" exact="$p.$OldOrder"/>
+        <set_value name="$newOrder" exact="$p.$NewOrder"/>
+        <set_value name="$originalName" exact="$p.$OriginalName"/>
+        
+        <!-- Resolve ship by ID again (it may have changed or been promoted) -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <set_value name="$hasDirectGT" exact="false"/>
+          <set_value name="$hasGTCommander" exact="false"/>
+          <set_value name="$commanderDefaultOrderNull" exact="false"/>
+          
+          <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK3'">
+            <set_value name="$hasDirectGT" exact="true"/>
+          </do_if>
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <do_if value="$ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$hasGTCommander" exact="true"/>
+            </do_if>
+            <do_elseif value="(not @$ship.commander.defaultorder) or (@$ship.commander.defaultorder == null)">
+              <set_value name="$commanderDefaultOrderNull" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <do_if value="$hasDirectGT or $hasGTCommander or $commanderDefaultOrderNull">
+            <!-- False positive / still transitioning: do nothing -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Verified GTOrderRemoved was transient for ' + $shipID + ' (directGT=' + $hasDirectGT + ', viaCommander=' + $hasGTCommander + ', commanderDefaultNull=' + $commanderDefaultOrderNull + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Still removed: proceed with cleanup -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Verified GTOrderRemoved - cleaning up ' + $shipID + ' (old=' + (if $oldOrder? then $oldOrder else 'null') + ', new=' + (if $newOrder? then $newOrder else 'null') + ')'" chance="100"/>
+            </do_if>
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $ship.pilot,
+              $Reason = 'GT order removed (Lua detection, verified)',
+              $OriginalName = $originalName
+            ]"/>
+          </do_else>
         </do_if>
       </actions>
     </cue>
