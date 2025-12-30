@@ -1569,6 +1569,119 @@
       </actions>
     </library>
 
+    <!-- Purge cache entries by offer-pair across ALL home-sector caches -->
+    <!-- Motivation:
+         With per-home-sector caching, the same BuyOffer/SellOffer pair can be cached under multiple home sectors.
+         If we only remove from the executing ship's home sector, other home caches retain stale entries and ships revalidate "ghost" trades.
+         This helper removes matching entries from:
+           - global.$GT_TradeCache.{home}
+           - global.$GT_TradeCacheByWare.{home}.{wareKey} (best-effort for both ware object key and ware.id string key) -->
+    <library name="GT_PurgeCacheOfferPair_AllHomes" purpose="run_actions">
+      <params>
+        <param name="ship" default="null" comment="Ship for logging context (optional)"/>
+        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only)"/>
+        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="reason" default="'unknown'" comment="Reason for purge (debug)"/>
+      </params>
+      <actions>
+        <set_value name="$removedTotal" exact="0"/>
+
+        <!-- Validate required offer handle -->
+        <do_if value="$sellOffer == null">
+          <return value="table[$Removed = 0, $Homes = 0]"/>
+        </do_if>
+
+        <set_value name="$homes" exact="[]"/>
+        <do_if value="global.$GT_TradeCacheHomes? and global.$GT_TradeCacheHomes != null and global.$GT_TradeCacheHomes.count gt 0">
+          <set_value name="$homes" exact="global.$GT_TradeCacheHomes"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: use keys (can be unreliable in some saves, but better than nothing) -->
+          <do_if value="global.$GT_TradeCache?">
+            <set_value name="$homes" exact="@global.$GT_TradeCache.keys"/>
+            <do_if value="$homes == null">
+              <set_value name="$homes" exact="[]"/>
+            </do_if>
+          </do_if>
+        </do_else>
+
+        <do_all exact="$homes.count" counter="$hi">
+          <set_value name="$home" exact="$homes.{$hi}"/>
+          <do_if value="$home? and global.$GT_TradeCache? and global.$GT_TradeCache.{$home}?">
+            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$home}"/>
+            <do_all exact="$sectorCache.count" counter="$i" reverse="true">
+              <set_value name="$entry" exact="$sectorCache.{$i}"/>
+              <do_if value="$entry != null">
+                <set_value name="$buyOfferMatches" exact="false"/>
+                <set_value name="$sellOfferMatches" exact="false"/>
+
+                <!-- Sell-only match: buyOffer is null => only match sell offer -->
+                <do_if value="$buyOffer == null">
+                  <set_value name="$buyOfferMatches" exact="true"/>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <do_if value="$entry.$BuyOffer? and $entry.$BuyOffer == $buyOffer">
+                    <set_value name="$buyOfferMatches" exact="true"/>
+                  </do_if>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_else>
+
+                <do_if value="$buyOfferMatches and $sellOfferMatches">
+                  <!-- Remove from main cache -->
+                  <remove_value name="global.$GT_TradeCache.{$home}.{$i}"/>
+                  <set_value name="$removedTotal" operation="add"/>
+
+                  <!-- Best-effort: remove from per-ware index (handles both ware-object keys and legacy ware-id keys) -->
+                  <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                    <set_value name="$wareObj" exact="null"/>
+                    <set_value name="$wareIdKey" exact="null"/>
+                    <do_if value="$entry.$BuyOffer?">
+                      <set_value name="$wareObj" exact="@$entry.$BuyOffer.ware"/>
+                      <do_if value="$wareObj?">
+                        <set_value name="$wareIdKey" exact="@$wareObj.id"/>
+                      </do_if>
+                    </do_if>
+                    <do_elseif value="$entry.$WareId?">
+                      <set_value name="$wareIdKey" exact="@$entry.$WareId"/>
+                    </do_elseif>
+
+                    <!-- Remove by ware object key -->
+                    <do_if value="$wareObj? and global.$GT_TradeCacheByWare.{$home}.{$wareObj}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareObj}" exact="$entry"/>
+                    </do_if>
+                    <!-- Remove by ware id key (legacy / mixed saves) -->
+                    <do_if value="$wareIdKey? and global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}" exact="$entry"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+
+            <!-- Clean up empty home cache lists -->
+            <do_if value="global.$GT_TradeCache.{$home}? and global.$GT_TradeCache.{$home}.count == 0">
+              <remove_value name="global.$GT_TradeCache.{$home}"/>
+              <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                <remove_value name="global.$GT_TradeCacheByWare.{$home}"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$shipId" exact="if $ship != null then $ship.idcode else 'N/A'"/>
+          <debug_text text="'[GT-Cache] Purged offer-pair across homes: removed=' + $removedTotal + ', homes=' + $homes.count + ', ship=' + $shipId + ', reason=' + $reason" chance="100"/>
+        </do_if>
+
+        <return value="table[$Removed = $removedTotal, $Homes = $homes.count]"/>
+      </actions>
+    </library>
+
     <!-- Pick Best Cached Trade (lightweight, hard-budget friendly) -->
     <!-- Design:
          - Cache list is already sorted by Profit desc (insertion sort at write time).
