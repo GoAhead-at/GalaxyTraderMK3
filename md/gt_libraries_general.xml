@@ -384,6 +384,115 @@
             </do_if>
           </do_else>
         </do_if>
+
+        <!-- IMPORTANT:
+             stale_lock_cleanup should reset MORE than just the registry lock/params.
+             Otherwise ships can remain stuck in "live search already in progress (pre-gate)" / batch-wait states
+             even after the lock is released, leading to repeat AI timeouts and home-sector refresh blocking.
+             Keep this block narrow: only runs for stale_lock_cleanup. -->
+        <do_if value="$reason == 'stale_lock_cleanup'">
+          <!-- 1) If this ship had acquired a live slot, decrement ActiveLiveSearches to avoid permanent saturation -->
+          <set_value name="$hadLiveSlot" exact="false"/>
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
+            <set_value name="$liveParams" exact="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
+            <do_if value="$liveParams? and $liveParams.$LiveSlotAcquired? and $liveParams.$LiveSlotAcquired">
+              <set_value name="$hadLiveSlot" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_if value="$hadLiveSlot">
+            <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveLiveSearches">
+              <param name="clampToZero" value="true"/>
+              <param name="triggerQueueProcessor" value="true"/>
+            </run_actions>
+          </do_if>
+
+          <!-- 2) Remove ship from live-search queue structures (params + per-sector queue) -->
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$BySector?">
+            <do_all exact="global.$GT_LiveSearchQueue.$BySector.keys.count" counter="$sectorIdx">
+              <set_value name="$sector" exact="global.$GT_LiveSearchQueue.$BySector.keys.{$sectorIdx}"/>
+              <do_if value="$sector? and global.$GT_LiveSearchQueue.$BySector.{$sector}? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count gt 0">
+                <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count" counter="$i" reverse="true">
+                  <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.{$i} == $ship">
+                    <remove_from_list name="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships" exact="$ship"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+
+          <!-- 3) Clear per-ship live-search state markers so pre-gate checks don't block retries -->
+          <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceScheduled? and global.$GT_LiveOfferSliceScheduled.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceScheduled.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Queued? and global.$GT_LiveOfferSliceQueue.$Queued.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Params? and global.$GT_LiveOfferSliceQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceQueue.$Params.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Ships? and global.$GT_LiveOfferSliceQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
+          </do_if>
+          <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+            <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+          </do_if>
+
+          <!-- 4) Clear batch state and remove ship from batch queue/active lists (prevent indefinite batch-wait) -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+
+          <set_value name="$wasInActiveShips" exact="false"/>
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips? and global.$GT_BatchProcessorQueue.$ActiveShips.count gt 0">
+            <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$ai" reverse="true">
+              <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$ai} == $ship">
+                <set_value name="$wasInActiveShips" exact="true"/>
+                <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$wasInActiveShips">
+            <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveProcessors">
+              <param name="clampToZero" value="true"/>
+              <param name="triggerQueueProcessor" value="true"/>
+            </run_actions>
+          </do_if>
+
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- 5) If this ship was the home-sector live-refresh initiator, release the marker so other ships aren't blocked.
+               IMPORTANT: Do NOT call GT_GetHomeSector here. Some stale-lock cleanup cases involve ships that no longer have
+               a valid defaultorder.$home / GT_AIParameters.$HomeBase, which would spam GT_GetHomeSector "THIS SHOULD NEVER HAPPEN"
+               errors and trigger ship.sector fallback drift.
+               Instead, scan the refresh table for any entry whose $Initiator == this ship. -->
+          <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.keys.count gt 0">
+            <do_all exact="global.$GT_TS_LiveRefreshBySector.keys.count" counter="$hsIdx">
+              <set_value name="$hs" exact="global.$GT_TS_LiveRefreshBySector.keys.{$hsIdx}"/>
+              <do_if value="$hs? and global.$GT_TS_LiveRefreshBySector.{$hs}?">
+                <set_value name="$refreshEntry" exact="global.$GT_TS_LiveRefreshBySector.{$hs}"/>
+                <do_if value="$refreshEntry? and $refreshEntry.$Initiator? and $refreshEntry.$Initiator == $ship">
+                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$Active" exact="false"/>
+                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$LastFinished" exact="player.age"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+
+          <do_if value="$shouldLog and global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Registry] stale_lock_cleanup: reset live/batch state for ' + $ship.idcode" chance="100"/>
+          </do_if>
+        </do_if>
         
         <set_value name="this.$released" exact="true"/>
       </actions>
@@ -1757,6 +1866,16 @@
           </do_if>
         </do_all>
 
+        <!-- Debug: explain why small candidate lists happen (top-N validation + filters + maxReturnTrades cap) -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Cache] (' + $ship.idcode + ') CachePickBest summary: cacheCount=' + $cache.count +
+            ', maxReturnTrades=' + $maxReturnTrades +
+            ', effectiveMaxEntries=' + $effectiveMaxEntries +
+            ', validatedTop=' + $limit +
+            ', returned=' + $validTrades.count +
+            ', minFailCount=' + $minFailCount" chance="100"/>
+        </do_if>
+
         <set_value name="$result.$Trades" exact="$validTrades"/>
         <return value="$result"/>
       </actions>
@@ -1917,8 +2036,8 @@
       <actions>
         <!-- Returns price range from config: $sellPriceMax, $buyPriceMin -->
         <!-- For isolated ships, uses isolated-specific price ranges -->
-        <set_value name="$sellPriceMax" exact="0.5"/>  <!-- Default fallback -->
-        <set_value name="$buyPriceMin" exact="-0.5"/>  <!-- Default fallback -->
+        <set_value name="$sellPriceMax" exact="1.0"/>  <!-- Default fallback: +100% -->
+        <set_value name="$buyPriceMin" exact="-1.0"/>  <!-- Default fallback: -100% -->
         <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
           <do_if value="$shipIsIsolated">
             <!-- Isolated ships: Use isolated-specific price ranges -->
@@ -2972,6 +3091,12 @@
           <return value="$return"/>
         </do_if>
         
+        <!-- Check if dynamic blacklist is enabled (required for blacklist-aware pathfinding) -->
+        <set_value name="$useDynamicBlacklist" exact="false"/>
+        <do_if value="global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist?">
+          <set_value name="$useDynamicBlacklist" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+        </do_if>
+        
         <!-- Get threat expiry time -->
         <set_value name="$threatExpiry" exact="if global.$GT_GlobalSettings.$ThreatAvoidance.$ThreatExpiry? then global.$GT_GlobalSettings.$ThreatAvoidance.$ThreatExpiry else 600s"/>
         
@@ -2987,8 +3112,8 @@
         </do_if>
         
         <!-- Check if preferred route goes through threatened sectors -->
-        <!-- Compare normal vs blacklist-aware gatedistance to detect threats in path -->
-        <do_if value="$ship? and $sellStation.sector != $buyStation.sector">
+        <!-- Compare normal vs blacklist-aware gatedistance to detect threats in path (only if dynamic blacklist enabled) -->
+        <do_if value="$ship? and $sellStation.sector != $buyStation.sector and $useDynamicBlacklist">
           <!-- Extract sectors before gatedistance calculation (property chains in curly braces can fail) -->
           <set_value name="$sellSector" exact="@$sellStation.sector"/>
           <do_if value="$sellSector?">
