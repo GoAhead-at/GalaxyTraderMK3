@@ -42,6 +42,17 @@
         <!-- Initialize delayed ships table for variable isolation -->
         <set_value name="global.$GT_DelayedShips" exact="table[]"/>
         
+        <!-- Initialize trace ID counter for pipeline logging -->
+        <set_value name="global.$GT_TraceIdCounter" exact="1"/>
+        
+        <!-- Initialize pipeline counters for observability -->
+        <set_value name="global.$GT_PipelineCounters" exact="table[
+          $Queued = 0,
+          $Active = 0,
+          $Completed = 0,
+          $Failed = 0
+        ]"/>
+        
         <!-- Initialize search queue - ONE search at a time to prevent stuttering -->
         <set_value name="global.$GT_SearchQueue" exact="table[]"/>
         <set_value name="global.$GT_SearchQueue.$Ships" exact="[]"/>
@@ -119,6 +130,86 @@
         <set_value name="global.$GT_BatchResultsList" exact="table[]"/> <!-- Batch processor output data (string keys) -->
         <!-- Mark as migrated for this session -->
         <set_value name="global.$GT_BatchDataListMigrated" exact="true"/>
+        
+        <!-- Initialize trade index for cross-cache invalidation (Phase 1) -->
+        <run_actions ref="md.GT_Libraries_General.GT_InitializeTradeIndex"/>
+        
+        <!-- Initialize central scheduler (Phase 2) -->
+        <do_if value="not global.$GT_Scheduler?">
+          <set_value name="global.$GT_Scheduler" exact="table[
+            $WorkQueue = [],
+            $ActiveWork = table[],
+            $Budgets = table[
+              $CheapOpsPerTick = 10,
+              $OfferOpsPerTick = 5,
+              $MatchOpsPerTick = 1,
+              $MaxActiveHomeSearches = 1
+            ],
+            $Counters = table[
+              $Queued = 0,
+              $Active = 0,
+              $Completed = 0,
+              $Failed = 0
+            ],
+            $Processing = false,
+            $LastStatsLog = player.age
+          ]"/>
+        </do_if>
+        <do_else>
+          <!-- Ensure all required properties exist -->
+          <do_if value="not global.$GT_Scheduler.$WorkQueue?">
+            <set_value name="global.$GT_Scheduler.$WorkQueue" exact="[]"/>
+          </do_if>
+          <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - defensive check for save game compatibility -->
+          <!-- Tables have .keys property, lists don't - use this to detect if it's NOT a table -->
+          <do_if value="not global.$GT_Scheduler.$ActiveWork?">
+            <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
+          </do_if>
+          <do_else>
+            <!-- Check if it's NOT a table by testing .keys property - if .keys doesn't exist, it's a list -->
+            <do_if value="not global.$GT_Scheduler.$ActiveWork.keys?">
+              <!-- ActiveWork is a list (from old save) - reinitialize as table -->
+              <debug_text text="'[GT-WARN] SystemInit: ActiveWork is a list (no .keys property), reinitializing as table[]'" chance="100"/>
+              <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
+            </do_if>
+          </do_else>
+          <do_if value="not global.$GT_Scheduler.$Budgets?">
+            <set_value name="global.$GT_Scheduler.$Budgets" exact="table[
+              $CheapOpsPerTick = 10,
+              $OfferOpsPerTick = 5,
+              $MatchOpsPerTick = 1,
+              $MaxActiveHomeSearches = 1
+            ]"/>
+          </do_if>
+          <do_if value="not global.$GT_Scheduler.$Counters?">
+            <set_value name="global.$GT_Scheduler.$Counters" exact="table[
+              $Queued = 0,
+              $Active = 0,
+              $Completed = 0,
+              $Failed = 0
+            ]"/>
+          </do_if>
+          <do_if value="not global.$GT_Scheduler.$Processing?">
+            <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
+          </do_if>
+          <do_if value="not global.$GT_Scheduler.$LastStatsLog?">
+            <set_value name="global.$GT_Scheduler.$LastStatsLog" exact="player.age"/>
+          </do_if>
+        </do_else>
+        
+        <!-- Initialize reservation system (Phase 3) -->
+        <do_if value="not global.$GT_Reservations?">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_ReservationStats?">
+          <set_value name="global.$GT_ReservationStats" exact="table[
+            $Active = 0,
+            $Expired = 0,
+            $Conflicts = 0,
+            $Created = 0,
+            $Cleared = 0
+          ]"/>
+        </do_if>
         
         <!-- Initialize cached active trader count (performance optimization) -->
         <!-- Prevents O(n) loops when assigning orders to many ships -->
@@ -446,10 +537,52 @@
           <!-- Lock acquired successfully -->
           <set_value name="this.$lockedShip" exact="$ship"/>
           
-          <!-- DEBUG: Trade request received -->
+          <!-- Generate trace ID for this request -->
+          <run_actions ref="md.GT_Libraries_General.GT_GenerateTraceId" result="$traceId"/>
+          <set_value name="$parametersTable.$TraceId" exact="$traceId"/>
+          <set_value name="global.$GT_AIParameters.{$ship}.$TraceId" exact="$traceId"/>
+          
+          <!-- Update pipeline counter -->
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Queued'"/>
+            <param name="delta" value="1"/>
+          </run_actions>
+          
+          <!-- CRITICAL: Cannot combine @ and ? operators in X4 - extract values first -->
+          <!-- Extract values BEFORE run_actions call so they're in scope for param tag -->
+          <set_value name="$homeBaseName" exact="'Unknown'"/>
+          <do_if value="$requestData.$HomeBase?">
+            <set_value name="$homeBase" exact="$requestData.$HomeBase"/>
+            <do_if value="$homeBase.sector?">
+              <set_value name="$homeBaseName" exact="@$homeBase.sector.knownname"/>
+            </do_if>
+          </do_if>
+          <set_value name="$maxBuyVal" exact="0"/>
+          <do_if value="$requestData.$MaxBuy?">
+            <set_value name="$maxBuyVal" exact="$requestData.$MaxBuy"/>
+          </do_if>
+          <set_value name="$maxSellVal" exact="0"/>
+          <do_if value="$requestData.$MaxSell?">
+            <set_value name="$maxSellVal" exact="$requestData.$MaxSell"/>
+          </do_if>
+          
+          <!-- Log request entry with structured format -->
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearchStructured">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Request'"/>
+            <param name="action" value="'Start'"/>
+            <param name="fields" value="table[
+              $ship = $ship.idcode,
+              $home = $homeBaseName,
+              $maxBuy = $maxBuyVal,
+              $maxSell = $maxSellVal
+            ]"/>
+          </run_actions>
+          
+          <!-- Legacy debug log (keep for compatibility) -->
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <!-- Use safe access (@) for optional properties in debug text -->
-            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI trade request received for ' + $ship.knownname + ' (MaxBuy: ' + @$requestData.$MaxBuy + ', MaxSell: ' + @$requestData.$MaxSell + ')'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') AI trade request received for ' + $ship.knownname + ' (MaxBuy: ' + @$requestData.$MaxBuy + ', MaxSell: ' + @$requestData.$MaxSell + ', TraceId: ' + $traceId + ')'" chance="100"/>
           </do_if>
           
           <!-- Add ship to trading queue -->

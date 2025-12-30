@@ -145,8 +145,10 @@
       </actions>
       <delay exact="this.$DelayTime"/>
       <actions>
-        <!-- Hardcoded for now (TODO: expose later) -->
-        <set_value name="$startIntervalMs" exact="150"/>
+        <!-- CRITICAL: Reduced interval from 150ms to 25ms for faster cache query processing -->
+        <!-- Cache queries are lightweight and should be processed quickly -->
+        <!-- 25ms = 40 ships/second, which is sufficient for large fleets without causing stutter -->
+        <set_value name="$startIntervalMs" exact="25"/>
         <set_value name="global.$GT_TS.$NextStartTime" exact="player.age + ($startIntervalMs * 1ms)"/>
 
         <!-- Dequeue one ship -->
@@ -180,6 +182,705 @@
         <do_if value="global.$GT_TS.$Queue.count gt 0">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
         </do_if>
+      </actions>
+    </cue>
+    
+    <!-- =====================================================================
+         Central Work Queue Processor (Phase 2)
+         
+         Purpose:
+         - Processes work items from global.$GT_Scheduler.$WorkQueue
+         - Respects budgets for different work types
+         - Updates work item states
+         - Logs scheduler operations
+         
+         Work Item Types:
+         - 'Request': Initial trade search request
+         - 'CacheQuery': Cache lookup work
+         - 'HomeSearch': Home sector pathfinding work
+         - 'OfferCollect': Offer collection work
+         - 'Match': Trade matching/batch processing work
+         - 'Finalize': Finalization work
+         ===================================================================== -->
+    
+    <!-- Process Work Queue -->
+    <cue name="ProcessWorkQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- Validate scheduler exists - ERROR if missing -->
+        <do_if value="not global.$GT_Scheduler?">
+          <debug_text text="'[GT-ERROR] ProcessWorkQueue: Scheduler not initialized'" chance="100"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Prevent concurrent processing -->
+        <do_if value="global.$GT_Scheduler.$Processing">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <set_value name="global.$GT_Scheduler.$Processing" exact="true"/>
+        
+        <!-- If no work, stop -->
+        <do_if value="not global.$GT_Scheduler.$WorkQueue? or global.$GT_Scheduler.$WorkQueue.count le 0">
+          <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Initialize budgets if missing, using global settings if available, otherwise defaults -->
+        <do_if value="not global.$GT_Scheduler.$Budgets?">
+          <!-- Try to read from global settings first -->
+          <set_value name="$defaultCacheSearches" exact="5"/>
+          <set_value name="$defaultLiveSearches" exact="1"/>
+          <set_value name="$defaultMatches" exact="1"/>
+          
+          <!-- Load from global settings if available -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
+            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
+              <set_value name="$defaultCacheSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
+            </do_if>
+            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
+              <set_value name="$defaultLiveSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
+            </do_if>
+          </do_if>
+          
+          <set_value name="global.$GT_Scheduler.$Budgets" exact="table[
+            $CheapOpsPerTick = $defaultCacheSearches,
+            $OfferOpsPerTick = 5,
+            $MatchOpsPerTick = $defaultMatches,
+            $MaxActiveHomeSearches = $defaultLiveSearches
+          ]"/>
+        </do_if>
+        <do_else>
+          <!-- Budgets exist - reload from global settings every tick to pick up changes -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
+            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
+              <set_value name="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
+            </do_if>
+            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
+              <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
+            </do_if>
+          </do_if>
+        </do_else>
+        
+        <!-- Count active work by type -->
+        <set_value name="$activeCacheQueries" exact="0"/>
+        <set_value name="$activeHomeSearches" exact="0"/>
+        <set_value name="$activeMatches" exact="0"/>
+        
+        <do_if value="global.$GT_Scheduler.$ActiveWork?">
+          <do_all exact="global.$GT_Scheduler.$ActiveWork.keys.count" counter="$i">
+            <set_value name="$key" exact="global.$GT_Scheduler.$ActiveWork.keys.{$i}"/>
+            <set_value name="$workItem" exact="global.$GT_Scheduler.$ActiveWork.{$key}"/>
+            <do_if value="$workItem? and $workItem.$Type? and $workItem.$State == 'active'">
+              <do_if value="$workItem.$Type == 'CacheQuery'">
+                <set_value name="$activeCacheQueries" operation="add"/>
+              </do_if>
+              <do_elseif value="$workItem.$Type == 'HomeSearch'">
+                <set_value name="$activeHomeSearches" operation="add"/>
+              </do_elseif>
+              <do_elseif value="$workItem.$Type == 'Match'">
+                <set_value name="$activeMatches" operation="add"/>
+              </do_elseif>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Process work items respecting budgets -->
+        <set_value name="$processed" exact="0"/>
+        <set_value name="$budgetCheapOps" exact="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick - $activeCacheQueries"/>
+        <set_value name="$budgetHomeSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches - $activeHomeSearches"/>
+        <set_value name="$budgetMatches" exact="global.$GT_Scheduler.$Budgets.$MatchOpsPerTick - $activeMatches"/>
+        
+        <!-- Log scheduler tick -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="0"/>
+          <param name="stage" value="'Scheduler'"/>
+          <param name="action" value="'Tick'"/>
+          <param name="details" value="'queue=' + global.$GT_Scheduler.$WorkQueue.count + ' active=' + (if global.$GT_Scheduler.$ActiveWork? then global.$GT_Scheduler.$ActiveWork.keys.count else 0) + ' budgetCache=' + $budgetCheapOps + ' budgetHome=' + $budgetHomeSearches + ' budgetMatch=' + $budgetMatches"/>
+          <param name="logLevel" value="3"/>
+        </run_actions>
+        
+        <!-- Process work items from queue - process up to budget limit per tick to prevent frame blocking -->
+        <!-- CRITICAL: Frame distribution - process items per tick, then yield to prevent stutter with large fleets -->
+        <!-- Cache queries are cheap (synchronous, complete immediately) - process many per tick -->
+        <!-- Live searches and matches are expensive - limit more strictly -->
+        <set_value name="$maxItemsPerTick" exact="20"/>
+        <do_while value="global.$GT_Scheduler.$WorkQueue.count gt 0 and $processed lt $maxItemsPerTick">
+          <set_value name="$workItem" exact="global.$GT_Scheduler.$WorkQueue.{1}"/>
+          
+          <!-- Validate work item - ERROR if invalid -->
+          <do_if value="not $workItem? or not $workItem.$Type? or not $workItem.$Key?">
+            <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="0"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_workItem'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+            <continue/>
+          </do_if>
+          
+          <!-- Check budget for this work type -->
+          <!-- CRITICAL: Cache queries complete synchronously, but we still respect MaxConcurrentCacheSearches limit -->
+          <!-- This prevents too many cache queries from running simultaneously, even though they complete quickly -->
+          <set_value name="$canProcess" exact="false"/>
+          <do_if value="$workItem.$Type == 'CacheQuery' and $budgetCheapOps gt 0">
+            <set_value name="$canProcess" exact="true"/>
+            <set_value name="$budgetCheapOps" operation="subtract"/>
+            <!-- Note: Budget is subtracted here, but cache queries complete synchronously and are removed from ActiveWork immediately -->
+            <!-- This means the budget effectively limits how many start per tick, not how many are concurrently active -->
+          </do_if>
+          <do_elseif value="$workItem.$Type == 'HomeSearch' and $budgetHomeSearches gt 0">
+            <set_value name="$canProcess" exact="true"/>
+            <set_value name="$budgetHomeSearches" operation="subtract"/>
+          </do_elseif>
+          <do_elseif value="$workItem.$Type == 'Match' and $budgetMatches gt 0">
+            <set_value name="$canProcess" exact="true"/>
+            <set_value name="$budgetMatches" operation="subtract"/>
+          </do_elseif>
+          <do_elseif value="$workItem.$Type == 'Request' or $workItem.$Type == 'OfferCollect' or $workItem.$Type == 'Finalize'">
+            <!-- These types don't have strict budgets yet -->
+            <set_value name="$canProcess" exact="true"/>
+          </do_elseif>
+          
+          <!-- Process if budget allows -->
+          <do_if value="$canProcess">
+            <!-- Remove from queue -->
+            <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
+            
+            <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - defensive check for save game compatibility -->
+            <!-- Tables have .keys property, lists don't - use this to detect if it's NOT a table -->
+            <do_if value="not global.$GT_Scheduler.$ActiveWork?">
+              <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
+            </do_if>
+            <do_else>
+              <!-- Check if it's NOT a table by testing .keys property - if .keys doesn't exist, it's a list -->
+              <do_if value="not global.$GT_Scheduler.$ActiveWork.keys?">
+                <!-- ActiveWork is a list (from old save) - reinitialize as table -->
+                <debug_text text="'[GT-WARN] ProcessWorkQueue: ActiveWork is a list (no .keys property), reinitializing as table[]'" chance="100"/>
+                <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
+              </do_if>
+            </do_else>
+            
+            <!-- Extract ship from payload to use as ActiveWork key (ship object, not string key) -->
+            <set_value name="$payload" exact="$workItem.$Payload"/>
+            <set_value name="$ship" exact="@$payload.$Ship"/>
+            
+            <!-- Add to ActiveWork BEFORE updating state (keyed by ship object, not string key) -->
+            <do_if value="$ship?">
+              <set_value name="global.$GT_Scheduler.$ActiveWork.{$ship}" exact="$workItem"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-ERROR] ProcessWorkQueue: workItem missing payload ship; cannot track ActiveWork key=' + (if $workItem.$Key? then $workItem.$Key else 'unknown')" chance="100"/>
+            </do_else>
+            
+            <!-- Update state to active (pass work item to avoid lookup issues) -->
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'active'"/>
+              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              <param name="workItem" value="$workItem"/>
+            </run_actions>
+            
+            <!-- Dispatch to appropriate handler -->
+            <do_if value="$workItem.$Type == 'CacheQuery'">
+              <!-- Process CacheQuery work item -->
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork" param="$workItem"/>
+            </do_if>
+            <do_elseif value="$workItem.$Type == 'HomeSearch'">
+              <!-- Process HomeSearch work item -->
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessHomeSearchWork" param="$workItem"/>
+            </do_elseif>
+            <do_elseif value="$workItem.$Type == 'Match'">
+              <!-- Process Match work item -->
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessMatchWork" param="$workItem"/>
+            </do_elseif>
+            <do_elseif value="$workItem.$Type == 'Request'">
+              <!-- Process Request work item (start search) -->
+              <!-- For now, keep using existing flow - will migrate later -->
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+                <param name="stage" value="'Scheduler'"/>
+                <param name="action" value="'WorkItemActivated'"/>
+                <param name="details" value="'type=' + $workItem.$Type + ' key=' + $workItem.$Key + ' note=handler_not_implemented_yet'"/>
+                <param name="logLevel" value="2"/>
+              </run_actions>
+              <!-- Mark as completed for now (will implement handler later) -->
+              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+                <param name="key" value="$workItem.$Key"/>
+                <param name="newState" value="'completed'"/>
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              </run_actions>
+              <!-- Remove from ActiveWork using ship key -->
+              <do_if value="$ship?">
+                <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+              </do_if>
+            </do_elseif>
+            <do_else>
+              <!-- Other work types (OfferCollect, Finalize) - log and mark as completed (handlers will be implemented in later phases) -->
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+                <param name="stage" value="'Scheduler'"/>
+                <param name="action" value="'WorkItemActivated'"/>
+                <param name="details" value="'type=' + $workItem.$Type + ' key=' + $workItem.$Key + ' note=handler_not_implemented_yet'"/>
+                <param name="logLevel" value="2"/>
+              </run_actions>
+              <!-- Mark as completed for now (will implement handlers later) -->
+              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+                <param name="key" value="$workItem.$Key"/>
+                <param name="newState" value="'completed'"/>
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              </run_actions>
+              <!-- Remove from ActiveWork using ship key -->
+              <do_if value="$ship?">
+                <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+              </do_if>
+            </do_else>
+            
+            <set_value name="$processed" operation="add"/>
+          </do_if>
+          <do_else>
+            <!-- Budget exhausted for this type - skip this item and continue to next item in queue -->
+            <!-- The item stays in queue and will be processed in next tick when budget is available -->
+            <!-- Only break if ALL budgets are exhausted (no more work can be processed this tick) -->
+            <do_if value="$budgetCheapOps le 0 and $budgetHomeSearches le 0 and $budgetMatches le 0">
+              <break/>
+            </do_if>
+            <!-- Otherwise, continue to next item (might be different type with available budget) -->
+          </do_else>
+        </do_while>
+        
+        <!-- Periodic statistics logging and cleanup (every 10 seconds) -->
+        <set_value name="$timeSinceLastStats" exact="player.age - global.$GT_Scheduler.$LastStatsLog"/>
+        <do_if value="$timeSinceLastStats ge 10s">
+          <set_value name="global.$GT_Scheduler.$LastStatsLog" exact="player.age"/>
+          
+          <!-- Cleanup expired reservations -->
+          <run_actions ref="md.GT_Libraries_General.GT_CleanupExpiredReservations" result="$cleanupResult">
+            <param name="traceId" value="0"/>
+          </run_actions>
+          
+          <!-- Collect statistics -->
+          <set_value name="$counters" exact="global.$GT_Scheduler.$Counters"/>
+          <set_value name="$cacheHitRate" exact="0.0"/>
+          <do_if value="$counters.$Completed gt 0">
+            <!-- TODO: Calculate actual cache hit rate from completed work items -->
+            <set_value name="$cacheHitRate" exact="0.0"/>
+          </do_if>
+          
+          <!-- Reservation statistics -->
+          <set_value name="$reservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0]"/>
+          <do_if value="global.$GT_ReservationStats?">
+            <set_value name="$reservationStats" exact="global.$GT_ReservationStats"/>
+          </do_if>
+          
+          <!-- Log combined statistics -->
+          <set_value name="$statsDetails" exact="'queue=' + global.$GT_Scheduler.$WorkQueue.count + ' active=' + (if global.$GT_Scheduler.$ActiveWork? then global.$GT_Scheduler.$ActiveWork.keys.count else 0) + ' completed=' + (if $counters.$Completed? then $counters.$Completed else 0) + ' failed=' + (if $counters.$Failed? then $counters.$Failed else 0) + ' cacheHitRate=' + ($cacheHitRate * 100) + '% reservations=' + (if $reservationStats.$Active? then $reservationStats.$Active else 0) + ' expired=' + (if $reservationStats.$Expired? then $reservationStats.$Expired else 0) + ' conflicts=' + (if $reservationStats.$Conflicts? then $reservationStats.$Conflicts else 0)"/>
+          
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="0"/>
+            <param name="stage" value="'Scheduler'"/>
+            <param name="action" value="'Stats'"/>
+            <param name="details" value="$statsDetails"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Continue processing if more work exists -->
+        <!-- CRITICAL: Reduced items per tick (5 instead of 20) to distribute load across frames and prevent stutter -->
+        <!-- signal_cue_instantly naturally distributes across frames, preventing tight loop processing -->
+        <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
+        <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Process CacheQuery Work Item -->
+    <!-- Handles cache query work items by calling GT_TS_CachePickBest -->
+    <cue name="ProcessCacheQueryWork" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$workItem" exact="event.param"/>
+        
+        <!-- Validate work item - ERROR if missing -->
+        <do_if value="not $workItem? or not $workItem.$Payload?">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+            <param name="stage" value="'Scheduler'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_cachequery_workitem key=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'unknown')"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <!-- Extract ship from payload for ActiveWork key -->
+          <set_value name="$payload" exact="$workItem.$Payload"/>
+          <set_value name="$workShip" exact="@$payload.$Ship"/>
+          <do_if value="$workItem? and $workItem.$Key?">
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'failed'"/>
+              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              <param name="reason" value="'invalid_payload'"/>
+            </run_actions>
+            <!-- Remove from ActiveWork using ship key -->
+            <do_if value="$workShip?">
+              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}"/>
+            </do_if>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <set_value name="$payload" exact="$workItem.$Payload"/>
+        <set_value name="$ship" exact="@$payload.$Ship"/>
+        <set_value name="$homeSector" exact="@$payload.$HomeSector"/>
+        <set_value name="$maxDistance" exact="@$payload.$MaxDistance"/>
+        <set_value name="$minROI" exact="@$payload.$MinROI"/>
+        <set_value name="$minAbsoluteProfit" exact="@$payload.$MinAbsoluteProfit"/>
+        <set_value name="$ignoreBuildStorage" exact="@$payload.$IgnoreBuildStorage"/>
+        <set_value name="$ignoreCarrierAux" exact="@$payload.$IgnoreCarrierAux"/>
+        <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+        
+        <!-- Validate required parameters - ERROR if missing -->
+        <do_if value="not $ship? or not $ship.exists or not $homeSector? or not $homeSector.exists">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheQuery'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_params ship=' + (if $ship? then $ship.idcode else 'null') + ' homeSector=' + (if $homeSector? then 'valid' else 'null')"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'failed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="reason" value="'invalid_params'"/>
+          </run_actions>
+          <!-- Remove from ActiveWork using ship key -->
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Execute cache query -->
+        <set_value name="$startTime" exact="player.age"/>
+        <run_actions ref="md.GT_Libraries_General.GT_TS_CachePickBest" result="$cacheResult">
+          <param name="ship" value="$ship"/>
+          <param name="homeSector" value="$homeSector"/>
+          <param name="maxDistance" value="$maxDistance"/>
+          <param name="minROI" value="$minROI"/>
+          <param name="minAbsoluteProfit" value="$minAbsoluteProfit"/>
+          <param name="ignoreBuildStorage" value="$ignoreBuildStorage"/>
+          <param name="ignoreCarrierAux" value="$ignoreCarrierAux"/>
+          <param name="traceId" value="$traceId"/>
+        </run_actions>
+        <set_value name="$duration" exact="player.age - $startTime"/>
+        
+        <!-- Store result in payload for continuation -->
+        <set_value name="$workItem.$Payload.$Result" exact="$cacheResult"/>
+        
+        <!-- NOTE: Work item is already in ActiveWork (added by ProcessWorkQueue before signaling this cue) -->
+        <!-- No need to check or re-add it here - ProcessWorkQueue ensures ActiveWork is a table -->
+        
+        <!-- Log cache query result -->
+        <set_value name="$resultAction" exact="if $cacheResult? and $cacheResult.$Found then 'Hit' else 'Miss'"/>
+        <set_value name="$resultDetails" exact="'trades=' + (if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades.count else 0) + ' score=' + (if $cacheResult? and $cacheResult.$BestScore? then $cacheResult.$BestScore else 0) + ' duration=' + ($duration / 1ms) + 'ms'"/>
+        
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'CacheQuery'"/>
+          <param name="action" value="$resultAction"/>
+          <param name="details" value="$resultDetails"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <!-- Mark work item as completed -->
+        <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+          <param name="key" value="$workItem.$Key"/>
+          <param name="newState" value="'completed'"/>
+          <param name="traceId" value="$traceId"/>
+          <param name="workItem" value="$workItem"/>
+        </run_actions>
+        
+        <!-- Remove from ActiveWork using ship key -->
+        <do_if value="$ship?">
+          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+        </do_if>
+        
+        <!-- CRITICAL: Signal ProcessWorkQueue to continue processing more cache queries immediately -->
+        <!-- Cache queries complete synchronously, so we can process many more in the same tick -->
+        <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
+        </do_if>
+        
+        <!-- Signal continuation handler if provided -->
+        <!-- CRITICAL: X4 doesn't support variable cue names in cue attribute - must use explicit cue reference -->
+        <do_if value="$payload.$ContinuationCue?">
+          <set_value name="$continuationCueName" exact="$payload.$ContinuationCue"/>
+          <!-- Check for known continuation cues and signal appropriately -->
+          <do_if value="$continuationCueName == 'md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation'">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation" param="$workItem"/>
+          </do_if>
+          <do_else>
+            <!-- Unknown continuation cue - log error -->
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=unknown_continuation_cue cue=' + $continuationCueName"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_else>
+        </do_if>
+        <do_else>
+          <!-- Default continuation: signal SearchTradeRoutes to resume with cache results -->
+          <do_if value="$payload.$ResumeParams?">
+            <set_value name="$resumeParams" exact="$payload.$ResumeParams"/>
+            <set_value name="$resumeParams.$CacheContinuation" exact="true"/>
+            <set_value name="$resumeParams.$CacheResult" exact="$cacheResult"/>
+            <!-- CRITICAL: Set SearchState to 'fresh' to ensure cache result extraction logic runs -->
+            <set_value name="$resumeParams.$SearchState" exact="'fresh'"/>
+            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$resumeParams"/>
+          </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Process HomeSearch Work Item -->
+    <!-- Handles home sector pathfinding and sector collection for live searches -->
+    <cue name="ProcessHomeSearchWork" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$workItem" exact="event.param"/>
+        
+        <!-- Validate work item - ERROR if missing -->
+        <do_if value="not $workItem? or not $workItem.$Payload?">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+            <param name="stage" value="'Scheduler'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_homesearch_workitem key=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'unknown')"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <!-- Extract ship from payload for ActiveWork key -->
+          <set_value name="$payload" exact="$workItem.$Payload"/>
+          <set_value name="$workShip" exact="@$payload.$Ship"/>
+          <do_if value="$workItem? and $workItem.$Key?">
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'failed'"/>
+              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              <param name="reason" value="'invalid_payload'"/>
+            </run_actions>
+            <!-- Remove from ActiveWork using ship key -->
+            <do_if value="$workShip?">
+              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}"/>
+            </do_if>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <set_value name="$payload" exact="$workItem.$Payload"/>
+        <set_value name="$ship" exact="@$payload.$Ship"/>
+        <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+        
+        <!-- Validate required parameters - ERROR if missing -->
+        <do_if value="not $ship? or not $ship.exists">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'HomeSearch'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_ship'"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'failed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="reason" value="'invalid_ship'"/>
+          </run_actions>
+          <!-- Remove from ActiveWork using ship key -->
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Execute home search by signaling SearchLiveTrades -->
+        <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
+        <set_value name="$startTime" exact="player.age"/>
+        
+        <!-- Build params table for SearchLiveTrades -->
+        <set_value name="$searchParams" exact="table[]"/>
+        <do_if value="$payload.$Ship?">
+          <set_value name="$searchParams.$Ship" exact="$payload.$Ship"/>
+        </do_if>
+        <do_if value="$payload.$MaxDistance?">
+          <set_value name="$searchParams.$MaxDistance" exact="$payload.$MaxDistance"/>
+        </do_if>
+        <do_if value="$payload.$OriginalMaxDistance?">
+          <set_value name="$searchParams.$OriginalMaxDistance" exact="$payload.$OriginalMaxDistance"/>
+        </do_if>
+        <do_if value="$payload.$PilotSkillMaxDistance?">
+          <set_value name="$searchParams.$PilotSkillMaxDistance" exact="$payload.$PilotSkillMaxDistance"/>
+        </do_if>
+        <do_if value="$payload.$MinROI?">
+          <set_value name="$searchParams.$MinROI" exact="$payload.$MinROI"/>
+        </do_if>
+        <do_if value="$payload.$MinAbsoluteProfit?">
+          <set_value name="$searchParams.$MinAbsoluteProfit" exact="$payload.$MinAbsoluteProfit"/>
+        </do_if>
+        <do_if value="$payload.$FactionPriority?">
+          <set_value name="$searchParams.$FactionPriority" exact="$payload.$FactionPriority"/>
+        </do_if>
+        <do_if value="$payload.$FactionPriorityText?">
+          <set_value name="$searchParams.$FactionPriorityText" exact="$payload.$FactionPriorityText"/>
+        </do_if>
+        <do_if value="$payload.$DistancePenaltyMultiplier?">
+          <set_value name="$searchParams.$DistancePenaltyMultiplier" exact="$payload.$DistancePenaltyMultiplier"/>
+        </do_if>
+        <do_if value="$payload.$SkillLevel?">
+          <set_value name="$searchParams.$SkillLevel" exact="$payload.$SkillLevel"/>
+        </do_if>
+        <do_if value="$payload.$ThreatIntel?">
+          <set_value name="$searchParams.$ThreatIntel" exact="$payload.$ThreatIntel"/>
+        </do_if>
+        <do_if value="$payload.$FleetCoord?">
+          <set_value name="$searchParams.$FleetCoord" exact="$payload.$FleetCoord"/>
+        </do_if>
+        <do_if value="$payload.$AdvancedAnalytics?">
+          <set_value name="$searchParams.$AdvancedAnalytics" exact="$payload.$AdvancedAnalytics"/>
+        </do_if>
+        <do_if value="$payload.$TraceId?">
+          <set_value name="$searchParams.$TraceId" exact="$payload.$TraceId"/>
+        </do_if>
+        <do_else>
+          <set_value name="$searchParams.$TraceId" exact="$traceId"/>
+        </do_else>
+        
+        <!-- Store work item reference in state for continuation -->
+        <do_if value="not global.$GT_SearchLiveTrades_State?">
+          <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
+        </do_if>
+        <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
+        <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
+        <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
+        
+        <!-- Signal SearchLiveTrades (async operation) -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'HomeSearch'"/>
+          <param name="action" value="'Start'"/>
+          <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown')"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
+        
+        <!-- Note: Work item remains active until SearchLiveTrades completes -->
+        <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
+      </actions>
+    </cue>
+    
+    <!-- Process Match Work Item -->
+    <!-- Handles batch trade matching work -->
+    <cue name="ProcessMatchWork" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$workItem" exact="event.param"/>
+        
+        <!-- Validate work item - ERROR if missing -->
+        <do_if value="not $workItem? or not $workItem.$Payload?">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+            <param name="stage" value="'Scheduler'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_match_workitem key=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'unknown')"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <!-- Extract ship from payload for ActiveWork key -->
+          <set_value name="$payload" exact="$workItem.$Payload"/>
+          <set_value name="$workShip" exact="@$payload.$Ship"/>
+          <do_if value="$workItem? and $workItem.$Key?">
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'failed'"/>
+              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              <param name="reason" value="'invalid_payload'"/>
+            </run_actions>
+            <!-- Remove from ActiveWork using ship key -->
+            <do_if value="$workShip?">
+              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}"/>
+            </do_if>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <set_value name="$payload" exact="$workItem.$Payload"/>
+        <set_value name="$ship" exact="@$payload.$Ship"/>
+        <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+        
+        <!-- Validate required parameters - ERROR if missing -->
+        <do_if value="not $ship? or not $ship.exists">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Match'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_ship'"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'failed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="reason" value="'invalid_ship'"/>
+          </run_actions>
+          <!-- Remove from ActiveWork using ship key -->
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Execute batch matching by signaling ProcessTradeMatchingBatch -->
+        <!-- This is async - ProcessTradeMatchingBatch will handle chunked processing -->
+        <set_value name="$startTime" exact="player.age"/>
+        
+        <!-- Store work item reference in batch state for continuation -->
+        <do_if value="not global.$GT_BatchDataList?">
+          <set_value name="global.$GT_BatchDataList" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_BatchDataList.{$ship}?">
+          <set_value name="global.$GT_BatchDataList.{$ship}" exact="table[]"/>
+        </do_if>
+        <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
+        <set_value name="global.$GT_BatchDataList.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
+        <set_value name="global.$GT_BatchDataList.{$ship}.$WorkItemShip" exact="$ship"/>
+        
+        <!-- Signal ProcessTradeMatchingBatch (async operation) -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'Match'"/>
+          <param name="action" value="'Start'"/>
+          <param name="details" value="'ship=' + $ship.idcode + ' wares=' + (if $payload.$WareCount? then $payload.$WareCount else 'unknown')"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessTradeMatchingBatch" param="$ship"/>
+        
+        <!-- Note: Work item remains active until ProcessTradeMatchingBatch completes -->
+        <!-- Completion will be handled by batch processor completion handler -->
       </actions>
     </cue>
   </cues>

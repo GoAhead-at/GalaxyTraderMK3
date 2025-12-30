@@ -16,6 +16,8 @@
         <set_value name="$ship" exact="$params.$Ship"/>
         <set_value name="$trade" exact="@$params.$Trade"/>  <!-- Use @ operator - Trade may not exist -->
         <set_value name="$tradeList" exact="@$params.$TradeList"/> <!-- Trade list for fallback -->
+        <set_value name="$tradeKey" exact="@$params.$TradeKey"/> <!-- Trade key for reservation cleanup (Phase 3) -->
+        <set_value name="$traceId" exact="@$params.$TraceId"/> <!-- Trace ID for logging -->
         
         <!-- IMPORTANT: ? only checks whether a variable is defined, not whether its value is null.
              Since $trade/$tradeList are always defined by set_value above, use explicit null checks. -->
@@ -73,6 +75,10 @@
         
         <!-- Enhanced execution logging (will be updated if fallback trade is used) -->
         <set_value name="$executionLogDone" exact="false"/>
+        <set_value name="$searchMethod" exact="@$params.$SearchMethod"/>
+        <do_if value="not $searchMethod?">
+          <set_value name="$searchMethod" exact="'unknown'"/>
+        </do_if>
         <do_if value="$tradeValid">
           <set_value name="$profit" exact="@$trade.$Profit"/>
           <set_value name="$amount" exact="@$trade.$Amount"/>
@@ -132,7 +138,7 @@
             </do_if>
             <do_else>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Distance: ' + $distance + ' jumps' + '\n  Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+                <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit (source: ' + $searchMethod + ')' + '\n  Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Distance: ' + $distance + ' jumps' + '\n  Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
               </do_if>
             </do_else>
           </do_if>
@@ -165,12 +171,65 @@
                         <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSectorObj}.{$entryWare}" exact="$entry"/>
                       </do_if>
                     </do_if>
+                    <!-- Extract trace ID for logging -->
+                    <set_value name="$purgeTraceId2" exact="''"/>
+                    <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId?">
+                      <set_value name="$purgeTraceId2" exact="global.$GT_AIParameters.{$ship}.$TraceId"/>
+                    </do_if>
+                    
+                    <!-- Phase 3: Release reservation before purging cache (trade invalidated) -->
+                    <do_if value="$tradeKey != ''">
+                      <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                        <param name="tradeKey" value="$tradeKey"/>
+                        <param name="reason" value="'invalidated'"/>
+                        <param name="traceId" value="$purgeTraceId2"/>
+                      </run_actions>
+                    </do_if>
+                    <do_else>
+                      <!-- Generate trade key if not provided -->
+                      <!-- CRITICAL: Validate offers have valid IDs before generating trade key -->
+                      <set_value name="$tradeKey" exact="''"/>
+                      <set_value name="$sellOfferIdValid" exact="false"/>
+                      
+                      <!-- Validate sellOffer has valid ID (required) -->
+                      <do_if value="$sellOffer? and $sellOffer.exists">
+                        <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+                        <do_if value="$tempSellId? and $tempSellId != null">
+                          <set_value name="$sellOfferIdValid" exact="true"/>
+                        </do_if>
+                      </do_if>
+                      
+                      <!-- Only generate trade key if sellOffer has valid ID -->
+                      <do_if value="$sellOfferIdValid">
+                        <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                          <param name="buyOffer" value="$buyOffer"/>
+                          <param name="sellOffer" value="$sellOffer"/>
+                          <param name="traceId" value="$purgeTraceId2"/>
+                        </run_actions>
+                      </do_if>
+                      <do_else>
+                        <!-- Invalid sellOffer.id - skip reservation release (trade already invalidated) -->
+                        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                          <debug_text text="'[GT-INFO] (' + $ship.idcode + ') Cannot generate trade key for reservation release: sellOffer.id is invalid (offer may have been removed) - reservation release skipped'" chance="100"/>
+                        </do_if>
+                      </do_else>
+                      
+                      <do_if value="$tradeKey != ''">
+                        <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                          <param name="tradeKey" value="$tradeKey"/>
+                          <param name="reason" value="'invalidated'"/>
+                          <param name="traceId" value="$purgeTraceId2"/>
+                        </run_actions>
+                      </do_if>
+                    </do_else>
+                    
                     <!-- Purge offer-pair across ALL home-sector caches (per-home caches can hold duplicates) -->
                     <run_actions ref="md.GT_Libraries_General.GT_PurgeCacheOfferPair_AllHomes" result="$purgeResult">
                       <param name="ship" value="$ship"/>
                       <param name="buyOffer" value="$buyOffer"/>
                       <param name="sellOffer" value="$sellOffer"/>
                       <param name="reason" value="'invalid_offers'"/>
+                      <param name="traceId" value="$purgeTraceId2"/>
                     </run_actions>
                     <set_value name="$purged" exact="true"/>
                     <break/>
@@ -752,14 +811,76 @@
             <!-- CRITICAL FIX: Remove cache entry when trade order is created from cache -->
             <!-- This prevents multiple ships from using the same cached trade -->
             <do_if value="$searchMethod == 'cache'">
-              <!-- Purge offer-pair across ALL home-sector caches (per-home caches can hold duplicates) -->
+              <!-- Extract trace ID for logging -->
+              <set_value name="$purgeTraceId" exact="''"/>
+              <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId?">
+                <set_value name="$purgeTraceId" exact="global.$GT_AIParameters.{$ship}.$TraceId"/>
+              </do_if>
+              
+              <!-- Phase 3: Release reservation before purging cache -->
               <set_value name="$purgeBuyOffer" exact="if $isSellOnly then null else $buyOffer"/>
-              <run_actions ref="md.GT_Libraries_General.GT_PurgeCacheOfferPair_AllHomes" result="$purgeResult">
-                <param name="ship" value="$ship"/>
-                <param name="buyOffer" value="$purgeBuyOffer"/>
-                <param name="sellOffer" value="$sellOffer"/>
-                <param name="reason" value="'consumed_cache_trade'"/>
-              </run_actions>
+              <do_if value="$tradeKey != ''">
+                <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                  <param name="tradeKey" value="$tradeKey"/>
+                  <param name="reason" value="'consumed'"/>
+                  <param name="traceId" value="$purgeTraceId"/>
+                </run_actions>
+              </do_if>
+              <do_else>
+                <!-- Generate trade key if not provided -->
+                <!-- CRITICAL: Validate sellOffer has valid ID before generating trade key -->
+                <set_value name="$tradeKey" exact="''"/>
+                <set_value name="$sellOfferIdValid" exact="false"/>
+                
+                <!-- Validate sellOffer exists and has valid ID -->
+                <do_if value="$sellOffer? and $sellOffer != null and $sellOffer.exists">
+                  <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+                  <do_if value="$tempSellId? and $tempSellId != null">
+                    <set_value name="$sellOfferIdValid" exact="true"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Only generate trade key if sellOffer has valid ID -->
+                <do_if value="$sellOfferIdValid">
+                  <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                    <param name="buyOffer" value="$purgeBuyOffer"/>
+                    <param name="sellOffer" value="$sellOffer"/>
+                    <param name="traceId" value="$purgeTraceId"/>
+                  </run_actions>
+                </do_if>
+                <do_else>
+                  <!-- Invalid sellOffer or sellOffer.id - log info (expected when offers become invalid) -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-INFO] (' + $ship.idcode + ') Cannot generate trade key for cache purge: sellOffer.id is invalid (offer may have been removed) - trade executed but cache purge skipped'" chance="100"/>
+                  </do_if>
+                </do_else>
+                <do_if value="$tradeKey != ''">
+                  <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                    <param name="tradeKey" value="$tradeKey"/>
+                    <param name="reason" value="'consumed'"/>
+                    <param name="traceId" value="$purgeTraceId"/>
+                  </run_actions>
+                </do_if>
+              </do_else>
+              
+              <!-- Purge offer-pair across ALL home-sector caches (per-home caches can hold duplicates) -->
+              <!-- Only purge if sellOffer is valid (required for trade key generation) -->
+              <do_if value="$sellOffer? and $sellOffer != null and $sellOffer.exists">
+                <run_actions ref="md.GT_Libraries_General.GT_PurgeCacheOfferPair_AllHomes" result="$purgeResult">
+                  <param name="ship" value="$ship"/>
+                  <param name="buyOffer" value="$purgeBuyOffer"/>
+                  <param name="sellOffer" value="$sellOffer"/>
+                  <param name="reason" value="'consumed_cache_trade'"/>
+                  <param name="traceId" value="$purgeTraceId"/>
+                </run_actions>
+              </do_if>
+              <do_else>
+                <!-- Invalid sellOffer - skip cache purge -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-ERROR] (' + $ship.idcode + ') Cannot purge cache: sellOffer is null or invalid'" chance="100"/>
+                </do_if>
+                <set_value name="$purgeResult" exact="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+              </do_else>
             </do_if>
             
             <!-- DEBUG: Log exact trade list stored for AI validation -->
