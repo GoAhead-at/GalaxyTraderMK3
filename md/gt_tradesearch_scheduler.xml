@@ -207,99 +207,113 @@
       </actions>
       <delay exact="this.$DelayTime"/>
       <actions>
-        <!-- CRITICAL: Reduced interval from 150ms to 25ms for faster cache query processing -->
-        <!-- Cache queries are lightweight and should be processed quickly -->
-        <!-- 25ms = 40 ships/second, which is sufficient for large fleets without causing stutter -->
+        <!-- ROOT CAUSE FIX: Create multiple work items per tick to fill queue faster -->
+        <!-- Tick was creating 1 work item per 25ms, causing bottleneck with large queues -->
+        <!-- ProcessWorkQueue can process 10 items per tick, so Tick should create multiple items per call -->
+        <!-- Creating work items is cheap (just data structures), so we can create 5-10 per call without stutter -->
         <set_value name="$startIntervalMs" exact="25"/>
         <set_value name="global.$GT_TS.$NextStartTime" exact="player.age + ($startIntervalMs * 1ms)"/>
-
-        <!-- Dequeue one ship -->
-        <set_value name="$ship" exact="global.$GT_TS.$Queue.{1}"/>
-        <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
-        <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
-        <!-- Clear enqueue timestamp (ship is being processed) -->
-        <remove_value name="global.$GT_TS.$EnqueuedAt.{$ship}"/>
-
-        <!-- Ship may have been destroyed -->
-        <do_if value="not $ship? or not $ship.exists">
-          <set_value name="global.$GT_TS.$Processing" exact="false"/>
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <!-- Load latest request -->
-        <set_value name="$req" exact="@global.$GT_TS.$Requests.{$ship}"/>
-        <do_if value="$req == null">
-          <set_value name="global.$GT_TS.$Processing" exact="false"/>
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <!-- Start the search engine (one ship per tick) -->
-        <!-- CRITICAL FIX: Create CacheQuery work item directly instead of signaling SearchTradeRoutes -->
-        <!-- This prevents concurrent SearchTradeRoutes instances (up to 22 per frame) causing stutter -->
-        <!-- SearchTradeRoutes will be signaled by scheduler when cache query completes -->
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-TS] Start: ' + $ship.idcode + ' (queue_remaining=' + global.$GT_TS.$Queue.count + ') - creating CacheQuery work item'" chance="100"/>
-        </do_if>
         
-        <!-- Extract parameters from request (same as SearchTradeRoutes does) -->
-        <set_value name="$traceId" exact="if $req.$TraceId? then $req.$TraceId else '0'"/>
+        <!-- Process multiple ships per tick (up to reasonable limit to prevent stutter) -->
+        <!-- Limit to 5 ships per tick to balance throughput vs frame time -->
+        <set_value name="$maxShipsPerTick" exact="5"/>
+        <set_value name="$shipsProcessed" exact="0"/>
         
-        <!-- CRITICAL FIX: Determine home sector using GT_GetHomeSector (same as SearchTradeRoutes) -->
-        <!-- $req.$HomeSector may not exist - SearchTradeRoutes determines it dynamically -->
-        <set_value name="$homeSector" exact="null"/>
-        <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-          <param name="ship" value="$ship"/>
-        </run_actions>
-        
-        <set_value name="$maxDistance" exact="@$req.$MaxDistance"/>
-        <set_value name="$minROI" exact="@$req.$MinROI"/>
-        <set_value name="$minAbsoluteProfit" exact="@$req.$MinAbsoluteProfit"/>
-        <set_value name="$ignoreBuildStorage" exact="if $req.$IgnoreBuildStorage? then $req.$IgnoreBuildStorage else false"/>
-        <set_value name="$ignoreCarrierAux" exact="if $req.$IgnoreCarrierAux? then $req.$IgnoreCarrierAux else false"/>
-        
-        <!-- CRITICAL FIX: Validate home sector before creating work item (prevents invalid_params errors) -->
-        <do_if value="not $homeSector? or not $homeSector.exists">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'Scheduler'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=cannot_determine_home_sector ship=' + $ship.idcode + ' - skipping cache query'"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <!-- Remove from queue and continue -->
+        <do_while value="global.$GT_TS.$Queue.count gt 0 and $shipsProcessed lt $maxShipsPerTick">
+          <!-- Dequeue one ship -->
+          <set_value name="$ship" exact="global.$GT_TS.$Queue.{1}"/>
+          
+          <!-- CRITICAL FIX: Validate ship exists BEFORE clearing timestamp (preserves diagnostic info) -->
+          <do_if value="not $ship? or not $ship.exists">
+            <!-- Ship destroyed - remove from queue but preserve timestamp for diagnostics -->
+            <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
+            <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
+            <!-- Note: Keep $EnqueuedAt for diagnostics (shows how long destroyed ship was queued) -->
+            <set_value name="$shipsProcessed" operation="add"/>
+            <continue/>
+          </do_if>
+          
+          <!-- Ship is valid - proceed with dequeue and timestamp cleanup -->
           <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
           <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
+          <!-- Clear enqueue timestamp (ship is being processed) -->
           <remove_value name="global.$GT_TS.$EnqueuedAt.{$ship}"/>
-          <set_value name="global.$GT_TS.$Processing" exact="false"/>
-          <do_if value="global.$GT_TS.$Queue.count gt 0">
-            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+
+          <!-- Load latest request -->
+          <set_value name="$req" exact="@global.$GT_TS.$Requests.{$ship}"/>
+          <do_if value="$req == null">
+            <!-- Request cleared - skip this ship -->
+            <set_value name="$shipsProcessed" operation="add"/>
+            <continue/>
           </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        
-        <!-- Create CacheQuery work item directly (bypasses SearchTradeRoutes initial entry) -->
-        <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$cacheWorkItem">
-          <param name="type" value="'CacheQuery'"/>
-          <param name="key" value="$ship.idcode + '_CacheQuery'"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="payload" value="table[
-            $Ship = $ship,
-            $HomeSector = $homeSector,
-            $MaxDistance = $maxDistance,
-            $MinROI = $minROI,
-            $MinAbsoluteProfit = $minAbsoluteProfit,
-            $IgnoreBuildStorage = $ignoreBuildStorage,
-            $IgnoreCarrierAux = $ignoreCarrierAux,
-            $ResumeParams = $req
-          ]"/>
-        </run_actions>
-        
-        <!-- Enqueue work item to scheduler -->
-        <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
-          <param name="workItem" value="$cacheWorkItem"/>
-        </run_actions>
+
+          <!-- Start the search engine -->
+          <!-- CRITICAL FIX: Create CacheQuery work item directly instead of signaling SearchTradeRoutes -->
+          <!-- This prevents concurrent SearchTradeRoutes instances (up to 22 per frame) causing stutter -->
+          <!-- SearchTradeRoutes will be signaled by scheduler when cache query completes -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TS] Start: ' + $ship.idcode + ' (queue_remaining=' + global.$GT_TS.$Queue.count + ') - creating CacheQuery work item'" chance="100"/>
+          </do_if>
+          
+          <!-- Extract parameters from request (same as SearchTradeRoutes does) -->
+          <set_value name="$traceId" exact="if $req.$TraceId? then $req.$TraceId else '0'"/>
+          
+          <!-- CRITICAL FIX: Determine home sector using GT_GetHomeSector (same as SearchTradeRoutes) -->
+          <!-- $req.$HomeSector may not exist - SearchTradeRoutes determines it dynamically -->
+          <set_value name="$homeSector" exact="null"/>
+          <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <set_value name="$maxDistance" exact="@$req.$MaxDistance"/>
+          <set_value name="$minROI" exact="@$req.$MinROI"/>
+          <set_value name="$minAbsoluteProfit" exact="@$req.$MinAbsoluteProfit"/>
+          <set_value name="$ignoreBuildStorage" exact="if $req.$IgnoreBuildStorage? then $req.$IgnoreBuildStorage else false"/>
+          <set_value name="$ignoreCarrierAux" exact="if $req.$IgnoreCarrierAux? then $req.$IgnoreCarrierAux else false"/>
+          
+          <!-- CRITICAL FIX: Validate home sector before creating work item (prevents invalid_params errors) -->
+          <do_if value="not $homeSector? or not $homeSector.exists">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=cannot_determine_home_sector ship=' + $ship.idcode + ' - skipping cache query'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+            <!-- CRITICAL FIX: Release lock and signal AI (terminal failure routine) -->
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'cannot_determine_home_sector'"/>
+            </run_actions>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'"/>
+            <set_value name="$shipsProcessed" operation="add"/>
+            <continue/>
+          </do_if>
+          
+          <!-- Create CacheQuery work item directly (bypasses SearchTradeRoutes initial entry) -->
+          <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$cacheWorkItem">
+            <param name="type" value="'CacheQuery'"/>
+            <param name="key" value="$ship.idcode + '_CacheQuery'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="payload" value="table[
+              $Ship = $ship,
+              $HomeSector = $homeSector,
+              $MaxDistance = $maxDistance,
+              $MinROI = $minROI,
+              $MinAbsoluteProfit = $minAbsoluteProfit,
+              $IgnoreBuildStorage = $ignoreBuildStorage,
+              $IgnoreCarrierAux = $ignoreCarrierAux,
+              $ResumeParams = $req
+            ]"/>
+          </run_actions>
+          
+          <!-- Enqueue work item to scheduler -->
+          <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
+            <param name="workItem" value="$cacheWorkItem"/>
+          </run_actions>
+          
+          <set_value name="$shipsProcessed" operation="add"/>
+        </do_while>
 
         <!-- Continue if more work exists -->
         <set_value name="global.$GT_TS.$Processing" exact="false"/>
@@ -352,22 +366,20 @@
         </do_if>
         
         <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - MUST be checked BEFORE counting active work -->
-        <!-- Tables have .keys property, lists don't - use this to detect if it's NOT a table -->
-        <!-- This check must happen ONCE per tick, not per work item, to avoid clearing active work during processing -->
+        <!-- ROOT CAUSE: Accessing .keys.count on an empty table might corrupt it in X4 MD -->
+        <!-- SOLUTION: Store the count in a variable BEFORE the do_all loop to prevent corruption -->
         <do_if value="not global.$GT_Scheduler.$ActiveWork?">
           <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
         </do_if>
+        <!-- Ensure ActiveWork is a table - if it's not, reinitialize it (should never happen, but defensive) -->
         <do_else>
-          <!-- Check if it's NOT a table by testing .keys property - if .keys doesn't exist, it's a list -->
-          <do_if value="not global.$GT_Scheduler.$ActiveWork.keys?">
-            <!-- ActiveWork is a list (from old save or corruption) - reinitialize as table -->
-            <!-- WARNING: This will lose active work items, but it's better than crashing -->
-            <!-- CRITICAL FIX: Don't try to access .count on a list - it may fail, just log the corruption -->
+          <do_if value="typeof global.$GT_Scheduler.$ActiveWork != datatype.table">
+            <!-- ActiveWork is not a table - reinitialize (this should never happen, indicates a bug) -->
             <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
               <param name="traceId" value="0"/>
               <param name="stage" value="'Scheduler'"/>
               <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=ActiveWork_corrupted_to_list - reinitializing as table (active work items will be lost)'"/>
+              <param name="details" value="'reason=ActiveWork_not_table_reinitializing'"/>
               <param name="logLevel" value="0"/>
             </run_actions>
             <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
@@ -416,9 +428,12 @@
         <set_value name="$activeMatches" exact="0"/>
         
         <!-- CRITICAL: Only count active work if ActiveWork is a table (has .keys property) -->
-        <!-- Corruption check above (lines 354-375) should have fixed any list corruption, but be defensive -->
+        <!-- ROOT CAUSE FIX: Store .keys.count in a variable BEFORE do_all to prevent corruption -->
+        <!-- Accessing .keys.count directly in do_all might corrupt the table in X4 MD -->
+        <set_value name="$activeWorkKeysCount" exact="0"/>
         <do_if value="global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.keys?">
-          <do_all exact="global.$GT_Scheduler.$ActiveWork.keys.count" counter="$i">
+          <set_value name="$activeWorkKeysCount" exact="global.$GT_Scheduler.$ActiveWork.keys.count"/>
+          <do_all exact="$activeWorkKeysCount" counter="$i">
             <set_value name="$key" exact="global.$GT_Scheduler.$ActiveWork.keys.{$i}"/>
             <set_value name="$workItem" exact="global.$GT_Scheduler.$ActiveWork.{$key}"/>
             <do_if value="$workItem? and $workItem.$Type? and $workItem.$State == 'active'">
@@ -459,8 +474,14 @@
         <!-- Cache queries are cheap (synchronous, complete immediately) but we limit to prevent tight loops -->
         <!-- Live searches and matches are expensive - limit more strictly -->
         <!-- Reduced from 20 to 5 to prevent stutter - ProcessWorkQueue will signal itself to continue if more work exists -->
-        <set_value name="$maxItemsPerTick" exact="5"/>
-        <do_while value="global.$GT_Scheduler.$WorkQueue.count gt 0 and $processed lt $maxItemsPerTick">
+        <!-- ROOT CAUSE FIX: Process multiple cache queries per tick since they complete synchronously -->
+        <!-- Cache queries are cheap and complete immediately, so we can process more per tick -->
+        <!-- For stutter reduction: reduce maxItemsPerTick for large fleets, increase delay -->
+        <set_value name="$maxItemsPerTick" exact="10"/>
+        <!-- CRITICAL FIX: Track rotations to prevent infinite rotation when all items are unprocessable -->
+        <set_value name="$rotationsThisTick" exact="0"/>
+        <set_value name="$maxRotationsPerTick" exact="global.$GT_Scheduler.$WorkQueue.count"/>
+        <do_while value="global.$GT_Scheduler.$WorkQueue.count gt 0 and $processed lt $maxItemsPerTick and $rotationsThisTick lt $maxRotationsPerTick">
           <set_value name="$workItem" exact="global.$GT_Scheduler.$WorkQueue.{1}"/>
           
           <!-- Validate work item - ERROR if invalid -->
@@ -512,13 +533,29 @@
             <set_value name="$payload" exact="$workItem.$Payload"/>
             <set_value name="$ship" exact="@$payload.$Ship"/>
             
-            <!-- Add to ActiveWork BEFORE updating state (keyed by ship object, not string key) -->
-            <do_if value="$ship?">
-              <set_value name="global.$GT_Scheduler.$ActiveWork.{$ship}" exact="$workItem"/>
+            <!-- CRITICAL FIX: Validate ship exists and is valid before processing work item -->
+            <do_if value="not $ship? or not $ship.exists">
+              <!-- Invalid ship - mark work item as failed and skip processing -->
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+                <param name="stage" value="'Scheduler'"/>
+                <param name="action" value="'Error'"/>
+                <param name="details" value="'reason=invalid_ship_in_payload type=' + $workItem.$Type + ' key=' + (if $workItem.$Key? then $workItem.$Key else 'unknown')"/>
+                <param name="logLevel" value="0"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+                <param name="key" value="$workItem.$Key"/>
+                <param name="newState" value="'failed'"/>
+                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+                <param name="reason" value="'invalid_ship'"/>
+                <param name="workItem" value="$workItem"/>
+              </run_actions>
+              <continue/>
             </do_if>
-            <do_else>
-              <debug_text text="'[GT-ERROR] ProcessWorkQueue: workItem missing payload ship; cannot track ActiveWork key=' + (if $workItem.$Key? then $workItem.$Key else 'unknown')" chance="100"/>
-            </do_else>
+            
+            <!-- Ship is valid - proceed with processing -->
+            <!-- Add to ActiveWork BEFORE updating state (keyed by ship object, not string key) -->
+            <set_value name="global.$GT_Scheduler.$ActiveWork.{$ship}" exact="$workItem"/>
             
             <!-- Update state to active (pass work item to avoid lookup issues) -->
             <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
@@ -590,15 +627,27 @@
             <set_value name="$processed" operation="add"/>
           </do_if>
           <do_else>
-            <!-- Budget exhausted for this type - skip this item and continue to next item in queue -->
-            <!-- The item stays in queue and will be processed in next tick when budget is available -->
+            <!-- CRITICAL FIX: Budget exhausted for this type - rotate item to end of queue to prevent infinite loop -->
+            <!-- This allows us to scan for processable items while preserving queue order -->
             <!-- Only break if ALL budgets are exhausted (no more work can be processed this tick) -->
-            <!-- CRITICAL FIX: Check cache queries started this tick, not budgetCheapOps (which is constant) -->
             <set_value name="$cacheBudgetExhausted" exact="$cacheQueriesStartedThisTick ge global.$GT_Scheduler.$Budgets.$CheapOpsPerTick"/>
             <do_if value="$cacheBudgetExhausted and $budgetHomeSearches le 0 and $budgetMatches le 0">
+              <!-- All budgets exhausted - break to prevent infinite loop -->
               <break/>
             </do_if>
-            <!-- Otherwise, continue to next item (might be different type with available budget) -->
+            <do_else>
+              <!-- Some budgets still available - rotate unprocessable item to end of queue -->
+              <!-- This prevents infinite loop when head item can't be processed but other items can -->
+              <!-- CRITICAL FIX: Track rotations to prevent rotating entire queue multiple times -->
+              <set_value name="$rotationsThisTick" operation="add"/>
+              <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
+              <append_to_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
+              <!-- Continue to next item (might be different type with available budget) -->
+              <!-- If we've rotated as many times as queue size, all items are likely unprocessable - break to prevent infinite rotation -->
+              <do_if value="$rotationsThisTick ge $maxRotationsPerTick">
+                <break/>
+              </do_if>
+            </do_else>
           </do_else>
         </do_while>
         
@@ -639,11 +688,12 @@
         </do_if>
         
         <!-- Continue processing if more work exists -->
-        <!-- CRITICAL: Reduced items per tick (5 instead of 20) to distribute load across frames and prevent stutter -->
-        <!-- signal_cue_instantly naturally distributes across frames, preventing tight loop processing -->
+        <!-- CRITICAL FIX: Use delayed cue instead of instant self-signal to ensure frame distribution -->
+        <!-- signal_cue_instantly can run in same frame, defeating "5 items per tick" limit -->
+        <!-- Using a separate delayed cue ensures proper frame distribution -->
         <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
         <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueueDelayed"/>
         </do_if>
       </actions>
     </cue>
@@ -714,6 +764,14 @@
             <param name="reason" value="'invalid_params'"/>
             <param name="workItem" value="$workItem"/>
           </run_actions>
+          <!-- CRITICAL FIX: Release lock and signal AI (terminal failure routine) -->
+          <do_if value="$ship? and $ship.exists">
+            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'invalid_params'"/>
+            </run_actions>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'"/>
+          </do_if>
           <!-- Remove from ActiveWork using ship key -->
           <do_if value="$ship?">
             <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
@@ -772,34 +830,69 @@
         
         <!-- Signal continuation handler if provided -->
         <!-- CRITICAL: X4 doesn't support variable cue names in cue attribute - must use explicit cue reference -->
+        <set_value name="$continuationHandled" exact="false"/>
         <do_if value="$payload.$ContinuationCue?">
           <set_value name="$continuationCueName" exact="$payload.$ContinuationCue"/>
           <!-- Check for known continuation cues and signal appropriately -->
           <do_if value="$continuationCueName == 'md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation'">
             <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation" param="$workItem"/>
+            <set_value name="$continuationHandled" exact="true"/>
           </do_if>
           <do_else>
-            <!-- Unknown continuation cue - log error -->
+            <!-- Unknown continuation cue - log error and fall back to default -->
             <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
               <param name="traceId" value="$traceId"/>
               <param name="stage" value="'Scheduler'"/>
               <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=unknown_continuation_cue cue=' + $continuationCueName"/>
+              <param name="details" value="'reason=unknown_continuation_cue cue=' + $continuationCueName + ' - falling back to default'"/>
               <param name="logLevel" value="0"/>
             </run_actions>
           </do_else>
         </do_if>
-        <do_else>
-          <!-- Default continuation: signal SearchTradeRoutes to resume with cache results -->
+        
+        <!-- CRITICAL FIX: If continuation cue was not handled (missing or unknown), use default continuation -->
+        <!-- This ensures SearchTradeRoutes always resumes, preventing ships from waiting indefinitely -->
+        <do_if value="not $continuationHandled">
+          <!-- Default continuation: queue SearchTradeRoutes continuation with cache results -->
+          <!-- ROOT CAUSE FIX: Use EnqueueSearchTradeRoutes instead of signal_cue_instantly -->
+          <!-- This prevents 10+ concurrent SearchTradeRoutes instances in same frame (causing stutter) -->
+          <!-- EnqueueSearchTradeRoutes has 0-30ms jitter delay and proper pacing -->
+          <!-- CRITICAL FIX: Extract cacheResult from workItem payload (it was stored there at line 797) -->
+          <set_value name="$extractedCacheResult" exact="@$workItem.$Payload.$Result"/>
           <do_if value="$payload.$ResumeParams?">
             <set_value name="$resumeParams" exact="$payload.$ResumeParams"/>
             <set_value name="$resumeParams.$CacheContinuation" exact="true"/>
-            <set_value name="$resumeParams.$CacheResult" exact="$cacheResult"/>
-            <!-- CRITICAL: Set SearchState to 'fresh' to ensure cache result extraction logic runs -->
+            <set_value name="$resumeParams.$CacheResult" exact="$extractedCacheResult"/>
+            <!-- ROOT CAUSE FIX: Keep SearchState as 'fresh' so cache result extraction logic runs -->
+            <!-- CacheContinuation flag ensures SearchTradeRoutes proceeds past cache check gate -->
+            <!-- Setting to 'cache' causes cache extraction block to be skipped (line 814 requires 'fresh') -->
             <set_value name="$resumeParams.$SearchState" exact="'fresh'"/>
+            <!-- CRITICAL FIX: Signal SearchTradeRoutes directly instead of EnqueueSearchTradeRoutes -->
+            <!-- EnqueueSearchTradeRoutes routes through scheduler again, creating another CacheQuery work item -->
+            <!-- We already have cache results, so call SearchTradeRoutes directly to process them -->
             <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$resumeParams"/>
           </do_if>
-        </do_else>
+          <do_else>
+            <!-- CRITICAL: No continuation params - signal ship with 'busy' to trigger retry -->
+            <!-- Extract ship from payload to signal -->
+            <set_value name="$resumeShip" exact="@$payload.$Ship"/>
+            <do_if value="$resumeShip? and $resumeShip.exists">
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="$traceId"/>
+                <param name="stage" value="'Scheduler'"/>
+                <param name="action" value="'Error'"/>
+                <param name="details" value="'reason=missing_continuation_params ship=' + $resumeShip.idcode + ' - signaling busy retry'"/>
+                <param name="logLevel" value="0"/>
+              </run_actions>
+              <!-- Release lock and signal busy -->
+              <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                <param name="ship" value="$resumeShip"/>
+                <param name="reason" value="'missing_continuation_params'"/>
+              </run_actions>
+              <signal_objects object="$resumeShip" param="'GT_No_Trade_Found'" param2="'busy'"/>
+            </do_if>
+          </do_else>
+        </do_if>
       </actions>
     </cue>
     
@@ -1042,6 +1135,22 @@
         
         <!-- Note: Work item remains active until ProcessTradeMatchingBatch completes -->
         <!-- Completion will be handled by batch processor completion handler -->
+      </actions>
+    </cue>
+    
+    <!-- Delayed Work Queue Processor (Frame Distribution) -->
+    <!-- Purpose: Ensures ProcessWorkQueue is called with frame delay to prevent tight loops -->
+    <cue name="ProcessWorkQueueDelayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- ROOT CAUSE FIX: Increase delay to reduce stutter with large fleets -->
+      <!-- 1ms was too short - multiple ProcessWorkQueue instances could run in same frame -->
+      <!-- 5ms ensures proper frame distribution and prevents tight loops -->
+      <delay exact="5ms"/>
+      <actions>
+        <!-- Signal ProcessWorkQueue with frame delay -->
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
       </actions>
     </cue>
   </cues>
