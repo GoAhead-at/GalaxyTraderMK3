@@ -4746,6 +4746,85 @@
           <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
         </do_if>
         
+        <!-- OPTIMIZATION: If cache is now populated for this home sector, move other ships from live queue to cache search -->
+        <!-- This prevents redundant live searches when cache is already available -->
+        <do_if value="$finalTradeCount gt 0">
+          <!-- Get home sector for the ship that just completed live search -->
+          <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$completedShipHomeSector">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <!-- Check if cache is populated for this home sector -->
+          <set_value name="$cacheIsPopulated" exact="false"/>
+          <do_if value="$completedShipHomeSector? and $completedShipHomeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$completedShipHomeSector}?">
+            <set_value name="$cacheCount" exact="global.$GT_TradeCache.{$completedShipHomeSector}.count"/>
+            <do_if value="$cacheCount gt 0">
+              <set_value name="$cacheIsPopulated" exact="true"/>
+            </do_if>
+          </do_if>
+          
+          <!-- If cache is populated, check for other ships from same home sector in live queue -->
+          <do_if value="$cacheIsPopulated and global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}?">
+            <set_value name="$queuedShips" exact="global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}.$Ships"/>
+            <set_value name="$movedCount" exact="0"/>
+            
+            <!-- Process ships in reverse order to safely remove from list -->
+            <do_if value="$queuedShips? and $queuedShips.count gt 0">
+              <do_all exact="$queuedShips.count" counter="$i" reverse="true">
+                <set_value name="$queuedShip" exact="$queuedShips.{$i}"/>
+                
+                <!-- Skip the ship that just completed (shouldn't be in queue, but safety check) -->
+                <do_if value="$queuedShip != $ship and $queuedShip? and $queuedShip.exists">
+                  <!-- Get params for this queued ship -->
+                  <set_value name="$queuedParams" exact="@global.$GT_LiveSearchQueue.$Params.{$queuedShip}"/>
+                  
+                  <do_if value="$queuedParams?">
+                    <!-- Remove from live search queue -->
+                    <remove_from_list name="global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}.$Ships" exact="$queuedShip"/>
+                    
+                    <!-- Remove from params -->
+                    <do_if value="global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$queuedShip}?">
+                      <remove_value name="global.$GT_LiveSearchQueue.$Params.{$queuedShip}"/>
+                    </do_if>
+                    
+                    <!-- Clear ForceLiveSearch flag so ship will check cache instead -->
+                    <set_value name="$queuedParams.$ForceLiveSearch" exact="false"/>
+                    <set_value name="$queuedParams.$SearchState" exact="'fresh'"/>
+                    
+                    <!-- Re-queue for cache search via normal search queue -->
+                    <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$queuedParams"/>
+                    
+                    <set_value name="$movedCount" exact="$movedCount + 1"/>
+                    
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Optimization] (' + $ship.idcode + ') Moved ship ' + $queuedShip.idcode + ' from live queue to cache search (home sector cache populated with ' + $cacheCount + ' trades)'" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <!-- Clean up empty sector entry from live queue -->
+              <do_if value="global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}? and global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}.$Ships.count == 0">
+                <remove_value name="global.$GT_LiveSearchQueue.$BySector.{$completedShipHomeSector}"/>
+                
+                <!-- Remove from sectors list if present -->
+                <do_if value="global.$GT_LiveSearchQueue.$Sectors?">
+                  <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$si" reverse="true">
+                    <do_if value="global.$GT_LiveSearchQueue.$Sectors.{$si} == $completedShipHomeSector">
+                      <remove_from_list name="global.$GT_LiveSearchQueue.$Sectors" exact="$completedShipHomeSector"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$movedCount gt 0 and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Optimization] (' + $ship.idcode + ') Moved ' + $movedCount + ' ship(s) from live queue to cache search for home sector ' + (if $completedShipHomeSector? then @$completedShipHomeSector.knownname else 'unknown')" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        
         <!-- 9. Cleanup batch data (using ship object as key) -->
         <remove_value name="global.$GT_BatchDataList.{$ship}"/>
         <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
