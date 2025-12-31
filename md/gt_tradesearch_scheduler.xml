@@ -44,6 +44,10 @@
         <do_if value="not global.$GT_TS.$NextStartTime?">
           <set_value name="global.$GT_TS.$NextStartTime" exact="0s"/>
         </do_if>
+        <!-- Throttle expensive queue-wide maintenance in Tick -->
+        <do_if value="not global.$GT_TS.$LastStaleScan?">
+          <set_value name="global.$GT_TS.$LastStaleScan" exact="0s"/>
+        </do_if>
 
         <!-- Reset transient coalescing / output queues on load (not safe to resume across save/load) -->
         <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
@@ -142,51 +146,55 @@
           <set_value name="global.$GT_TS.$EnqueuedAt" exact="table[]"/>
         </do_if>
 
-        <!-- SAFEGUARD: Remove stale queue entries (older than 60 seconds) -->
-        <!-- Prevents ships from being stuck in queue indefinitely -->
-        <set_value name="$staleThreshold" exact="60s"/>
-        <set_value name="$staleShips" exact="[]"/>
-        <do_all exact="global.$GT_TS.$Queue.count" counter="$i">
-          <set_value name="$queuedShip" exact="global.$GT_TS.$Queue.{$i}"/>
-          <set_value name="$enqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$queuedShip}"/>
-          <do_if value="$enqueuedAt? and $enqueuedAt != null">
-            <set_value name="$queueAge" exact="player.age - $enqueuedAt"/>
-            <do_if value="$queueAge gt $staleThreshold">
-              <!-- Ship has been queued for more than 60 seconds - remove and signal busy -->
+        <!-- SAFEGUARD: Remove stale queue entries (older than 60 seconds), but DO NOT scan the entire queue every Tick.
+             Under large fleets, queue scanning becomes O(N) and can cause continuous stutter by itself. -->
+        <set_value name="$doStaleScan" exact="false"/>
+        <set_value name="$staleScanInterval" exact="2s"/>
+        <set_value name="$lastStaleScan" exact="@global.$GT_TS.$LastStaleScan"/>
+        <do_if value="not $lastStaleScan? or $lastStaleScan == null or (player.age - $lastStaleScan) ge $staleScanInterval">
+          <set_value name="$doStaleScan" exact="true"/>
+          <set_value name="global.$GT_TS.$LastStaleScan" exact="player.age"/>
+        </do_if>
+
+        <do_if value="$doStaleScan">
+          <set_value name="$staleThreshold" exact="60s"/>
+          <set_value name="$staleShips" exact="[]"/>
+          <do_all exact="global.$GT_TS.$Queue.count" counter="$i">
+            <set_value name="$queuedShip" exact="global.$GT_TS.$Queue.{$i}"/>
+            <set_value name="$enqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$queuedShip}"/>
+            <do_if value="$enqueuedAt? and $enqueuedAt != null">
+              <set_value name="$queueAge" exact="player.age - $enqueuedAt"/>
+              <do_if value="$queueAge gt $staleThreshold">
+                <append_to_list name="$staleShips" exact="$queuedShip"/>
+              </do_if>
+            </do_if>
+            <do_else>
               <append_to_list name="$staleShips" exact="$queuedShip"/>
+            </do_else>
+          </do_all>
+
+          <do_all exact="$staleShips.count" counter="$j">
+            <set_value name="$staleShip" exact="$staleShips.{$j}"/>
+            <set_value name="$staleAge" exact="0s"/>
+            <set_value name="$staleEnqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
+            <do_if value="$staleEnqueuedAt? and $staleEnqueuedAt != null">
+              <set_value name="$staleAge" exact="player.age - $staleEnqueuedAt"/>
             </do_if>
-          </do_if>
-          <do_else>
-            <!-- Missing enqueue timestamp - treat as stale (shouldn't happen, but handle gracefully) -->
-            <append_to_list name="$staleShips" exact="$queuedShip"/>
-          </do_else>
-        </do_all>
-        
-        <!-- Remove stale ships from queue and signal busy -->
-        <do_all exact="$staleShips.count" counter="$j">
-          <set_value name="$staleShip" exact="$staleShips.{$j}"/>
-          <!-- Store age before removing timestamp (for logging) -->
-          <set_value name="$staleAge" exact="0s"/>
-          <set_value name="$staleEnqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
-          <do_if value="$staleEnqueuedAt? and $staleEnqueuedAt != null">
-            <set_value name="$staleAge" exact="player.age - $staleEnqueuedAt"/>
-          </do_if>
-          <remove_from_list name="global.$GT_TS.$Queue" exact="$staleShip"/>
-          <remove_value name="global.$GT_TS.$Queued.{$staleShip}"/>
-          <remove_value name="global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
-          <do_if value="$staleShip? and $staleShip.exists">
-            <!-- Release request registry lock -->
-            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-              <param name="ship" value="$staleShip"/>
-              <param name="reason" value="'busy'"/>
-            </run_actions>
-            <!-- Signal ship that system is busy (AI will retry after 10s) -->
-            <signal_objects object="$staleShip" param="'GT_No_Trade_Found'" param2="'busy'"/>
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-TS] SAFEGUARD: Removed stale queue entry for ' + $staleShip.idcode + ' (queued for ' + ($staleAge / 1s) + 's, threshold=60s) - signaling busy retry'" chance="100"/>
+            <remove_from_list name="global.$GT_TS.$Queue" exact="$staleShip"/>
+            <remove_value name="global.$GT_TS.$Queued.{$staleShip}"/>
+            <remove_value name="global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
+            <do_if value="$staleShip? and $staleShip.exists">
+              <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                <param name="ship" value="$staleShip"/>
+                <param name="reason" value="'busy'"/>
+              </run_actions>
+              <signal_objects object="$staleShip" param="'GT_No_Trade_Found'" param2="'busy'"/>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-TS] SAFEGUARD: Removed stale queue entry for ' + $staleShip.idcode + ' (queued for ' + ($staleAge / 1s) + 's, threshold=60s) - signaling busy retry'" chance="100"/>
+              </do_if>
             </do_if>
-          </do_if>
-        </do_all>
+          </do_all>
+        </do_if>
 
         <!-- If no pending ships after cleanup, stop -->
         <do_if value="global.$GT_TS.$Queue.count le 0">
@@ -211,12 +219,13 @@
         <!-- Tick was creating 1 work item per 25ms, causing bottleneck with large queues -->
         <!-- ProcessWorkQueue can process 10 items per tick, so Tick should create multiple items per call -->
         <!-- Creating work items is cheap (just data structures), so we can create 5-10 per call without stutter -->
-        <set_value name="$startIntervalMs" exact="25"/>
+        <!-- Start pacing: make sure we don't flood the work queue under big fleets -->
+        <set_value name="$startIntervalMs" exact="100"/>
         <set_value name="global.$GT_TS.$NextStartTime" exact="player.age + ($startIntervalMs * 1ms)"/>
         
-        <!-- Process multiple ships per tick (up to reasonable limit to prevent stutter) -->
-        <!-- Limit to 5 ships per tick to balance throughput vs frame time -->
-        <set_value name="$maxShipsPerTick" exact="5"/>
+        <!-- Under big fleets, creating many CacheQuery work items quickly can keep the scheduler busy continuously.
+             Keep this small so work is distributed across frames. -->
+        <set_value name="$maxShipsPerTick" exact="1"/>
         <set_value name="$shipsProcessed" exact="0"/>
         
         <do_while value="global.$GT_TS.$Queue.count gt 0 and $shipsProcessed lt $maxShipsPerTick">
@@ -334,7 +343,8 @@
          
          Work Item Types:
          - 'Request': Initial trade search request
-         - 'CacheQuery': Cache lookup work
+         - 'CacheQuery': Cache lookup work (can be expensive due to reachability/path checks)
+         - 'SearchContinuation': Resume SearchTradeRoutes with prior stage results (paced; avoids same-frame bursts)
          - 'HomeSearch': Home sector pathfinding work
          - 'OfferCollect': Offer collection work
          - 'Match': Trade matching/batch processing work
@@ -452,13 +462,38 @@
         
         <!-- Process work items respecting budgets -->
         <set_value name="$processed" exact="0"/>
-        <!-- CRITICAL FIX: Cache queries complete synchronously, so they're never "active" when counted -->
-        <!-- Instead, track how many cache queries we START in this tick (not how many are active) -->
-        <!-- This allows continuous processing: process 5 cache queries, they complete immediately, budget resets, process 5 more -->
+        <!-- IMPORTANT:
+             CacheQuery is synchronous, but NOT necessarily cheap (CachePickBest can do gatedistance/path checks).
+             Under big-fleet backlog, we must hard-budget CacheQuery per tick + add real frame spacing. -->
         <set_value name="$cacheQueriesStartedThisTick" exact="0"/>
+        <set_value name="$continuationsStartedThisTick" exact="0"/>
         <set_value name="$budgetCheapOps" exact="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick"/>
         <set_value name="$budgetHomeSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches - $activeHomeSearches"/>
         <set_value name="$budgetMatches" exact="global.$GT_Scheduler.$Budgets.$MatchOpsPerTick - $activeMatches"/>
+
+        <!-- Hard per-tick budgets (separate from "concurrent" budgets).
+             Goal: prevent continuous stutter when many ships enqueue at once. -->
+        <set_value name="$maxCacheQueriesPerTick" exact="1"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxCacheQueriesPerTick?">
+          <set_value name="$maxCacheQueriesPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxCacheQueriesPerTick"/>
+        </do_if>
+        <do_if value="$maxCacheQueriesPerTick lt 1">
+          <set_value name="$maxCacheQueriesPerTick" exact="1"/>
+        </do_if>
+        <do_if value="$maxCacheQueriesPerTick gt 5">
+          <set_value name="$maxCacheQueriesPerTick" exact="5"/>
+        </do_if>
+
+        <set_value name="$maxContinuationsPerTick" exact="1"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxSearchContinuationsPerTick?">
+          <set_value name="$maxContinuationsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxSearchContinuationsPerTick"/>
+        </do_if>
+        <do_if value="$maxContinuationsPerTick lt 1">
+          <set_value name="$maxContinuationsPerTick" exact="1"/>
+        </do_if>
+        <do_if value="$maxContinuationsPerTick gt 5">
+          <set_value name="$maxContinuationsPerTick" exact="5"/>
+        </do_if>
         
         <!-- Log scheduler tick -->
         <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
@@ -469,18 +504,13 @@
           <param name="logLevel" value="3"/>
         </run_actions>
         
-        <!-- Process work items from queue - process up to budget limit per tick to prevent frame blocking -->
-        <!-- CRITICAL: Frame distribution - process items per tick, then yield to prevent stutter with large fleets -->
-        <!-- Cache queries are cheap (synchronous, complete immediately) but we limit to prevent tight loops -->
-        <!-- Live searches and matches are expensive - limit more strictly -->
-        <!-- Reduced from 20 to 5 to prevent stutter - ProcessWorkQueue will signal itself to continue if more work exists -->
-        <!-- ROOT CAUSE FIX: Process multiple cache queries per tick since they complete synchronously -->
-        <!-- Cache queries are cheap and complete immediately, so we can process more per tick -->
-        <!-- For stutter reduction: reduce maxItemsPerTick for large fleets, increase delay -->
-        <set_value name="$maxItemsPerTick" exact="10"/>
+        <!-- Process work items from queue - hard-budget per tick to prevent frame blocking.
+             IMPORTANT: Do NOT scan/rotate huge queues within the same tick (can become O(N) and cause stutter itself). -->
+        <set_value name="$maxItemsPerTick" exact="1"/>
         <!-- CRITICAL FIX: Track rotations to prevent infinite rotation when all items are unprocessable -->
         <set_value name="$rotationsThisTick" exact="0"/>
-        <set_value name="$maxRotationsPerTick" exact="global.$GT_Scheduler.$WorkQueue.count"/>
+        <set_value name="$queueCountAtStart" exact="global.$GT_Scheduler.$WorkQueue.count"/>
+        <set_value name="$maxRotationsPerTick" exact="[$queueCountAtStart, 5].min"/>
         <do_while value="global.$GT_Scheduler.$WorkQueue.count gt 0 and $processed lt $maxItemsPerTick and $rotationsThisTick lt $maxRotationsPerTick">
           <set_value name="$workItem" exact="global.$GT_Scheduler.$WorkQueue.{1}"/>
           
@@ -498,18 +528,20 @@
           </do_if>
           
           <!-- Check budget for this work type -->
-          <!-- CRITICAL FIX: Cache queries complete synchronously, so track how many we START per tick -->
-          <!-- Since they complete immediately, we can process many per tick, but limit concurrent starts -->
           <set_value name="$canProcess" exact="false"/>
           <do_if value="$workItem.$Type == 'CacheQuery'">
-            <!-- Check if we've started fewer than MaxConcurrentCacheSearches cache queries this tick -->
-            <do_if value="$cacheQueriesStartedThisTick lt global.$GT_Scheduler.$Budgets.$CheapOpsPerTick">
+            <!-- Hard per-tick cap (independent of concurrent cache search setting) -->
+            <do_if value="$cacheQueriesStartedThisTick lt $maxCacheQueriesPerTick">
               <set_value name="$canProcess" exact="true"/>
               <set_value name="$cacheQueriesStartedThisTick" operation="add"/>
-              <!-- Note: Cache queries complete synchronously, so they don't stay "active" -->
-              <!-- We track starts per tick to limit concurrent processing, but allow continuous flow -->
             </do_if>
           </do_if>
+          <do_elseif value="$workItem.$Type == 'SearchContinuation'">
+            <do_if value="$continuationsStartedThisTick lt $maxContinuationsPerTick">
+              <set_value name="$canProcess" exact="true"/>
+              <set_value name="$continuationsStartedThisTick" operation="add"/>
+            </do_if>
+          </do_elseif>
           <do_elseif value="$workItem.$Type == 'HomeSearch' and $budgetHomeSearches gt 0">
             <set_value name="$canProcess" exact="true"/>
             <set_value name="$budgetHomeSearches" operation="subtract"/>
@@ -570,6 +602,10 @@
               <!-- Process CacheQuery work item -->
               <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork" param="$workItem"/>
             </do_if>
+            <do_elseif value="$workItem.$Type == 'SearchContinuation'">
+              <!-- Process SearchTradeRoutes continuation (paced) -->
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessSearchContinuationWork" param="$workItem"/>
+            </do_elseif>
             <do_elseif value="$workItem.$Type == 'HomeSearch'">
               <!-- Process HomeSearch work item -->
               <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessHomeSearchWork" param="$workItem"/>
@@ -630,8 +666,15 @@
             <!-- CRITICAL FIX: Budget exhausted for this type - rotate item to end of queue to prevent infinite loop -->
             <!-- This allows us to scan for processable items while preserving queue order -->
             <!-- Only break if ALL budgets are exhausted (no more work can be processed this tick) -->
-            <set_value name="$cacheBudgetExhausted" exact="$cacheQueriesStartedThisTick ge global.$GT_Scheduler.$Budgets.$CheapOpsPerTick"/>
-            <do_if value="$cacheBudgetExhausted and $budgetHomeSearches le 0 and $budgetMatches le 0">
+            <set_value name="$cacheBudgetExhausted" exact="$cacheQueriesStartedThisTick ge $maxCacheQueriesPerTick"/>
+            <set_value name="$continuationBudgetExhausted" exact="$continuationsStartedThisTick ge $maxContinuationsPerTick"/>
+
+            <!-- If we hit our per-tick cap for CacheQuery/Continuation, DO NOT rotate-scan a large queue. Yield to next tick. -->
+            <do_if value="($workItem.$Type == 'CacheQuery' and $cacheBudgetExhausted) or ($workItem.$Type == 'SearchContinuation' and $continuationBudgetExhausted)">
+              <break/>
+            </do_if>
+
+            <do_if value="$cacheBudgetExhausted and $continuationBudgetExhausted and $budgetHomeSearches le 0 and $budgetMatches le 0">
               <!-- All budgets exhausted - break to prevent infinite loop -->
               <break/>
             </do_if>
@@ -695,6 +738,55 @@
         <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueueDelayed"/>
         </do_if>
+      </actions>
+    </cue>
+
+    <!-- Process SearchContinuation Work Item -->
+    <!-- Purpose: resume SearchTradeRoutes with prior stage results, but under scheduler pacing (avoid same-frame bursts). -->
+    <cue name="ProcessSearchContinuationWork" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$workItem" exact="event.param"/>
+
+        <do_if value="not $workItem? or not $workItem.$Payload?">
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <set_value name="$payload" exact="$workItem.$Payload"/>
+        <set_value name="$params" exact="@$payload.$Params"/>
+        <set_value name="$ship" exact="@$payload.$Ship"/>
+        <do_if value="not $ship? and $params? and $params.$Ship?">
+          <set_value name="$ship" exact="@$params.$Ship"/>
+        </do_if>
+
+        <!-- Validate -->
+        <do_if value="not $ship? or not $ship.exists or not $params?">
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="if $workItem.$Key? then $workItem.$Key else ''"/>
+            <param name="newState" value="'failed'"/>
+            <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+            <param name="reason" value="'invalid_params'"/>
+            <param name="workItem" value="$workItem"/>
+          </run_actions>
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Resume SearchTradeRoutes (paced by this work item) -->
+        <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
+
+        <!-- Mark as completed and remove from ActiveWork -->
+        <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+          <param name="key" value="$workItem.$Key"/>
+          <param name="newState" value="'completed'"/>
+          <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+          <param name="workItem" value="$workItem"/>
+        </run_actions>
+        <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
       </actions>
     </cue>
     
@@ -850,31 +942,37 @@
           </do_else>
         </do_if>
         
-        <!-- CRITICAL FIX: If continuation cue was not handled (missing or unknown), use default continuation -->
-        <!-- This ensures SearchTradeRoutes always resumes, preventing ships from waiting indefinitely -->
+        <!-- If continuation cue was not handled (missing or unknown), use default continuation.
+             IMPORTANT: Do NOT signal SearchTradeRoutes directly here; enqueue a SearchContinuation work item so
+             continuations are paced by the scheduler (prevents continuous stutter / same-frame bursts). -->
         <do_if value="not $continuationHandled">
-          <!-- Default continuation: queue SearchTradeRoutes continuation with cache results -->
-          <!-- ROOT CAUSE FIX: Use EnqueueSearchTradeRoutes instead of signal_cue_instantly -->
-          <!-- This prevents 10+ concurrent SearchTradeRoutes instances in same frame (causing stutter) -->
-          <!-- EnqueueSearchTradeRoutes has 0-30ms jitter delay and proper pacing -->
-          <!-- CRITICAL FIX: Extract cacheResult from workItem payload (it was stored there at line 797) -->
           <set_value name="$extractedCacheResult" exact="@$workItem.$Payload.$Result"/>
           <do_if value="$payload.$ResumeParams?">
             <set_value name="$resumeParams" exact="$payload.$ResumeParams"/>
             <set_value name="$resumeParams.$CacheContinuation" exact="true"/>
             <set_value name="$resumeParams.$CacheResult" exact="$extractedCacheResult"/>
-            <!-- ROOT CAUSE FIX: Keep SearchState as 'fresh' so cache result extraction logic runs -->
-            <!-- CacheContinuation flag ensures SearchTradeRoutes proceeds past cache check gate -->
-            <!-- Setting to 'cache' causes cache extraction block to be skipped (line 814 requires 'fresh') -->
             <set_value name="$resumeParams.$SearchState" exact="'fresh'"/>
-            <!-- CRITICAL FIX: Signal SearchTradeRoutes directly instead of EnqueueSearchTradeRoutes -->
-            <!-- EnqueueSearchTradeRoutes routes through scheduler again, creating another CacheQuery work item -->
-            <!-- We already have cache results, so call SearchTradeRoutes directly to process them -->
-            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$resumeParams"/>
+
+            <!-- Enqueue a continuation work item (paced) -->
+            <set_value name="$contKey" exact="$ship.idcode + '_SearchContinuation_' + $traceId"/>
+            <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$contWorkItem">
+              <param name="type" value="'SearchContinuation'"/>
+              <param name="key" value="$contKey"/>
+              <param name="traceId" value="$traceId"/>
+              <param name="payload" value="table[
+                $Ship = $ship,
+                $Params = $resumeParams
+              ]"/>
+            </run_actions>
+            <do_if value="$contWorkItem != null">
+              <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
+                <param name="workItem" value="$contWorkItem"/>
+                <param name="traceId" value="$traceId"/>
+              </run_actions>
+            </do_if>
           </do_if>
           <do_else>
-            <!-- CRITICAL: No continuation params - signal ship with 'busy' to trigger retry -->
-            <!-- Extract ship from payload to signal -->
+            <!-- No continuation params - terminal failure -->
             <set_value name="$resumeShip" exact="@$payload.$Ship"/>
             <do_if value="$resumeShip? and $resumeShip.exists">
               <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
@@ -884,7 +982,6 @@
                 <param name="details" value="'reason=missing_continuation_params ship=' + $resumeShip.idcode + ' - signaling busy retry'"/>
                 <param name="logLevel" value="0"/>
               </run_actions>
-              <!-- Release lock and signal busy -->
               <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
                 <param name="ship" value="$resumeShip"/>
                 <param name="reason" value="'missing_continuation_params'"/>
@@ -1144,10 +1241,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <!-- ROOT CAUSE FIX: Increase delay to reduce stutter with large fleets -->
-      <!-- 1ms was too short - multiple ProcessWorkQueue instances could run in same frame -->
-      <!-- 5ms ensures proper frame distribution and prevents tight loops -->
-      <delay exact="5ms"/>
+      <!-- Frame pacing: use a real cross-frame delay (and a bit of jitter) so backlog can't peg a CPU core continuously. -->
+      <delay min="35ms" max="80ms"/>
       <actions>
         <!-- Signal ProcessWorkQueue with frame delay -->
         <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
