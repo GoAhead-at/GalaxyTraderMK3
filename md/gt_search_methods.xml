@@ -2302,7 +2302,25 @@
               <set_value name="$deferOfferSlice" exact="true"/>
             </do_if>
             <do_else>
-            <do_if value="$buyIndex lt $buyspaces.count">
+            <!-- EARLY CUTOVER: For large searches, collecting *all* sell sectors before *any* buy sectors can take minutes
+                 under the global slice budget (especially with many ships / large maxDistance). This looked like "no trades".
+                 Once we have sampled a few sectors on BOTH sides AND have at least one sell+buy offer, cut over to matching. -->
+            <set_value name="$minSectorsEachSide" exact="2"/>
+            <set_value name="$didEarlyCutover" exact="false"/>
+            <do_if value="$buyIndex ge $minSectorsEachSide and $sellIndex ge $minSectorsEachSide and $allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
+              <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+              <set_value name="$didEarlyCutover" exact="true"/>
+              <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+              <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- cancel_cue does NOT stop execution; guard the rest to prevent enqueuing more slices after cutover -->
+            <do_if value="not $didEarlyCutover and $buyIndex lt $buyspaces.count">
+              <!-- Interleave phases: if the other side still has sectors, switch to buyoffers for the next slice. -->
+              <do_if value="$sellIndex lt $sellspaces.count">
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'buyoffers'"/>
+              </do_if>
               <set_value name="$deferOfferSlice" exact="true"/>
               <!-- Enqueue next offer slice (global fair queue; one ship per budget tick) -->
               <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
@@ -2445,7 +2463,20 @@
               <set_value name="$deferOfferSlice" exact="true"/>
             </do_if>
             <do_else>
+            <!-- EARLY CUTOVER (same as selloffers branch) -->
+            <set_value name="$minSectorsEachSide" exact="2"/>
+            <do_if value="$buyIndex ge $minSectorsEachSide and $sellIndex ge $minSectorsEachSide and $allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
+              <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+              <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+              <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+
             <do_if value="$sellIndex lt $sellspaces.count">
+              <!-- Interleave phases: if the other side still has sectors, switch back to selloffers for the next slice. -->
+              <do_if value="$buyIndex lt $buyspaces.count">
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
+              </do_if>
               <set_value name="$deferOfferSlice" exact="true"/>
               <!-- Enqueue next offer slice (global fair queue; one ship per budget tick) -->
               <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
@@ -2473,8 +2504,38 @@
               </do_if>
             </do_if>
             <do_else>
-              <!-- Offers complete; fall through to filtering/matching -->
+              <!-- If sellspaces are complete but buyspaces are not, switch back to selloffers to finish remaining selloffer sectors.
+                   Otherwise mark done and fall through to filtering/matching. -->
+              <do_if value="not $didEarlyCutover and $buyIndex lt $buyspaces.count">
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
+                <set_value name="$deferOfferSlice" exact="true"/>
+                <!-- Enqueue next offer slice -->
+                <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
+                  <set_value name="global.$GT_LiveOfferSliceQueue" exact="table[
+                    $Ships = [],
+                    $Queued = table[],
+                    $Params = table[],
+                    $Processing = false
+                  ]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveOfferSliceScheduled?">
+                  <set_value name="global.$GT_LiveOfferSliceScheduled" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_LiveOfferSliceScheduled.{$ship}?">
+                  <set_value name="global.$GT_LiveOfferSliceScheduled.{$ship}" exact="player.age"/>
+                  <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+                  <set_value name="global.$GT_LiveOfferSliceQueue.$Params.{$ship}" exact="$params"/>
+                  <do_if value="not global.$GT_LiveOfferSliceQueue.$Queued.{$ship}?">
+                    <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
+                    <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
+                  </do_if>
+                  <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Offers complete; fall through to filtering/matching -->
               <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+              </do_else>
             </do_else>
             </do_else>
           </do_elseif>
@@ -2487,6 +2548,28 @@
           <!-- IMPORTANT: Some MD environments may still evaluate following actions after cancel.
                Guard the rest of the continuation so we NEVER run filtering/batching on partial offers. -->
           <do_if value="not $deferOfferSlice">
+
+            <!-- Prevent repeated batch restarts:
+                 once we begin filtering/matching, this ship must NOT remain enqueued for LiveOffer slices. -->
+            <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue != null">
+              <remove_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}"/>
+              <remove_value name="global.$GT_LiveOfferSliceQueue.$Params.{$ship}"/>
+
+              <!-- Remove from Ships list (explicit loop; avoid indexof/? pitfalls) -->
+              <do_if value="global.$GT_LiveOfferSliceQueue.$Ships? and global.$GT_LiveOfferSliceQueue.$Ships.count gt 0">
+                <set_value name="$tmpShips" exact="[]"/>
+                <do_all exact="global.$GT_LiveOfferSliceQueue.$Ships.count" counter="$i">
+                  <set_value name="$s" exact="global.$GT_LiveOfferSliceQueue.$Ships.{$i}"/>
+                  <do_if value="$s != $ship">
+                    <append_to_list name="$tmpShips" exact="$s"/>
+                  </do_if>
+                </do_all>
+                <set_value name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$tmpShips"/>
+              </do_if>
+            </do_if>
+            <do_if value="global.$GT_LiveOfferSliceScheduled? and global.$GT_LiveOfferSliceScheduled != null">
+              <remove_value name="global.$GT_LiveOfferSliceScheduled.{$ship}"/>
+            </do_if>
 
         <!-- REMOVED: Post-query distance filtering no longer needed -->
         <!-- Sector lists already restrict queries to in-range sectors -->
@@ -2991,6 +3074,42 @@
           <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}? and global.$GT_SearchLiveTrades_State.{$ship}.$TraceId?">
             <set_value name="$batchTraceId" exact="global.$GT_SearchLiveTrades_State.{$ship}.$TraceId"/>
           </do_if>
+
+          <!-- CRITICAL: Prevent repeated batch re-initialization while a prior batch is still queued/active for this ship.
+               Re-preparing batch data resets global.$GT_BatchDataList.{$ship} mid-search and can prevent HomeSearch from ever completing. -->
+          <set_value name="$skipPrepareBatch" exact="false"/>
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <set_value name="$inBatchQueueOrActive" exact="false"/>
+            <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips? and global.$GT_BatchProcessorQueue.$ActiveShips.count gt 0">
+              <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$i">
+                <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$i} == $ship">
+                  <set_value name="$inBatchQueueOrActive" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="not $inBatchQueueOrActive and global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+              <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
+                <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
+                  <set_value name="$inBatchQueueOrActive" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="$inBatchQueueOrActive">
+              <set_value name="$skipPrepareBatch" exact="true"/>
+            </do_if>
+          </do_if>
+
+          <do_if value="$skipPrepareBatch">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') SKIP prepare: batch already queued/active - preventing reset'" chance="100"/>
+            </do_if>
+            <!-- Ensure queue processor runs (idempotent) -->
+            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
           
           <set_value name="$stateData" exact="table[
             $batchId = $batchIndex,
@@ -3120,6 +3239,8 @@
           <do_if value="$preservedLastRejectionStats?">
             <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
           </do_if>
+          
+          </do_else>
         </do_if>
           </do_if>
         </do_if>
@@ -3417,11 +3538,31 @@
           <set_value name="$offerPhase" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase"/>
           <set_value name="$buyIndex" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$BuyIndex"/>
           <set_value name="$sellIndex" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$SellIndex"/>
+          <set_value name="$allSellOffers" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$AllSellOffers"/>
+          <set_value name="$allBuyOffers" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$AllBuyOffers"/>
+
+          <!-- EARLY CUTOVER: once we have sampled a couple sectors on BOTH sides and have at least one sell+buy offer,
+               stop collecting and proceed into filtering/matching. This prevents multi-minute "no trades" under global slice throttling. -->
+          <set_value name="$minSectorsEachSide" exact="2"/>
+          <set_value name="$didEarlyCutover" exact="false"/>
+          <do_if value="$offerPhase != 'done' and $buyIndex ge $minSectorsEachSide and $sellIndex ge $minSectorsEachSide and $allSellOffers != null and $allBuyOffers != null and $allSellOffers.count gt 0 and $allBuyOffers.count gt 0">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+            <set_value name="$didEarlyCutover" exact="true"/>
+            <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+            <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
+            <cancel_cue cue="this"/>
+          </do_if>
 
           <!-- Helper: enqueue next offer slice via global fair queue -->
+          <!-- cancel_cue does NOT stop execution; prevent enqueuing slices after cutover -->
           <set_value name="$queueNextSlice" exact="false"/>
+          <do_if value="not $didEarlyCutover">
           <do_if value="$offerPhase == 'selloffers'">
+            <!-- Interleave: if both sides still have work, flip to buyoffers for the next slice -->
             <do_if value="$buyIndex lt @$params.$BuySpaces.count">
+              <do_if value="$sellIndex lt @$params.$SellSpaces.count">
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'buyoffers'"/>
+              </do_if>
               <set_value name="$queueNextSlice" exact="true"/>
             </do_if>
             <do_else>
@@ -3432,14 +3573,25 @@
           <do_else>
             <do_if value="$offerPhase == 'buyoffers'">
               <do_if value="$sellIndex lt @$params.$SellSpaces.count">
+                <!-- Interleave: if both sides still have work, flip back to selloffers for the next slice -->
+                <do_if value="$buyIndex lt @$params.$BuySpaces.count">
+                  <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
+                </do_if>
                 <set_value name="$queueNextSlice" exact="true"/>
               </do_if>
               <do_else>
-                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
-                <!-- Continue SearchLiveTrades to proceed into filtering/matching -->
-                <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
-                <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
-                <cancel_cue cue="this"/>
+                <!-- If sellspaces are complete but buyspaces are not, switch to selloffers to finish remaining selloffer sectors -->
+                <do_if value="$buyIndex lt @$params.$BuySpaces.count">
+                  <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
+                  <set_value name="$queueNextSlice" exact="true"/>
+                </do_if>
+                <do_else>
+                  <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+                  <!-- Continue SearchLiveTrades to proceed into filtering/matching -->
+                  <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+                  <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
+                  <cancel_cue cue="this"/>
+                </do_else>
               </do_else>
             </do_if>
           </do_else>
@@ -3466,6 +3618,7 @@
               </do_if>
               <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
             </do_if>
+          </do_if>
           </do_if>
         </do_else>
 

@@ -373,7 +373,8 @@
           <set_value name="$perfSellChunk" exact="if $state? and $state.$sellOfferChunkStart? then @$state.$sellOfferChunkStart else -1"/>
           <set_value name="$perfBuyChunk" exact="if $state? and $state.$buyOfferChunkStart? then @$state.$buyOfferChunkStart else -1"/>
           <set_value name="$perfWareChunk" exact="if $state? and $state.$currentWareChunkStart? then @$state.$currentWareChunkStart else -1"/>
-          <debug_text text="'[GT-PERF] BatchSlice WAKE ship=' + $ship.idcode + ' wareIndex=' + $perfWareIndex + ' wareChunk=' + $perfWareChunk + ' sellChunk=' + $perfSellChunk + ' buyChunk=' + $perfBuyChunk" chance="100"/>
+          <set_value name="$perfPhase" exact="if $state? and $state.$warePhase? then @$state.$warePhase else 'intra'"/>
+          <debug_text text="'[GT-PERF] BatchSlice WAKE ship=' + $ship.idcode + ' wareIndex=' + $perfWareIndex + ' wareChunk=' + $perfWareChunk + ' phase=' + $perfPhase + ' sellChunk=' + $perfSellChunk + ' buyChunk=' + $perfBuyChunk" chance="100"/>
         </do_if>
 
         <!-- Control flow: MD <cancel_cue/> does NOT stop the current actions block. -->
@@ -692,6 +693,20 @@
               <set_value name="$sellOfferChunkStart" exact="0"/>
               <set_value name="$buyOfferChunkStart" exact="0"/>
               <set_value name="$currentWareChunkStart" exact="$wareIdx"/>
+              <!-- Track per-ware phase (used to prevent cross-sector continuations from re-running Phase 1 with mismatched chunk pointers) -->
+              <set_value name="$state.$warePhase" exact="'intra'"/>
+            </do_if>
+
+            <!-- Determine per-ware phase (default intra if missing) -->
+            <set_value name="$warePhase" exact="'intra'"/>
+            <do_if value="$state.$warePhase? and @$state.$warePhase != null and @$state.$warePhase != ''">
+              <set_value name="$warePhase" exact="@$state.$warePhase"/>
+            </do_if>
+
+            <!-- If we're resuming a cross-sector continuation for the SAME ware, skip Phase 1 (intra-sector) entirely. -->
+            <set_value name="$skipIntraPhase" exact="false"/>
+            <do_if value="$wareIdx == $currentWareChunkStart and $warePhase == 'cross'">
+              <set_value name="$skipIntraPhase" exact="true"/>
             </do_if>
             
             <!-- ═══════════════════════════════════════════════════════════════════════════ -->
@@ -915,13 +930,13 @@
               <!-- NOW run nested loops: PRIORITIZE intra-sector matches first -->
               <!-- Phase 1: Match intra-sector sell offers with intra-sector buy offers (TRUE intra-sector trades) -->
               <!-- Log Phase 1 availability -->
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="not $skipIntraPhase and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
                 <set_value name="$sectorName" exact="if $currentSector? then @$currentSector.knownname else 'NULL'"/>
                 <set_value name="$isolationLabel" exact="if $shipIsIsolated then ' [ISOLATED]' else ''"/>
                 <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Phase 1 (INTRA-SECTOR)' + $isolationLabel + ' for ' + $wareName + ' in ' + $sectorName + ': ' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy offers' + (if ($intraSectorSellOffers.count == 0 or $intraSectorBuyOffers.count == 0) then '  MISSING ONE TYPE!' else '')" chance="100"/>
               </do_if>
-              <do_if value="$intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
+              <do_if value="not $skipIntraPhase and $intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
                 <!-- PERFORMANCE: Process intra-sector offers in 5×5 chunks -->
                 <set_value name="$intraSellChunkEnd" exact="[$sellOfferChunkStart + $chunkSize, $intraSectorSellOffers.count].min"/>
                 <set_value name="$intraBuyChunkEnd" exact="[$buyOfferChunkStart + $chunkSize, $intraSectorBuyOffers.count].min"/>
@@ -1180,6 +1195,7 @@
                 <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
                 <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
                 <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$warePhase" exact="'intra'"/>
                 <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
                 <set_value name="$state.$tradeList" exact="$tradeList"/>
                 <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
@@ -1395,26 +1411,33 @@
                           <!-- PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
                           <!-- Only cache if home sector is valid AND is actually a sector (not a component) -->
                           <do_if value="@$homeSector.exists and $homeSector.isclass.sector">
+                            <!-- Defensive: old saves / corrupted globals can leave GT_TradeCache as a LIST (old flat cache) or null.
+                                 Ensure the root cache container is a TABLE (homeSector -> list of entries), otherwise batch caching will error out. -->
+                            <do_if value="not global.$GT_TradeCache? or typeof global.$GT_TradeCache != datatype.table">
+                              <debug_text text="'[GT-ERROR] TradeCache corrupted: global.$GT_TradeCache is ' + (if global.$GT_TradeCache? then typeof global.$GT_TradeCache else 'UNDEFINED') + ' - resetting to table[]'" chance="100"/>
+                              <set_value name="global.$GT_TradeCache" exact="table[]"/>
+                            </do_if>
+
                             <!-- Initialize home sector cache if needed -->
-                            <do_if value="not global.$GT_TradeCache.{$homeSector}?">
+                            <do_if value="not global.$GT_TradeCache.{$homeSector}? or global.$GT_TradeCache.{$homeSector} == null or typeof global.$GT_TradeCache.{$homeSector} != datatype.list">
                               <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
                             </do_if>
 
                             <!-- Optional index: per-ware cache lists for faster lookup during cache search -->
-                            <do_if value="not global.$GT_TradeCacheByWare?">
+                            <do_if value="not global.$GT_TradeCacheByWare? or typeof global.$GT_TradeCacheByWare != datatype.table">
                               <set_value name="global.$GT_TradeCacheByWare" exact="table[]"/>
                             </do_if>
-                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}?">
+                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}? or global.$GT_TradeCacheByWare.{$homeSector} == null or typeof global.$GT_TradeCacheByWare.{$homeSector} != datatype.table">
                               <set_value name="global.$GT_TradeCacheByWare.{$homeSector}" exact="table[]"/>
                             </do_if>
                             <!-- IMPORTANT: Use WARE OBJECT as key (not ware.id string). -->
                             <!-- Using ware.id caused MD table property errors (keys without '$' prefix can fail). -->
-                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}?">
+                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}? or global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare} == null or typeof global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare} != datatype.list">
                               <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}" exact="[]"/>
                             </do_if>
 
                             <!-- Track known home sectors for diagnostics (avoids relying on GT_TradeCache.keys, which can be unreliable in some saves) -->
-                            <do_if value="not global.$GT_TradeCacheHomes?">
+                            <do_if value="not global.$GT_TradeCacheHomes? or global.$GT_TradeCacheHomes == null or typeof global.$GT_TradeCacheHomes != datatype.list">
                               <set_value name="global.$GT_TradeCacheHomes" exact="[]"/>
                             </do_if>
                             <set_value name="$homeAlreadyTracked" exact="false"/>
@@ -1679,7 +1702,10 @@
                             <!-- CRITICAL: Only proceed if homeSector is valid sector (not component) -->
                             <do_if value="@$homeSector.exists and $homeSector.isclass.sector">
                               <set_value name="$insertIndex" exact="0"/>
-                              <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                              <set_value name="$homeSectorCache" exact="[]"/>
+                              <do_if value="global.$GT_TradeCache? and typeof global.$GT_TradeCache == datatype.table and global.$GT_TradeCache.{$homeSector}? and global.$GT_TradeCache.{$homeSector} != null and typeof global.$GT_TradeCache.{$homeSector} == datatype.list">
+                                <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                              </do_if>
                               <set_value name="$insertionFound" exact="false"/>
                               <do_if value="$homeSectorCache.count gt 0">
                                 <!-- Linear search: find first entry with profit < new profit -->
@@ -2055,6 +2081,7 @@
                 <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
                 <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
                 <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$warePhase" exact="'cross'"/>
                 <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
                 <set_value name="$state.$tradeList" exact="$tradeList"/>
                 <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
@@ -2154,6 +2181,7 @@
             <set_value name="$state.$sellOfferChunkStart" exact="0"/>
             <set_value name="$state.$buyOfferChunkStart" exact="0"/>
             <set_value name="$state.$currentWareChunkStart" exact="$batchEnd1Based"/>
+            <set_value name="$state.$warePhase" exact="'intra'"/>
             <set_value name="$state.$tradeList" exact="$tradeList"/>
             <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
             <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
