@@ -3735,7 +3735,7 @@
           $intraSectorTradesFiltered = $intraSectorTradesFiltered,
           $intraSectorTradesValid = $intraSectorTradesValid,
           $filterIndex = 0,
-          $filterBatchSize = 10,
+          $filterBatchSize = 5,
           $maxDistance = $maxDistance,
           $crossStationBestTrade = $crossStationBestTrade,
           $crossStationBestScore = $crossStationBestScore,
@@ -3770,8 +3770,10 @@
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
           <set_value name="$batchDelay" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
         </do_if>
+        <!-- Smoothness > speed: add jitter so fleets don't wake/filter on the same frame. -->
+        <set_value name="$batchDelayJitter" min="0" max="80"/>
         <!-- Convert to time value (milliseconds) -->
-        <set_value name="this.$batchDelayTime" exact="$batchDelay * 1ms"/>
+        <set_value name="this.$batchDelayTime" exact="($batchDelay + $batchDelayJitter) * 1ms"/>
       </actions>
       <delay exact="this.$batchDelayTime"/>
       <actions>
@@ -3810,7 +3812,7 @@
             $intraSectorTradesFiltered = 0,
             $intraSectorTradesValid = 0,
             $filterIndex = 0,
-            $filterBatchSize = 10
+            $filterBatchSize = 5
           ]"/>
           <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
           <cancel_cue cue="this"/>
@@ -3835,7 +3837,8 @@
             <set_value name="$filterIndex" exact="0"/>
           </do_if>
           <do_if value="not $filterBatchSize?">
-            <set_value name="$filterBatchSize" exact="10"/>
+            <!-- Smoothness > speed: smaller batch reduces per-frame spikes when many ships filter simultaneously. -->
+            <set_value name="$filterBatchSize" exact="5"/>
           </do_if>
           
           <!-- Get mutable lists/stats from state (or initialize if first batch) -->
@@ -3884,6 +3887,10 @@
           <!-- Process one batch of trades -->
           <set_value name="$filterTotalTrades" exact="$tradeList.count"/>
           <set_value name="$batchEnd" exact="[$filterIndex + $filterBatchSize, $filterTotalTrades].min"/>
+          <!-- PERF MARKER: one line per slice so timeline analyzer can attribute heavy filtering work -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-PERF] FilterSlice START ship=' + $ship.idcode + ' idx=' + $filterIndex + ' end=' + $batchEnd + ' total=' + $filterTotalTrades + ' batchSize=' + $filterBatchSize" chance="100"/>
+          </do_if>
           <do_all exact="$batchEnd - $filterIndex" counter="$batchOffset">
             <set_value name="$i" exact="$filterIndex + $batchOffset"/>
             <set_value name="$trade" exact="$tradeList.{$i}"/>
@@ -3988,10 +3995,16 @@
           
           <!-- Check if more batches needed -->
           <do_if value="$filterIndex lt $filterTotalTrades">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-PERF] FilterSlice END ship=' + $ship.idcode + ' nextIdx=' + $filterIndex + ' total=' + $filterTotalTrades + ' remaining=' + ($filterTotalTrades - $filterIndex) + ' filteredOut=' + ($filteredByWareBasket + $filteredByIllegal + $filteredByBlacklist + $filteredByPathBlocked)" chance="100"/>
+            </do_if>
             <!-- Signal next batch -->
             <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Batch" param="$ship"/>
           </do_if>
           <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-PERF] FilterSlice COMPLETE ship=' + $ship.idcode + ' totalTrades=' + $filterTotalTrades + ' kept=' + $filteredTradeList.count + ' filteredOut=' + ($filteredByWareBasket + $filteredByIllegal + $filteredByBlacklist + $filteredByPathBlocked)" chance="100"/>
+            </do_if>
             <!-- All batches complete - signal resume cue to continue processing -->
             <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
           </do_else>
@@ -4032,7 +4045,7 @@
               $intraSectorTradesFiltered = 0,
               $intraSectorTradesValid = 0,
               $filterIndex = 0,
-              $filterBatchSize = 10
+              $filterBatchSize = 5
             ]"/>
             <signal_cue_instantly cue="md.GT_Trading_Search.FilterTradeList_Resume" param="$ship"/>
             <cancel_cue cue="this"/>
@@ -5256,11 +5269,13 @@
       </actions>
     </cue>
 
-    <!-- Debug: Periodic cache snapshot (heavy). Runs only when debug logging is enabled. -->
+    <!-- Debug: Periodic cache snapshot (VERY heavy).
+         IMPORTANT: This can cause microstutter by dumping hundreds/thousands of lines in a single frame.
+         It is now opt-in via global.$GT_Config.$Debug.$CacheSnapshotEnabled. -->
     <!-- Purpose: Diagnose cache composition (missing wares, low diversity, unexpected evictions). -->
     <cue name="CacheSnapshotLogger" instantiate="true" checkinterval="2min">
       <conditions>
-        <check_value value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging"/>
+        <check_value value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and @global.$GT_Config.$Debug.$CacheSnapshotEnabled"/>
       </conditions>
       <actions>
         <set_value name="$total" exact="0"/>
@@ -5309,8 +5324,8 @@
               <!-- Per-ware counts for this home sector (avoid table.keys; some saves/types make .keys unreliable) -->
               <set_value name="$wareSummary" exact="[]"/>
 
-              <!-- Full dump (bounded to prevent runaway logs) -->
-              <set_value name="$dumpLimit" exact="5000"/>
+              <!-- Full dump (bounded HARD to prevent microstutter during debug sessions). -->
+              <set_value name="$dumpLimit" exact="200"/>
               <set_value name="$dumpCount" exact="[$sectorCache.count, $dumpLimit].min"/>
               <do_all exact="$dumpCount" counter="$i">
                 <set_value name="$e" exact="$sectorCache.{$i}"/>
