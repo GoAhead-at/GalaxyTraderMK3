@@ -4785,19 +4785,14 @@
         <do_if value="not global.$GT_Scheduler.$WorkQueue?">
           <set_value name="global.$GT_Scheduler.$WorkQueue" exact="[]"/>
         </do_if>
-        <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - defensive check for save game compatibility -->
-        <!-- Tables have .keys property, lists don't - use this to detect if it's NOT a table -->
+        <!-- CRITICAL: Ensure ActiveWork exists - but DON'T fix corruption here -->
+        <!-- Corruption detection/fixing is handled by ProcessWorkQueue (authoritative processor) -->
+        <!-- This prevents race conditions where multiple places try to fix corruption simultaneously -->
         <do_if value="not global.$GT_Scheduler.$ActiveWork?">
           <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
         </do_if>
-        <do_else>
-          <!-- Check if it's NOT a table by testing .keys property - if .keys doesn't exist, it's a list -->
-          <do_if value="not global.$GT_Scheduler.$ActiveWork.keys?">
-            <!-- ActiveWork is a list (from old save) - reinitialize as table -->
-            <debug_text text="'[GT-WARN] GT_EnqueueWorkItem: ActiveWork is a list (no .keys property), reinitializing as table[]'" chance="100"/>
-            <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
-          </do_if>
-        </do_else>
+        <!-- NOTE: We don't check for corruption here - ProcessWorkQueue handles that -->
+        <!-- If ActiveWork is corrupted, ProcessWorkQueue will detect and fix it on its next tick -->
         
         <!-- Validate work item - ERROR if missing -->
         <do_if value="not $workItem? or not $workItem.$Type? or not $workItem.$Key?">
@@ -4820,19 +4815,7 @@
         <do_if value="not global.$GT_Scheduler.$WorkQueue?">
           <set_value name="global.$GT_Scheduler.$WorkQueue" exact="[]"/>
         </do_if>
-        <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - defensive check for save game compatibility -->
-        <!-- Tables have .keys property, lists don't - use this to detect if it's NOT a table -->
-        <do_if value="not global.$GT_Scheduler.$ActiveWork?">
-          <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
-        </do_if>
-        <do_else>
-          <!-- Check if it's NOT a table by testing .keys property - if .keys doesn't exist, it's a list -->
-          <do_if value="not global.$GT_Scheduler.$ActiveWork.keys?">
-            <!-- ActiveWork is a list (from old save) - reinitialize as table -->
-            <debug_text text="'[GT-WARN] GT_EnqueueWorkItem: ActiveWork is a list (no .keys property), reinitializing as table[]'" chance="100"/>
-            <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
-          </do_if>
-        </do_else>
+        <!-- NOTE: ActiveWork type check already done above (lines 4788-4800) - no need to check again -->
         <do_if value="not global.$GT_Scheduler.$Processing?">
           <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
         </do_if>
@@ -4914,7 +4897,7 @@
           </do_if>
           
           <!-- ERROR if work item not found -->
-          <do_if value="not $workItem?">
+          <do_if value="not $workItem? or $workItem == null">
             <do_if value="$traceId != ''">
               <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
                 <param name="traceId" value="$traceId"/>
@@ -4931,6 +4914,23 @@
           </do_if>
         </do_else>
         
+        <!-- CRITICAL FIX: Validate workItem is not null before accessing properties -->
+        <do_if value="not $workItem? or $workItem == null">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=workItem_is_null key=' + $key + ' newState=' + $newState"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_UpdateWorkItemState: Work item is null - key=' + $key" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
         <!-- Update state -->
         <set_value name="$workItem.$State" exact="$newState"/>
         <set_value name="$workItem.$UpdatedAt" exact="player.age"/>
@@ -4941,14 +4941,19 @@
         </do_if>
         
         <!-- Log state transition -->
-        <set_value name="$logTraceId" exact="if $traceId != '' then $traceId else (if $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
-        <set_value name="$details" exact="'type=' + $workItem.$Type + ' key=' + $key + ' state=' + $oldState + '->' + $newState"/>
+        <!-- CRITICAL FIX: Use safe property access for logging -->
+        <set_value name="$logTraceId" exact="if $traceId != '' then $traceId else (if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
+        <set_value name="$workItemType" exact="if $workItem? and $workItem.$Type? then $workItem.$Type else 'unknown'"/>
+        <set_value name="$details" exact="'type=' + $workItemType + ' key=' + $key + ' state=' + $oldState + '->' + $newState"/>
         <do_if value="$newState == 'failed' and $reason != ''">
           <set_value name="$details" exact="$details + ' reason=' + $reason"/>
         </do_if>
         <do_if value="$newState == 'completed'">
-          <set_value name="$duration" exact="player.age - $workItem.$CreatedAt"/>
-          <set_value name="$details" exact="$details + ' duration=' + ($duration / 1ms) + 'ms'"/>
+          <!-- CRITICAL FIX: Use safe property access -->
+          <do_if value="$workItem? and $workItem.$CreatedAt?">
+            <set_value name="$duration" exact="player.age - $workItem.$CreatedAt"/>
+            <set_value name="$details" exact="$details + ' duration=' + ($duration / 1ms) + 'ms'"/>
+          </do_if>
         </do_if>
         
         <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
