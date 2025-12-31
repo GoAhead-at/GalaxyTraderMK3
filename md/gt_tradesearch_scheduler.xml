@@ -898,7 +898,26 @@
         </do_if>
         <do_else>
         
-        <!-- Execute cache query -->
+        <!-- Execute cache query (CHUNKED for frame distribution) -->
+        <!-- CacheQuery spikes can be hundreds of ms; split scanning across multiple ticks via scanStart/scanCount + delayed reschedule. -->
+        <set_value name="$scanStart" exact="if $payload.$CacheScanStart? then $payload.$CacheScanStart else 1"/>
+        <set_value name="$scanMinFailCount" exact="if $payload.$CacheScanMinFailCount? then $payload.$CacheScanMinFailCount else 999999"/>
+        <set_value name="$scanTrades" exact="if $payload.$CacheScanTrades? then $payload.$CacheScanTrades else []"/>
+        <set_value name="$scanCount" exact="40"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryChunkSize?">
+          <set_value name="$tmpChunk" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryChunkSize"/>
+          <do_if value="$tmpChunk? and $tmpChunk != null and $tmpChunk gt 0">
+            <set_value name="$scanCount" exact="$tmpChunk"/>
+          </do_if>
+        </do_if>
+        <!-- Clamp scanCount to sane bounds -->
+        <do_if value="$scanCount lt 10">
+          <set_value name="$scanCount" exact="10"/>
+        </do_if>
+        <do_if value="$scanCount gt 200">
+          <set_value name="$scanCount" exact="200"/>
+        </do_if>
+        
         <set_value name="$startTime" exact="player.age"/>
         <run_actions ref="md.GT_Libraries_General.GT_TS_CachePickBest" result="$cacheResult">
           <param name="ship" value="$ship"/>
@@ -908,117 +927,156 @@
           <param name="minAbsoluteProfit" value="$minAbsoluteProfit"/>
           <param name="ignoreBuildStorage" value="$ignoreBuildStorage"/>
           <param name="ignoreCarrierAux" value="$ignoreCarrierAux"/>
+          <param name="scanStart" value="$scanStart"/>
+          <param name="scanCount" value="$scanCount"/>
+          <param name="minFailCountIn" value="$scanMinFailCount"/>
+          <param name="validTradesIn" value="$scanTrades"/>
           <param name="traceId" value="$traceId"/>
         </run_actions>
         <set_value name="$duration" exact="player.age - $startTime"/>
-        
-        <!-- Store result in payload for continuation -->
-        <set_value name="$workItem.$Payload.$Result" exact="$cacheResult"/>
+
+        <!-- Persist scan state back into payload -->
+        <set_value name="$workItem.$Payload.$CacheScanStart" exact="if $cacheResult? and $cacheResult.$ScanNext? then $cacheResult.$ScanNext else 0"/>
+        <set_value name="$workItem.$Payload.$CacheScanMinFailCount" exact="if $cacheResult? and $cacheResult.$MinFailCount? then $cacheResult.$MinFailCount else 999999"/>
+        <set_value name="$workItem.$Payload.$CacheScanTrades" exact="if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades else []"/>
         
         <!-- NOTE: Work item is already in ActiveWork (added by ProcessWorkQueue before signaling this cue) -->
         <!-- No need to check or re-add it here - ProcessWorkQueue ensures ActiveWork is a table -->
         
-        <!-- Log cache query result -->
-        <set_value name="$resultAction" exact="if $cacheResult? and $cacheResult.$Found then 'Hit' else 'Miss'"/>
-        <set_value name="$resultDetails" exact="'trades=' + (if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades.count else 0) + ' score=' + (if $cacheResult? and $cacheResult.$BestScore? then $cacheResult.$BestScore else 0) + ' duration=' + ($duration / 1ms) + 'ms'"/>
-        
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="$traceId"/>
-          <param name="stage" value="'CacheQuery'"/>
-          <param name="action" value="$resultAction"/>
-          <param name="details" value="$resultDetails"/>
-          <param name="logLevel" value="1"/>
-        </run_actions>
-        
-        <!-- Mark work item as completed -->
-        <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-          <param name="key" value="$workItem.$Key"/>
-          <param name="newState" value="'completed'"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="workItem" value="$workItem"/>
-        </run_actions>
-        
-        <!-- Remove from ActiveWork using ship key -->
-        <do_if value="$ship?">
-          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-        </do_if>
-        
-        <!-- NOTE: Do NOT signal ProcessWorkQueue here - it causes multiple concurrent instances and stutter -->
-        <!-- ProcessWorkQueue processes up to $maxItemsPerTick items per tick, then signals itself at the end -->
-        <!-- This allows proper frame distribution and prevents tight loops -->
-        
-        <!-- Signal continuation handler if provided -->
-        <!-- CRITICAL: X4 doesn't support variable cue names in cue attribute - must use explicit cue reference -->
-        <set_value name="$continuationHandled" exact="false"/>
-        <do_if value="$payload.$ContinuationCue?">
-          <set_value name="$continuationCueName" exact="$payload.$ContinuationCue"/>
-          <!-- Check for known continuation cues and signal appropriately -->
-          <do_if value="$continuationCueName == 'md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation'">
-            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation" param="$workItem"/>
-            <set_value name="$continuationHandled" exact="true"/>
-          </do_if>
-          <do_else>
-            <!-- Unknown continuation cue - log error and fall back to default -->
-            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-              <param name="traceId" value="$traceId"/>
-              <param name="stage" value="'Scheduler'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=unknown_continuation_cue cue=' + $continuationCueName + ' - falling back to default'"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-          </do_else>
-        </do_if>
-        
-        <!-- If continuation cue was not handled (missing or unknown), use default continuation.
-             IMPORTANT: Do NOT signal SearchTradeRoutes directly here; enqueue a SearchContinuation work item so
-             continuations are paced by the scheduler (prevents continuous stutter / same-frame bursts). -->
-        <do_if value="not $continuationHandled">
-          <set_value name="$extractedCacheResult" exact="@$workItem.$Payload.$Result"/>
-          <do_if value="$payload.$ResumeParams?">
-            <set_value name="$resumeParams" exact="$payload.$ResumeParams"/>
-            <set_value name="$resumeParams.$CacheContinuation" exact="true"/>
-            <set_value name="$resumeParams.$CacheResult" exact="$extractedCacheResult"/>
-            <set_value name="$resumeParams.$SearchState" exact="'fresh'"/>
+        <!-- Control flow: cancel_cue does NOT stop this actions block; use explicit flag to prevent fallthrough. -->
+        <set_value name="$shouldFinalize" exact="true"/>
 
-            <!-- Enqueue a continuation work item (paced) -->
-            <set_value name="$contKey" exact="$ship.idcode + '_SearchContinuation_' + $traceId"/>
-            <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$contWorkItem">
-              <param name="type" value="'SearchContinuation'"/>
-              <param name="key" value="$contKey"/>
-              <param name="traceId" value="$traceId"/>
-              <param name="payload" value="table[
-                $Ship = $ship,
-                $Params = $resumeParams
-              ]"/>
-            </run_actions>
-            <do_if value="$contWorkItem != null">
-              <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
-                <param name="workItem" value="$contWorkItem"/>
-                <param name="traceId" value="$traceId"/>
-              </run_actions>
-            </do_if>
+        <!-- If scan is NOT done, schedule next chunk with a frame delay and return without completing work item -->
+        <do_if value="$cacheResult? and $cacheResult.$ScanDone? and not $cacheResult.$ScanDone">
+          <set_value name="$shouldFinalize" exact="false"/>
+          <do_if value="not $workItem.$Payload.$CacheScanScheduled? or not $workItem.$Payload.$CacheScanScheduled">
+            <set_value name="$workItem.$Payload.$CacheScanScheduled" exact="true"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork_Delayed" param="$workItem"/>
           </do_if>
-          <do_else>
-            <!-- No continuation params - terminal failure -->
-            <set_value name="$resumeShip" exact="@$payload.$Ship"/>
-            <do_if value="$resumeShip? and $resumeShip.exists">
+        </do_if>
+
+        <do_if value="$shouldFinalize">
+          <!-- Scan done: finalize result, log, complete work item -->
+          <set_value name="$workItem.$Payload.$Result" exact="$cacheResult"/>
+
+          <set_value name="$resultAction" exact="if $cacheResult? and $cacheResult.$Found then 'Hit' else 'Miss'"/>
+          <set_value name="$resultDetails" exact="'trades=' + (if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades.count else 0) + ' score=' + (if $cacheResult? and $cacheResult.$BestScore? then $cacheResult.$BestScore else 0) + ' duration=' + ($duration / 1ms) + 'ms chunkscan=' + $scanCount"/>
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheQuery'"/>
+            <param name="action" value="$resultAction"/>
+            <param name="details" value="$resultDetails"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'completed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="workItem" value="$workItem"/>
+          </run_actions>
+
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+        </do_if>
+        
+        <!-- IMPORTANT: If cache scanning is chunked, we MUST NOT run any continuation logic until the scan is finalized.
+             Otherwise, we can enqueue SearchContinuation work for incomplete results and create a flood of work items. -->
+        <do_if value="$shouldFinalize">
+          <!-- NOTE: Do NOT signal ProcessWorkQueue here - it causes multiple concurrent instances and stutter -->
+          <!-- ProcessWorkQueue processes up to $maxItemsPerTick items per tick, then signals itself at the end -->
+          <!-- This allows proper frame distribution and prevents tight loops -->
+          
+          <!-- Signal continuation handler if provided -->
+          <!-- CRITICAL: X4 doesn't support variable cue names in cue attribute - must use explicit cue reference -->
+          <set_value name="$continuationHandled" exact="false"/>
+          <do_if value="$payload.$ContinuationCue?">
+            <set_value name="$continuationCueName" exact="$payload.$ContinuationCue"/>
+            <!-- Check for known continuation cues and signal appropriately -->
+            <do_if value="$continuationCueName == 'md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation'">
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SearchTradeRoutes_CacheContinuation" param="$workItem"/>
+              <set_value name="$continuationHandled" exact="true"/>
+            </do_if>
+            <do_else>
+              <!-- Unknown continuation cue - log error and fall back to default -->
               <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
                 <param name="traceId" value="$traceId"/>
                 <param name="stage" value="'Scheduler'"/>
                 <param name="action" value="'Error'"/>
-                <param name="details" value="'reason=missing_continuation_params ship=' + $resumeShip.idcode + ' - signaling busy retry'"/>
+                <param name="details" value="'reason=unknown_continuation_cue cue=' + $continuationCueName + ' - falling back to default'"/>
                 <param name="logLevel" value="0"/>
               </run_actions>
-              <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-                <param name="ship" value="$resumeShip"/>
-                <param name="reason" value="'missing_continuation_params'"/>
+            </do_else>
+          </do_if>
+          
+          <!-- If continuation cue was not handled (missing or unknown), use default continuation.
+               IMPORTANT: Do NOT signal SearchTradeRoutes directly here; enqueue a SearchContinuation work item so
+               continuations are paced by the scheduler (prevents continuous stutter / same-frame bursts). -->
+          <do_if value="not $continuationHandled">
+            <set_value name="$extractedCacheResult" exact="@$workItem.$Payload.$Result"/>
+            <do_if value="$payload.$ResumeParams?">
+              <set_value name="$resumeParams" exact="$payload.$ResumeParams"/>
+              <set_value name="$resumeParams.$CacheContinuation" exact="true"/>
+              <set_value name="$resumeParams.$CacheResult" exact="$extractedCacheResult"/>
+              <set_value name="$resumeParams.$SearchState" exact="'fresh'"/>
+  
+              <!-- Enqueue a continuation work item (paced) -->
+              <set_value name="$contKey" exact="$ship.idcode + '_SearchContinuation_' + $traceId"/>
+              <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$contWorkItem">
+                <param name="type" value="'SearchContinuation'"/>
+                <param name="key" value="$contKey"/>
+                <param name="traceId" value="$traceId"/>
+                <param name="payload" value="table[
+                  $Ship = $ship,
+                  $Params = $resumeParams
+                ]"/>
               </run_actions>
-              <signal_objects object="$resumeShip" param="'GT_No_Trade_Found'" param2="'busy'"/>
+              <do_if value="$contWorkItem != null">
+                <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
+                  <param name="workItem" value="$contWorkItem"/>
+                  <param name="traceId" value="$traceId"/>
+                </run_actions>
+              </do_if>
             </do_if>
-          </do_else>
+            <do_else>
+              <!-- No continuation params - terminal failure -->
+              <set_value name="$resumeShip" exact="@$payload.$Ship"/>
+              <do_if value="$resumeShip? and $resumeShip.exists">
+                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                  <param name="traceId" value="$traceId"/>
+                  <param name="stage" value="'Scheduler'"/>
+                  <param name="action" value="'Error'"/>
+                  <param name="details" value="'reason=missing_continuation_params ship=' + $resumeShip.idcode + ' - signaling busy retry'"/>
+                  <param name="logLevel" value="0"/>
+                </run_actions>
+                <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                  <param name="ship" value="$resumeShip"/>
+                  <param name="reason" value="'missing_continuation_params'"/>
+                </run_actions>
+                <signal_objects object="$resumeShip" param="'GT_No_Trade_Found'" param2="'busy'"/>
+              </do_if>
+            </do_else>
+          </do_if>
         </do_if>
         </do_else>
         </do_else>
+      </actions>
+    </cue>
+
+    <!-- CacheQuery continuation (Frame Distribution) -->
+    <!-- Purpose: Ensure chunked cache scanning yields cross-frame and cannot peg a core in a tight loop. -->
+    <cue name="ProcessCacheQueryWork_Delayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay min="5ms" max="20ms"/>
+      <actions>
+        <set_value name="$workItem" exact="event.param"/>
+        <do_if value="$workItem? and $workItem.$Payload?">
+          <set_value name="$workItem.$Payload.$CacheScanScheduled" exact="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork" param="$workItem"/>
       </actions>
     </cue>
     

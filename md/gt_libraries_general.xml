@@ -1962,6 +1962,12 @@
         <param name="ignoreCarrierAux" default="false" comment="Skip carrier/aux targets"/>
         <param name="maxEntries" default="5" comment="Minimum number of top cache entries to validate. Will be increased automatically if maxReturnTrades requires more entries (to account for filtered invalid entries)."/>
         <param name="cacheMaxAge" default="600s" comment="TTL for cache entries"/>
+        <!-- Chunking (frame distribution):
+             If scanCount > 0, only scan [scanStart .. scanStart+scanCount-1] (clamped) and return continuation state. -->
+        <param name="scanStart" default="1" comment="1-based cache index to start scanning from (for chunked cache queries)"/>
+        <param name="scanCount" default="0" comment="Number of cache entries to scan this call (0 = scan full effectiveMaxEntries)"/>
+        <param name="minFailCountIn" default="999999" comment="Carry-over min failcount from previous chunk"/>
+        <param name="validTradesIn" default="[]" comment="Carry-over candidate trades from previous chunk"/>
         <param name="traceId" default="''" comment="Trace ID for logging"/>
       </params>
       <actions>
@@ -1969,12 +1975,15 @@
           $Found = false,
           $Trade = null,
           $BestScore = 0,
-          $Trades = []
+          $Trades = [],
+          $ScanDone = true,
+          $ScanNext = 0,
+          $MinFailCount = 999999
         ]"/>
 
         <!-- Return up to MaxTradesToReturn valid candidates (configurable via global settings).
              This prevents fleet-coordination claim-check from stalling when the best trade is already reserved. -->
-        <set_value name="$validTrades" exact="[]"/>
+        <set_value name="$validTrades" exact="if $validTradesIn? then $validTradesIn else []"/>
         <set_value name="$maxReturnTrades" exact="20"/> <!-- Default fallback -->
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
           <set_value name="$maxReturnTrades" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
@@ -2056,7 +2065,7 @@
         </do_if>
 
         <!-- Prefer entries with the lowest FailCount; skip entries already failed by this ship. -->
-        <set_value name="$minFailCount" exact="999999"/>
+        <set_value name="$minFailCount" exact="if $minFailCountIn? then $minFailCountIn else 999999"/>
 
         <!-- Determine blacklist group once (used for reachability check) -->
         <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
@@ -2102,7 +2111,19 @@
           </do_elseif>
         </do_if>
 
-        <do_all exact="$limit" counter="$i">
+        <!-- Chunking: compute scan window -->
+        <set_value name="$scanStartIdx" exact="[$scanStart, 1].max"/>
+        <set_value name="$scanEndIdx" exact="$limit"/>
+        <do_if value="$scanCount gt 0">
+          <set_value name="$scanEndIdx" exact="[$scanStartIdx + $scanCount - 1, $limit].min"/>
+        </do_if>
+        <set_value name="$toScan" exact="[$scanEndIdx - $scanStartIdx + 1, 0].max"/>
+        <set_value name="$result.$ScanDone" exact="false"/>
+        <set_value name="$result.$ScanNext" exact="$scanEndIdx + 1"/>
+        <set_value name="$result.$MinFailCount" exact="$minFailCount"/>
+
+        <do_all exact="$toScan" counter="$j">
+          <set_value name="$i" exact="$scanStartIdx + $j - 1"/>
           <set_value name="$entry" exact="$cache.{$i}"/>
 
           <!-- Structure + TTL -->
@@ -2330,9 +2351,21 @@
 
           <!-- Stop early once we have enough candidates at the optimal failcount (0 is best possible). -->
           <do_if value="$minFailCount == 0 and $validTrades.count ge $maxReturnTrades">
+            <set_value name="$result.$ScanDone" exact="true"/>
+            <set_value name="$result.$ScanNext" exact="0"/>
             <break/>
           </do_if>
         </do_all>
+
+        <!-- If we scanned to the end of our window and still have remaining entries, keep ScanDone=false (caller will schedule next chunk).
+             If we reached the global scan cap, mark done. -->
+        <do_if value="$result.$ScanNext gt $limit">
+          <set_value name="$result.$ScanDone" exact="true"/>
+          <set_value name="$result.$ScanNext" exact="0"/>
+        </do_if>
+
+        <!-- Persist chunking state -->
+        <set_value name="$result.$MinFailCount" exact="$minFailCount"/>
 
         <!-- Debug: explain why small candidate lists happen (top-N validation + filters + maxReturnTrades cap) -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
