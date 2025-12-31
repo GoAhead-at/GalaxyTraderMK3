@@ -2176,6 +2176,43 @@
             <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$AllBuyOffers" exact="$allBuyOffers"/>
           </do_if>
           
+        <!-- CRITICAL SMOOTHNESS GATE:
+             Do NOT run native offer queries unless this invocation was granted a slice by the global queue.
+             Without this, many ships can enter this continuation simultaneously (after pathfinding resume)
+             and each will do a "first slice" query in the same frame bucket (microstutter). -->
+        <set_value name="$sliceGranted" exact="false"/>
+        <do_if value="$params.$SliceGranted? and $params.$SliceGranted == true">
+          <set_value name="$sliceGranted" exact="true"/>
+        </do_if>
+        <do_if value="($offerPhase == 'selloffers' or $offerPhase == 'buyoffers') and not $sliceGranted">
+          <set_value name="$deferOfferSlice" exact="true"/>
+          <!-- Enqueue via global fair queue (one ship per budget tick) -->
+          <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
+            <set_value name="global.$GT_LiveOfferSliceQueue" exact="table[
+              $Ships = [],
+              $Queued = table[],
+              $Params = table[],
+              $Processing = false
+            ]"/>
+          </do_if>
+          <do_if value="not global.$GT_LiveOfferSliceScheduled?">
+            <set_value name="global.$GT_LiveOfferSliceScheduled" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_LiveOfferSliceScheduled.{$ship}?">
+            <set_value name="global.$GT_LiveOfferSliceScheduled.{$ship}" exact="player.age"/>
+            <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+            <!-- Ensure we don't accidentally carry a prior grant -->
+            <set_value name="$params.$SliceGranted" exact="false"/>
+            <set_value name="global.$GT_LiveOfferSliceQueue.$Params.{$ship}" exact="$params"/>
+            <do_if value="not global.$GT_LiveOfferSliceQueue.$Queued.{$ship}?">
+              <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
+              <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+
           <!-- Smoothness > speed:
                keep slice work very small to prevent microstutter (large offer lists => many append_to_list ops).
                This is still globally throttled by LiveOfferSliceInterval + the fair slice queue. -->
@@ -2289,7 +2326,7 @@
                   <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
                   <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
                 </do_if>
-                <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+                <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
               </do_if>
             </do_if>
             <do_else>
@@ -2318,7 +2355,7 @@
                   <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
                   <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
                 </do_if>
-                <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+                <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
               </do_if>
             </do_else>
             </do_else>
@@ -2432,7 +2469,7 @@
                   <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
                   <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
                 </do_if>
-                <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+                <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
               </do_if>
             </do_if>
             <do_else>
@@ -3139,6 +3176,51 @@
       </actions>
     </cue>
 
+    <!-- Offer-slice queue kick (de-dupe)
+         Problem: many ships can signal ProcessLiveOfferSliceQueue in the same frame, creating multiple instances
+                  that may each dequeue a ship and grant a slice (microstutter).
+         Fix: route all kicks through this deduped + delayed cue. -->
+    <cue name="KickLiveOfferSliceQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
+          <set_value name="global.$GT_LiveOfferSliceQueue" exact="table[
+            $Ships = [],
+            $Queued = table[],
+            $Params = table[],
+            $Processing = false
+          ]"/>
+        </do_if>
+        <do_if value="not global.$GT_LiveOfferSliceQueue.$KickScheduled?">
+          <set_value name="global.$GT_LiveOfferSliceQueue.$KickScheduled" exact="false"/>
+        </do_if>
+
+        <do_if value="global.$GT_LiveOfferSliceQueue.$KickScheduled">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+          <set_value name="global.$GT_LiveOfferSliceQueue.$KickScheduled" exact="true"/>
+          <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue_Delayed"/>
+        </do_else>
+      </actions>
+    </cue>
+
+    <cue name="KickLiveOfferSliceQueue_Delayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- Smoothness > speed: ensure cross-frame execution -->
+      <delay min="20ms" max="80ms"/>
+      <actions>
+        <do_if value="global.$GT_LiveOfferSliceQueue?">
+          <set_value name="global.$GT_LiveOfferSliceQueue.$KickScheduled" exact="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+      </actions>
+    </cue>
+
     <!-- Global offer-slice fairness queue.
          Why: per-ship slice scheduling can starve other ships (one ship dominates the global budget),
               leading to "only one ship gets trades" even though others are stuck in continuations.
@@ -3148,6 +3230,9 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
+        <!-- cancel_cue does NOT stop actions in X4 MD, so we use an explicit proceed flag to prevent fallthrough. -->
+        <set_value name="$proceed" exact="true"/>
+
         <!-- Ensure queue table exists -->
         <do_if value="not global.$GT_LiveOfferSliceQueue? or global.$GT_LiveOfferSliceQueue == null">
           <set_value name="global.$GT_LiveOfferSliceQueue" exact="table[
@@ -3160,12 +3245,18 @@
 
         <!-- single-thread -->
         <do_if value="global.$GT_LiveOfferSliceQueue.$Processing">
-          <cancel_cue cue="this"/>
+          <set_value name="$proceed" exact="false"/>
         </do_if>
-        <set_value name="global.$GT_LiveOfferSliceQueue.$Processing" exact="true"/>
+        <do_if value="$proceed">
+          <set_value name="global.$GT_LiveOfferSliceQueue.$Processing" exact="true"/>
+        </do_if>
 
-        <do_if value="global.$GT_LiveOfferSliceQueue.$Ships.count le 0">
+        <do_if value="$proceed and global.$GT_LiveOfferSliceQueue.$Ships.count le 0">
           <set_value name="global.$GT_LiveOfferSliceQueue.$Processing" exact="false"/>
+          <set_value name="$proceed" exact="false"/>
+        </do_if>
+
+        <do_if value="not $proceed">
           <cancel_cue cue="this"/>
         </do_if>
 
@@ -3216,6 +3307,8 @@
         <do_if value="$params != null and $ship? and $ship.exists">
           <!-- CRITICAL: Slice-driven continuations MUST force ContinueFromSectorLists=true -->
           <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+          <!-- Grant exactly one slice worth of offer-query work to this invocation -->
+          <set_value name="$params.$SliceGranted" exact="true"/>
           <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
         </do_if>
         <do_else>
@@ -3228,7 +3321,7 @@
         <!-- Continue queue if still pending -->
         <set_value name="global.$GT_LiveOfferSliceQueue.$Processing" exact="false"/>
         <do_if value="global.$GT_LiveOfferSliceQueue.$Ships.count gt 0">
-          <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+          <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
         </do_if>
       </actions>
     </cue>
@@ -3371,7 +3464,7 @@
                 <set_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}" exact="true"/>
                 <append_to_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
               </do_if>
-              <signal_cue_instantly cue="md.GT_Search_Methods.ProcessLiveOfferSliceQueue"/>
+              <signal_cue_instantly cue="md.GT_Search_Methods.KickLiveOfferSliceQueue"/>
             </do_if>
           </do_if>
         </do_else>
