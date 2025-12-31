@@ -81,6 +81,7 @@
         <do_if value="not $ship? or not $ship.exists">
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
 
         <!-- Ensure global structures exist -->
         <do_if value="not global.$GT_TS?">
@@ -122,6 +123,7 @@
 
         <!-- Kick scheduler -->
         <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
+        </do_else>
       </actions>
     </cue>
 
@@ -131,14 +133,20 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
+        <!-- IMPORTANT: In X4 MD, cancel_cue does NOT reliably stop the current actions block or a later action block after <delay>.
+             Use a persistent instance flag to gate BOTH action blocks. -->
+        <set_value name="this.$DelayTime" exact="0ms"/>
+        <set_value name="this.$TickProceed" exact="false"/>
+
         <do_if value="not global.$GT_TS? or not global.$GT_TS.$Queue?">
           <cancel_cue cue="this"/>
         </do_if>
-
-        <!-- Prevent stampede -->
-        <do_if value="global.$GT_TS.$Processing">
+        <do_elseif value="global.$GT_TS.$Processing">
+          <!-- Prevent stampede -->
           <cancel_cue cue="this"/>
-        </do_if>
+        </do_elseif>
+        <do_else>
+        <set_value name="this.$TickProceed" exact="true"/>
         <set_value name="global.$GT_TS.$Processing" exact="true"/>
 
         <!-- Initialize EnqueuedAt table if needed -->
@@ -199,11 +207,11 @@
         <!-- If no pending ships after cleanup, stop -->
         <do_if value="global.$GT_TS.$Queue.count le 0">
           <set_value name="global.$GT_TS.$Processing" exact="false"/>
+          <set_value name="this.$TickProceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
 
         <!-- Hard budget: enforce min interval between starting searches -->
-        <set_value name="this.$DelayTime" exact="0ms"/>
         <set_value name="$nextStart" exact="@global.$GT_TS.$NextStartTime"/>
         <do_if value="$nextStart? and $nextStart != null and player.age lt $nextStart">
           <set_value name="this.$DelayTime" exact="$nextStart - player.age"/>
@@ -212,9 +220,11 @@
         <do_if value="this.$DelayTime gt 0ms and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-TS] Budget: delaying next start by ' + (this.$DelayTime / 1ms) + 'ms (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
         </do_if>
+        </do_else>
       </actions>
       <delay exact="this.$DelayTime"/>
       <actions>
+        <do_if value="this.$TickProceed">
         <!-- ROOT CAUSE FIX: Create multiple work items per tick to fill queue faster -->
         <!-- Tick was creating 1 work item per 25ms, causing bottleneck with large queues -->
         <!-- ProcessWorkQueue can process 10 items per tick, so Tick should create multiple items per call -->
@@ -329,6 +339,7 @@
         <do_if value="global.$GT_TS.$Queue.count gt 0">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
         </do_if>
+        </do_if>
       </actions>
     </cue>
     
@@ -357,23 +368,32 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
+        <!-- IMPORTANT: In X4 MD, cancel_cue does NOT reliably stop the current actions block.
+             Use an explicit gate to prevent fallthrough into scheduler mutation. -->
+        <set_value name="this.$ProcessProceed" exact="true"/>
+
         <!-- Validate scheduler exists - ERROR if missing -->
         <do_if value="not global.$GT_Scheduler?">
           <debug_text text="'[GT-ERROR] ProcessWorkQueue: Scheduler not initialized'" chance="100"/>
+          <set_value name="this.$ProcessProceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
         
         <!-- Prevent concurrent processing -->
-        <do_if value="global.$GT_Scheduler.$Processing">
+        <do_if value="this.$ProcessProceed and global.$GT_Scheduler.$Processing">
+          <set_value name="this.$ProcessProceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
-        <set_value name="global.$GT_Scheduler.$Processing" exact="true"/>
         
         <!-- If no work, stop -->
-        <do_if value="not global.$GT_Scheduler.$WorkQueue? or global.$GT_Scheduler.$WorkQueue.count le 0">
+        <do_if value="this.$ProcessProceed and (not global.$GT_Scheduler.$WorkQueue? or global.$GT_Scheduler.$WorkQueue.count le 0)">
           <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
+          <set_value name="this.$ProcessProceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
+
+        <do_if value="this.$ProcessProceed">
+          <set_value name="global.$GT_Scheduler.$Processing" exact="true"/>
         
         <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - MUST be checked BEFORE counting active work -->
         <!-- ROOT CAUSE: Accessing .keys.count on an empty table might corrupt it in X4 MD -->
@@ -738,6 +758,7 @@
         <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueueDelayed"/>
         </do_if>
+        </do_if>
       </actions>
     </cue>
 
@@ -753,6 +774,7 @@
         <do_if value="not $workItem? or not $workItem.$Payload?">
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
 
         <set_value name="$payload" exact="$workItem.$Payload"/>
         <set_value name="$params" exact="@$payload.$Params"/>
@@ -775,6 +797,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
 
         <!-- Resume SearchTradeRoutes (paced by this work item) -->
         <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="$params"/>
@@ -787,6 +810,8 @@
           <param name="workItem" value="$workItem"/>
         </run_actions>
         <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+        </do_else>
+        </do_else>
       </actions>
     </cue>
     
@@ -827,6 +852,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <set_value name="$payload" exact="$workItem.$Payload"/>
         <set_value name="$ship" exact="@$payload.$Ship"/>
@@ -870,6 +896,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <!-- Execute cache query -->
         <set_value name="$startTime" exact="player.age"/>
@@ -990,6 +1017,8 @@
             </do_if>
           </do_else>
         </do_if>
+        </do_else>
+        </do_else>
       </actions>
     </cue>
     
@@ -1030,6 +1059,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <set_value name="$payload" exact="$workItem.$Payload"/>
         <set_value name="$ship" exact="@$payload.$Ship"/>
@@ -1058,6 +1088,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <!-- Execute home search by signaling SearchLiveTrades -->
         <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
@@ -1135,6 +1166,8 @@
         
         <!-- Note: Work item remains active until SearchLiveTrades completes -->
         <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
+        </do_else>
+        </do_else>
       </actions>
     </cue>
     
@@ -1175,6 +1208,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <set_value name="$payload" exact="$workItem.$Payload"/>
         <set_value name="$ship" exact="@$payload.$Ship"/>
@@ -1203,6 +1237,7 @@
           </do_if>
           <cancel_cue cue="this"/>
         </do_if>
+        <do_else>
         
         <!-- Execute batch matching by signaling ProcessTradeMatchingBatch -->
         <!-- This is async - ProcessTradeMatchingBatch will handle chunked processing -->
@@ -1232,6 +1267,8 @@
         
         <!-- Note: Work item remains active until ProcessTradeMatchingBatch completes -->
         <!-- Completion will be handled by batch processor completion handler -->
+        </do_else>
+        </do_else>
       </actions>
     </cue>
     
