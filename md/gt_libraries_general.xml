@@ -304,10 +304,71 @@
           <set_value name="this.$acquired" exact="true"/>
           <!-- Log successful lock acquisition -->
           <debug_text text="'[GT-Lock] (' + $ship.idcode + ') LOCK ACQUIRED (lockTime: ' + player.age + ')'" chance="100"/>
+
+          <!-- Hub status (lightweight): record request lock acquisition -->
+          <set_value name="$traceId" exact="if @$parameters.$TraceId != null then @$parameters.$TraceId else ''"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'lock_acquired'"/>
+            <param name="state" value="'in_progress'"/>
+            <param name="reason" value="'acquired'"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
         </do_if>
         <do_else>
           <set_value name="this.$acquired" exact="false"/>
         </do_else>
+      </actions>
+    </library>
+
+    <!-- Hub Status: Initialize -->
+    <library name="GT_RequestStatus_Init" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_RequestStatus? or global.$GT_RequestStatus == null">
+          <set_value name="global.$GT_RequestStatus" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Hub Status: Update per-ship lifecycle state (debug/coordination only; does NOT signal AI) -->
+    <library name="GT_RequestStatus_Update" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship object key"/>
+        <param name="stage" default="'unknown'" comment="High-level pipeline stage"/>
+        <param name="state" default="'unknown'" comment="State within stage"/>
+        <param name="reason" default="''" comment="Optional reason code"/>
+        <param name="traceId" default="''" comment="Trace ID for correlation"/>
+        <param name="homeSector" default="null" comment="Home sector if known"/>
+        <param name="extra" default="null" comment="Optional table[] of extra fields"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_RequestStatus? or global.$GT_RequestStatus == null">
+          <set_value name="global.$GT_RequestStatus" exact="table[]"/>
+        </do_if>
+
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="not global.$GT_RequestStatus.{$ship}? or global.$GT_RequestStatus.{$ship} == null">
+            <set_value name="global.$GT_RequestStatus.{$ship}" exact="table[]"/>
+          </do_if>
+
+          <set_value name="global.$GT_RequestStatus.{$ship}.$Stage" exact="$stage"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$State" exact="$state"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$Reason" exact="$reason"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$TraceId" exact="$traceId"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$UpdatedAt" exact="player.age"/>
+
+          <do_if value="$homeSector? and $homeSector != null">
+            <set_value name="global.$GT_RequestStatus.{$ship}.$HomeSector" exact="$homeSector"/>
+          </do_if>
+
+          <!-- Best-effort merge of extra fields (tables only) -->
+          <do_if value="$extra? and $extra != null and $extra.keys?">
+            <do_all exact="$extra.keys.count" counter="$i">
+              <set_value name="$k" exact="$extra.keys.{$i}"/>
+              <set_value name="global.$GT_RequestStatus.{$ship}.{$k}" exact="$extra.{$k}"/>
+            </do_all>
+          </do_if>
+        </do_if>
       </actions>
     </library>
     
@@ -352,6 +413,15 @@
         <!-- We still clean up to prevent leaks, but don't log for non-GT ships -->
         <set_value name="$shouldLog" exact="$isGTControlled"/>
         
+        <!-- Hub status (lightweight): record release attempt early -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'release'"/>
+          <param name="state" value="'released'"/>
+          <param name="reason" value="$reason"/>
+          <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
+        </run_actions>
+
         <!-- Get lock time BEFORE releasing lock (needed for version check) -->
         <set_value name="$lockTime" exact="null"/>
         <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
@@ -421,34 +491,22 @@
              even after the lock is released, leading to repeat AI timeouts and home-sector refresh blocking.
              Keep this block narrow: only runs for stale_lock_cleanup. -->
         <do_if value="$reason == 'stale_lock_cleanup'">
-          <!-- 1) If this ship had acquired a live slot, decrement ActiveLiveSearches to avoid permanent saturation -->
-          <set_value name="$hadLiveSlot" exact="false"/>
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
-            <set_value name="$liveParams" exact="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
-            <do_if value="$liveParams? and $liveParams.$LiveSlotAcquired? and $liveParams.$LiveSlotAcquired">
-              <set_value name="$hadLiveSlot" exact="true"/>
-            </do_if>
-          </do_if>
-          <do_if value="$hadLiveSlot">
-            <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveLiveSearches">
-              <param name="clampToZero" value="true"/>
-              <param name="triggerQueueProcessor" value="true"/>
-            </run_actions>
-          </do_if>
-
-          <!-- 2) Remove ship from live-search queue structures (params + per-sector queue) -->
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Params? and global.$GT_LiveSearchQueue.$Params.{$ship}?">
-            <remove_value name="global.$GT_LiveSearchQueue.$Params.{$ship}"/>
-          </do_if>
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$BySector?">
-            <do_all exact="global.$GT_LiveSearchQueue.$BySector.keys.count" counter="$sectorIdx">
-              <set_value name="$sector" exact="global.$GT_LiveSearchQueue.$BySector.keys.{$sectorIdx}"/>
-              <do_if value="$sector? and global.$GT_LiveSearchQueue.$BySector.{$sector}? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships? and global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count gt 0">
-                <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.count" counter="$i" reverse="true">
-                  <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships.{$i} == $ship">
-                    <remove_from_list name="global.$GT_LiveSearchQueue.$BySector.{$sector}.$Ships" exact="$ship"/>
-                  </do_if>
-                </do_all>
+          <!-- Hub pipeline: LiveSearchQueue removed. If ship was waiting for a home-sector refresh, remove it from waiter lists. -->
+          <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.keys.count gt 0">
+            <do_all exact="global.$GT_TS_LiveRefreshBySector.keys.count" counter="$hsIdx">
+              <set_value name="$hs" exact="global.$GT_TS_LiveRefreshBySector.keys.{$hsIdx}"/>
+              <do_if value="$hs? and global.$GT_TS_LiveRefreshBySector.{$hs}?">
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued? and global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued.{$ship}?">
+                  <remove_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued.{$ship}"/>
+                </do_if>
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.count gt 0">
+                  <do_all exact="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.count" counter="$wi" reverse="true">
+                    <set_value name="$w" exact="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.{$wi}"/>
+                    <do_if value="$w? and $w.$Ship? and $w.$Ship == $ship">
+                      <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters" exact="$w"/>
+                    </do_if>
+                  </do_all>
+                </do_if>
               </do_if>
             </do_all>
           </do_if>
@@ -4649,20 +4707,7 @@
         <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
       </params>
       <actions>
-        <!-- Initialize counter if missing -->
-        <do_if value="$initializeIfMissing">
-          <do_if value="not global.$GT_LiveSearchQueue?">
-            <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Increment counter -->
-        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
-        </do_if>
+        <!-- LiveSearchQueue removed (hub finalization): no-op kept for compatibility -->
       </actions>
     </library>
     
@@ -4670,38 +4715,10 @@
     <library name="GT_DecrementActiveLiveSearches" purpose="run_actions">
       <params>
         <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
-        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessLiveSearchQueue after decrement if ships are waiting"/>
+        <param name="triggerQueueProcessor" default="false" comment="Legacy parameter (LiveSearchQueue removed); kept for compatibility"/>
       </params>
       <actions>
-        <!-- Decrement counter -->
-        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
-          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
-        </do_if>
-        
-        <!-- Hard clamp: ActiveLiveSearches must never go negative -->
-        <do_if value="$clampToZero">
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt 0">
-            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Trigger queue processor if requested and ships are waiting -->
-        <!-- FIX: Check actual queue structure ($Sectors + $BySector.{sector}.$Ships), not non-existent $Ships field -->
-        <do_if value="$triggerQueueProcessor">
-          <set_value name="$hasQueuedShips" exact="false"/>
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Sectors? and global.$GT_LiveSearchQueue.$Sectors.count gt 0">
-            <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$i">
-              <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$i}"/>
-              <do_if value="$sec? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
-                <set_value name="$hasQueuedShips" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          <do_if value="$hasQueuedShips">
-            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
-          </do_if>
-        </do_if>
+        <!-- LiveSearchQueue removed (hub finalization): no-op kept for compatibility -->
       </actions>
     </library>
     

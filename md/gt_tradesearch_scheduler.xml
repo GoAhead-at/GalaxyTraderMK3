@@ -117,6 +117,17 @@
           <set_value name="global.$GT_TS.$EnqueuedAt.{$ship}" exact="player.age"/>
         </do_else>
 
+        <!-- Hub status: request queued -->
+        <set_value name="$traceId" exact="if @$req.$TraceId != null then @$req.$TraceId else ''"/>
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'queued'"/>
+          <param name="state" value="'waiting'"/>
+          <param name="reason" value="''"/>
+          <param name="traceId" value="$traceId"/>
+          <param name="extra" value="table[$QueueSize = global.$GT_TS.$Queue.count]"/>
+        </run_actions>
+
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-TS] Enqueue: ' + $ship.idcode + ' (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
         </do_if>
@@ -875,6 +886,16 @@
         <set_value name="$ignoreBuildStorage" exact="@$payload.$IgnoreBuildStorage"/>
         <set_value name="$ignoreCarrierAux" exact="@$payload.$IgnoreCarrierAux"/>
         <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+
+        <!-- Hub status: cache query running -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'cache_query'"/>
+          <param name="state" value="'running'"/>
+          <param name="reason" value="''"/>
+          <param name="traceId" value="$traceId"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
         
         <!-- Validate required parameters - ERROR if missing -->
         <do_if value="not $ship? or not $ship.exists or not $homeSector? or not $homeSector.exists">
@@ -971,6 +992,19 @@
         <do_if value="$shouldFinalize">
           <!-- Scan done: finalize result, log, complete work item -->
           <set_value name="$workItem.$Payload.$Result" exact="$cacheResult"/>
+
+          <!-- Hub status: cache query complete -->
+          <set_value name="$cacheTrades" exact="if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades.count else 0"/>
+          <set_value name="$cacheBestScore" exact="if $cacheResult? and $cacheResult.$BestScore? then $cacheResult.$BestScore else 0"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'cache_query'"/>
+            <param name="state" value="if $cacheResult? and $cacheResult.$Found then 'hit' else 'miss'"/>
+            <param name="reason" value="''"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="homeSector" value="$homeSector"/>
+            <param name="extra" value="table[$CacheTrades=$cacheTrades, $CacheBestScore=$cacheBestScore, $CacheDurationMs=($duration / 1ms)]"/>
+          </run_actions>
 
           <set_value name="$resultAction" exact="if $cacheResult? and $cacheResult.$Found then 'Hit' else 'Miss'"/>
           <set_value name="$resultDetails" exact="'trades=' + (if $cacheResult? and $cacheResult.$Trades? then $cacheResult.$Trades.count else 0) + ' score=' + (if $cacheResult? and $cacheResult.$BestScore? then $cacheResult.$BestScore else 0) + ' duration=' + ($duration / 1ms) + 'ms chunkscan=' + $scanCount"/>
@@ -1161,6 +1195,113 @@
           <cancel_cue cue="this"/>
         </do_if>
         <do_else>
+
+        <!-- Central hub: enforce per-home-sector live-search exclusivity.
+             Only one ship may run HomeSearch/SearchLiveTrades per home sector at a time. Others wait silently and are resumed when the refresh completes. -->
+        <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+
+        <!-- Hub status: home search evaluating / reserving per-home-sector slot -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'home_search'"/>
+          <param name="state" value="'evaluating'"/>
+          <param name="reason" value="''"/>
+          <param name="traceId" value="$traceId"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'HomeSearch'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=no_home_sector ship=' + $ship.idcode"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'failed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="reason" value="'no_home_sector'"/>
+            <param name="workItem" value="$workItem"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+            <param name="ship" value="$ship"/>
+            <param name="reason" value="'no_home_sector'"/>
+          </run_actions>
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'"/>
+          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <do_if value="not global.$GT_TS_LiveRefreshBySector?">
+          <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
+          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[]"/>
+        </do_if>
+        <set_value name="$refreshEntry" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+        <set_value name="$refreshActive" exact="false"/>
+        <do_if value="$refreshEntry? and $refreshEntry != null and $refreshEntry.$Active? and $refreshEntry.$Active">
+          <set_value name="$refreshActive" exact="true"/>
+        </do_if>
+        <do_if value="$refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
+          <!-- Queue as silent waiter for this home sector -->
+          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
+          </do_if>
+          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
+            <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
+              $Ship = $ship,
+              $Params = @$payload.$ResumeParams,
+              $EnqueuedAt = player.age
+            ]"/>
+          </do_if>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <set_value name="global.$GT_AIParameters.{$ship}.$RequestTime" exact="player.age"/>
+            <set_value name="global.$GT_AIParameters.{$ship}.$WaitReason" exact="'home_refresh_wait'"/>
+          </do_if>
+
+          <!-- Hub status: waiting for home refresh -->
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'home_search'"/>
+            <param name="state" value="'waiting'"/>
+            <param name="reason" value="'home_refresh_wait'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="homeSector" value="$homeSector"/>
+            <param name="extra" value="table[$Initiator = $refreshEntry.$Initiator]"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+            <param name="key" value="$workItem.$Key"/>
+            <param name="newState" value="'completed'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="reason" value="'home_refresh_wait'"/>
+            <param name="workItem" value="$workItem"/>
+          </run_actions>
+          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- Mark as active initiator (best-effort) -->
+        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Active" exact="true"/>
+        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Initiator" exact="$ship"/>
+        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$LastStarted" exact="player.age"/>
+
+        <!-- Hub status: initiator started home refresh -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'home_search'"/>
+          <param name="state" value="'running'"/>
+          <param name="reason" value="'initiator'"/>
+          <param name="traceId" value="$traceId"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
         
         <!-- Execute home search by signaling SearchLiveTrades -->
         <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
@@ -1240,6 +1381,91 @@
         <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
         </do_else>
         </do_else>
+      </actions>
+    </cue>
+
+    <!-- Home-sector live-refresh finished: wake ships that were waiting silently (FIFO per home sector) -->
+    <cue name="HomeRefreshFinished" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- Ensure cross-frame execution; avoid same-frame avalanches after big live searches -->
+      <delay min="10ms" max="60ms"/>
+      <actions>
+        <set_value name="$homeSector" exact="event.param"/>
+        <!-- IMPORTANT: cancel_cue does NOT stop the current actions block.
+             Use an explicit flag to prevent fallthrough into $Waiters access. -->
+        <set_value name="this.$Proceed" exact="true"/>
+
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <set_value name="this.$Proceed" exact="false"/>
+        </do_if>
+
+        <do_if value="this.$Proceed and (not global.$GT_TS_LiveRefreshBySector? or not global.$GT_TS_LiveRefreshBySector.{$homeSector}?)">
+          <set_value name="this.$Proceed" exact="false"/>
+        </do_if>
+
+        <!-- De-dupe / single-thread per home sector -->
+        <do_if value="this.$Proceed">
+          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing?">
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
+          </do_if>
+          <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing">
+            <set_value name="this.$Proceed" exact="false"/>
+          </do_if>
+          <do_if value="this.$Proceed">
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="true"/>
+          </do_if>
+        </do_if>
+
+        <!-- Nothing to do -->
+        <do_if value="this.$Proceed and (not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count le 0)">
+          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
+          <set_value name="this.$Proceed" exact="false"/>
+        </do_if>
+
+        <do_if value="this.$Proceed">
+          <!-- Process a small batch per call to avoid spikes -->
+          <set_value name="$maxWake" exact="5"/>
+          <set_value name="$woke" exact="0"/>
+
+          <do_while value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0 and $woke lt $maxWake">
+            <set_value name="$entry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.{1}"/>
+            <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="$entry"/>
+
+            <set_value name="$ship" exact="@$entry.$Ship"/>
+            <set_value name="$params" exact="@$entry.$Params"/>
+            <set_value name="$traceId" exact="if $params? and $params.$TraceId? then $params.$TraceId else (if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else '')"/>
+            <!-- Clear de-dupe marker -->
+            <do_if value="$ship? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+              <remove_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}"/>
+            </do_if>
+
+            <do_if value="$ship? and $ship.exists and $params?">
+              <!-- Hub status: woke after home refresh, re-queueing -->
+              <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+                <param name="ship" value="$ship"/>
+                <param name="stage" value="'home_search'"/>
+                <param name="state" value="'woken'"/>
+                <param name="reason" value="'home_refresh_finished'"/>
+                <param name="traceId" value="$traceId"/>
+                <param name="homeSector" value="$homeSector"/>
+              </run_actions>
+              <!-- Resume search by re-enqueueing SearchTradeRoutes through the central scheduler (silent to player) -->
+              <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
+            </do_if>
+
+            <set_value name="$woke" operation="add"/>
+          </do_while>
+
+          <!-- Done with this wake batch -->
+          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
+
+          <!-- If more waiters remain, schedule another pass -->
+          <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.HomeRefreshFinished" param="$homeSector"/>
+          </do_if>
+        </do_if>
       </actions>
     </cue>
     

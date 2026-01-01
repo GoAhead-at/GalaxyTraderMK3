@@ -52,6 +52,9 @@
           $Completed = 0,
           $Failed = 0
         ]"/>
+
+        <!-- Hub status table (per-ship request lifecycle) -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Init"/>
         
         <!-- Initialize search queue - ONE search at a time to prevent stuttering -->
         <set_value name="global.$GT_SearchQueue" exact="table[]"/>
@@ -228,28 +231,7 @@
         <set_value name="global.$GT_RegistrationQueue.$Ships" exact="[]"/>
         <set_value name="global.$GT_RegistrationQueue.$Processing" exact="false"/>
         
-        <!-- Initialize trade request processing queue - Limit concurrent processing to prevent CPU spikes -->
-        <set_value name="global.$GT_TradeRequestQueue" exact="table[]"/>
-        <set_value name="global.$GT_TradeRequestQueue.$Requests" exact="[]"/>
-        <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" exact="0"/>
-        <!-- Trade request processing concurrency:
-             - Too low → huge backlog → AI timeouts / duplicate requests
-             - Too high → CPU spikes
-           Tie to cache concurrency (cheap) but clamp to safe range (1-10). -->
-        <set_value name="$maxTradeRequests" exact="2"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
-          <set_value name="$maxTradeRequests" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
-        </do_if>
-        <do_elseif value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches?">
-          <set_value name="$maxTradeRequests" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentSearches"/>
-        </do_elseif>
-        <do_if value="$maxTradeRequests lt 1">
-          <set_value name="$maxTradeRequests" exact="1"/>
-        </do_if>
-        <do_if value="$maxTradeRequests gt 10">
-          <set_value name="$maxTradeRequests" exact="10"/>
-        </do_if>
-        <set_value name="global.$GT_TradeRequestQueue.$MaxConcurrent" exact="$maxTradeRequests"/>
+        <!-- Removed unused TradeRequestQueue (cleanup): trade requests are normalized and processed directly via ProcessDelayedTradeRequest -->
         
         <!-- Initialize maintenance queue - Limit concurrent maintenance operations to prevent CPU spikes -->
         <set_value name="global.$GT_MaintenanceQueue" exact="table[]"/>
@@ -305,6 +287,12 @@
              - stores AI parameters + acquires search lock
              - then FindBestTrade computes MinROI/MinAbsoluteProfit/MaxDistance and routes into scheduler -->
         <set_value name="$requestData" exact="event.param2"/>
+        <!-- Remember last requester for on-demand hub status dump -->
+        <do_if value="$requestData? and $requestData.$Ship? and $requestData.$Ship.exists">
+          <set_value name="global.$GT_LastTradeRequestShip" exact="$requestData.$Ship"/>
+          <set_value name="global.$GT_LastTradeRequestTraceId" exact="if @$requestData.$TraceId != null then @$requestData.$TraceId else ''"/>
+          <set_value name="global.$GT_LastTradeRequestTime" exact="player.age"/>
+        </do_if>
         <signal_cue_instantly cue="ProcessDelayedTradeRequest" param="$requestData"/>
       </actions>
     </cue>
@@ -420,43 +408,6 @@
     <!-- No longer needed - AI now iterates through trade list internally -->
     
     
-    <!-- Trade Request Queue Processor -->
-    <cue name="ProcessTradeRequestQueue" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <!-- CPU YIELDING: Prevent draining many requests in a single frame and creating a burst of delayed request instances -->
-      <delay exact="10ms"/>
-      <actions>
-        <!-- Process next request in queue if below concurrency limit -->
-        <do_if value="global.$GT_TradeRequestQueue? and global.$GT_TradeRequestQueue.$Requests? and global.$GT_TradeRequestQueue.$Requests.count gt 0">
-          <do_if value="global.$GT_TradeRequestQueue.$ActiveInstances lt global.$GT_TradeRequestQueue.$MaxConcurrent">
-            <!-- Below limit - process next request -->
-            <!-- CRITICAL FIX: X4 lists are 1-based, not 0-based - use {1} for first element -->
-            <set_value name="$nextRequest" exact="global.$GT_TradeRequestQueue.$Requests.{1}"/>
-            <do_if value="$nextRequest?">
-              <remove_from_list name="global.$GT_TradeRequestQueue.$Requests" exact="$nextRequest"/>
-              <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="add"/>
-              
-              <!-- Process request -->
-              <signal_cue_instantly cue="ProcessDelayedTradeRequest" param="$nextRequest"/>
-              
-              <!-- Continue processing queue -->
-              <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
-            </do_if>
-            <do_else>
-              <!-- Invalid request - remove it and continue -->
-              <do_if value="global.$GT_TradeRequestQueue.$Requests.count gt 0">
-                <remove_from_list name="global.$GT_TradeRequestQueue.$Requests" exact="global.$GT_TradeRequestQueue.$Requests.{1}"/>
-              </do_if>
-              <!-- Continue processing queue -->
-              <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
-            </do_else>
-          </do_if>
-        </do_if>
-      </actions>
-    </cue>
-    
     <!-- Delayed Trade Request Processing -->
     <cue name="ProcessDelayedTradeRequest" instantiate="true">
       <conditions>
@@ -491,14 +442,9 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-MD] ERROR: GT_Find_Trade signal missing required MaxBuy/MaxSell parameters for ship ' + $ship.idcode + ' (MaxBuy: ' + $maxBuy + ', MaxSell: ' + $maxSell + ') - signal must include these values!'" chance="100"/>
           </do_if>
-          <!-- Cannot proceed without valid distance parameters.
-               CRITICAL: decrement TradeRequestQueue ActiveInstances here to avoid stalling at MaxConcurrent. -->
+          <!-- Cannot proceed without valid distance parameters. -->
           <set_value name="$shouldProceed" exact="false"/>
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
-          <do_if value="global.$GT_TradeRequestQueue? and global.$GT_TradeRequestQueue.$ActiveInstances? and global.$GT_TradeRequestQueue.$ActiveInstances gt 0">
-            <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
-          </do_if>
-          <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
           <!-- cancel_cue does not stop the current actions block immediately; the rest of this cue is gated by $shouldProceed -->
           <cancel_cue cue="this"/>
         </do_if>
@@ -634,12 +580,7 @@
             <!-- Start processing queue (delegate to queue module) -->
             <signal_cue_instantly cue="md.GT_Trading_Queue.KickTradingQueue"/>
 
-            <!-- IMPORTANT: Release TradeRequestQueue concurrency slot immediately after request is accepted and queued.
-                 SearchLocks prevent duplicate in-flight searches; holding this slot until full search completion causes early stalls under fleet load. -->
-            <do_if value="global.$GT_TradeRequestQueue? and global.$GT_TradeRequestQueue.$ActiveInstances? and global.$GT_TradeRequestQueue.$ActiveInstances gt 0">
-              <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
-            </do_if>
-            <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
+            <!-- TradeRequestQueue removed (cleanup): request is accepted and queued directly -->
           </do_if>
           <do_elseif value="$isBusy">
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -655,9 +596,7 @@
             <!-- Signal AI that ship is busy -->
             <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
             
-            <!-- Decrement active instances counter and process next queue item -->
-            <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
-            <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
+            <!-- No TradeRequestQueue to update (cleanup) -->
           </do_elseif>
           <do_else>
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -670,9 +609,7 @@
               <param name="reason" value="'duplicate_request'"/>
             </run_actions>
             
-            <!-- Decrement active instances counter and process next queue item -->
-            <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
-            <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
+            <!-- No TradeRequestQueue to update (cleanup) -->
           </do_else>
         </do_if>
         <do_else>
@@ -761,22 +698,10 @@
               </do_if>
             </do_all>
           </do_if>
-          <!-- Live-search queue membership (per-home-sector fairness queue) -->
-          <do_if value="not $hasOngoingWork and global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$BySector? and global.$GT_LiveSearchQueue.$Sectors? and global.$GT_LiveSearchQueue.$Sectors.count gt 0">
-            <do_all exact="global.$GT_LiveSearchQueue.$Sectors.count" counter="$s">
-              <set_value name="$sec" exact="global.$GT_LiveSearchQueue.$Sectors.{$s}"/>
-              <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sec}? and global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count gt 0">
-                <do_all exact="global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.count" counter="$i">
-                  <do_if value="global.$GT_LiveSearchQueue.$BySector.{$sec}.$Ships.{$i} == $ship">
-                    <set_value name="$hasOngoingWork" exact="true"/>
-                    <break/>
-                  </do_if>
-                </do_all>
-              </do_if>
-              <do_if value="$hasOngoingWork">
-                <break/>
-              </do_if>
-            </do_all>
+          <!-- Home-sector refresh waiter marker (hub pipeline):
+               If the ship is waiting silently for a home-sector live refresh to finish, do not treat it as stale. -->
+          <do_if value="not $hasOngoingWork and global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$WaitReason? and global.$GT_AIParameters.{$ship}.$WaitReason == 'home_refresh_wait'">
+            <set_value name="$hasOngoingWork" exact="true"/>
           </do_if>
 
           <!-- Scheduler active work marker (new pipeline):
@@ -872,14 +797,7 @@
             <signal_objects object="$ship" param="'GT_TradeSearch_InProgress'"/>
           </do_else>
           
-          <!-- Decrement active instances counter and process next queue item -->
-          <!-- Defensive: GT_TradeRequestQueue may not exist in some V2 flows; never crash / never go negative -->
-          <do_if value="global.$GT_TradeRequestQueue? and global.$GT_TradeRequestQueue.$ActiveInstances? and global.$GT_TradeRequestQueue.$ActiveInstances gt 0">
-            <set_value name="global.$GT_TradeRequestQueue.$ActiveInstances" operation="subtract"/>
-          </do_if>
-          <do_if value="global.$GT_TradeRequestQueue?">
-            <signal_cue_instantly cue="md.GT_TradingAI.ProcessTradeRequestQueue"/>
-          </do_if>
+          <!-- No TradeRequestQueue to update (cleanup) -->
         </do_else>
 
         </do_if>
