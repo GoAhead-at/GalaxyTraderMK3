@@ -2410,7 +2410,7 @@
             
             <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
               $Message = $logbookMessage,
-              $Category = 'upkeep',
+              $Category = 'tips',
               $Title = 'Cargo Safety: ' + this.ship.knownname,
               $Object = this.ship,
               $Interaction = 'showonmap',
@@ -2531,6 +2531,11 @@
               </do_if>
               <!-- Reset retry counter on successful trade -->
               <set_value name="this.$searchFailed" exact="0"/>
+              
+              <!-- Clear per-ship no-trade attempt history on success (prevents stale attempts from polluting later reports) -->
+              <do_if value="global.$GT_NoTradeHistory? and global.$GT_NoTradeHistory.{this.ship}?">
+                <remove_value name="global.$GT_NoTradeHistory.{this.ship}"/>
+              </do_if>
               
               <!-- CARGO DISPOSAL: Reset cargo disposal failure counter on successful trade -->
               <do_if value="this.$cargoDisposalFailed?">
@@ -4749,6 +4754,28 @@
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh - waiting ' + ($waitTime/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
         </do_if>
+        
+        <!-- Record attempt summary (bounded history) -->
+        <do_if value="not global.$GT_NoTradeHistory?">
+          <set_value name="global.$GT_NoTradeHistory" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_NoTradeHistory.{this.ship}? or global.$GT_NoTradeHistory.{this.ship} == null or typeof global.$GT_NoTradeHistory.{this.ship} != datatype.list">
+          <set_value name="global.$GT_NoTradeHistory.{this.ship}" exact="[]"/>
+        </do_if>
+        <append_to_list name="global.$GT_NoTradeHistory.{this.ship}" exact="table[
+          $Time = player.age,
+          $Reason = $noTradeReason,
+          $Wait = $waitTime,
+          $Sector = @this.ship.sector.knownname,
+          $Home = if @this.$effectiveHome != null then @this.$effectiveHome.knownname else (if @this.ship.defaultorder.$home != null then @this.ship.defaultorder.$home.knownname else ''),
+          $MaxDistance = if this.$effectiveMaxDistance? then this.$effectiveMaxDistance else null
+        ]"/>
+        <!-- Keep last 12 entries max -->
+        <do_if value="global.$GT_NoTradeHistory.{this.ship}.count gt 12">
+          <set_value name="$old" exact="global.$GT_NoTradeHistory.{this.ship}.{1}"/>
+          <remove_from_list name="global.$GT_NoTradeHistory.{this.ship}" exact="$old"/>
+        </do_if>
+        
         <set_command command="command.wait"/>
         <set_command_action commandaction="commandaction.standingby"/>
         <!-- CRITICAL: Use min=max to ensure fixed wait time (wait without min is RANDOM 0..max in X4) -->
@@ -4778,6 +4805,51 @@
       <set_value name="$failureCount" exact="if $isCargoDisposal then this.$cargoDisposalFailed else this.$searchFailed"/>
       <!-- Escalating cooldown (cap 60s). This is also required for "no trade found" logbook notifications (they trigger at 60s). -->
       <set_value name="$waitTime" exact="([$failureCount, 6].min) * 10s"/>
+      
+      <!-- Record attempt summary (bounded history).
+           We capture the most recent MD rejection statistics (if available) so the 60s logbook report can show a timeline. -->
+      <do_if value="not global.$GT_NoTradeHistory?">
+        <set_value name="global.$GT_NoTradeHistory" exact="table[]"/>
+      </do_if>
+      <do_if value="not global.$GT_NoTradeHistory.{this.ship}? or global.$GT_NoTradeHistory.{this.ship} == null or typeof global.$GT_NoTradeHistory.{this.ship} != datatype.list">
+        <set_value name="global.$GT_NoTradeHistory.{this.ship}" exact="[]"/>
+      </do_if>
+      <set_value name="$lastRejectionStats" exact="null"/>
+      <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.$LastRejectionStats? and global.$GT_SearchResult.$LastRejectionStats.{this.ship}?">
+        <set_value name="$lastRejectionStats" exact="@global.$GT_SearchResult.$LastRejectionStats.{this.ship}"/>
+      </do_if>
+      <set_value name="$rsTotal" exact="if $lastRejectionStats != null and @$lastRejectionStats.$Total != null then @$lastRejectionStats.$Total else null"/>
+      <set_value name="$rsDock" exact="if $lastRejectionStats != null and @$lastRejectionStats.$Docking != null then @$lastRejectionStats.$Docking else null"/>
+      <set_value name="$rsProfit" exact="if $lastRejectionStats != null and @$lastRejectionStats.$Profit != null then @$lastRejectionStats.$Profit else null"/>
+      <set_value name="$rsAmount" exact="if $lastRejectionStats != null and @$lastRejectionStats.$Amount != null then @$lastRejectionStats.$Amount else null"/>
+      <set_value name="$rsBlacklist" exact="if $lastRejectionStats != null and @$lastRejectionStats.$Blacklist != null then @$lastRejectionStats.$Blacklist else null"/>
+      <set_value name="$rsSector" exact="if $lastRejectionStats != null and @$lastRejectionStats.$SectorName != null then @$lastRejectionStats.$SectorName else @this.ship.sector.knownname"/>
+      <set_value name="$rsMaxDist" exact="if $lastRejectionStats != null and @$lastRejectionStats.$MaxDistance != null then @$lastRejectionStats.$MaxDistance else null"/>
+      <set_value name="$rsMinProfit" exact="if $lastRejectionStats != null and @$lastRejectionStats.$MinAbsoluteProfit != null then @$lastRejectionStats.$MinAbsoluteProfit else null"/>
+      <set_value name="$rsDistance" exact="0"/>
+      <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.{this.ship}? and global.$GT_SearchResult.{this.ship}.$TradesRejectedDistance?">
+        <set_value name="$rsDistance" exact="global.$GT_SearchResult.{this.ship}.$TradesRejectedDistance"/>
+      </do_if>
+      <append_to_list name="global.$GT_NoTradeHistory.{this.ship}" exact="table[
+        $Time = player.age,
+        $Reason = $noTradeReason,
+        $Wait = $waitTime,
+        $Sector = $rsSector,
+        $Home = if @this.$effectiveHome != null then @this.$effectiveHome.knownname else (if @this.ship.defaultorder.$home != null then @this.ship.defaultorder.$home.knownname else ''),
+        $MaxDistance = $rsMaxDist,
+        $MinAbsoluteProfit = $rsMinProfit,
+        $Total = $rsTotal,
+        $Docking = $rsDock,
+        $Profit = $rsProfit,
+        $Amount = $rsAmount,
+        $Blacklist = $rsBlacklist,
+        $Distance = $rsDistance
+      ]"/>
+      <!-- Keep last 12 entries max -->
+      <do_if value="global.$GT_NoTradeHistory.{this.ship}.count gt 12">
+        <set_value name="$old" exact="global.$GT_NoTradeHistory.{this.ship}.{1}"/>
+        <remove_from_list name="global.$GT_NoTradeHistory.{this.ship}" exact="$old"/>
+      </do_if>
       
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No ' + (if $isCargoDisposal then 'cargo buyer' else 'profitable trades') + ' found (attempt ' + $failureCount + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>
@@ -4892,18 +4964,19 @@
       <do_if value="$shouldWriteLogbook">
         <!-- Check if logbook enabled -->
         <set_value name="$logEnabled" exact="false"/>
-        <do_if value="@this.ship.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.defaultorder.$logbookentries">
+        <!-- Use the already-computed effective logbook flag (matches other GT logbook messages). -->
+        <do_if value="$gt_logbookentries">
           <set_value name="$logEnabled" exact="true"/>
         </do_if>
-        <!-- Subordinates inherit logbook setting from commander -->
-        <do_elseif value="@this.ship.defaultorder.id == 'Assist' and @this.ship.commander.defaultorder.id == 'GalaxyTraderMK3' and @this.ship.commander.defaultorder.$logbookentries">
-          <set_value name="$logEnabled" exact="true"/>
-        </do_elseif>
         
         <do_if value="$logEnabled">
           <!-- Tables guaranteed valid by GT_InitializeGlobalTables -->
           <!-- Get last search rejection stats from global (set by MD script) - per-ship storage -->
-          <set_value name="$lastRejectionStats" exact="@global.$GT_SearchResult.$LastRejectionStats.{this.ship}"/>
+          <!-- IMPORTANT: safe lookup returns null when missing; treat null as "no stats". -->
+          <set_value name="$lastRejectionStats" exact="null"/>
+          <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.$LastRejectionStats? and global.$GT_SearchResult.$LastRejectionStats != null and global.$GT_SearchResult.$LastRejectionStats.{this.ship}?">
+            <set_value name="$lastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats.{this.ship}"/>
+          </do_if>
           <set_value name="$totalRejected" exact="0"/>
           <set_value name="$tradesRejectedDocking" exact="0"/>
           <set_value name="$tradesRejectedProfit" exact="0"/>
@@ -4913,26 +4986,26 @@
           <set_value name="$maxDistance" exact="10"/>
           <set_value name="$minAbsoluteProfit" exact="100"/>
           
-          <do_if value="$lastRejectionStats?">
+          <do_if value="$lastRejectionStats != null">
             <!-- Log what we retrieved -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': RETRIEVED LastRejectionStats:' +
-                '\n  Total exists: ' + (if $lastRejectionStats.$Total? then 'yes' else 'no') +
-                '\n  Total value: ' + (if $lastRejectionStats.$Total? then $lastRejectionStats.$Total else 'null') +
-                '\n  Docking exists: ' + (if $lastRejectionStats.$Docking? then 'yes' else 'no') +
-                '\n  Docking value: ' + (if $lastRejectionStats.$Docking? then $lastRejectionStats.$Docking else 'null') +
-                '\n  Profit exists: ' + (if $lastRejectionStats.$Profit? then 'yes' else 'no') +
-                '\n  Profit value: ' + (if $lastRejectionStats.$Profit? then $lastRejectionStats.$Profit else 'null') +
-                '\n  Amount exists: ' + (if $lastRejectionStats.$Amount? then 'yes' else 'no') +
-                '\n  Amount value: ' + (if $lastRejectionStats.$Amount? then $lastRejectionStats.$Amount else 'null') +
-                '\n  Blacklist exists: ' + (if $lastRejectionStats.$Blacklist? then 'yes' else 'no') +
-                '\n  Blacklist value: ' + (if $lastRejectionStats.$Blacklist? then $lastRejectionStats.$Blacklist else 'null') +
-                '\n  SectorName exists: ' + (if $lastRejectionStats.$SectorName? then 'yes' else 'no') +
-                '\n  SectorName value: ' + (if $lastRejectionStats.$SectorName? then $lastRejectionStats.$SectorName else 'null') +
-                '\n  MaxDistance exists: ' + (if $lastRejectionStats.$MaxDistance? then 'yes' else 'no') +
-                '\n  MaxDistance value: ' + (if $lastRejectionStats.$MaxDistance? then $lastRejectionStats.$MaxDistance else 'null') +
-                '\n  MinAbsoluteProfit exists: ' + (if $lastRejectionStats.$MinAbsoluteProfit? then 'yes' else 'no') +
-                '\n  MinAbsoluteProfit value: ' + (if $lastRejectionStats.$MinAbsoluteProfit? then $lastRejectionStats.$MinAbsoluteProfit else 'null')" 
+                '\n  Total exists: ' + (if $lastRejectionStats.$Total? and $lastRejectionStats.$Total != null then 'yes' else 'no') +
+                '\n  Total value: ' + (if $lastRejectionStats.$Total? and $lastRejectionStats.$Total != null then $lastRejectionStats.$Total else 'null') +
+                '\n  Docking exists: ' + (if $lastRejectionStats.$Docking? and $lastRejectionStats.$Docking != null then 'yes' else 'no') +
+                '\n  Docking value: ' + (if $lastRejectionStats.$Docking? and $lastRejectionStats.$Docking != null then $lastRejectionStats.$Docking else 'null') +
+                '\n  Profit exists: ' + (if $lastRejectionStats.$Profit? and $lastRejectionStats.$Profit != null then 'yes' else 'no') +
+                '\n  Profit value: ' + (if $lastRejectionStats.$Profit? and $lastRejectionStats.$Profit != null then $lastRejectionStats.$Profit else 'null') +
+                '\n  Amount exists: ' + (if $lastRejectionStats.$Amount? and $lastRejectionStats.$Amount != null then 'yes' else 'no') +
+                '\n  Amount value: ' + (if $lastRejectionStats.$Amount? and $lastRejectionStats.$Amount != null then $lastRejectionStats.$Amount else 'null') +
+                '\n  Blacklist exists: ' + (if $lastRejectionStats.$Blacklist? and $lastRejectionStats.$Blacklist != null then 'yes' else 'no') +
+                '\n  Blacklist value: ' + (if $lastRejectionStats.$Blacklist? and $lastRejectionStats.$Blacklist != null then $lastRejectionStats.$Blacklist else 'null') +
+                '\n  SectorName exists: ' + (if $lastRejectionStats.$SectorName? and $lastRejectionStats.$SectorName != null and $lastRejectionStats.$SectorName != '' then 'yes' else 'no') +
+                '\n  SectorName value: ' + (if $lastRejectionStats.$SectorName? and $lastRejectionStats.$SectorName != null then $lastRejectionStats.$SectorName else 'null') +
+                '\n  MaxDistance exists: ' + (if $lastRejectionStats.$MaxDistance? and $lastRejectionStats.$MaxDistance != null then 'yes' else 'no') +
+                '\n  MaxDistance value: ' + (if $lastRejectionStats.$MaxDistance? and $lastRejectionStats.$MaxDistance != null then $lastRejectionStats.$MaxDistance else 'null') +
+                '\n  MinAbsoluteProfit exists: ' + (if $lastRejectionStats.$MinAbsoluteProfit? and $lastRejectionStats.$MinAbsoluteProfit != null then 'yes' else 'no') +
+                '\n  MinAbsoluteProfit value: ' + (if $lastRejectionStats.$MinAbsoluteProfit? and $lastRejectionStats.$MinAbsoluteProfit != null then $lastRejectionStats.$MinAbsoluteProfit else 'null')" 
                 chance="100"/>
             </do_if>
             
@@ -5012,26 +5085,84 @@
               '\n  RejectedProfit: ' + $tradesRejectedProfit +
               '\n  RejectedAmount: ' + $tradesRejectedAmount +
               '\n  RejectedBlacklist: ' + $tradesRejectedBlacklist +
-              '\n  LastRejectionStats exists: ' + (if $lastRejectionStats? then 'yes' else 'no')" 
+              '\n  LastRejectionStats exists: ' + (if $lastRejectionStats != null then 'yes' else 'no')" 
               chance="100"/>
           </do_if>
           
-          <set_value name="$message" exact="{77000,3208}.[$sectorName,$maxDistance,($minAbsoluteProfit/100),$totalRejected,$tradesRejectedDocking,$tradesRejectedProfit,$tradesRejectedAmount,$tradesRejectedBlacklist]"/>
-          
-          <!-- Log the generated message -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GENERATED LOGBOOK MESSAGE:' +
-              '\n' + $message" 
-              chance="100"/>
+          <!-- Ensure variables used by the detailed logbook report always exist (AI scripts error on missing locals). -->
+          <set_value name="$totalEvaluated" exact="0"/>
+          <do_if value="$lastRejectionStats? and $lastRejectionStats != null and @$lastRejectionStats.$Total != null">
+            <set_value name="$totalEvaluated" exact="@$lastRejectionStats.$Total"/>
+          </do_if>
+          <set_value name="$tradesRejectedDistance" exact="0"/>
+          <do_if value="global.$GT_SearchResult? and global.$GT_SearchResult.{this.ship}? and global.$GT_SearchResult.{this.ship}.$TradesRejectedDistance?">
+            <set_value name="$tradesRejectedDistance" exact="global.$GT_SearchResult.{this.ship}.$TradesRejectedDistance"/>
           </do_if>
           
-          <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-          <set_value name="$logbookMessage" exact="{77000,3208}.[$sectorName,$maxDistance,($minAbsoluteProfit/100),$totalRejected,$tradesRejectedDocking,$tradesRejectedProfit,$tradesRejectedAmount,$tradesRejectedBlacklist]"/>
+          <!-- Build a size-safe detailed report (plain string; bounded history).
+               NOTE: X4 logbook has a hard size limit; keep this compact and cap the number of history lines. -->
+          <set_value name="$logbookMessage" exact="'Commander,\n\nNo profitable trades were found after ' + $failureCount + ' attempts (cooldown reached 60s).\n' +
+            'Ship: ' + this.ship.knownname + '\n' +
+            'Sector: ' + $sectorName + '\n' +
+            'Range: ' + $maxDistance + ' jump(s)\n' +
+            'Min profit: ' + ($minAbsoluteProfit/100) + ' Cr\n\n' +
+            'Latest rejection stats (evaluated=' + $totalEvaluated + '):\n' +
+            '  Profit: ' + $tradesRejectedProfit + '  Docking: ' + $tradesRejectedDocking + '  Amount: ' + $tradesRejectedAmount + '\n' +
+            '  Distance: ' + $tradesRejectedDistance + '  Blacklist/Path: ' + $tradesRejectedBlacklist + '\n\n' +
+            'Recent attempts:'"/>
+
+          <!-- Append up to last 4 history rows (most recent first) -->
+          <set_value name="$hist" exact="null"/>
+          <do_if value="global.$GT_NoTradeHistory? and global.$GT_NoTradeHistory.{this.ship}?">
+            <set_value name="$hist" exact="global.$GT_NoTradeHistory.{this.ship}"/>
+          </do_if>
+          <set_value name="$histCount" exact="if $hist != null then $hist.count else 0"/>
+          <set_value name="$linesToShow" exact="[$histCount, 4].min"/>
+          <do_all exact="$linesToShow" counter="$li">
+            <!-- Reverse index: last entry is most recent -->
+            <set_value name="$idx" exact="$histCount - ($li - 1)"/>
+            <set_value name="$h" exact="$hist.{$idx}"/>
+            <set_value name="$tSec" exact="if $h.$Time? and $h.$Time != null then (($h.$Time / 1s)i) else 0"/>
+            <set_value name="$r" exact="if $h.$Reason? and $h.$Reason != null and $h.$Reason != '' then $h.$Reason else 'none'"/>
+            <set_value name="$tot" exact="if $h.$Total? and $h.$Total != null then $h.$Total else 0"/>
+            <set_value name="$p" exact="if $h.$Profit? and $h.$Profit != null then $h.$Profit else 0"/>
+            <set_value name="$d" exact="if $h.$Docking? and $h.$Docking != null then $h.$Docking else 0"/>
+            <set_value name="$a" exact="if $h.$Amount? and $h.$Amount != null then $h.$Amount else 0"/>
+            <set_value name="$bl" exact="if $h.$Blacklist? and $h.$Blacklist != null then $h.$Blacklist else 0"/>
+            <set_value name="$dist" exact="if $h.$Distance? and $h.$Distance != null then $h.$Distance else 0"/>
+            <set_value name="$w" exact="if $h.$Wait? and $h.$Wait != null then (($h.$Wait / 1s)i) else 0"/>
+            <set_value name="$logbookMessage" exact="$logbookMessage + '\n- t=' + $tSec + 's r=' + $r + ' wait=' + $w + 's eval=' + $tot + ' P=' + $p + ' Dk=' + $d + ' Amt=' + $a + ' Dist=' + $dist + ' BL=' + $bl"/>
+          </do_all>
+
+          <!-- Quick hints (bounded) -->
+          <set_value name="$hint" exact="''"/>
+          <do_if value="$totalEvaluated == 0">
+            <set_value name="$hint" exact="'No offers were evaluated. Consider increasing range or checking if markets are visible/unblocked.'"/>
+          </do_if>
+          <do_elseif value="$tradesRejectedProfit gt ($tradesRejectedDocking + $tradesRejectedBlacklist + $tradesRejectedDistance)">
+            <set_value name="$hint" exact="'Most candidates failed profit checks. Lower min profit/ROI or increase range.'"/>
+          </do_elseif>
+          <do_elseif value="$tradesRejectedDocking gt 0 and $tradesRejectedDocking ge $tradesRejectedProfit">
+            <set_value name="$hint" exact="'Many candidates failed docking checks. Check docking restrictions at stations.'"/>
+          </do_elseif>
+          <do_elseif value="$tradesRejectedBlacklist gt 0">
+            <set_value name="$hint" exact="'Blacklist/path restrictions filtered many routes. Review blacklists/threat settings.'"/>
+          </do_elseif>
+          <do_elseif value="$tradesRejectedDistance gt 0">
+            <set_value name="$hint" exact="'Many candidates were out of range. Increase max distance (buy/sell) if appropriate.'"/>
+          </do_elseif>
+          <do_if value="$hint != ''">
+            <set_value name="$logbookMessage" exact="$logbookMessage + '\n\nHint: ' + $hint"/>
+          </do_if>
+          
+          <!-- Also dump the final logbook message to DebugLog for diagnosis/copy-paste.
+               This is rate-limited by the existing 60s escalation + 5min per-ship logbook cooldown. -->
+          <debug_text text="'[GT-LogbookDump] (' + this.ship.idcode + ') No Trades Available message:\n' + $logbookMessage" chance="100"/>
           
           <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
             $Message = $logbookMessage,
-            $Category = 'upkeep',
-            $Title = 'No Trades Available: ' + this.ship.knownname,
+            $Category = 'tips',
+            $Title = 'GalaxyTrader MK3: ' + this.ship.knownname + ' (' + this.ship.idcode + ')',
             $Object = this.ship,
             $Interaction = 'showonmap',
             $CheckGlobalSettings = false
