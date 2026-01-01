@@ -3433,6 +3433,107 @@
         <set_value name="$msg" exact="$msg + 'Queue: ' + $tsQueue + ' | WorkQueue: ' + $workQueue + ' | ActiveWork: ' + $activeWork + '\n'"/>
         <set_value name="$msg" exact="$msg + 'RequestStatus entries: ' + $statusCount + '\n'"/>
 
+        <!-- Cache coverage summary (matchable wares coverage).
+             Goal: quickly validate that the cache is being filled broadly (many wares) and deeply (enough entries/ware),
+             without flooding the log like the full cache dump. -->
+        <set_value name="$cacheTotal" exact="0"/>
+        <run_actions ref="md.GT_Libraries_General.GT_CalculateTotalCacheCount" result="$cacheTotal"/>
+        <set_value name="$cacheHomes" exact="0"/>
+        <set_value name="$homeKeys" exact="[]"/>
+        <do_if value="global.$GT_TradeCacheHomes?">
+          <set_value name="$homeKeys" exact="@global.$GT_TradeCacheHomes"/>
+        </do_if>
+        <do_else>
+          <do_if value="global.$GT_TradeCache?">
+            <set_value name="$cacheObj" exact="@global.$GT_TradeCache"/>
+            <set_value name="$homeKeys" exact="@$cacheObj.keys"/>
+            <do_if value="$homeKeys == null">
+              <set_value name="$homeKeys" exact="[]"/>
+            </do_if>
+          </do_if>
+        </do_else>
+        <set_value name="$cacheHomes" exact="$homeKeys.count"/>
+
+        <set_value name="$targetPerWare" exact="20"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+          <set_value name="$targetPerWare" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+        </do_if>
+        <do_if value="$targetPerWare lt 1">
+          <set_value name="$targetPerWare" exact="1"/>
+        </do_if>
+
+        <set_value name="$msg" exact="$msg + 'Cache: total=' + $cacheTotal + ' homes=' + $cacheHomes + ' targetPerWare=' + $targetPerWare + '\n'"/>
+
+        <do_if value="$cacheHomes gt 0 and global.$GT_TradeCache?">
+          <set_value name="$maxHomesToShow" exact="5"/>
+          <set_value name="$homesShown" exact="0"/>
+          <do_all exact="$homeKeys.count" counter="$hk">
+            <do_if value="$homesShown ge $maxHomesToShow">
+              <break/>
+            </do_if>
+            <set_value name="$home" exact="$homeKeys.{$hk}"/>
+            <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
+            <do_if value="$sectorCache == null or not $sectorCache.count?">
+              <continue/>
+            </do_if>
+            <set_value name="$homesShown" operation="add"/>
+
+            <set_value name="$homeName" exact="@$home.knownname"/>
+            <do_if value="not $homeName?">
+              <set_value name="$homeName" exact="'[unknown home]'"/>
+            </do_if>
+
+            <!-- Build per-ware counts (by ware name) -->
+            <set_value name="$wareSummary" exact="[]"/>
+            <set_value name="$scanLimit" exact="2000"/>
+            <set_value name="$scanCount" exact="[$sectorCache.count, $scanLimit].min"/>
+            <do_all exact="$scanCount" counter="$ci">
+              <set_value name="$e" exact="$sectorCache.{$ci}"/>
+              <do_if value="$e == null">
+                <continue/>
+              </do_if>
+              <set_value name="$wareObj" exact="@$e.$BuyOffer.ware"/>
+              <set_value name="$wareName" exact="if $e.$WareName? then $e.$WareName else @$wareObj.name"/>
+              <do_if value="not $wareName?">
+                <set_value name="$wareName" exact="'[unknown ware]'"/>
+              </do_if>
+              <set_value name="$found" exact="false"/>
+              <do_all exact="$wareSummary.count" counter="$wi">
+                <do_if value="$wareSummary.{$wi}.$WareName == $wareName">
+                  <set_value name="$wareSummary.{$wi}.$Count" exact="$wareSummary.{$wi}.$Count + 1"/>
+                  <set_value name="$found" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $found">
+                <append_to_list name="$wareSummary" exact="table[$WareName = $wareName, $Count = 1]"/>
+              </do_if>
+            </do_all>
+
+            <set_value name="$distinctWares" exact="$wareSummary.count"/>
+            <set_value name="$underfilled" exact="0"/>
+            <set_value name="$underList" exact="''"/>
+            <set_value name="$underShown" exact="0"/>
+            <do_all exact="$wareSummary.count" counter="$wi">
+              <set_value name="$row" exact="$wareSummary.{$wi}"/>
+              <set_value name="$c" exact="if $row.$Count? then $row.$Count else 0"/>
+              <do_if value="$c lt $targetPerWare">
+                <set_value name="$underfilled" exact="$underfilled + 1"/>
+                <do_if value="$underShown lt 8">
+                  <set_value name="$underList" exact="$underList + (if $row.$WareName? then $row.$WareName else 'unknown') + '(' + $c + ') '"/>
+                  <set_value name="$underShown" operation="add"/>
+                </do_if>
+              </do_if>
+            </do_all>
+
+            <set_value name="$msg" exact="$msg + '  HOME ' + $homeName + ': entries=' + $sectorCache.count + ' distinctWares=' + $distinctWares + ' underfilled=' + $underfilled"/>
+            <do_if value="$underfilled gt 0">
+              <set_value name="$msg" exact="$msg + ' sample=' + $underList"/>
+            </do_if>
+            <set_value name="$msg" exact="$msg + '\n'"/>
+          </do_all>
+        </do_if>
+
         <!-- Stage histogram (on-demand only).
              IMPORTANT: MD does not support dynamic table keys in set_value name="$table.{$key}".
              Use a list of rows ([$Stage,$Count]) instead. -->
@@ -3491,10 +3592,8 @@
 
         <show_notification text="$msg" timeout="10s" priority="5"/>
 
-        <!-- Also print to debug log when enabled -->
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="$msg" chance="100"/>
-        </do_if>
+        <!-- Always print to debug log for on-demand diagnostics (button-triggered, not periodic). -->
+        <debug_text text="$msg" chance="100"/>
       </actions>
     </cue>
     
