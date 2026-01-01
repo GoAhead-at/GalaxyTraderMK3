@@ -214,7 +214,10 @@
             <set_value name="$stateStarted" exact="global.$GT_SearchLiveTrades_State.{$params.$Ship}.$Started"/>
           </do_if>
           <set_value name="$stateAge" exact="-1"/>
-          <do_if value="$stateStarted?">
+          <!-- CRITICAL: In MD, `var?` checks "is defined", not "non-null".
+               If $stateStarted is null, `player.age - null` behaves like `player.age - 0`, producing a huge bogus age.
+               Only compute age when we have a real timestamp. -->
+          <do_if value="$stateStarted != null">
             <set_value name="$stateAge" exact="player.age - $stateStarted"/>
           </do_if>
           
@@ -506,22 +509,99 @@
              and incorrectly signal GT_No_Trade_Found while the async live-search/batch pipeline is still running
              (this is exactly what happens for EDS-278 in the log at 1669.86). -->
         <do_if value="$searchState == 'fresh' and global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
-          <!-- Check if state is stale (> 60 seconds old) - if so, clear it and release lock -->
+          <!-- Live search already in progress for this ship.
+               Use a DYNAMIC stale threshold based on configured slice pacing + current slice-queue contention
+               (otherwise 60s/30s constants will incorrectly clear legitimate long-running searches). -->
+          <set_value name="$lsState" exact="@global.$GT_SearchLiveTrades_State.{$ship}"/>
           <set_value name="$stateStarted" exact="null"/>
-          <do_if value="global.$GT_SearchLiveTrades_State.{$ship}.$Started?">
-            <set_value name="$stateStarted" exact="global.$GT_SearchLiveTrades_State.{$ship}.$Started"/>
-          </do_if>
-          <set_value name="$stateAge" exact="-1"/>
-          <do_if value="$stateStarted?">
-            <set_value name="$stateAge" exact="player.age - $stateStarted"/>
+          <do_if value="$lsState != null and $lsState.$Started? and $lsState.$Started != null">
+            <set_value name="$stateStarted" exact="$lsState.$Started"/>
           </do_if>
           
-          <!-- CRITICAL FIX: Reduce stale threshold from 60s to 30s to prevent ships from waiting too long -->
-          <!-- Batch processing can take time, but if it's been >30s without completion, something is likely stuck -->
-          <do_if value="$stateAge gt 30 or $stateAge lt 0">
-            <!-- State is stale or missing Started timestamp - clear it and release lock -->
+          <!-- CRITICAL: A state without .$Started is a stale/partial/legacy state. Clear it and continue with this request,
+               otherwise the ship can get stuck forever "waiting for live search" that isn't actually running. -->
+          <do_if value="$stateStarted == null">
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search state is stale (age: ' + $stateAge + 's) - clearing state and releasing lock'" chance="100"/>
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Clearing stale live-search state (missing .$Started) - proceeding with new search'" chance="100"/>
+            </do_if>
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$ship}"/>
+          </do_if>
+          <do_else>
+          <set_value name="$stateAgeSeconds" exact="-1"/>
+          <do_if value="$stateStarted != null">
+            <set_value name="$stateAgeSeconds" exact="(player.age - $stateStarted) / 1s"/>
+          </do_if>
+
+          <!-- Load pacing settings -->
+          <set_value name="$sliceIntervalMs" exact="500"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$LiveOfferSliceInterval?">
+            <set_value name="$tmpMs" exact="@global.$GT_GlobalSettings.$Performance.$LiveOfferSliceInterval"/>
+            <do_if value="$tmpMs? and $tmpMs != null and $tmpMs gt 0">
+              <set_value name="$sliceIntervalMs" exact="$tmpMs"/>
+            </do_if>
+          </do_if>
+          <do_if value="$sliceIntervalMs lt 5"><set_value name="$sliceIntervalMs" exact="5"/></do_if>
+          <do_if value="$sliceIntervalMs gt 2000"><set_value name="$sliceIntervalMs" exact="2000"/></do_if>
+
+          <set_value name="$appendChunkSize" exact="200"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$LiveOfferAppendChunkSize?">
+            <set_value name="$tmpChunk" exact="@global.$GT_GlobalSettings.$Performance.$LiveOfferAppendChunkSize"/>
+            <do_if value="$tmpChunk? and $tmpChunk != null and $tmpChunk gt 0">
+              <set_value name="$appendChunkSize" exact="$tmpChunk"/>
+            </do_if>
+          </do_if>
+          <do_if value="$appendChunkSize lt 50"><set_value name="$appendChunkSize" exact="50"/></do_if>
+          <do_if value="$appendChunkSize gt 2000"><set_value name="$appendChunkSize" exact="2000"/></do_if>
+
+          <set_value name="$sliceQueueShips" exact="1"/>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Ships?">
+            <set_value name="$tmpQ" exact="@global.$GT_LiveOfferSliceQueue.$Ships.count"/>
+            <do_if value="$tmpQ? and $tmpQ != null and $tmpQ gt 0">
+              <set_value name="$sliceQueueShips" exact="$tmpQ"/>
+            </do_if>
+          </do_if>
+
+          <set_value name="$buyCount" exact="0"/>
+          <set_value name="$sellCount" exact="0"/>
+          <do_if value="$lsState != null and $lsState.$BuySpaces? and $lsState.$BuySpaces != null">
+            <set_value name="$buyCount" exact="$lsState.$BuySpaces.count"/>
+          </do_if>
+          <do_if value="$lsState != null and $lsState.$SellSpaces? and $lsState.$SellSpaces != null">
+            <set_value name="$sellCount" exact="$lsState.$SellSpaces.count"/>
+          </do_if>
+          <set_value name="$buyIndex" exact="0"/>
+          <do_if value="$lsState != null and $lsState.$BuyIndex? and $lsState.$BuyIndex != null">
+            <set_value name="$buyIndex" exact="$lsState.$BuyIndex"/>
+          </do_if>
+          <set_value name="$sellIndex" exact="0"/>
+          <do_if value="$lsState != null and $lsState.$SellIndex? and $lsState.$SellIndex != null">
+            <set_value name="$sellIndex" exact="$lsState.$SellIndex"/>
+          </do_if>
+          <set_value name="$remainingSectors" exact="[$buyCount - $buyIndex, 0].max + [$sellCount - $sellIndex, 0].max"/>
+
+          <set_value name="$pendingChunksRemaining" exact="0"/>
+          <do_if value="$lsState != null and $lsState.$PendingOffers? and $lsState.$PendingOffers != null">
+            <set_value name="$pendingOffersCount" exact="$lsState.$PendingOffers.count"/>
+            <set_value name="$pendingIndex" exact="0"/>
+            <do_if value="$lsState.$PendingIndex? and $lsState.$PendingIndex != null">
+              <set_value name="$pendingIndex" exact="$lsState.$PendingIndex"/>
+            </do_if>
+            <set_value name="$pendingRemaining" exact="[$pendingOffersCount - $pendingIndex, 0].max"/>
+            <do_if value="$pendingRemaining gt 0">
+              <set_value name="$pendingChunksRemaining" exact="(($pendingRemaining + $appendChunkSize - 1) / $appendChunkSize)i"/>
+            </do_if>
+          </do_if>
+
+          <set_value name="$staleThresholdSeconds" exact="300"/>
+          <do_if value="$remainingSectors gt 0">
+            <set_value name="$sliceSeconds" exact="($remainingSectors * $sliceIntervalMs * $sliceQueueShips) / 1000.0"/>
+            <set_value name="$appendSeconds" exact="$pendingChunksRemaining * 0.05"/>
+            <set_value name="$staleThresholdSeconds" exact="[$sliceSeconds + $appendSeconds + 60, 300].max"/>
+          </do_if>
+
+          <do_if value="$stateAgeSeconds ge 0 and $stateAgeSeconds gt $staleThresholdSeconds">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search state is stale (age=' + $stateAgeSeconds + 's, threshold=' + $staleThresholdSeconds + 's, remainingSectors=' + $remainingSectors + ') - clearing state and releasing lock'" chance="100"/>
             </do_if>
             <remove_value name="global.$GT_SearchLiveTrades_State.{$ship}"/>
             <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
@@ -533,9 +613,10 @@
           <do_else>
             <!-- State is fresh - wait for continuation -->
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search already in progress - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Live search already in progress (age=' + (if $stateAgeSeconds ge 0 then $stateAgeSeconds + 's' else 'unknown') + ', threshold=' + $staleThresholdSeconds + 's) - exiting (SearchLiveTrades_Resume will signal when complete)'" chance="100"/>
             </do_if>
             <cancel_cue cue="this"/>
+          </do_else>
           </do_else>
         </do_if>
         
@@ -1626,11 +1707,12 @@
                   <set_value name="$stateStarted" exact="global.$GT_SearchLiveTrades_State.{$ship}.$Started"/>
                 </do_if>
                 <set_value name="$stateAge" exact="-1"/>
-                <do_if value="$stateStarted?">
+                <do_if value="$stateStarted != null">
                   <set_value name="$stateAge" exact="player.age - $stateStarted"/>
                 </do_if>
                 
-                <do_if value="$stateAge gt 60 or $stateAge lt 0">
+                <!-- Use time literal for correctness (was numeric 60) -->
+                <do_if value="$stateAge gt 60s or $stateAge lt 0">
                   <!-- State is stale or missing Started timestamp - clear it and release lock -->
                   <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                     <debug_text text="'[GT-Search] (' + $ship.idcode + ')    Search state is stale (age: ' + $stateAge + 's) - clearing state and releasing lock'" chance="100"/>
@@ -5061,7 +5143,9 @@
           
           <!-- Prefer an explicit home-sector registry (populated during caching) -->
           <set_value name="$keys" exact="[]"/>
-          <do_if value="global.$GT_TradeCacheHomes?">
+          <!-- Prefer homes registry only if it exists AND is non-empty; otherwise fall back to GT_TradeCache.keys.
+               Some saves can end up with cache keys but an empty registry, which made snapshots show total=0 incorrectly. -->
+          <do_if value="global.$GT_TradeCacheHomes? and global.$GT_TradeCacheHomes != null and typeof global.$GT_TradeCacheHomes == datatype.list and global.$GT_TradeCacheHomes.count gt 0">
             <set_value name="$keys" exact="@global.$GT_TradeCacheHomes"/>
           </do_if>
           <do_else>
