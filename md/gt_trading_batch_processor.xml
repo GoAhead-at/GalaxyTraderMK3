@@ -12,7 +12,8 @@
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <delay exact="1ms"/>
+      <!-- Smoothness > speed: avoid waking lots of batch continuations in the same frame -->
+      <delay min="20ms" max="120ms"/>
       <actions>
         <set_value name="$ship" exact="event.param"/>
         <!-- Clear scheduled marker -->
@@ -20,6 +21,12 @@
           <set_value name="global.$GT_BatchContinuationScheduled" exact="table[]"/>
         </do_if>
         <remove_value name="global.$GT_BatchContinuationScheduled.{$ship}"/>
+        
+        <!-- DETAILED LOGGING: Track continuation scheduling -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$hasState" exact="if global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}? then 'YES' else 'NO'"/>
+          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') SCHEDULED CONTINUATION: hasState=' + $hasState + ' (20-120ms delay)'" chance="100"/>
+        </do_if>
         
         <!-- Only continue if batch state still exists -->
         <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
@@ -328,17 +335,28 @@
             </do_if>
             <append_to_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR STARTING (active: ' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued: ' + (if global.$GT_BatchProcessorQueue.$Ships? then global.$GT_BatchProcessorQueue.$Ships.count else 0) + ')'" chance="100"/>
+              <set_value name="$queuedCount" exact="if global.$GT_BatchProcessorQueue.$Ships? then global.$GT_BatchProcessorQueue.$Ships.count else 0"/>
+              <set_value name="$wareCount" exact="if $wareKeysList? then $wareKeysList.count else 0"/>
+              <set_value name="$batchSize" exact="@$state.$batchSize"/>
+              <!-- Calculate ceiling division: (a + b - 1) / b for positive integers -->
+              <set_value name="$expectedBatchesCalc" exact="if $batchSize gt 0 then (($wareCount + $batchSize - 1) / $batchSize)i else 1"/>
+              <set_value name="$expectedBatches" exact="[$expectedBatchesCalc, 1].max"/>
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH PROCESSOR STARTING: active=' + global.$GT_BatchProcessorQueue.$ActiveProcessors + '/' + global.$GT_BatchProcessorQueue.$MaxConcurrent + ', queued=' + $queuedCount + ', wares=' + $wareCount + ', batchSize=' + $batchSize + ', expectedBatches=' + $expectedBatches" chance="100"/>
             </do_if>
           </do_if>
           
           <!-- Calculate delay from global Performance settings -->
-          <!-- Reduced default delay for faster batch processing (was 50ms, now 10ms) -->
-          <set_value name="$batchDelay" exact="10"/>
+          <!-- CRITICAL: Require real data from global settings - no fallback to prevent silent failures. -->
+          <set_value name="$batchDelay" exact="null"/>
           <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
             <set_value name="$batchDelay" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
           </do_if>
-          <set_value name="$batchDelayJitter" min="0" max="5"/>
+          <do_if value="not $batchDelay? or $batchDelay == null">
+            <debug_text text="'[GT-ERROR] BatchProcessingDelay not found in global settings for ' + $ship.idcode + ' - batch processing cannot proceed. This should never happen if global settings are initialized correctly.'" chance="100"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <!-- Smoothness > speed: bigger jitter to de-sync fleet-wide batch wakes -->
+          <set_value name="$batchDelayJitter" min="0" max="80"/>
           <set_value name="this.$batchDelayTime" exact="($batchDelay + $batchDelayJitter) * 1ms"/>
         </do_if>
       </actions>
@@ -348,6 +366,16 @@
         <!-- CRITICAL FIX: Restore $ship and $state from this.* (they don't persist across delay) -->
         <set_value name="$ship" exact="this.$ship"/>
         <set_value name="$state" exact="this.$state"/>
+
+        <!-- PERF MARKER: one line per batch slice wakeup so timeline analyzer can attribute batch CPU cost -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$perfWareIndex" exact="if $state? and $state.$currentWareIndex? then @$state.$currentWareIndex else -1"/>
+          <set_value name="$perfSellChunk" exact="if $state? and $state.$sellOfferChunkStart? then @$state.$sellOfferChunkStart else -1"/>
+          <set_value name="$perfBuyChunk" exact="if $state? and $state.$buyOfferChunkStart? then @$state.$buyOfferChunkStart else -1"/>
+          <set_value name="$perfWareChunk" exact="if $state? and $state.$currentWareChunkStart? then @$state.$currentWareChunkStart else -1"/>
+          <set_value name="$perfPhase" exact="if $state? and $state.$warePhase? then @$state.$warePhase else 'intra'"/>
+          <debug_text text="'[GT-PERF] BatchSlice WAKE ship=' + $ship.idcode + ' wareIndex=' + $perfWareIndex + ' wareChunk=' + $perfWareChunk + ' phase=' + $perfPhase + ' sellChunk=' + $perfSellChunk + ' buyChunk=' + $perfBuyChunk" chance="100"/>
+        </do_if>
 
         <!-- Control flow: MD <cancel_cue/> does NOT stop the current actions block. -->
         <!-- Use an explicit flag to prevent "fallthrough" after scheduling chunk continuations. -->
@@ -361,6 +389,24 @@
         <set_value name="$wareKeysList" exact="@$state.$wareKeysList"/>
         <set_value name="$sellOffersList" exact="@$state.$sellOffersList"/>
         <set_value name="$buyOffersList" exact="@$state.$buyOffersList"/>
+        
+        <!-- Extract trace ID from state for logging -->
+        <set_value name="$traceId" exact="''"/>
+        <do_if value="$state.$TraceId?">
+          <set_value name="$traceId" exact="$state.$TraceId"/>
+        </do_if>
+        
+        <!-- Log batch processor entry -->
+        <do_if value="$traceId != '' and not $isContinuation">
+          <set_value name="$wareCount" exact="if $wareKeysList? then $wareKeysList.count else 0"/>
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'BatchProcessor'"/>
+            <param name="action" value="'Start'"/>
+            <param name="details" value="'wares=' + $wareCount + ' batchId=' + (if $batchId? then $batchId else 'null')"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
         
         <!-- DEBUG: Verify lists were received correctly -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
@@ -414,7 +460,16 @@
         <!-- No escape sectors or current sector blacklist - removed for universal processing -->
         <set_value name="$currentWareIndex" exact="@$state.$currentWareIndex"/>
         <!-- Extract home sector for cache indexing -->
-        <set_value name="$homeSector" exact="@$state.$homeSector"/>
+        <!-- CRITICAL: Validate that homeSector is actually a sector (not a component) -->
+        <set_value name="$homeSectorRaw" exact="@$state.$homeSector"/>
+        <set_value name="$homeSector" exact="null"/>
+        <do_if value="@$homeSectorRaw.exists and $homeSectorRaw.isclass.sector">
+          <set_value name="$homeSector" exact="$homeSectorRaw"/>
+        </do_if>
+        <do_elseif value="@$homeSectorRaw.exists and $homeSectorRaw.isclass.station">
+          <!-- If it's a station, extract the sector -->
+          <set_value name="$homeSector" exact="@$homeSectorRaw.sector"/>
+        </do_elseif>
         <!-- Use library function to validate table safely -->
         <set_value name="$existingTradesPerWare" exact="@$state.$tradesPerWare"/>
         <run_actions ref="md.GT_Libraries_General.GT_ValidateTableSafe" result="$tradesPerWare">
@@ -430,6 +485,10 @@
         <set_value name="$minROI" exact="@$state.$minROI"/>
         <set_value name="$minAbsoluteProfit" exact="@$state.$minAbsoluteProfit"/>
         <set_value name="$gt_AdvancedAnalytics" exact="@$state.$gt_AdvancedAnalytics"/>
+        <set_value name="$ignoreTradeRules" exact="false"/>
+        <do_if value="$state.$IgnoreTradeRules?">
+          <set_value name="$ignoreTradeRules" exact="$state.$IgnoreTradeRules"/>
+        </do_if>
         
         <!-- Log thresholds being used for this batch -->
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -449,7 +508,15 @@
         <!-- PERFORMANCE: Chunked processing - process offers in chunks to reduce CPU load -->
         <!-- Initialize chunk tracking variables if not present -->
         <!-- Larger chunks improve throughput while still maintaining smooth gameplay -->
-        <set_value name="$chunkSize" exact="8"/> <!-- Process 8×8 = 64 combinations per chunk (increased from 4×4 for better throughput) -->
+        <!-- CRITICAL: Require real data from global settings - no fallback to prevent silent failures. -->
+        <set_value name="$chunkSize" exact="null"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchChunkSize?">
+          <set_value name="$chunkSize" exact="global.$GT_GlobalSettings.$Performance.$BatchChunkSize"/>
+        </do_if>
+        <do_if value="not $chunkSize? or $chunkSize == null">
+          <debug_text text="'[GT-ERROR] BatchChunkSize not found in global settings for ' + $ship.idcode + ' - batch processing cannot proceed. This should never happen if global settings are initialized correctly.'" chance="100"/>
+          <cancel_cue cue="this"/>
+        </do_if>
         <set_value name="$sellOfferChunkStart" exact="0"/>
         <set_value name="$buyOfferChunkStart" exact="0"/>
         <set_value name="$currentWareChunkStart" exact="0"/>
@@ -519,9 +586,9 @@
              This caused incomplete trade searches and missed opportunities.
              
              Instead, we rely on:
-             1. Larger chunk size (8×8 = 64 combinations, up from 4×4 = 16)
-             2. Reduced delay between continuations (10ms, down from 50ms)
-             3. Increased yield threshold (5 slices before yielding, up from 1)
+             1. Larger chunk size (10×10 = 100 combinations, up from 8×8 = 64)
+             2. Reduced delay between continuations (configurable via BatchProcessingDelay, default 50ms)
+             3. Increased yield threshold (8 slices before yielding, up from 5)
              4. Proper yielding when other ships are waiting (fairness without premature termination)
              
              If stalls occur, investigate:
@@ -582,10 +649,12 @@
         <set_value name="$batchStart1Based" exact="$currentWareIndex + 1"/>
         <set_value name="$batchEnd1Based" exact="[$currentWareIndex + $batchSize + 1, $wareCount + 1].min"/>
         
-        <!-- Commented out to reduce log spam -->
-        <!-- <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
-          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Processing batch: list indices ' + $batchStart1Based + '-' + ($batchEnd1Based - 1) + ' of ' + $wareCount" chance="100"/>
-        </do_if> -->
+        <!-- DETAILED LOGGING: Track batch processing progress -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$batchElapsedTime" exact="player.age - $state.$batchStartTime"/>
+          <set_value name="$waresInThisBatch" exact="$batchEnd1Based - $batchStart1Based"/>
+          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH START: Processing wares ' + $batchStart1Based + '-' + ($batchEnd1Based - 1) + ' of ' + $wareCount + ' (batchSize=' + $batchSize + ', waresInBatch=' + $waresInThisBatch + ', elapsed=' + ($batchElapsedTime / 1s) + 's, tradesFound=' + $tradeList.count + ')'" chance="100"/>
+        </do_if>
         
         <!-- Process this batch of wares -->
         <!-- NOTE: Lists in X4 are 1-based! $batchOffset starts at 1 -->
@@ -604,6 +673,12 @@
             <!-- Get ware from list -->
             <set_value name="$ware" exact="$wareKeysList.{$wareIdx}"/>
             <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+            
+            <!-- DETAILED LOGGING: Track ware processing -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$batchElapsedTime" exact="player.age - $state.$batchStartTime"/>
+              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Processing ware #' + $wareIdx + '/' + $wareCount + ': ' + $wareName + ' (batchElapsed=' + ($batchElapsedTime / 1s) + 's, tradesFound=' + $tradeList.count + ')'" chance="100"/>
+            </do_if>
 
             <!-- DEBUG WATCHLIST: Help compare live-search wares vs cache contents -->
             <!-- NOTE: We use ware name strings because ware IDs/macros vary by DLC/mods. -->
@@ -622,6 +697,20 @@
               <set_value name="$sellOfferChunkStart" exact="0"/>
               <set_value name="$buyOfferChunkStart" exact="0"/>
               <set_value name="$currentWareChunkStart" exact="$wareIdx"/>
+              <!-- Track per-ware phase (used to prevent cross-sector continuations from re-running Phase 1 with mismatched chunk pointers) -->
+              <set_value name="$state.$warePhase" exact="'intra'"/>
+            </do_if>
+
+            <!-- Determine per-ware phase (default intra if missing) -->
+            <set_value name="$warePhase" exact="'intra'"/>
+            <do_if value="$state.$warePhase? and @$state.$warePhase != null and @$state.$warePhase != ''">
+              <set_value name="$warePhase" exact="@$state.$warePhase"/>
+            </do_if>
+
+            <!-- If we're resuming a cross-sector continuation for the SAME ware, skip Phase 1 (intra-sector) entirely. -->
+            <set_value name="$skipIntraPhase" exact="false"/>
+            <do_if value="$wareIdx == $currentWareChunkStart and $warePhase == 'cross'">
+              <set_value name="$skipIntraPhase" exact="true"/>
             </do_if>
             
             <!-- ═══════════════════════════════════════════════════════════════════════════ -->
@@ -679,8 +768,10 @@
               </do_if>
             </do_if>
             
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $wareIdx lt 2 and $sellOfferChunkStart == 0 and $buyOfferChunkStart == 0">
-              <debug_text text="'[GT-Batch-DEBUG] (' + $ship.idcode + ') Found: ' + $sellOffersForWare.count + ' sell, ' + $buyOffersForWare.count + ' buy offers for ' + $wareName" chance="10"/>
+            <!-- DETAILED LOGGING: Always log offer counts for each ware -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$wareLogMsg" exact="'[GT-Batch] (' + $ship.idcode + ') Ware #' + $wareIdx + ' (' + $wareName + '): ' + $sellOffersForWare.count + ' sell offers, ' + $buyOffersForWare.count + ' buy offers'"/>
+              <debug_text text="$wareLogMsg" chance="100"/>
             </do_if>
 
             <!-- WATCH: Log whether batch processor is actually seeing the same offers per ware that live search reported -->
@@ -843,13 +934,13 @@
               <!-- NOW run nested loops: PRIORITIZE intra-sector matches first -->
               <!-- Phase 1: Match intra-sector sell offers with intra-sector buy offers (TRUE intra-sector trades) -->
               <!-- Log Phase 1 availability -->
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="not $skipIntraPhase and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
                 <set_value name="$sectorName" exact="if $currentSector? then @$currentSector.knownname else 'NULL'"/>
                 <set_value name="$isolationLabel" exact="if $shipIsIsolated then ' [ISOLATED]' else ''"/>
                 <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Phase 1 (INTRA-SECTOR)' + $isolationLabel + ' for ' + $wareName + ' in ' + $sectorName + ': ' + $intraSectorSellOffers.count + ' sell, ' + $intraSectorBuyOffers.count + ' buy offers' + (if ($intraSectorSellOffers.count == 0 or $intraSectorBuyOffers.count == 0) then '  MISSING ONE TYPE!' else '')" chance="100"/>
               </do_if>
-              <do_if value="$intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
+              <do_if value="not $skipIntraPhase and $intraSectorSellOffers.count gt 0 and $intraSectorBuyOffers.count gt 0">
                 <!-- PERFORMANCE: Process intra-sector offers in 5×5 chunks -->
                 <set_value name="$intraSellChunkEnd" exact="[$sellOfferChunkStart + $chunkSize, $intraSectorSellOffers.count].min"/>
                 <set_value name="$intraBuyChunkEnd" exact="[$buyOfferChunkStart + $chunkSize, $intraSectorBuyOffers.count].min"/>
@@ -1108,6 +1199,7 @@
                 <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
                 <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
                 <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$warePhase" exact="'intra'"/>
                 <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
                 <set_value name="$state.$tradeList" exact="$tradeList"/>
                 <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
@@ -1133,6 +1225,12 @@
                   <set_value name="global.$GT_BatchContinuationScheduled.{$ship}" exact="true"/>
                   <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ScheduleBatchContinuation" param="$ship"/>
                 </do_if>
+                <!-- DETAILED LOGGING: Track chunk continuation -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$batchElapsedTime" exact="player.age - $state.$batchStartTime"/>
+                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') CHUNK CONTINUATION: Ware #' + $wareIdx + ' (' + $wareName + ') needs chunk continuation (sellChunk=' + $sellOfferChunkStart + ', buyChunk=' + $buyOfferChunkStart + ', elapsed=' + ($batchElapsedTime / 1s) + 's)'" chance="100"/>
+                </do_if>
+                
                 <!-- CRITICAL: Stop processing further wares in this instance.
                      Without this break, the current instance continues iterating other wares but does NOT commit state
                      (because $scheduledChunkContinuation prevents finalize), causing infinite re-processing of ware #1
@@ -1229,7 +1327,7 @@
                     <!-- ═══════════════════════════════════════════════════════════════════════════ -->
                     <!-- CACHE FIRST: Cache ALL profitable trades BEFORE any filtering -->
                     <!-- This ensures cache contains all trades that ANY ship might accept -->
-                    <!-- Blacklist filtering happens when READING from cache (SearchCachedTrades) -->
+                    <!-- Blacklist filtering happens when reading from cache (GT_TS_CachePickBest / cache-read stage) -->
                     <!-- ═══════════════════════════════════════════════════════════════════════════ -->
                     <!-- Cache trade if enabled and meets global cache threshold -->
                     <!-- CRITICAL: Cache respects global CacheProfitThreshold setting -->
@@ -1315,28 +1413,35 @@
                           </do_if>
                           
                           <!-- PERFORMANCE OPTIMIZATION v5: Per-home-sector cache with pre-computed distances -->
-                          <!-- Only cache if home sector is valid -->
-                          <do_if value="@$homeSector.exists">
+                          <!-- Only cache if home sector is valid AND is actually a sector (not a component) -->
+                          <do_if value="@$homeSector.exists and $homeSector.isclass.sector">
+                            <!-- Defensive: old saves / corrupted globals can leave GT_TradeCache as a LIST (old flat cache) or null.
+                                 Ensure the root cache container is a TABLE (homeSector -> list of entries), otherwise batch caching will error out. -->
+                            <do_if value="not global.$GT_TradeCache? or typeof global.$GT_TradeCache != datatype.table">
+                              <debug_text text="'[GT-ERROR] TradeCache corrupted: global.$GT_TradeCache is ' + (if global.$GT_TradeCache? then typeof global.$GT_TradeCache else 'UNDEFINED') + ' - resetting to table[]'" chance="100"/>
+                              <set_value name="global.$GT_TradeCache" exact="table[]"/>
+                            </do_if>
+
                             <!-- Initialize home sector cache if needed -->
-                            <do_if value="not global.$GT_TradeCache.{$homeSector}?">
+                            <do_if value="not global.$GT_TradeCache.{$homeSector}? or global.$GT_TradeCache.{$homeSector} == null or typeof global.$GT_TradeCache.{$homeSector} != datatype.list">
                               <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
                             </do_if>
 
                             <!-- Optional index: per-ware cache lists for faster lookup during cache search -->
-                            <do_if value="not global.$GT_TradeCacheByWare?">
+                            <do_if value="not global.$GT_TradeCacheByWare? or typeof global.$GT_TradeCacheByWare != datatype.table">
                               <set_value name="global.$GT_TradeCacheByWare" exact="table[]"/>
                             </do_if>
-                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}?">
+                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}? or global.$GT_TradeCacheByWare.{$homeSector} == null or typeof global.$GT_TradeCacheByWare.{$homeSector} != datatype.table">
                               <set_value name="global.$GT_TradeCacheByWare.{$homeSector}" exact="table[]"/>
                             </do_if>
                             <!-- IMPORTANT: Use WARE OBJECT as key (not ware.id string). -->
                             <!-- Using ware.id caused MD table property errors (keys without '$' prefix can fail). -->
-                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}?">
+                            <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}? or global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare} == null or typeof global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare} != datatype.list">
                               <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}" exact="[]"/>
                             </do_if>
 
                             <!-- Track known home sectors for diagnostics (avoids relying on GT_TradeCache.keys, which can be unreliable in some saves) -->
-                            <do_if value="not global.$GT_TradeCacheHomes?">
+                            <do_if value="not global.$GT_TradeCacheHomes? or global.$GT_TradeCacheHomes == null or typeof global.$GT_TradeCacheHomes != datatype.list">
                               <set_value name="global.$GT_TradeCacheHomes" exact="[]"/>
                             </do_if>
                             <set_value name="$homeAlreadyTracked" exact="false"/>
@@ -1364,9 +1469,14 @@
                             <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheMaxAge?">
                               <set_value name="$cacheMaxAge" exact="global.$GT_GlobalSettings.$Fleet.$CacheMaxAge"/>
                             </do_if>
-                            <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                            <!-- CRITICAL: Double-check homeSector is valid before accessing cache -->
+                            <set_value name="$homeSectorCache" exact="null"/>
+                            <do_if value="@$homeSector.exists and $homeSector.isclass.sector and global.$GT_TradeCache.{$homeSector}?">
+                              <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                            </do_if>
                             <set_value name="$expiredEntriesToRemove" exact="[]"/>
-                            <do_all exact="$homeSectorCache.count" counter="$cacheIdx" reverse="true">
+                            <do_if value="$homeSectorCache? and $homeSectorCache != null">
+                              <do_all exact="$homeSectorCache.count" counter="$cacheIdx" reverse="true">
                               <set_value name="$cachedEntry" exact="$homeSectorCache.{$cacheIdx}"/>
                               <do_if value="$cachedEntry?">
                                 <!-- Check if entry is expired (TTL validation) -->
@@ -1385,16 +1495,28 @@
                                   </do_if>
                                 </do_elseif>
                               </do_if>
-                            </do_all>
+                              </do_all>
+                            </do_if>
                             
                             <!-- Remove expired entries (cleanup during write) -->
+                            <!-- CRITICAL: Only proceed if homeSector is valid sector -->
+                            <do_if value="@$homeSector.exists and $homeSector.isclass.sector">
                             <do_if value="$expiredEntriesToRemove.count gt 0">
                               <do_all exact="$expiredEntriesToRemove.count" counter="$expIdx">
                                 <set_value name="$expiredIdx" exact="$expiredEntriesToRemove.{$expIdx}"/>
                                 <set_value name="$expiredEntry" exact="global.$GT_TradeCache.{$homeSector}.{$expiredIdx}"/>
                                 <!-- Remove from per-ware index if present -->
-                                <do_if value="$expiredEntry? and $expiredEntry.$WareId? and global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}? and global.$GT_TradeCacheByWare.{$homeSector}.{$expiredEntry.$WareId}?">
-                                  <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$expiredEntry.$WareId}" exact="$expiredEntry"/>
+                                <!-- CRITICAL: Per-ware index is keyed by WARE OBJECT, not ware.id.
+                                     Old code incorrectly used $WareId (string/int) which causes property lookup failures and leaves index desynced. -->
+                                <set_value name="$expiredWare" exact="null"/>
+                                <do_if value="$expiredEntry? and $expiredEntry.$Ware? and $expiredEntry.$Ware != null">
+                                  <set_value name="$expiredWare" exact="$expiredEntry.$Ware"/>
+                                </do_if>
+                                <do_elseif value="$expiredEntry? and $expiredEntry.$BuyOffer? and $expiredEntry.$BuyOffer != null">
+                                  <set_value name="$expiredWare" exact="@$expiredEntry.$BuyOffer.ware"/>
+                                </do_elseif>
+                                <do_if value="$expiredWare? and $expiredWare != null and global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}? and global.$GT_TradeCacheByWare.{$homeSector}.{$expiredWare}?">
+                                  <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$expiredWare}" exact="$expiredEntry"/>
                                 </do_if>
                                 <!-- Remove from cache -->
                                 <remove_value name="global.$GT_TradeCache.{$homeSector}.{$expiredIdx}"/>
@@ -1403,9 +1525,11 @@
                                 <debug_text text="'[GT-Batch] Removed ' + $expiredEntriesToRemove.count + ' expired cache entries during write (TTL: ' + ($cacheMaxAge / 60) + ' minutes)'" chance="100"/>
                               </do_if>
                             </do_if>
+                            </do_if>
                             
                             <!-- If this ware already has max entries in this home sector, replace the oldest one -->
-                            <do_if value="$wareEntryCount ge $maxCachedRoutesPerWare">
+                            <!-- CRITICAL: Only proceed if homeSector is valid sector -->
+                            <do_if value="@$homeSector.exists and $homeSector.isclass.sector and $wareEntryCount ge $maxCachedRoutesPerWare">
                               <do_if value="$oldestWareEntryIdx ge 0">
                                 <!-- Keep per-ware index in sync: capture removed entry then remove from both structures -->
                                 <set_value name="$removedEntry" exact="global.$GT_TradeCache.{$homeSector}.{$oldestWareEntryIdx}"/>
@@ -1424,7 +1548,8 @@
                             <!-- These distances are the same for all ships with this home sector -->
                             <set_value name="$homeToBuyDistance" exact="-1"/>
                             <set_value name="$homeToSellDistance" exact="-1"/>
-                            <do_if value="$buySector? and $sellSector?">
+                            <!-- CRITICAL: Only calculate distances if homeSector is valid sector (not component) -->
+                            <do_if value="$buySector? and $sellSector? and @$homeSector.exists and $homeSector.isclass.sector">
                               <set_value name="$homeToBuyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
                               <set_value name="$homeToSellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
                               <!-- Handle invalid distances -->
@@ -1558,6 +1683,7 @@
                             <!-- OPTIMIZATION: Insert in sorted order (by profit) so validation can use top N entries without sorting -->
                             <set_value name="$newCacheEntry" exact="table[
                               $WareId = $sellOfferWare.id,
+                              $Ware = $sellOfferWare,
                               $WareName = $sellOfferWare.name,
                               $SellStationId = $buyOfferOwner.idcode,
                               $BuyStationId = $sellOfferOwner.idcode,
@@ -1567,6 +1693,7 @@
                               $SellTargetType = $sellTargetType,
                               $BuyDockCaps = $buyDockCaps,
                               $SellDockCaps = $sellDockCaps,
+                              $TradeRulesRespected = not $ignoreTradeRules,
                               $OfferMaxAmount = $cacheOfferMaxAmount,
                               $ProfitPerUnit = $cacheProfitPerUnit,
                               $VolumePerUnit = $cacheVolumePerUnit,
@@ -1587,51 +1714,127 @@
                             
                             <!-- Find insertion position: insert where profit > existing profit (maintain descending order) -->
                             <!-- Example: cache has [300, 200, 100], new entry has 150 -> insert at index 2 (between 200 and 100) -->
-                            <set_value name="$insertIndex" exact="0"/>
-                            <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
-                            <set_value name="$insertionFound" exact="false"/>
-                            <do_if value="$homeSectorCache.count gt 0">
-                              <!-- Linear search: find first entry with profit < new profit -->
-                              <do_all exact="$homeSectorCache.count" counter="$i">
-                                <set_value name="$existingProfit" exact="if $homeSectorCache.{$i}.$Profit? then $homeSectorCache.{$i}.$Profit else 0"/>
-                                <do_if value="$cacheProfit gt $existingProfit">
-                                  <!-- Found insertion point: insert before this entry (it has lower profit) -->
-                                  <set_value name="$insertIndex" exact="$i"/>
-                                  <set_value name="$insertionFound" exact="true"/>
-                                  <break/>
+                            <!-- CRITICAL: Only proceed if homeSector is valid sector (not component) -->
+                            <do_if value="@$homeSector.exists and $homeSector.isclass.sector">
+                              <set_value name="$insertIndex" exact="0"/>
+                              <set_value name="$homeSectorCache" exact="[]"/>
+                              <do_if value="global.$GT_TradeCache? and typeof global.$GT_TradeCache == datatype.table and global.$GT_TradeCache.{$homeSector}? and global.$GT_TradeCache.{$homeSector} != null and typeof global.$GT_TradeCache.{$homeSector} == datatype.list">
+                                <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                              </do_if>
+                              <set_value name="$insertionFound" exact="false"/>
+                              <do_if value="$homeSectorCache.count gt 0">
+                                <!-- Linear search: find first entry with profit < new profit -->
+                                <do_all exact="$homeSectorCache.count" counter="$i">
+                                  <set_value name="$existingProfit" exact="if $homeSectorCache.{$i}.$Profit? then $homeSectorCache.{$i}.$Profit else 0"/>
+                                  <do_if value="$cacheProfit gt $existingProfit">
+                                    <!-- Found insertion point: insert before this entry (it has lower profit) -->
+                                    <set_value name="$insertIndex" exact="$i"/>
+                                    <set_value name="$insertionFound" exact="true"/>
+                                    <break/>
+                                  </do_if>
+                                </do_all>
+                              </do_if>
+                              
+                              <!-- Insert at calculated position (or append if at end) -->
+                              <do_if value="$insertionFound">
+                                <set_value name="global.$GT_TradeCache.{$homeSector}.{$insertIndex}" exact="$newCacheEntry" operation="insert"/>
+                              </do_if>
+                              <do_else>
+                                <!-- Append if insertion point is at end (new entry has lowest profit) -->
+                                <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="$newCacheEntry"/>
+                              </do_else>
+                              
+                              <!-- Maintain per-ware index list (sorted by Profit desc, same as main cache intent) -->
+                              <set_value name="$byWareInsertIndex" exact="0"/>
+                              <set_value name="$byWareInsertionFound" exact="false"/>
+                              <set_value name="$byWareList" exact="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}"/>
+                              <do_if value="$byWareList? and $byWareList != null and $byWareList.count gt 0">
+                                <do_all exact="$byWareList.count" counter="$j">
+                                  <set_value name="$existingProfit" exact="if $byWareList.{$j}.$Profit? then $byWareList.{$j}.$Profit else 0"/>
+                                  <do_if value="$cacheProfit gt $existingProfit">
+                                    <set_value name="$byWareInsertIndex" exact="$j"/>
+                                    <set_value name="$byWareInsertionFound" exact="true"/>
+                                    <break/>
+                                  </do_if>
+                                </do_all>
+                              </do_if>
+                              <do_if value="$byWareInsertionFound">
+                                <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}.{$byWareInsertIndex}" exact="$newCacheEntry" operation="insert"/>
+                              </do_if>
+                              <do_else>
+                                <append_to_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}" exact="$newCacheEntry"/>
+                              </do_else>
+                              
+                              <!-- PHASE 1: Add trade to central index for cross-cache invalidation -->
+                              <!-- Extract trace ID from batch state for logging -->
+                              <set_value name="$cacheTraceId" exact="''"/>
+                              <do_if value="$state.$TraceId?">
+                                <set_value name="$cacheTraceId" exact="$state.$TraceId"/>
+                              </do_if>
+                              
+                              <!-- Generate trade key and add to index -->
+                              <!-- CRITICAL: Validate offers have valid IDs before generating trade key -->
+                              <!-- Offers can become invalid (station destroyed, offer removed) between collection and processing -->
+                              <set_value name="$tradeKey" exact="''"/>
+                              <set_value name="$sellOfferIdValid" exact="false"/>
+                              <set_value name="$buyOfferIdValid" exact="false"/>
+                              
+                              <!-- Validate sellOffer has valid ID (required) -->
+                              <do_if value="$sellOffer? and $sellOffer.exists">
+                                <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+                                <do_if value="$tempSellId? and $tempSellId != null">
+                                  <set_value name="$sellOfferIdValid" exact="true"/>
                                 </do_if>
-                              </do_all>
-                            </do_if>
-                            
-                            <!-- Insert at calculated position (or append if at end) -->
-                            <do_if value="$insertionFound">
-                              <set_value name="global.$GT_TradeCache.{$homeSector}.{$insertIndex}" exact="$newCacheEntry" operation="insert"/>
-                            </do_if>
-                            <do_else>
-                              <!-- Append if insertion point is at end (new entry has lowest profit) -->
-                              <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="$newCacheEntry"/>
-                            </do_else>
-
-                            <!-- Maintain per-ware index list (sorted by Profit desc, same as main cache intent) -->
-                            <set_value name="$byWareInsertIndex" exact="0"/>
-                            <set_value name="$byWareInsertionFound" exact="false"/>
-                            <set_value name="$byWareList" exact="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}"/>
-                            <do_if value="$byWareList? and $byWareList != null and $byWareList.count gt 0">
-                              <do_all exact="$byWareList.count" counter="$j">
-                                <set_value name="$existingProfit" exact="if $byWareList.{$j}.$Profit? then $byWareList.{$j}.$Profit else 0"/>
-                                <do_if value="$cacheProfit gt $existingProfit">
-                                  <set_value name="$byWareInsertIndex" exact="$j"/>
-                                  <set_value name="$byWareInsertionFound" exact="true"/>
-                                  <break/>
+                              </do_if>
+                              
+                              <!-- Validate buyOffer has valid ID (optional for sell-only trades) -->
+                              <do_if value="$buyOffer? and $buyOffer.exists">
+                                <set_value name="$tempBuyId" exact="@$buyOffer.id"/>
+                                <do_if value="$tempBuyId? and $tempBuyId != null">
+                                  <set_value name="$buyOfferIdValid" exact="true"/>
                                 </do_if>
-                              </do_all>
+                              </do_if>
+                              <do_else>
+                                <!-- No buyOffer (sell-only trade) - this is valid -->
+                                <set_value name="$buyOfferIdValid" exact="true"/>
+                              </do_else>
+                              
+                              <!-- Only generate trade key if sellOffer has valid ID -->
+                              <do_if value="$sellOfferIdValid">
+                                <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                                  <param name="buyOffer" value="$buyOffer"/>
+                                  <param name="sellOffer" value="$sellOffer"/>
+                                  <param name="traceId" value="$cacheTraceId"/>
+                                </run_actions>
+                              </do_if>
+                              <do_else>
+                                <!-- Invalid sellOffer.id - skip index update (trade will still be cached, but won't be in index) -->
+                                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                                  <set_value name="$wareName" exact="if $sellOfferWare? then @$sellOfferWare.name else 'Unknown'"/>
+                                  <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Skipping trade index update: sellOffer.id is invalid (ware=' + $wareName + ', offer may have been removed)'" chance="10"/>
+                                </do_if>
+                              </do_else>
+                              
+                              <do_if value="$tradeKey != ''">
+                                <run_actions ref="md.GT_Libraries_General.GT_AddTradeToIndex">
+                                  <param name="tradeKey" value="$tradeKey"/>
+                                  <param name="homeSector" value="$homeSector"/>
+                                  <param name="traceId" value="$cacheTraceId"/>
+                                </run_actions>
+                                
+                                <!-- Log cache write with trade key -->
+                                <do_if value="$cacheTraceId != ''">
+                                  <set_value name="$cacheCount" exact="global.$GT_TradeCache.{$homeSector}.count"/>
+                                  <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                                    <param name="traceId" value="$cacheTraceId"/>
+                                    <param name="stage" value="'CacheWrite'"/>
+                                    <param name="action" value="'Added'"/>
+                                    <param name="details" value="'trade=' + $tradeKey + ' home=' + (if $homeSector? then @$homeSector.knownname else 'null') + ' entries=' + $cacheCount"/>
+                                    <param name="logLevel" value="2"/>
+                                  </run_actions>
+                                </do_if>
+                              </do_if>
                             </do_if>
-                            <do_if value="$byWareInsertionFound">
-                              <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}.{$byWareInsertIndex}" exact="$newCacheEntry" operation="insert"/>
-                            </do_if>
-                            <do_else>
-                              <append_to_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$sellOfferWare}" exact="$newCacheEntry"/>
-                            </do_else>
                           </do_if>
                           
                           <!-- Debug logging for cache population -->
@@ -1893,6 +2096,7 @@
                 <set_value name="$state.$buyOfferChunkStart" exact="$buyOfferChunkStart"/>
                 <set_value name="$state.$currentWareChunkStart" exact="$currentWareChunkStart"/>
                 <set_value name="$state.$currentWareIndex" exact="$wareIdx - 1"/> <!-- Will be incremented to same ware -->
+                <set_value name="$state.$warePhase" exact="'cross'"/>
                 <set_value name="$state.$tradesPerWare" exact="$tradesPerWare"/>
                 <set_value name="$state.$tradeList" exact="$tradeList"/>
                 <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
@@ -1920,9 +2124,9 @@
 
                 <set_value name="$hasQueuedShipsWaiting" exact="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0"/>
                 <!-- Fairness: yield periodically when other ships are waiting, but allow more work per slice.
-                     Increased from 1 to 5 slices to improve throughput while maintaining fairness.
+                     Increased from 5 to 8 slices to improve throughput while maintaining fairness.
                      This allows processing more chunks before yielding, reducing overhead from frequent re-queueing. -->
-                <set_value name="$maxSlicesBeforeYield" exact="5"/>
+                <set_value name="$maxSlicesBeforeYield" exact="8"/>
                 <do_if value="$hasQueuedShipsWaiting and $continuationSlices ge $maxSlicesBeforeYield">
                   <!-- Re-queue this ship (de-dupe) -->
                   <do_if value="not global.$GT_BatchProcessorQueue?">
@@ -1992,6 +2196,7 @@
             <set_value name="$state.$sellOfferChunkStart" exact="0"/>
             <set_value name="$state.$buyOfferChunkStart" exact="0"/>
             <set_value name="$state.$currentWareChunkStart" exact="$batchEnd1Based"/>
+            <set_value name="$state.$warePhase" exact="'intra'"/>
             <set_value name="$state.$tradeList" exact="$tradeList"/>
             <set_value name="$state.$crossStationBestScore" exact="$crossStationBestScore"/>
             <set_value name="$state.$crossStationBestTrade" exact="$crossStationBestTrade"/>
@@ -2019,6 +2224,16 @@
             <!-- Check if more batches needed -->
             <!-- batchEnd1Based is exclusive (can be wareCount+1). If it's <= wareCount, there is more work. -->
             <do_if value="$batchEnd1Based le $wareCount and $tradeList.count lt $earlyExitThreshold">
+              <!-- DETAILED LOGGING: Track continuation scheduling -->
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$batchElapsedTime" exact="player.age - $state.$batchStartTime"/>
+                <set_value name="$remainingWares" exact="$wareCount - $currentWareIndex"/>
+                <!-- Calculate ceiling division: (a + b - 1) / b for positive integers -->
+                <set_value name="$expectedRemainingBatchesCalc" exact="if $batchSize gt 0 then (($remainingWares + $batchSize - 1) / $batchSize)i else 1"/>
+                <set_value name="$expectedRemainingBatches" exact="[$expectedRemainingBatchesCalc, 1].max"/>
+                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH CONTINUATION: Processed ' + ($currentWareIndex + 1) + '/' + $wareCount + ' wares, ' + $remainingWares + ' remaining, expectedBatches=' + $expectedRemainingBatches + ', elapsed=' + ($batchElapsedTime / 1s) + 's, tradesFound=' + $tradeList.count + ', nextBatchStart=' + ($currentWareIndex + 1)" chance="100"/>
+              </do_if>
+              
               <!-- IMPORTANT: Always signal continuation directly.
                    Continuation handling is already done at the top of ProcessTradeMatchingBatch via ActiveShips,
                    and queueing here can deadlock when ActiveProcessors == MaxConcurrent (active ship can never finish). -->
@@ -2048,8 +2263,68 @@
               </do_if>
               
               <!-- All batches complete - signal completion -->
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Complete. Total: ' + $tradeList.count + ' trades (active: ' + (if global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? then global.$GT_BatchProcessorQueue.$ActiveProcessors else 0) + '/' + (if global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$MaxConcurrent? then global.$GT_BatchProcessorQueue.$MaxConcurrent else 1) + ')'" chance="100"/>
+              <set_value name="$totalBatchTime" exact="player.age - $state.$batchStartTime"/>
+              <set_value name="$traceId" exact="''"/>
+              <do_if value="$state.$TraceId?">
+                <set_value name="$traceId" exact="$state.$TraceId"/>
+              </do_if>
+              
+              <!-- Log batch processor completion -->
+              <do_if value="$traceId != ''">
+                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                  <param name="traceId" value="$traceId"/>
+                  <param name="stage" value="'BatchProcessor'"/>
+                  <param name="action" value="'Complete'"/>
+                  <param name="details" value="'wares=' + $wareCount + ' trades=' + $tradeList.count + ' time=' + ($totalBatchTime / 1s) + 's rejected=' + ($tradesRejectedProfit + $tradesRejectedDocking + $tradesRejectedAmount + $tradesRejectedDistance)"/>
+                  <param name="logLevel" value="1"/>
+                </run_actions>
+              </do_if>
+              
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$tradesPerWareSummary" exact="''"/>
+                <do_if value="$tradesPerWare? and $tradesPerWare.keys.count gt 0">
+                  <set_value name="$tradesPerWareSummary" exact="' (tradesPerWare: '"/>
+                  <do_all exact="[$tradesPerWare.keys.count, 5].min" counter="$i">
+                    <set_value name="$w" exact="$tradesPerWare.keys.{$i}"/>
+                    <set_value name="$count" exact="$tradesPerWare.{$w}"/>
+                    <set_value name="$separator" exact="if $i lt [$tradesPerWare.keys.count, 5].min then ', ' else ''"/>
+                    <set_value name="$tradesPerWareSummary" exact="$tradesPerWareSummary + @$w.name + '=' + $count + $separator"/>
+                  </do_all>
+                  <set_value name="$closingParen" exact="')'"/>
+                  <set_value name="$tradesPerWareSummary" exact="$tradesPerWareSummary + $closingParen"/>
+                </do_if>
+                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') BATCH COMPLETE: Processed ' + $wareCount + ' wares in ' + ($totalBatchTime / 1s) + 's, found ' + $tradeList.count + ' trades' + $tradesPerWareSummary + ' (rejected: profit=' + $tradesRejectedProfit + ', docking=' + $tradesRejectedDocking + ', amount=' + $tradesRejectedAmount + ', distance=' + $tradesRejectedDistance + ', active=' + (if global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveProcessors? then global.$GT_BatchProcessorQueue.$ActiveProcessors else 0) + '/' + (if global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$MaxConcurrent? then global.$GT_BatchProcessorQueue.$MaxConcurrent else 1) + ')'" chance="100"/>
+              </do_if>
+              
+              <!-- Phase 4: Complete scheduler work item if it exists -->
+              <!-- Use ship as ActiveWork key (not string WorkItemKey) -->
+              <set_value name="$workItemKey" exact="@$state.$WorkItemKey"/>
+              <do_if value="$workItemKey? and $workItemKey != ''">
+                <!-- Lookup ActiveWork by ship (not by string key) -->
+                <do_if value="global.$GT_Scheduler? and global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.{$ship}?">
+                  <set_value name="$workItem" exact="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+                  <set_value name="$workTraceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+                  
+                  <!-- Mark work item as completed -->
+                  <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+                    <param name="key" value="$workItemKey"/>
+                    <param name="newState" value="'completed'"/>
+                    <param name="traceId" value="$workTraceId"/>
+                    <param name="workItem" value="$workItem"/>
+                  </run_actions>
+                  
+                  <!-- Remove from ActiveWork using ship key -->
+                  <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+                  
+                  <!-- Log completion -->
+                  <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                    <param name="traceId" value="$workTraceId"/>
+                    <param name="stage" value="'Match'"/>
+                    <param name="action" value="'Complete'"/>
+                    <param name="details" value="'ship=' + $ship.idcode + ' wares=' + $wareCount + ' trades=' + $tradeList.count + ' duration=' + ($totalBatchTime / 1ms) + 'ms'"/>
+                    <param name="logLevel" value="1"/>
+                  </run_actions>
+                </do_if>
               </do_if>
               
               <!-- Pack results -->

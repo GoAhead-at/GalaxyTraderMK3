@@ -1,7 +1,131 @@
 ﻿GalaxyTrader MK3 - Changelog
 ========================================
 
-Version 0.7.4 - 2025-12-28
+
+Version 0.7.5 - 2026-01-01
+
+FEATURE: Enhanced "No Trades Found" analysis logbookmessage per ship
+
+BUGFIX/IMPROVEMENT: mostly refactoring the whole BS again. this time using more than one braincell
+  - the whole locksystem which should prevent deadlocks was locking itself under certain raceconditions and never got released which caused stuck ships
+
+FEATURE: added Traderules
+
+BUGFIX: fixed Tradereservations
+
+Version 0.7.4 - 2025-12-29
+
+BUGFIX: Fix cache snapshot logger error when cache has empty keys list
+  - Symptom: Logger reported "ERROR: GT_TradeCache has no keys and no count" even when cacheHasKeys=1
+  - Root cause: Empty keys list (valid state - no cached home sectors yet) was treated as error
+  - Fix:
+    * `md/gt_trading_search.xml`: Added explicit handling for empty keys list case (normal state, not error)
+    * Now logs "Cache is empty (no home sectors cached yet)" instead of error when keys.count=0
+
+BUGFIX: Fix "NO TRADES FOUND ANALYSIS" misleading counters and skipped live search detection
+  - Symptom: Counters showed 0 even when offers were queried, making diagnosis harder. Also showed "Search Method: live" with 0 counters when live search was actually skipped. Additionally, showed "Live search SKIPPED" even when live search had already completed (continuation case)
+  - Root cause: Conditional logging skipped counters when variables were missing or 0. No distinction between "live search ran and found 0" vs "live search was skipped". Flag was set incorrectly when checking isolation AFTER live search completed
+  - Fix:
+    * `md/gt_trading_search.xml`: Always log counters even if 0 or missing (use display variables with fallback to 0)
+    * `md/gt_trading_search.xml`: Added `$liveSearchSkipped` flag to track when live search is skipped BEFORE it runs
+    * `md/gt_trading_search.xml`: Set flag when cooldown is active (line 1138) and when home refresh is denied (line 1215)
+    * `md/gt_trading_search.xml`: Only set flag when NOT a live search continuation (line 1854) - prevents false "skipped" message when live search already ran
+    * `md/gt_trading_search.xml`: Analysis now shows "Live search SKIPPED" message only when live search was actually skipped, preventing confusion
+    * Now always shows "Stations evaluated" and "Offers found" for live searches that actually ran, preventing confusion
+
+BUGFIX: Fix maxDistance: null in SearchLiveTrades_Resume logging
+  - Symptom: Resume logging showed "maxDistance: null" removing important debugging dimension
+  - Root cause: maxDistance only retrieved from batch data, not from live search state fallback
+  - Fix:
+    * `md/gt_trading_search.xml`: Added fallback to retrieve maxDistance from live search state if batch data doesn't have it
+    * Ensures maxDistance is always available for logging and filtering
+
+IMPROVEMENT: Make zero-trade cooldown configurable (was hardcoded 60s)
+  - Symptom: 60s cooldown after zero-trade live search was too long and not configurable
+  - Fix:
+    * `md/gt_global_settings.xml`: Added `global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown` setting (default: 30s)
+    * `md/gt_trading_search.xml`: Use configurable cooldown duration instead of hardcoded 60s
+    * Users can now adjust cooldown duration via global settings
+
+BUGFIX: Fix ForceLiveSearch flag persistence due to storage location mismatch
+  - Symptom: ForceLiveSearch flag persisted across search cycles even after clearing (149+ occurrences in log)
+  - Root cause: Flag stored in multiple locations (`$params.$ForceLiveSearch`, `global.$GT_AIParameters.{$ship}.$ForceLiveSearch`, `global.$GT_TS.$Requests.{$ship}.$ForceLiveSearch`). Params were recreated from global or request table before next search, causing flag to persist
+  - Fix:
+    * `md/gt_trading_queue.xml`: Clear flag from global IMMEDIATELY after reading (before params are created) to prevent re-reading
+    * `md/gt_trading_search.xml`: Clear flag from all storage locations (params, global AI params, and request table) after use
+    * `md/gt_trading_search.xml`: Removed redundant ForceLiveSearch setting in live search queue params (queue already bypasses cache)
+    * Prevents flag from being carried forward when params are recreated from global or request table
+
+IMPROVEMENT: Optimize live search queue retry handling - early exit for already-queued ships
+  - Symptom: Ships already queued for live search would retry and go through unnecessary processing (sector queue setup, round-robin registration) before exiting
+  - Root cause: Queue membership check happened after all setup logic, causing redundant work on retries
+  - Fix:
+    * `md/gt_trading_search.xml`: Check if ship is already queued immediately after determining home sector (before sector queue setup)
+    * `md/gt_trading_search.xml`: Early exit with debug log when ship is already queued, avoiding unnecessary processing
+    * `md/gt_trading_search.xml`: All subsequent setup logic (sector queue creation, round-robin registration, enqueueing) now guarded by `not $alreadyQueuedForLive` check
+  - Impact: Reduces CPU overhead when ships retry while already queued, improves queue processing efficiency
+
+BUGFIX: Fix auto-wake queue processor in GT_DecrementActiveLiveSearches - check correct queue structure
+  - Symptom: Auto-wake queue processor after live search completion did not reliably trigger, even when ships were queued
+  - Root cause: `GT_DecrementActiveLiveSearches` checked non-existent field `global.$GT_LiveSearchQueue.$Ships` instead of actual structure (`$Sectors` + `$BySector.{sector}.$Ships`)
+  - Fix:
+    * `md/gt_libraries_general.xml`: Updated queue check to iterate through `$Sectors` and check `$BySector.{sector}.$Ships.count` for each sector
+    * `md/gt_libraries_general.xml`: Matches the same pattern used in `ProcessLiveSearchQueue` for consistency
+  - Impact: Auto-wake now correctly triggers when ships are queued, ensuring timely processing of queued live searches after slot release
+
+PERFORMANCE: Speed up live search processing - remove fallbacks, increase throughput, make settings configurable
+  - Problem: Live search processing had hardcoded performance parameters and fallback values that could cause silent failures
+  - Changes:
+    * `md/gt_search_methods.xml`: Removed EarlyExitThreshold fallback (200) - now requires real data from global settings, throws error if missing
+    * `md/gt_trading_batch_processor.xml`: Removed BatchProcessingDelay fallback (10ms) - now requires real data from global settings, throws error if missing
+    * `md/gt_search_methods.xml`: Made LiveOfferSliceInterval configurable (was hardcoded 150ms, now configurable via global settings)
+    * `md/gt_trading_batch_processor.xml`: Increased chunk size from 8×8 (64 combinations) to 10×10 (100 combinations) for better throughput
+    * `md/gt_trading_batch_processor.xml`: Increased yield threshold from 5 to 8 slices before yielding for better throughput
+    * `md/gt_global_settings.xml`: Added `LiveOfferSliceInterval` setting (default: 500ms, range: 50-500ms) with validation
+    * `md/gt_global_settings.xml`: Added UI slider for LiveOfferSliceInterval in Performance settings
+    * `t/0001-l044.xml` through `t/0001-l086.xml`: Added translation entries for LiveOfferSliceInterval to all 9 language files (ID: 9241 label, 9341 tooltip)
+  - Impact:
+    * Faster live search processing (25% larger chunks, 60% more slices before yielding)
+    * More reliable error detection (no silent fallbacks - errors are logged if settings missing)
+    * Configurable live offer slice interval allows users to tune CPU vs speed trade-off
+    * Default slice interval set to 500ms to reduce CPU load by default (users can adjust via slider)
+
+BUGFIX: Fix illegal ware filtering to ensure legal wares (illegal=0) are not incorrectly filtered
+  - Symptom: Legal wares with illegal=0 might have been incorrectly filtered due to inconsistent checks
+  - Root cause: Inconsistent use of safe operator (@) and implicit truthiness checks that could treat illegal=0 ambiguously
+  - Fix:
+    * `md/gt_search_methods.xml`: Changed `$cacheEntry.$BuyOffer.ware.illegal` to `@$cacheEntry.$BuyOffer.ware.illegal gt 0` (safe operator + explicit check)
+    * `md/gt_libraries_general.xml`: Changed all `@$ware.illegal` and `$ware.illegal` checks to `@$ware.illegal gt 0` (3 locations: lines 757, 1603, 2542)
+    * `md/gt_trading_execution.xml`: Changed `@$ware.illegal` to `@$ware.illegal gt 0` (explicit check)
+    * `md/gt_ware_filter.xml`: Changed `$wareIllegal` check to `$wareIllegal gt 0` (explicit check)
+  - Impact: All illegal ware checks now explicitly verify illegal > 0, ensuring legal wares (illegal=0 or null) are never filtered
+
+BUGFIX: Prevent sectors from being added to blacklist when threat avoidance is disabled
+  - Symptom: Sectors were still being added to threat intelligence and blacklist even when threat avoidance was disabled in global settings
+  - Root cause: Threat detection cues did not check if threat avoidance was enabled before processing threats and adding sectors to blacklist
+  - Fix:
+    * `md/gt_threat_intelligence.xml`: Added `$Enabled` check at start of `DetectAttackThreats` cue (early exit if disabled)
+    * `md/gt_threat_intelligence.xml`: Added `$Enabled` check at start of `DetectMissileThreats` cue (early exit if disabled)
+    * `md/gt_threat_intelligence.xml`: Added `$Enabled` check at start of `DetectShipDestruction` cue (early exit if disabled)
+    * `md/gt_threat_intelligence.xml`: Added `$Enabled` check at start of `ReceiveThreatWarning` cue (early exit if disabled)
+  - Impact: Threat detection cues now respect the threat avoidance enabled setting, preventing sectors from being tracked or blacklisted when feature is disabled
+
+BUGFIX: Fix sector-change route recalculation to respect threat avoidance toggle
+  - Symptom: Ships were recalculating routes using blacklist-aware pathfinding even when threat avoidance was disabled, causing unnecessary reroutes
+  - Root cause: Sector-change handler in `move.generic.xml` always calculated blacklist-aware distances without checking threat avoidance settings
+  - Fix:
+    * `aiscripts/move.generic.xml`: Added checks for `$ThreatAvoidance.$Enabled` and `$UseDynamicBlacklist` before calculating blacklist-aware distances
+    * `aiscripts/move.generic.xml`: Only calculates `$blacklistDistance` if both threat avoidance and dynamic blacklist are enabled
+    * `aiscripts/move.generic.xml`: Only triggers reroute due to blacklist path changes if both are enabled
+    * `md/gt_libraries_general.xml`: Added `$UseDynamicBlacklist` check in `GT_AnalyzeRouteThreat` library before doing blacklist-aware pathfinding
+  - Impact: Ships will only reroute due to blacklist path changes when threat avoidance is enabled, reducing unnecessary route recalculation
+
+IMPROVEMENT: Change threat avoidance and blacklist defaults to disabled
+  - Symptom: Threat avoidance and dynamic blacklist were enabled by default, which some users may not want
+  - Change:
+    * `md/gt_global_settings.xml`: Changed `$ThreatAvoidance.$Enabled` default from `true` to `false` (initialization, migration, reset handler)
+    * `md/gt_global_settings.xml`: Changed `$ThreatAvoidance.$UseDynamicBlacklist` default from `true` to `false` (initialization, migration, reset handler)
+  - Impact: New installations and "Reset All Settings" will have threat avoidance disabled by default, requiring users to explicitly enable it if desired
 
 BUGFIX: Prevent cascading MD errors when DirectTrade queue is empty/null
   - Symptom: bursts of errors like:
@@ -12,6 +136,39 @@ BUGFIX: Prevent cascading MD errors when DirectTrade queue is empty/null
     * `md/gt_trading_signals.xml`: hard gate queue processing, guard `$data == null`, and guard ship/exists before signalling/updates
     * `md/gt_trade_logging.xml`: ignore `LogCompletedTrade` when signalled with null param
     * `md/gt_xp_training.xml`: ignore `ProcessSingleXPEvent` when signalled with null param
+
+FEATURE: Add "Reset All Settings to Defaults" button in Debug section
+  - Added new button in Maintenance & Diagnostics section of Global Settings menu
+  - Resets all global settings to their default values:
+    * XP and Training Settings
+    * Fleet Coordination Settings
+    * Notification Settings
+    * Mobile Satellite Intelligence Settings
+    * Threat Avoidance Settings
+    * Debug Settings (always resets to false)
+    * Ship Naming Settings
+    * Auto-Repair Settings
+    * Ship Modifications Settings
+    * Performance Settings
+    * Number Formatting Settings
+  - Changes:
+    * `md/gt_global_settings.xml`: Added button UI and `GT_ResetAllSettings` handler cue
+    * `t/0001-l044.xml` through `t/0001-l086.xml`: Added translations for all 9 language files (IDs: 9225 label, 9226 button, 9325 tooltip)
+  - Impact: Users can quickly reset all settings to defaults without manually adjusting each setting
+
+IMPROVEMENT: Ensure debug logging is disabled by default
+  - Problem: Reset handler preserved debug logging state, potentially keeping it enabled after reset
+  - Fix:
+    * `md/gt_global_settings.xml`: Removed preservation logic in reset handler - now always resets to false
+    * Debug logging now consistently defaults to false in all scenarios (initialization, migration, reset)
+  - Impact: Debug logging is always disabled by default, preventing accidental log spam
+
+PERFORMANCE: Increase default Live Offer Slice Interval from 100ms to 500ms
+  - Problem: Default interval of 100ms may cause excessive CPU load with many ships
+  - Changes:
+    * `md/gt_global_settings.xml`: Changed default from 100ms to 500ms in all locations (initialization, migration, validation, UI slider, reset handler)
+    * `md/gt_search_methods.xml`: Updated comment to reference configurable value instead of hardcoded 150ms
+  - Impact: Reduces CPU load by default while still allowing users to adjust via Performance settings slider (range: 50-500ms)
 
 BUGFIX: Pathfinding debug log null-safety (`$isContinuation`)
   - Root cause: debug log referenced `$isContinuation` before it was initialized

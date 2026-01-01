@@ -16,6 +16,13 @@
         <set_value name="$ship" exact="$params.$Ship"/>
         <set_value name="$trade" exact="@$params.$Trade"/>  <!-- Use @ operator - Trade may not exist -->
         <set_value name="$tradeList" exact="@$params.$TradeList"/> <!-- Trade list for fallback -->
+        <set_value name="$tradeKey" exact="@$params.$TradeKey"/> <!-- Trade key for reservation cleanup (Phase 3) -->
+        <set_value name="$traceId" exact="@$params.$TraceId"/> <!-- Trace ID for logging -->
+        
+        <!-- DIAGNOSTIC: Log ExecuteTrade entry -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Execution] ExecuteTrade CALLED for ' + $ship.idcode + ' (Trade: ' + (if $trade != null then 'exists' else 'null') + ', TradeList count: ' + (if $tradeList != null then $tradeList.count else 'null') + ')'" chance="100"/>
+        </do_if>
         
         <!-- IMPORTANT: ? only checks whether a variable is defined, not whether its value is null.
              Since $trade/$tradeList are always defined by set_value above, use explicit null checks. -->
@@ -37,6 +44,13 @@
             <debug_text text="'[GT-Execution]  ERROR: ExecuteTrade called with null trade for ' + $ship.idcode + ' (TradeList count: ' + $tradeList.count + ')'" chance="100"/>
           </do_if>
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'execute_trade'"/>
+            <param name="state" value="'no_trade'"/>
+            <param name="reason" value="'null_trade'"/>
+            <param name="traceId" value="if $traceId? and $traceId != null then $traceId else ''"/>
+          </run_actions>
           <cancel_cue cue="this"/>
         </do_if>
         
@@ -68,11 +82,22 @@
             <debug_text text="'[GT-Execution]  ERROR: ExecuteTrade called with invalid trade (missing BuyOffer/SellOffer) for ' + $ship.idcode" chance="100"/>
           </do_if>
           <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'execute_trade'"/>
+            <param name="state" value="'no_trade'"/>
+            <param name="reason" value="'invalid_trade'"/>
+            <param name="traceId" value="if $traceId? and $traceId != null then $traceId else ''"/>
+          </run_actions>
           <cancel_cue cue="this"/>
         </do_if>
         
         <!-- Enhanced execution logging (will be updated if fallback trade is used) -->
         <set_value name="$executionLogDone" exact="false"/>
+        <set_value name="$searchMethod" exact="@$params.$SearchMethod"/>
+        <do_if value="not $searchMethod?">
+          <set_value name="$searchMethod" exact="'unknown'"/>
+        </do_if>
         <do_if value="$tradeValid">
           <set_value name="$profit" exact="@$trade.$Profit"/>
           <set_value name="$amount" exact="@$trade.$Amount"/>
@@ -132,7 +157,7 @@
             </do_if>
             <do_else>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit' + '\n  Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Distance: ' + $distance + ' jumps' + '\n  Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
+                <debug_text text="'[GalaxyTrader MK3] ' + $ship.knownname + ' executing trade for ' + ($profit / 100) + ' Cr profit (source: ' + $searchMethod + ')' + '\n  Ware: ' + $wareName + ' (x' + $amount + ')' + '\n  BUY from: ' + $buyStationName + ' @ ' + ($buyPrice / 100) + ' Cr' + '\n  SELL to: ' + $sellStationName + ' @ ' + ($sellPrice / 100) + ' Cr' + '\n  Distance: ' + $distance + ' jumps' + '\n  Profit: ' + ($profit / 100) + ' Cr'" chance="100"/>
               </do_if>
             </do_else>
           </do_if>
@@ -165,10 +190,48 @@
                         <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSectorObj}.{$entryWare}" exact="$entry"/>
                       </do_if>
                     </do_if>
-                    <set_value name="$purged" exact="true"/>
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-Execution] Purged stale cache entry after invalid offers for ' + $ship.idcode + ' (home=' + $homeSectorObj.knownname + ')'" chance="100"/>
+                    <!-- Extract trace ID for logging -->
+                    <set_value name="$purgeTraceId2" exact="''"/>
+                    <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId?">
+                      <set_value name="$purgeTraceId2" exact="global.$GT_AIParameters.{$ship}.$TraceId"/>
                     </do_if>
+                    
+                    <!-- Phase 3: Release reservation before purging cache (trade invalidated) -->
+                    <do_if value="$tradeKey != ''">
+                      <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                        <param name="tradeKey" value="$tradeKey"/>
+                        <param name="reason" value="'invalidated'"/>
+                        <param name="traceId" value="$purgeTraceId2"/>
+                      </run_actions>
+                    </do_if>
+                    <do_else>
+                      <!-- Generate trade key if not provided.
+                           NOTE: offer.id is not reliably available; GT_GenerateTradeKey has a fallback (method B). -->
+                      <set_value name="$tradeKey" exact="''"/>
+                      <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                        <param name="buyOffer" value="$buyOffer"/>
+                        <param name="sellOffer" value="$sellOffer"/>
+                        <param name="traceId" value="$purgeTraceId2"/>
+                      </run_actions>
+                      
+                      <do_if value="$tradeKey != ''">
+                        <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                          <param name="tradeKey" value="$tradeKey"/>
+                          <param name="reason" value="'invalidated'"/>
+                          <param name="traceId" value="$purgeTraceId2"/>
+                        </run_actions>
+                      </do_if>
+                    </do_else>
+                    
+                    <!-- Purge offer-pair across ALL home-sector caches (per-home caches can hold duplicates) -->
+                    <run_actions ref="md.GT_Libraries_General.GT_PurgeCacheOfferPair_AllHomes" result="$purgeResult">
+                      <param name="ship" value="$ship"/>
+                      <param name="buyOffer" value="$buyOffer"/>
+                      <param name="sellOffer" value="$sellOffer"/>
+                      <param name="reason" value="'invalid_offers'"/>
+                      <param name="traceId" value="$purgeTraceId2"/>
+                    </run_actions>
+                    <set_value name="$purged" exact="true"/>
                     <break/>
                   </do_if>
                 </do_if>
@@ -279,9 +342,10 @@
                 <!-- Keep AI waiting for a real result; don't send GT_No_Trade_Found here. -->
                 <cancel_cue cue="this"/>
               </do_if>
-
-              <!-- If we cannot re-enqueue (missing request), fall back to notifying AI. -->
-              <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+              <do_else>
+                <!-- If we cannot re-enqueue (missing request), fall back to notifying AI. -->
+                <signal_objects object="$ship" param="'GT_No_Trade_Found'"/>
+              </do_else>
             </do_if>
           </do_if>
           
@@ -362,7 +426,8 @@
           <set_value name="$allowIllegal" exact="@global.$GT_AIParameters.{$ship}.$AllowIllegal"/>
           <do_if value="not $allowIllegal">
             <!-- Simple type check: is this ware illegal to any faction? -->
-            <do_if value="$ware != null and @$ware.illegal">
+            <!-- FIX: Explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
+            <do_if value="$ware != null and @$ware.illegal gt 0">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Execution]   ILLEGAL WARE BLOCKED: ' + $ship.knownname + ' attempted to trade ' + @$ware.name + ' (ware type is illegal, AllowIllegal: ' + @$params.$AllowIllegal + ')'" chance="100"/>
               </do_if>
@@ -732,6 +797,11 @@
             <!-- Store the full trade list -->
             <set_value name="global.$GT_PendingTrades.{$ship}" exact="$tradeList"/>
             
+            <!-- DIAGNOSTIC: Log trade storage -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Execution] STORED ' + $tradeList.count + ' trades in global.$GT_PendingTrades for ' + $ship.idcode + ' (will signal GT_Trade_Found)'" chance="100"/>
+            </do_if>
+            
             <!-- NEW: Store search method so AI knows if trades came from cache or live search -->
             <!-- Store separately since $tradeList is a list and we need to track the source -->
             <set_value name="$searchMethod" exact="@event.param.$SearchMethod"/>
@@ -747,98 +817,53 @@
             <!-- CRITICAL FIX: Remove cache entry when trade order is created from cache -->
             <!-- This prevents multiple ships from using the same cached trade -->
             <do_if value="$searchMethod == 'cache'">
-              <!-- Find and remove the matching cache entry -->
-              <!-- Extract home sector from ship's home base -->
-              <set_value name="$homeBase" exact="@$ship.defaultorder.$home"/>
-              <set_value name="$homeSector" exact="null"/>
-              <do_if value="$homeBase? and $homeBase.exists">
-                <set_value name="$homeSector" exact="$homeBase.sector"/>
+              <!-- Extract trace ID for logging -->
+              <set_value name="$purgeTraceId" exact="''"/>
+              <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId?">
+                <set_value name="$purgeTraceId" exact="global.$GT_AIParameters.{$ship}.$TraceId"/>
+              </do_if>
+              
+              <!-- Phase 3: Release reservation before purging cache -->
+              <set_value name="$purgeBuyOffer" exact="if $isSellOnly then null else $buyOffer"/>
+              <do_if value="$tradeKey != ''">
+                <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                  <param name="tradeKey" value="$tradeKey"/>
+                  <param name="reason" value="'consumed'"/>
+                  <param name="traceId" value="$purgeTraceId"/>
+                </run_actions>
               </do_if>
               <do_else>
-                <!-- Fallback: use ship's current sector if no home base -->
-                <set_value name="$homeSector" exact="$ship.sector"/>
+                <!-- Generate trade key if not provided.
+                     NOTE: offer.id is not reliably available; GT_GenerateTradeKey has a fallback (method B). -->
+                <set_value name="$tradeKey" exact="''"/>
+                <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                  <param name="buyOffer" value="$purgeBuyOffer"/>
+                  <param name="sellOffer" value="$sellOffer"/>
+                  <param name="traceId" value="$purgeTraceId"/>
+                </run_actions>
+                <do_if value="$tradeKey != ''">
+                  <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+                    <param name="tradeKey" value="$tradeKey"/>
+                    <param name="reason" value="'consumed'"/>
+                    <param name="traceId" value="$purgeTraceId"/>
+                  </run_actions>
+                </do_if>
               </do_else>
               
-              <!-- Only proceed if we have a home sector and cache exists -->
-              <do_if value="$homeSector != null and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
-                <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
-                <set_value name="$cacheEntryRemoved" exact="false"/>
-                
-                <!-- Iterate backwards through cache to find matching entry -->
-                <do_all exact="$sectorCache.count" counter="$i" reverse="true">
-                  <do_if value="not $cacheEntryRemoved">
-                    <set_value name="$cacheEntry" exact="$sectorCache.{$i}"/>
-                    
-                    <!-- Match by comparing BuyOffer and SellOffer objects -->
-                    <!-- Handle sell-only trades (BuyOffer may be null) -->
-                    <set_value name="$buyOfferMatches" exact="false"/>
-                    <set_value name="$sellOfferMatches" exact="false"/>
-                    
-                    <do_if value="$isSellOnly">
-                      <!-- Sell-only trade: only match SellOffer -->
-                      <do_if value="$cacheEntry.$SellOffer? and $sellOffer != null">
-                        <do_if value="$cacheEntry.$SellOffer == $sellOffer">
-                          <set_value name="$sellOfferMatches" exact="true"/>
-                        </do_if>
-                      </do_if>
-                      <set_value name="$buyOfferMatches" exact="true"/>  <!-- Always true for sell-only -->
-                    </do_if>
-                    <do_else>
-                      <!-- Normal trade: match both offers -->
-                      <do_if value="$cacheEntry.$BuyOffer? and $buyOffer != null">
-                        <do_if value="$cacheEntry.$BuyOffer == $buyOffer">
-                          <set_value name="$buyOfferMatches" exact="true"/>
-                        </do_if>
-                      </do_if>
-                      <do_if value="$cacheEntry.$SellOffer? and $sellOffer != null">
-                        <do_if value="$cacheEntry.$SellOffer == $sellOffer">
-                          <set_value name="$sellOfferMatches" exact="true"/>
-                        </do_if>
-                      </do_if>
-                    </do_else>
-                    
-                    <!-- If both offers match, remove this cache entry -->
-                    <do_if value="$buyOfferMatches and $sellOfferMatches">
-                      <remove_value name="global.$GT_TradeCache.{$homeSector}.{$i}"/>
-                      <set_value name="$cacheEntryRemoved" exact="true"/>
-
-                      <!-- Optional index: keep per-ware cache index in sync -->
-                      <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
-                        <set_value name="$entryWare" exact="@$cacheEntry.$BuyOffer.ware"/>
-                        <do_if value="$entryWare? and global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
-                          <remove_from_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$cacheEntry"/>
-                        </do_if>
-                      </do_if>
-                      
-                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                        <set_value name="$wareName" exact="'Unknown'"/>
-                        <do_if value="not $isSellOnly and $trade.$BuyOffer?">
-                          <set_value name="$wareName" exact="@$trade.$BuyOffer.ware.name"/>
-                        </do_if>
-                        <do_elseif value="$isSellOnly and $trade.$Ware?">
-                          <set_value name="$wareName" exact="@$trade.$Ware.name"/>
-                        </do_elseif>
-                        <debug_text text="'[GT-Execution] Removed cache entry for trade: ' + $wareName + ' (Ship: ' + $ship.idcode + ', Home Sector: ' + (if $homeSector.knownname? then @$homeSector.knownname else 'Unknown') + ')'" chance="100"/>
-                      </do_if>
-                      
-                      <!-- Clean up empty cache lists -->
-                      <do_if value="global.$GT_TradeCache.{$homeSector}? and global.$GT_TradeCache.{$homeSector}.count == 0">
-                        <remove_value name="global.$GT_TradeCache.{$homeSector}"/>
-                        <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
-                          <remove_value name="global.$GT_TradeCacheByWare.{$homeSector}"/>
-                        </do_if>
-                      </do_if>
-                      
-                      <break/>
-                    </do_if>
-                  </do_if>
-                </do_all>
-                
-                <!-- Log if cache entry was not found (shouldn't happen, but useful for debugging) -->
-                <do_if value="not $cacheEntryRemoved and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Execution] WARNING: Cache entry not found for removal (Ship: ' + $ship.idcode + ', SearchMethod: cache)'" chance="10"/>
-                </do_if>
+              <!-- Purge offer-pair across ALL home-sector caches (per-home caches can hold duplicates) -->
+              <do_if value="$sellOffer? and $sellOffer != null and $sellOffer.exists">
+                <run_actions ref="md.GT_Libraries_General.GT_PurgeCacheOfferPair_AllHomes" result="$purgeResult">
+                  <param name="ship" value="$ship"/>
+                  <param name="buyOffer" value="$purgeBuyOffer"/>
+                  <param name="sellOffer" value="$sellOffer"/>
+                  <param name="reason" value="'consumed_cache_trade'"/>
+                  <param name="traceId" value="$purgeTraceId"/>
+                </run_actions>
               </do_if>
+              <do_else>
+                <!-- Invalid sellOffer - skip cache purge -->
+                <set_value name="$purgeResult" exact="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+              </do_else>
             </do_if>
             
             <!-- DEBUG: Log exact trade list stored for AI validation -->
@@ -1035,6 +1060,11 @@
         <do_if value="not global.$GT_TS_OutputQueue? or not global.$GT_TS_OutputQueue.$TradeFoundQueue?">
           <cancel_cue cue="this"/>
         </do_if>
+        <!-- SAFEGUARD: Reset processing flag if stuck (prevents infinite stall after crash/reload) -->
+        <!-- Check if processing flag is stuck (set but queue is empty or no active processing) -->
+        <do_if value="global.$GT_TS_OutputQueue.$TradeFoundProcessing and global.$GT_TS_OutputQueue.$TradeFoundQueue.count le 0">
+          <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
+        </do_if>
         <do_if value="global.$GT_TS_OutputQueue.$TradeFoundProcessing">
           <cancel_cue cue="this"/>
         </do_if>
@@ -1067,6 +1097,14 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Execution] SENDING GT_Trade_Found (queued) to ' + $ship.idcode + ' at ' + player.age" chance="100"/>
           </do_if>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'result'"/>
+            <param name="state" value="'trade_found'"/>
+            <param name="reason" value="''"/>
+            <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
+            <param name="extra" value="table[$PendingTrades = (if global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}? then global.$GT_PendingTrades.{$ship}.count else 0)]"/>
+          </run_actions>
           <signal_objects object="$ship" param="'GT_Trade_Found'"/>
         </do_if>
 
@@ -1248,7 +1286,7 @@
                 <debug_text text="'[GalaxyTrader MK3] Recovering idle ship (event): ' + $ship.knownname" chance="100"/>
               </do_if>
               <append_to_list name="global.$GT_TradingQueue.$Ships" exact="$ship"/>
-              <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessTradingQueue"/>
+              <signal_cue_instantly cue="md.GT_Trading_Queue.KickTradingQueue"/>
             </do_if>
             <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
           </do_if>
@@ -1258,10 +1296,17 @@
         <do_if value="global.$GT_SearchLocks?">
           <set_value name="$staleLocks" exact="0"/>
           <set_value name="$lockKeys" exact="global.$GT_SearchLocks.keys.list"/>
+          <set_value name="$lockTtlSeconds" exact="600"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$SearchLockTTL?">
+            <set_value name="$tmpTtl" exact="@global.$GT_GlobalSettings.$Performance.$SearchLockTTL"/>
+            <do_if value="$tmpTtl? and $tmpTtl != null and $tmpTtl ge 60 and $tmpTtl le 7200">
+              <set_value name="$lockTtlSeconds" exact="$tmpTtl"/>
+            </do_if>
+          </do_if>
           <do_all exact="$lockKeys.count" counter="$i">
             <set_value name="$ship" exact="$lockKeys.{$i}"/>
             <set_value name="$lockTime" exact="global.$GT_SearchLocks.{$ship}"/>
-            <do_if value="(player.age - $lockTime) gt 60s">
+            <do_if value="$lockTime? and $lockTime != null and (player.age - $lockTime) gt ($lockTtlSeconds * 1s)">
               <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
                 <param name="ship" value="$ship"/>
                 <param name="reason" value="'stale_lock_cleanup'"/>

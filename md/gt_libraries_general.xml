@@ -293,6 +293,8 @@
         <set_value name="this.$alreadyLocked" exact="false"/>
         <do_if value="global.$GT_SearchLocks.{$ship}?">
           <set_value name="this.$alreadyLocked" exact="true"/>
+          <!-- Log lock already exists -->
+          <debug_text text="'[GT-Lock] (' + $ship.idcode + ') LOCK ACQUIRE FAILED - lock already exists (lockTime: ' + global.$GT_SearchLocks.{$ship} + ')'" chance="100"/>
         </do_if>
         
         <!-- Acquire lock and store parameters -->
@@ -300,10 +302,73 @@
           <set_value name="global.$GT_SearchLocks.{$ship}" exact="player.age"/>
           <set_value name="global.$GT_AIParameters.{$ship}" exact="$parameters"/>
           <set_value name="this.$acquired" exact="true"/>
+          <!-- Log successful lock acquisition -->
+          <debug_text text="'[GT-Lock] (' + $ship.idcode + ') LOCK ACQUIRED (lockTime: ' + player.age + ')'" chance="100"/>
+
+          <!-- Hub status (lightweight): record request lock acquisition -->
+          <set_value name="$traceId" exact="if @$parameters.$TraceId != null then @$parameters.$TraceId else ''"/>
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'lock_acquired'"/>
+            <param name="state" value="'in_progress'"/>
+            <param name="reason" value="'acquired'"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
         </do_if>
         <do_else>
           <set_value name="this.$acquired" exact="false"/>
         </do_else>
+      </actions>
+    </library>
+
+    <!-- Hub Status: Initialize -->
+    <library name="GT_RequestStatus_Init" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_RequestStatus? or global.$GT_RequestStatus == null">
+          <set_value name="global.$GT_RequestStatus" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Hub Status: Update per-ship lifecycle state (debug/coordination only; does NOT signal AI) -->
+    <library name="GT_RequestStatus_Update" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship object key"/>
+        <param name="stage" default="'unknown'" comment="High-level pipeline stage"/>
+        <param name="state" default="'unknown'" comment="State within stage"/>
+        <param name="reason" default="''" comment="Optional reason code"/>
+        <param name="traceId" default="''" comment="Trace ID for correlation"/>
+        <param name="homeSector" default="null" comment="Home sector if known"/>
+        <param name="extra" default="null" comment="Optional table[] of extra fields"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_RequestStatus? or global.$GT_RequestStatus == null">
+          <set_value name="global.$GT_RequestStatus" exact="table[]"/>
+        </do_if>
+
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="not global.$GT_RequestStatus.{$ship}? or global.$GT_RequestStatus.{$ship} == null">
+            <set_value name="global.$GT_RequestStatus.{$ship}" exact="table[]"/>
+          </do_if>
+
+          <set_value name="global.$GT_RequestStatus.{$ship}.$Stage" exact="$stage"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$State" exact="$state"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$Reason" exact="$reason"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$TraceId" exact="$traceId"/>
+          <set_value name="global.$GT_RequestStatus.{$ship}.$UpdatedAt" exact="player.age"/>
+
+          <do_if value="$homeSector? and $homeSector != null">
+            <set_value name="global.$GT_RequestStatus.{$ship}.$HomeSector" exact="$homeSector"/>
+          </do_if>
+
+          <!-- Best-effort merge of extra fields (tables only) -->
+          <do_if value="$extra? and $extra != null and $extra.keys?">
+            <do_all exact="$extra.keys.count" counter="$i">
+              <set_value name="$k" exact="$extra.keys.{$i}"/>
+              <set_value name="global.$GT_RequestStatus.{$ship}.{$k}" exact="$extra.{$k}"/>
+            </do_all>
+          </do_if>
+        </do_if>
       </actions>
     </library>
     
@@ -316,6 +381,18 @@
         <param name="reason" default="'search_complete'" comment="Reason for release (for debugging)"/>
       </params>
       <actions>
+        <!-- CRITICAL: Validate ship is valid before accessing any properties (ship may have been destroyed) -->
+        <do_if value="not $ship? or not $ship.exists">
+          <!-- Ship is invalid (destroyed) - clean up locks/params silently and exit -->
+          <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
+            <remove_value name="global.$GT_SearchLocks.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+            <remove_value name="global.$GT_AIParameters.{$ship}"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
         <!-- PERFORMANCE FIX: Early exit check for non-GT ships -->
         <!-- If ship is not GT-controlled, exit immediately to prevent stutter -->
         <set_value name="$isGTControlled" exact="false"/>
@@ -336,6 +413,15 @@
         <!-- We still clean up to prevent leaks, but don't log for non-GT ships -->
         <set_value name="$shouldLog" exact="$isGTControlled"/>
         
+        <!-- Hub status (lightweight): record release attempt early -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+          <param name="ship" value="$ship"/>
+          <param name="stage" value="'release'"/>
+          <param name="state" value="'released'"/>
+          <param name="reason" value="$reason"/>
+          <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
+        </run_actions>
+
         <!-- Get lock time BEFORE releasing lock (needed for version check) -->
         <set_value name="$lockTime" exact="null"/>
         <do_if value="global.$GT_SearchLocks? and global.$GT_SearchLocks.{$ship}?">
@@ -345,9 +431,17 @@
         <!-- Release lock -->
         <do_if value="$lockTime != null">
           <remove_value name="global.$GT_SearchLocks.{$ship}"/>
-          <do_if value="$shouldLog and global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Registry] Search lock released for ' + $ship.idcode + ' (' + $reason + ')'" chance="100"/>
+          <!-- Always log lock release with ship ID and reason -->
+          <!-- CRITICAL: Validate ship is valid before accessing idcode (ship may have been destroyed or invalidated) -->
+          <!-- Use safe operator @ to prevent errors when ship component handle is invalid -->
+          <set_value name="$shipIdCode" exact="'INVALID_SHIP'"/>
+          <do_if value="$ship? and $ship.exists">
+            <set_value name="$tempShipIdCode" exact="@$ship.idcode"/>
+            <do_if value="$tempShipIdCode? and $tempShipIdCode != null and $tempShipIdCode != ''">
+              <set_value name="$shipIdCode" exact="$tempShipIdCode"/>
+            </do_if>
           </do_if>
+          <debug_text text="'[GT-Lock] (' + $shipIdCode + ') LOCK RELEASED (reason: ' + $reason + ', lockTime: ' + $lockTime + ', age: ' + (player.age - $lockTime) + ')'" chance="100"/>
         </do_if>
         
         <!-- Clean up parameters ONLY if they belong to this request -->
@@ -374,15 +468,121 @@
           <do_if value="$shouldDeleteParams">
             <remove_value name="global.$GT_AIParameters.{$ship}"/>
             <do_if value="$shouldLog and global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Registry] AI parameters cleaned up for ' + $ship.idcode + ' (' + $reason + ', RequestTime: ' + $paramsRequestTime + ')'" chance="100"/>
+              <!-- Use safe operator to prevent errors with invalid ship objects -->
+              <set_value name="$logShipIdCode" exact="@$ship.idcode"/>
+              <set_value name="$safeShipIdCode" exact="if ($logShipIdCode? and $logShipIdCode != null and $logShipIdCode != '') then $logShipIdCode else 'INVALID_SHIP'"/>
+              <debug_text text="'[GT-Registry] AI parameters cleaned up for ' + $safeShipIdCode + ' (' + $reason + ', RequestTime: ' + $paramsRequestTime + ')'" chance="100"/>
             </do_if>
           </do_if>
           <do_else>
             <!-- Parameters belong to newer request - don't delete -->
             <do_if value="$shouldLog and global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Registry] Skipping parameter cleanup for ' + $ship.idcode + ' - parameters belong to newer request (lock: ' + $lockTime + ', params: ' + $paramsRequestTime + ')'" chance="100"/>
+              <!-- Use safe operator to prevent errors with invalid ship objects -->
+              <set_value name="$logShipIdCode2" exact="@$ship.idcode"/>
+              <set_value name="$safeShipIdCode2" exact="if ($logShipIdCode2? and $logShipIdCode2 != null and $logShipIdCode2 != '') then $logShipIdCode2 else 'INVALID_SHIP'"/>
+              <debug_text text="'[GT-Registry] Skipping parameter cleanup for ' + $safeShipIdCode2 + ' - parameters belong to newer request (lock: ' + $lockTime + ', params: ' + $paramsRequestTime + ')'" chance="100"/>
             </do_if>
           </do_else>
+        </do_if>
+
+        <!-- IMPORTANT:
+             stale_lock_cleanup should reset MORE than just the registry lock/params.
+             Otherwise ships can remain stuck in "live search already in progress (pre-gate)" / batch-wait states
+             even after the lock is released, leading to repeat AI timeouts and home-sector refresh blocking.
+             Keep this block narrow: only runs for stale_lock_cleanup. -->
+        <do_if value="$reason == 'stale_lock_cleanup'">
+          <!-- Hub pipeline: LiveSearchQueue removed. If ship was waiting for a home-sector refresh, remove it from waiter lists. -->
+          <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.keys.count gt 0">
+            <do_all exact="global.$GT_TS_LiveRefreshBySector.keys.count" counter="$hsIdx">
+              <set_value name="$hs" exact="global.$GT_TS_LiveRefreshBySector.keys.{$hsIdx}"/>
+              <do_if value="$hs? and global.$GT_TS_LiveRefreshBySector.{$hs}?">
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued? and global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued.{$ship}?">
+                  <remove_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$WaiterQueued.{$ship}"/>
+                </do_if>
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.count gt 0">
+                  <do_all exact="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.count" counter="$wi" reverse="true">
+                    <set_value name="$w" exact="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters.{$wi}"/>
+                    <do_if value="$w? and $w.$Ship? and $w.$Ship == $ship">
+                      <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$hs}.$Waiters" exact="$w"/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+
+          <!-- 3) Clear per-ship live-search state markers so pre-gate checks don't block retries -->
+          <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+            <remove_value name="global.$GT_SearchLiveTrades_State.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceScheduled? and global.$GT_LiveOfferSliceScheduled.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceScheduled.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Queued? and global.$GT_LiveOfferSliceQueue.$Queued.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceQueue.$Queued.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Params? and global.$GT_LiveOfferSliceQueue.$Params.{$ship}?">
+            <remove_value name="global.$GT_LiveOfferSliceQueue.$Params.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_LiveOfferSliceQueue? and global.$GT_LiveOfferSliceQueue.$Ships? and global.$GT_LiveOfferSliceQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_LiveOfferSliceQueue.$Ships" exact="$ship"/>
+          </do_if>
+          <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+            <remove_value name="global.$GT_CacheMissCooldowns.{$ship}"/>
+          </do_if>
+
+          <!-- 4) Clear batch state and remove ship from batch queue/active lists (prevent indefinite batch-wait) -->
+          <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+            <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+            <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+          </do_if>
+
+          <set_value name="$wasInActiveShips" exact="false"/>
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$ActiveShips? and global.$GT_BatchProcessorQueue.$ActiveShips.count gt 0">
+            <do_all exact="global.$GT_BatchProcessorQueue.$ActiveShips.count" counter="$ai" reverse="true">
+              <do_if value="global.$GT_BatchProcessorQueue.$ActiveShips.{$ai} == $ship">
+                <set_value name="$wasInActiveShips" exact="true"/>
+                <remove_from_list name="global.$GT_BatchProcessorQueue.$ActiveShips" exact="$ship"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$wasInActiveShips">
+            <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveProcessors">
+              <param name="clampToZero" value="true"/>
+              <param name="triggerQueueProcessor" value="true"/>
+            </run_actions>
+          </do_if>
+
+          <do_if value="global.$GT_BatchProcessorQueue? and global.$GT_BatchProcessorQueue.$Ships? and global.$GT_BatchProcessorQueue.$Ships.count gt 0">
+            <remove_from_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
+          </do_if>
+
+          <!-- 5) If this ship was the home-sector live-refresh initiator, release the marker so other ships aren't blocked.
+               IMPORTANT: Do NOT call GT_GetHomeSector here. Some stale-lock cleanup cases involve ships that no longer have
+               a valid defaultorder.$home / GT_AIParameters.$HomeBase, which would spam GT_GetHomeSector "THIS SHOULD NEVER HAPPEN"
+               errors and trigger ship.sector fallback drift.
+               Instead, scan the refresh table for any entry whose $Initiator == this ship. -->
+          <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.keys.count gt 0">
+            <do_all exact="global.$GT_TS_LiveRefreshBySector.keys.count" counter="$hsIdx">
+              <set_value name="$hs" exact="global.$GT_TS_LiveRefreshBySector.keys.{$hsIdx}"/>
+              <do_if value="$hs? and global.$GT_TS_LiveRefreshBySector.{$hs}?">
+                <set_value name="$refreshEntry" exact="global.$GT_TS_LiveRefreshBySector.{$hs}"/>
+                <do_if value="$refreshEntry? and $refreshEntry.$Initiator? and $refreshEntry.$Initiator == $ship">
+                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$Active" exact="false"/>
+                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$hs}.$LastFinished" exact="player.age"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+
+          <do_if value="$shouldLog and global.$GT_Config? and global.$GT_Config.$Debug? and global.$GT_Config.$Debug.$TradeSearch? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- Use safe operator to prevent errors with invalid ship objects -->
+            <set_value name="$logShipIdCode3" exact="@$ship.idcode"/>
+            <set_value name="$safeShipIdCode3" exact="if ($logShipIdCode3? and $logShipIdCode3 != null and $logShipIdCode3 != '') then $logShipIdCode3 else 'INVALID_SHIP'"/>
+            <debug_text text="'[GT-Registry] stale_lock_cleanup: reset live/batch state for ' + $safeShipIdCode3" chance="100"/>
+          </do_if>
         </do_if>
         
         <set_value name="this.$released" exact="true"/>
@@ -754,7 +954,8 @@
         </do_if>
         
         <!-- Illegal ware check -->
-        <do_if value="$wareAllowed and not $allowIllegal and @$ware.illegal">
+        <!-- FIX: Explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
+        <do_if value="$wareAllowed and not $allowIllegal and @$ware.illegal gt 0">
           <set_value name="$wareAllowed" exact="false"/>
           <set_value name="$isAllowed" exact="false"/>
           <set_value name="$filterReason" exact="'illegal'"/>
@@ -1373,6 +1574,7 @@
     
     <!-- Clear Pending Trade Data -->
     <!-- EXTRACTED: Cleanup function for pending trade data to avoid code duplication -->
+    <!-- Phase 3: Enhanced to clean up reservations, work items, and scheduler state -->
     <library name="GT_ClearPendingTradeData" purpose="run_actions">
       <params>
         <param name="ship" comment="Ship to clear pending trade data for"/>
@@ -1400,6 +1602,113 @@
         <do_if value="global.$GT_FallbackLogbookWritten? and global.$GT_FallbackLogbookWritten.{$ship}?">
           <remove_value name="global.$GT_FallbackLogbookWritten.{$ship}"/>
         </do_if>
+        
+        <!-- Phase 3: Release all reservations for this ship -->
+        <!-- CRITICAL: global.$GT_Reservations can exist but be null or a non-table (savegame compatibility / corruption).
+             Never access .keys unless it is a real table. -->
+        <do_if value="not global.$GT_Reservations? or typeof global.$GT_Reservations != datatype.table">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+        </do_if>
+        <set_value name="$reservationKeysCount" exact="@global.$GT_Reservations.keys.count"/>
+        <do_if value="$reservationKeysCount != null and $reservationKeysCount gt 0">
+          <set_value name="$reservationsToRemove" exact="[]"/>
+          <do_all exact="$reservationKeysCount" counter="$i">
+            <set_value name="$tradeKey" exact="global.$GT_Reservations.keys.{$i}"/>
+            <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+            <set_value name="$reservedByShip" exact="@$reservation.$Ship"/>
+            <do_if value="$reservedByShip == $ship">
+              <append_to_list name="$reservationsToRemove" exact="$tradeKey"/>
+            </do_if>
+          </do_all>
+          <do_for_each name="$tradeKeyToRemove" in="$reservationsToRemove">
+            <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+              <param name="tradeKey" value="$tradeKeyToRemove"/>
+              <param name="reason" value="'ship_destroyed'"/>
+              <param name="traceId" value="'0'"/>
+            </run_actions>
+          </do_for_each>
+        </do_if>
+        
+        <!-- Phase 3: Clean up scheduler work items for this ship -->
+        <do_if value="global.$GT_Scheduler?">
+          <!-- Remove from work queue -->
+          <do_if value="global.$GT_Scheduler.$WorkQueue?">
+            <set_value name="$workQueue" exact="global.$GT_Scheduler.$WorkQueue"/>
+            <set_value name="$filteredQueue" exact="[]"/>
+            <do_all exact="$workQueue.count" counter="$i">
+              <set_value name="$workItem" exact="$workQueue.{$i}"/>
+              <do_if value="$workItem.$Payload?">
+                <set_value name="$workShip" exact="@$workItem.$Payload.$Ship"/>
+                <do_if value="$workShip != $ship">
+                  <append_to_list name="$filteredQueue" exact="$workItem"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Keep work items without ship payload (shouldn't happen, but be safe) -->
+                <append_to_list name="$filteredQueue" exact="$workItem"/>
+              </do_else>
+            </do_all>
+            <set_value name="global.$GT_Scheduler.$WorkQueue" exact="$filteredQueue"/>
+          </do_if>
+          
+          <!-- Remove from active work (keyed by ship, so direct lookup) -->
+          <do_if value="global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.{$ship}?">
+            <set_value name="$workItem" exact="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+            <!-- Mark work item as failed -->
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="if $workItem.$Key? then $workItem.$Key else 'unknown'"/>
+              <param name="newState" value="'failed'"/>
+              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+              <param name="reason" value="'ship_destroyed'"/>
+              <param name="workItem" value="$workItem"/>
+            </run_actions>
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Phase 3: Release request registry lock -->
+        <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+          <param name="ship" value="$ship"/>
+          <param name="reason" value="'ship_destroyed'"/>
+        </run_actions>
+        
+        <!-- Phase 3: Clear search state -->
+        <do_if value="global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$ship}?">
+          <remove_value name="global.$GT_SearchLiveTrades_State.{$ship}"/>
+        </do_if>
+        
+        <!-- Phase 3: Clear batch data -->
+        <do_if value="global.$GT_BatchDataList? and global.$GT_BatchDataList.{$ship}?">
+          <remove_value name="global.$GT_BatchDataList.{$ship}"/>
+        </do_if>
+        <do_if value="global.$GT_BatchResultsList? and global.$GT_BatchResultsList.{$ship}?">
+          <remove_value name="global.$GT_BatchResultsList.{$ship}"/>
+        </do_if>
+        
+        <!-- Phase 3: Clear AI parameters -->
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+          <remove_value name="global.$GT_AIParameters.{$ship}"/>
+        </do_if>
+        
+        <!-- Phase 4: Clear scheduler entry queue (GT_TS) -->
+        <do_if value="global.$GT_TS?">
+          <!-- Remove from queue list -->
+          <do_if value="global.$GT_TS.$Queue? and global.$GT_TS.$Queue.count gt 0">
+            <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
+          </do_if>
+          <!-- Remove queue markers -->
+          <do_if value="global.$GT_TS.$Queued? and global.$GT_TS.$Queued.{$ship}?">
+            <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
+          </do_if>
+          <!-- Remove enqueue timestamp -->
+          <do_if value="global.$GT_TS.$EnqueuedAt? and global.$GT_TS.$EnqueuedAt.{$ship}?">
+            <remove_value name="global.$GT_TS.$EnqueuedAt.{$ship}"/>
+          </do_if>
+          <!-- Remove request params -->
+          <do_if value="global.$GT_TS.$Requests? and global.$GT_TS.$Requests.{$ship}?">
+            <remove_value name="global.$GT_TS.$Requests.{$ship}"/>
+          </do_if>
+        </do_if>
       </actions>
     </library>
     
@@ -1417,10 +1726,13 @@
         <!-- Returns total count of all trades across all home sector caches -->
         <set_value name="$totalCount" exact="0"/>
         <do_if value="global.$GT_TradeCache?">
-          <!-- Prefer explicit home registry (more reliable than .keys in some saves) -->
+          <!-- Prefer explicit home registry if it exists AND is non-empty. Some saves can end up with an empty registry
+               while the cache table still has keys; in that case, fall back to GT_TradeCache.keys so counts/dumps work. -->
           <set_value name="$homes" exact="[]"/>
-          <do_if value="global.$GT_TradeCacheHomes?">
+          <set_value name="$usedRegistry" exact="false"/>
+          <do_if value="global.$GT_TradeCacheHomes? and global.$GT_TradeCacheHomes != null and typeof global.$GT_TradeCacheHomes == datatype.list and global.$GT_TradeCacheHomes.count gt 0">
             <set_value name="$homes" exact="@global.$GT_TradeCacheHomes"/>
+            <set_value name="$usedRegistry" exact="true"/>
           </do_if>
           <do_else>
             <set_value name="$homes" exact="@global.$GT_TradeCache.keys"/>
@@ -1428,6 +1740,11 @@
               <set_value name="$homes" exact="[]"/>
             </do_if>
           </do_else>
+
+          <!-- Optional self-heal: if registry exists but was empty, rebuild it from keys (best-effort). -->
+          <do_if value="not $usedRegistry and global.$GT_TradeCacheHomes? and (global.$GT_TradeCacheHomes == null or typeof global.$GT_TradeCacheHomes != datatype.list or global.$GT_TradeCacheHomes.count == 0) and $homes.count gt 0">
+            <set_value name="global.$GT_TradeCacheHomes" exact="$homes"/>
+          </do_if>
           
           <do_all exact="$homes.count" counter="$sectorIdx">
             <set_value name="$home" exact="$homes.{$sectorIdx}"/>
@@ -1459,6 +1776,241 @@
       </actions>
     </library>
 
+    <!-- Purge cache entries by offer-pair across ALL home-sector caches -->
+    <!-- Motivation:
+         With per-home-sector caching, the same BuyOffer/SellOffer pair can be cached under multiple home sectors.
+         If we only remove from the executing ship's home sector, other home caches retain stale entries and ships revalidate "ghost" trades.
+         This helper removes matching entries from:
+           - global.$GT_TradeCache.{home}
+           - global.$GT_TradeCacheByWare.{home}.{wareKey} (best-effort for both ware object key and ware.id string key) -->
+    <library name="GT_PurgeCacheOfferPair_AllHomes" purpose="run_actions">
+      <params>
+        <param name="ship" default="null" comment="Ship for logging context (optional)"/>
+        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only)"/>
+        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="reason" default="'unknown'" comment="Reason for purge (debug)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <set_value name="$removedTotal" exact="0"/>
+
+        <!-- Validate required offer handle -->
+        <do_if value="$sellOffer == null">
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+
+        <!-- PHASE 1: Use index-based lookup (O(1)) - ERROR if index missing -->
+        <set_value name="$usedIndex" exact="false"/>
+        <set_value name="$homes" exact="[]"/>
+        
+        <!-- Generate trade key -->
+        <!-- CRITICAL: Validate sellOffer has valid ID before generating trade key -->
+        <set_value name="$tradeKey" exact="''"/>
+        <set_value name="$sellOfferIdValid" exact="false"/>
+        
+        <!-- Validate sellOffer exists and has valid ID -->
+        <do_if value="$sellOffer? and $sellOffer != null and $sellOffer.exists">
+          <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+          <do_if value="$tempSellId? and $tempSellId != null">
+            <set_value name="$sellOfferIdValid" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only generate trade key if sellOffer has valid ID -->
+        <do_if value="$sellOfferIdValid">
+          <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+            <param name="buyOffer" value="$buyOffer"/>
+            <param name="sellOffer" value="$sellOffer"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Validate trade key was generated -->
+        <!-- CRITICAL FIX: This is expected behavior when offers become invalid - log as INFO, not ERROR -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Info'"/>
+              <param name="details" value="'reason=invalid_tradeKey reason=' + $reason + ' note=expected_when_offers_become_invalid'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-INFO] GT_PurgeCacheOfferPair_AllHomes: Failed to generate trade key - cannot invalidate cache (offer may have been removed, trade executed but cache purge skipped)'" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Validate index exists -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_not_initialized trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_PurgeCacheOfferPair_AllHomes: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Look up homes from index -->
+        <run_actions ref="md.GT_Libraries_General.GT_GetTradeIndexHomes" result="$indexHomes">
+          <param name="tradeKey" value="$tradeKey"/>
+        </run_actions>
+        
+        <!-- Validate index lookup returned valid result -->
+        <do_if value="not $indexHomes?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_lookup_failed trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_PurgeCacheOfferPair_AllHomes: Index lookup returned null - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Use index homes -->
+        <set_value name="$homes" exact="$indexHomes"/>
+        <set_value name="$usedIndex" exact="true"/>
+        
+        <!-- Log index-based invalidation -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheInvalidate'"/>
+            <param name="action" value="'IndexLookup'"/>
+            <param name="details" value="'trade=' + $tradeKey + ' homes=' + $homes.count + ' reason=' + $reason"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- ERROR if index lookup returned empty list but trade should exist -->
+        <do_if value="$homes.count == 0">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_entry_not_found trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_PurgeCacheOfferPair_AllHomes: Trade not found in index - tradeKey=' + $tradeKey + ' (trade may not be cached or index incomplete)'" chance="100"/>
+          </do_else>
+          <!-- Continue with empty homes list - will result in 0 removals, which is correct -->
+        </do_if>
+
+        <do_all exact="$homes.count" counter="$hi">
+          <set_value name="$home" exact="$homes.{$hi}"/>
+          <do_if value="$home? and global.$GT_TradeCache? and global.$GT_TradeCache.{$home}?">
+            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$home}"/>
+            <do_all exact="$sectorCache.count" counter="$i" reverse="true">
+              <set_value name="$entry" exact="$sectorCache.{$i}"/>
+              <do_if value="$entry != null">
+                <set_value name="$buyOfferMatches" exact="false"/>
+                <set_value name="$sellOfferMatches" exact="false"/>
+
+                <!-- Sell-only match: buyOffer is null => only match sell offer -->
+                <do_if value="$buyOffer == null">
+                  <set_value name="$buyOfferMatches" exact="true"/>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <do_if value="$entry.$BuyOffer? and $entry.$BuyOffer == $buyOffer">
+                    <set_value name="$buyOfferMatches" exact="true"/>
+                  </do_if>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_else>
+
+                <do_if value="$buyOfferMatches and $sellOfferMatches">
+                  <!-- Remove from main cache -->
+                  <remove_value name="global.$GT_TradeCache.{$home}.{$i}"/>
+                  <set_value name="$removedTotal" operation="add"/>
+
+                  <!-- Best-effort: remove from per-ware index (handles both ware-object keys and legacy ware-id keys) -->
+                  <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                    <set_value name="$wareObj" exact="null"/>
+                    <set_value name="$wareIdKey" exact="null"/>
+                    <do_if value="$entry.$BuyOffer?">
+                      <set_value name="$wareObj" exact="@$entry.$BuyOffer.ware"/>
+                      <do_if value="$wareObj?">
+                        <set_value name="$wareIdKey" exact="@$wareObj.id"/>
+                      </do_if>
+                    </do_if>
+                    <do_elseif value="$entry.$WareId?">
+                      <set_value name="$wareIdKey" exact="@$entry.$WareId"/>
+                    </do_elseif>
+
+                    <!-- Remove by ware object key -->
+                    <do_if value="$wareObj? and global.$GT_TradeCacheByWare.{$home}.{$wareObj}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareObj}" exact="$entry"/>
+                    </do_if>
+                    <!-- Remove by ware id key (legacy / mixed saves) -->
+                    <do_if value="$wareIdKey? and global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}" exact="$entry"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+
+            <!-- Clean up empty home cache lists -->
+            <do_if value="global.$GT_TradeCache.{$home}? and global.$GT_TradeCache.{$home}.count == 0">
+              <remove_value name="global.$GT_TradeCache.{$home}"/>
+              <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                <remove_value name="global.$GT_TradeCacheByWare.{$home}"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <!-- PHASE 1: Remove from index after invalidation -->
+        <do_if value="$tradeKey != '' and $removedTotal gt 0">
+          <run_actions ref="md.GT_Libraries_General.GT_RemoveTradeFromIndex">
+            <param name="tradeKey" value="$tradeKey"/>
+            <param name="homeSector" value="null"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Log invalidation completion -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheInvalidate'"/>
+            <param name="action" value="'Complete'"/>
+            <param name="details" value="'trade=' + (if $tradeKey != '' then $tradeKey else 'unknown') + ' removed=' + $removedTotal + ' homes=' + $homes.count + ' usedIndex=' + (if $usedIndex then 'true' else 'false') + ' reason=' + $reason"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$shipId" exact="if $ship != null then $ship.idcode else 'N/A'"/>
+          <debug_text text="'[GT-Cache] Purged offer-pair across homes: removed=' + $removedTotal + ', homes=' + $homes.count + ', ship=' + $shipId + ', reason=' + $reason + ', usedIndex=' + $usedIndex" chance="100"/>
+        </do_if>
+
+        <return value="table[$Removed = $removedTotal, $Homes = $homes.count, $UsedIndex = $usedIndex]"/>
+      </actions>
+    </library>
+
     <!-- Pick Best Cached Trade (lightweight, hard-budget friendly) -->
     <!-- Design:
          - Cache list is already sorted by Profit desc (insertion sort at write time).
@@ -1476,18 +2028,28 @@
         <param name="ignoreCarrierAux" default="false" comment="Skip carrier/aux targets"/>
         <param name="maxEntries" default="5" comment="Minimum number of top cache entries to validate. Will be increased automatically if maxReturnTrades requires more entries (to account for filtered invalid entries)."/>
         <param name="cacheMaxAge" default="600s" comment="TTL for cache entries"/>
+        <!-- Chunking (frame distribution):
+             If scanCount > 0, only scan [scanStart .. scanStart+scanCount-1] (clamped) and return continuation state. -->
+        <param name="scanStart" default="1" comment="1-based cache index to start scanning from (for chunked cache queries)"/>
+        <param name="scanCount" default="0" comment="Number of cache entries to scan this call (0 = scan full effectiveMaxEntries)"/>
+        <param name="minFailCountIn" default="999999" comment="Carry-over min failcount from previous chunk"/>
+        <param name="validTradesIn" default="[]" comment="Carry-over candidate trades from previous chunk"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
       </params>
       <actions>
         <set_value name="$result" exact="table[
           $Found = false,
           $Trade = null,
           $BestScore = 0,
-          $Trades = []
+          $Trades = [],
+          $ScanDone = true,
+          $ScanNext = 0,
+          $MinFailCount = 999999
         ]"/>
 
         <!-- Return up to MaxTradesToReturn valid candidates (configurable via global settings).
              This prevents fleet-coordination claim-check from stalling when the best trade is already reserved. -->
-        <set_value name="$validTrades" exact="[]"/>
+        <set_value name="$validTrades" exact="if $validTradesIn? then $validTradesIn else []"/>
         <set_value name="$maxReturnTrades" exact="20"/> <!-- Default fallback -->
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
           <set_value name="$maxReturnTrades" exact="global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
@@ -1503,22 +2065,62 @@
         <!-- IMPORTANT: don't use @ with .exists in boolean expressions; split into safe object + exists check -->
         <set_value name="$homeSectorObj" exact="$homeSector"/>
         <do_if value="not $ship? or not $ship.exists or not $homeSectorObj? or not $homeSectorObj.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheQuery'"/>
+              <param name="action" value="'InvalidParams'"/>
+              <param name="details" value="'ship=' + (if $ship? then $ship.idcode else 'null') + ' homeSector=' + (if $homeSectorObj? then 'valid' else 'null')"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
           <return value="$result"/>
         </do_if>
 
         <do_if value="not global.$GT_TradeCache? or not global.$GT_TradeCache.{$homeSector}?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheQuery'"/>
+              <param name="action" value="'Miss'"/>
+              <param name="details" value="'reason=no_cache_for_sector'"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+          </do_if>
           <return value="$result"/>
         </do_if>
 
         <set_value name="$cache" exact="global.$GT_TradeCache.{$homeSector}"/>
         <do_if value="$cache == null or $cache.count le 0">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheQuery'"/>
+              <param name="action" value="'Miss'"/>
+              <param name="details" value="'reason=empty_cache count=' + (if $cache? then $cache.count else '0')"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+          </do_if>
           <return value="$result"/>
+        </do_if>
+
+        <!-- Log cache query start -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheQuery'"/>
+            <param name="action" value="'Start'"/>
+            <param name="details" value="'cacheCount=' + $cache.count + ' maxEntries=' + $maxEntries + ' maxReturnTrades=' + $maxReturnTrades"/>
+            <param name="logLevel" value="2"/>
+          </run_actions>
         </do_if>
 
         <!-- CRITICAL: maxEntries must be at least maxReturnTrades to allow returning multiple trades.
              If maxEntries < maxReturnTrades, we can only return as many trades as entries validated.
              Add buffer (2x) to account for invalid entries that get filtered out. -->
-        <set_value name="$effectiveMaxEntries" exact="[$maxEntries, $maxReturnTrades * 2].max"/>
+        <!-- Fleet scaling: under large fleets, the top-N cache entries can all be reserved or stale.
+             Scan deeper than 2x return size to find unreserved/valid entries, but clamp to a sane cap. -->
+        <set_value name="$effectiveMaxEntries" exact="[$maxEntries, [$maxReturnTrades * 10, 400].min].max"/>
         <set_value name="$limit" exact="[$cache.count, $effectiveMaxEntries].min"/>
         <set_value name="$shipDockSize" exact="$ship.docksize"/>
 
@@ -1528,8 +2130,17 @@
           <set_value name="$allowIllegal" exact="false"/>
         </do_if>
 
+        <!-- Trade rules mode:
+             - If ignoreTradeRules=false (default), ONLY accept cache entries that were discovered with trade rules respected.
+             - If ignoreTradeRules=true, accept both kinds of cache entries. -->
+        <set_value name="$ignoreTradeRules" exact="@global.$GT_AIParameters.{$ship}.$IgnoreTradeRules"/>
+        <do_if value="$ignoreTradeRules == null">
+          <set_value name="$ignoreTradeRules" exact="false"/>
+        </do_if>
+
+
         <!-- Prefer entries with the lowest FailCount; skip entries already failed by this ship. -->
-        <set_value name="$minFailCount" exact="999999"/>
+        <set_value name="$minFailCount" exact="if $minFailCountIn? then $minFailCountIn else 999999"/>
 
         <!-- Determine blacklist group once (used for reachability check) -->
         <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
@@ -1575,7 +2186,19 @@
           </do_elseif>
         </do_if>
 
-        <do_all exact="$limit" counter="$i">
+        <!-- Chunking: compute scan window -->
+        <set_value name="$scanStartIdx" exact="[$scanStart, 1].max"/>
+        <set_value name="$scanEndIdx" exact="$limit"/>
+        <do_if value="$scanCount gt 0">
+          <set_value name="$scanEndIdx" exact="[$scanStartIdx + $scanCount - 1, $limit].min"/>
+        </do_if>
+        <set_value name="$toScan" exact="[$scanEndIdx - $scanStartIdx + 1, 0].max"/>
+        <set_value name="$result.$ScanDone" exact="false"/>
+        <set_value name="$result.$ScanNext" exact="$scanEndIdx + 1"/>
+        <set_value name="$result.$MinFailCount" exact="$minFailCount"/>
+
+        <do_all exact="$toScan" counter="$j">
+          <set_value name="$i" exact="$scanStartIdx + $j - 1"/>
           <set_value name="$entry" exact="$cache.{$i}"/>
 
           <!-- Structure + TTL -->
@@ -1597,12 +2220,25 @@
             <continue/>
           </do_if>
 
+          <!-- Docking permission (ship-specific): skip entries this ship cannot dock at.
+               Vanilla property is dockingallowed.{$ship} (see x4Original/libraries/scriptproperties.xml). -->
+          <do_if value="not @$entry.$BuyOffer.owner.dockingallowed.{$ship} or not @$entry.$SellOffer.owner.dockingallowed.{$ship}">
+            <continue/>
+          </do_if>
+
           <!-- Illegal-ware filter (ship setting). -->
+          <!-- FIX: Explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
           <do_if value="not $allowIllegal">
             <set_value name="$ware" exact="@$entry.$BuyOffer.ware"/>
-            <do_if value="$ware != null and @$ware.illegal">
+            <do_if value="$ware != null and @$ware.illegal gt 0">
               <continue/>
             </do_if>
+          </do_if>
+
+          <!-- Trade rules filter (cache metadata).
+               Backward compatible: if field missing, assume "respected". -->
+          <do_if value="not $ignoreTradeRules and $entry.$TradeRulesRespected? and not $entry.$TradeRulesRespected">
+            <continue/>
           </do_if>
 
           <!-- Failure-distribution filter: skip if this ship already failed this entry. -->
@@ -1716,11 +2352,54 @@
             <continue/>
           </do_if>
 
-          <!-- Reachability (cheap sanity): ship to buy-sector must have a path (blacklist-aware) -->
-          <set_value name="$buySector" exact="$entry.$BuyOffer.owner.sector"/>
-          <set_value name="$shipToBuy" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
-          <do_if value="$shipToBuy lt 0">
+          <!-- Live offer sanity: cached trade entries can become stale under fleet load.
+               Ensure current offers are still available AND have enough amount for this trade. -->
+          <set_value name="$tradeAmount" exact="@$entry.$Amount"/>
+          <do_if value="$tradeAmount == null or $tradeAmount le 0">
             <continue/>
+          </do_if>
+          <set_value name="$buyOfferObj" exact="@$entry.$BuyOffer"/>
+          <set_value name="$sellOfferObj" exact="@$entry.$SellOffer"/>
+          <do_if value="not $buyOfferObj? or $buyOfferObj == null or not $buyOfferObj.exists or not $sellOfferObj? or $sellOfferObj == null or not $sellOfferObj.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$buyAvailNow" exact="@$buyOfferObj.available"/>
+          <set_value name="$sellAvailNow" exact="@$sellOfferObj.available"/>
+          <set_value name="$buyAmtNow" exact="@$buyOfferObj.amount"/>
+          <set_value name="$sellAmtNow" exact="@$sellOfferObj.amount"/>
+          <do_if value="$buyAmtNow == null">
+            <set_value name="$buyAmtNow" exact="0"/>
+          </do_if>
+          <do_if value="$sellAmtNow == null">
+            <set_value name="$sellAmtNow" exact="0"/>
+          </do_if>
+          <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow lt $tradeAmount or $sellAmtNow lt $tradeAmount">
+            <continue/>
+          </do_if>
+
+          <!-- Reachability NOTE:
+               DO NOT do ship.gatedistance checks here.
+               Under large fleets this becomes very expensive (pathfinding per cache entry) and causes frame spikes.
+               AI validation already performs blacklist-aware path checks; rely on that + failcount distribution. -->
+
+          <!-- Phase 3: Reservation check - skip trades reserved by other ships -->
+          <set_value name="$entryTradeKey" exact="''"/>
+          <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$entryTradeKey">
+            <param name="buyOffer" value="$entry.$BuyOffer"/>
+            <param name="sellOffer" value="$entry.$SellOffer"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+          
+          <do_if value="$entryTradeKey != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_IsTradeReserved" result="$isReserved">
+              <param name="tradeKey" value="$entryTradeKey"/>
+              <param name="ship" value="$ship"/>
+              <param name="traceId" value="$traceId"/>
+            </run_actions>
+            <do_if value="$isReserved">
+              <!-- Trade is reserved by another ship - skip it -->
+              <continue/>
+            </do_if>
           </do_if>
 
           <!-- Build canonical trade object for execution -->
@@ -1751,9 +2430,53 @@
 
           <!-- Stop early once we have enough candidates at the optimal failcount (0 is best possible). -->
           <do_if value="$minFailCount == 0 and $validTrades.count ge $maxReturnTrades">
+            <set_value name="$result.$ScanDone" exact="true"/>
+            <set_value name="$result.$ScanNext" exact="0"/>
             <break/>
           </do_if>
         </do_all>
+
+        <!-- If we scanned to the end of our window and still have remaining entries, keep ScanDone=false (caller will schedule next chunk).
+             If we reached the global scan cap, mark done. -->
+        <do_if value="$result.$ScanNext gt $limit">
+          <set_value name="$result.$ScanDone" exact="true"/>
+          <set_value name="$result.$ScanNext" exact="0"/>
+        </do_if>
+
+        <!-- Persist chunking state -->
+        <set_value name="$result.$MinFailCount" exact="$minFailCount"/>
+
+        <!-- Debug: explain why small candidate lists happen (top-N validation + filters + maxReturnTrades cap) -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Cache] (' + $ship.idcode + ') CachePickBest summary: cacheCount=' + $cache.count +
+            ', maxReturnTrades=' + $maxReturnTrades +
+            ', effectiveMaxEntries=' + $effectiveMaxEntries +
+            ', validatedTop=' + $limit +
+            ', returned=' + $validTrades.count +
+            ', minFailCount=' + $minFailCount" chance="100"/>
+        </do_if>
+
+        <!-- Log cache query result -->
+        <do_if value="$traceId != ''">
+          <do_if value="$result.$Found">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheQuery'"/>
+              <param name="action" value="'Hit'"/>
+              <param name="details" value="'trades=' + $validTrades.count + ' bestScore=' + $result.$BestScore + ' validatedTop=' + $limit + ' minFailCount=' + $minFailCount"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheQuery'"/>
+              <param name="action" value="'Miss'"/>
+              <param name="details" value="'reason=no_valid_trades validatedTop=' + $limit"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+          </do_else>
+        </do_if>
 
         <set_value name="$result.$Trades" exact="$validTrades"/>
         <return value="$result"/>
@@ -1915,8 +2638,8 @@
       <actions>
         <!-- Returns price range from config: $sellPriceMax, $buyPriceMin -->
         <!-- For isolated ships, uses isolated-specific price ranges -->
-        <set_value name="$sellPriceMax" exact="0.5"/>  <!-- Default fallback -->
-        <set_value name="$buyPriceMin" exact="-0.5"/>  <!-- Default fallback -->
+        <set_value name="$sellPriceMax" exact="1.0"/>  <!-- Default fallback: +100% -->
+        <set_value name="$buyPriceMin" exact="-1.0"/>  <!-- Default fallback: -100% -->
         <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
           <do_if value="$shipIsIsolated">
             <!-- Isolated ships: Use isolated-specific price ranges -->
@@ -2539,7 +3262,8 @@
           </do_if>
           <do_else>
             <!-- Fallback: Global illegal check (may be overly restrictive - use context-aware check when possible) -->
-            <do_if value="$ware.illegal">
+            <!-- FIX: Use safe operator and explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
+            <do_if value="@$ware.illegal gt 0">
               <return value="false"/>
             </do_if>
           </do_else>
@@ -2779,11 +3503,13 @@
         </do_if>
         
         <!-- REMOVED: Never fall back to $ship.sector (causes cascading drift) -->
-        <!-- If home is still null, log critical error -->
+        <!-- If home is still null, log critical error and return null -->
         <do_if value="not $homeBase? or not $homeBase.exists">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-ERROR] Home sector not found for ' + $ship.idcode + ' - defaultorder.$home is null and GT_AIParameters.$HomeBase is null! This should never happen.'" chance="100"/>
+            <debug_text text="'[GT-ERROR] Home sector not found for ' + $ship.idcode + ' - defaultorder.$home is null and GT_AIParameters.$HomeBase is null! This should never happen. Returning null to prevent drift.'" chance="100"/>
           </do_if>
+          <!-- Return null instead of ship.sector to prevent drift -->
+          <return value="null"/>
         </do_if>
         
         <!-- Extract sector from home base (station/sector) -->
@@ -2797,13 +3523,13 @@
           </do_elseif>
         </do_if>
         
-        <!-- Validate final home sector -->
+        <!-- Validate final home sector - return null if extraction failed (prevents drift) -->
         <do_if value="not $homeSector? or not $homeSector.exists">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-ERROR] Failed to extract home sector from homeBase for ' + $ship.idcode + ' - using ship.sector as emergency fallback (THIS WILL CAUSE DRIFT!)'" chance="100"/>
+            <debug_text text="'[GT-ERROR] Failed to extract home sector from homeBase for ' + $ship.idcode + ' - returning null to prevent drift!'" chance="100"/>
           </do_if>
-          <!-- Emergency fallback only - this should never happen -->
-          <set_value name="$homeSector" exact="$ship.sector"/>
+          <!-- Return null instead of ship.sector to prevent drift -->
+          <return value="null"/>
         </do_if>
         
         <return value="$homeSector"/>
@@ -2969,6 +3695,12 @@
           <return value="$return"/>
         </do_if>
         
+        <!-- Check if dynamic blacklist is enabled (required for blacklist-aware pathfinding) -->
+        <set_value name="$useDynamicBlacklist" exact="false"/>
+        <do_if value="global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist?">
+          <set_value name="$useDynamicBlacklist" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+        </do_if>
+        
         <!-- Get threat expiry time -->
         <set_value name="$threatExpiry" exact="if global.$GT_GlobalSettings.$ThreatAvoidance.$ThreatExpiry? then global.$GT_GlobalSettings.$ThreatAvoidance.$ThreatExpiry else 600s"/>
         
@@ -2984,8 +3716,8 @@
         </do_if>
         
         <!-- Check if preferred route goes through threatened sectors -->
-        <!-- Compare normal vs blacklist-aware gatedistance to detect threats in path -->
-        <do_if value="$ship? and $sellStation.sector != $buyStation.sector">
+        <!-- Compare normal vs blacklist-aware gatedistance to detect threats in path (only if dynamic blacklist enabled) -->
+        <do_if value="$ship? and $sellStation.sector != $buyStation.sector and $useDynamicBlacklist">
           <!-- Extract sectors before gatedistance calculation (property chains in curly braces can fail) -->
           <set_value name="$sellSector" exact="@$sellStation.sector"/>
           <do_if value="$sellSector?">
@@ -3998,20 +4730,7 @@
         <param name="initializeIfMissing" default="true" comment="Initialize counter to 0 if it doesn't exist"/>
       </params>
       <actions>
-        <!-- Initialize counter if missing -->
-        <do_if value="$initializeIfMissing">
-          <do_if value="not global.$GT_LiveSearchQueue?">
-            <set_value name="global.$GT_LiveSearchQueue" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Increment counter -->
-        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches?">
-          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="add"/>
-        </do_if>
+        <!-- LiveSearchQueue removed (hub finalization): no-op kept for compatibility -->
       </actions>
     </library>
     
@@ -4019,27 +4738,10 @@
     <library name="GT_DecrementActiveLiveSearches" purpose="run_actions">
       <params>
         <param name="clampToZero" default="true" comment="Clamp counter to 0 if it goes negative"/>
-        <param name="triggerQueueProcessor" default="false" comment="Signal ProcessLiveSearchQueue after decrement if ships are waiting"/>
+        <param name="triggerQueueProcessor" default="false" comment="Legacy parameter (LiveSearchQueue removed); kept for compatibility"/>
       </params>
       <actions>
-        <!-- Decrement counter -->
-        <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches gt 0">
-          <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" operation="subtract"/>
-        </do_if>
-        
-        <!-- Hard clamp: ActiveLiveSearches must never go negative -->
-        <do_if value="$clampToZero">
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$ActiveLiveSearches? and global.$GT_LiveSearchQueue.$ActiveLiveSearches lt 0">
-            <set_value name="global.$GT_LiveSearchQueue.$ActiveLiveSearches" exact="0"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Trigger queue processor if requested and ships are waiting -->
-        <do_if value="$triggerQueueProcessor">
-          <do_if value="global.$GT_LiveSearchQueue? and global.$GT_LiveSearchQueue.$Ships? and global.$GT_LiveSearchQueue.$Ships.count gt 0">
-            <signal_cue_instantly cue="md.GT_Trading_Queue.ProcessLiveSearchQueue"/>
-          </do_if>
-        </do_if>
+        <!-- LiveSearchQueue removed (hub finalization): no-op kept for compatibility -->
       </actions>
     </library>
     
@@ -4091,6 +4793,1153 @@
             <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
           </do_if>
         </do_if>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
+    <!-- TRADE SEARCH PIPELINE LOGGING -->
+    <!-- ========================================= -->
+    
+    <!-- ========================================= -->
+    <!-- TRADE INDEX (Cross-Cache Invalidation) -->
+    <!-- ========================================= -->
+    
+    <!-- ========================================= -->
+    <!-- CENTRAL SCHEDULER (Phase 2) -->
+    <!-- ========================================= -->
+    
+    <!-- Create Work Item for Scheduler -->
+    <!-- Work items represent units of work in the trade search pipeline -->
+    <library name="GT_CreateWorkItem" purpose="run_actions">
+      <params>
+        <param name="type" comment="Work item type: 'Request', 'CacheQuery', 'SearchContinuation', 'HomeSearch', 'OfferCollect', 'Match', 'Finalize'"/>
+        <param name="key" comment="Unique key for this work item (typically ship.idcode + '_' + type)"/>
+        <param name="traceId" comment="Trace ID for this work item"/>
+        <param name="payload" default="table[]" comment="Type-specific payload data"/>
+      </params>
+      <actions>
+        <!-- Validate inputs - ERROR if missing -->
+        <do_if value="$type == '' or $key == ''">
+          <debug_text text="'[GT-ERROR] GT_CreateWorkItem: type or key is empty - type=' + $type + ' key=' + $key" chance="100"/>
+          <return value="null"/>
+        </do_if>
+        
+        <set_value name="$workItem" exact="table[
+          $Type = $type,
+          $Key = $key,
+          $TraceId = $traceId,
+          $CreatedAt = player.age,
+          $UpdatedAt = player.age,
+          $State = 'queued',
+          $Payload = $payload
+        ]"/>
+        
+        <return value="$workItem"/>
+      </actions>
+    </library>
+    
+    <!-- Enqueue Work Item to Scheduler -->
+    <library name="GT_EnqueueWorkItem" purpose="run_actions">
+      <params>
+        <param name="workItem" comment="Work item to enqueue"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- CRITICAL: Initialize scheduler if missing (defensive initialization) -->
+        <!-- This handles race conditions where work items are enqueued before SystemInit completes -->
+        <do_if value="not global.$GT_Scheduler?">
+          <set_value name="global.$GT_Scheduler" exact="table[
+            $WorkQueue = [],
+            $ActiveWork = table[],
+            $Budgets = table[
+              $CheapOpsPerTick = 10,
+              $OfferOpsPerTick = 5,
+              $MatchOpsPerTick = 1,
+              $MaxActiveHomeSearches = 1
+            ],
+            $Counters = table[
+              $Queued = 0,
+              $Active = 0,
+              $Completed = 0,
+              $Failed = 0
+            ],
+            $Processing = false,
+            $LastStatsLog = player.age
+          ]"/>
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Initialized'"/>
+              <param name="details" value="'reason=auto_init_on_enqueue type=' + (if $workItem? and $workItem.$Type? then $workItem.$Type else 'unknown')"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-WARN] GT_EnqueueWorkItem: Scheduler auto-initialized (should have been initialized by SystemInit)'" chance="100"/>
+          </do_else>
+        </do_if>
+        <!-- Ensure required properties exist (defensive check) -->
+        <do_if value="not global.$GT_Scheduler.$WorkQueue?">
+          <set_value name="global.$GT_Scheduler.$WorkQueue" exact="[]"/>
+        </do_if>
+        <!-- CRITICAL: Ensure ActiveWork exists - but DON'T fix corruption here -->
+        <!-- Corruption detection/fixing is handled by ProcessWorkQueue (authoritative processor) -->
+        <!-- This prevents race conditions where multiple places try to fix corruption simultaneously -->
+        <do_if value="not global.$GT_Scheduler.$ActiveWork?">
+          <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
+        </do_if>
+        <!-- NOTE: We don't check for corruption here - ProcessWorkQueue handles that -->
+        <!-- If ActiveWork is corrupted, ProcessWorkQueue will detect and fix it on its next tick -->
+        
+        <!-- Validate work item - ERROR if missing -->
+        <do_if value="not $workItem? or not $workItem.$Type? or not $workItem.$Key?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_workItem'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_EnqueueWorkItem: Work item is null or missing required fields'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Ensure WorkQueue exists -->
+        <do_if value="not global.$GT_Scheduler.$WorkQueue?">
+          <set_value name="global.$GT_Scheduler.$WorkQueue" exact="[]"/>
+        </do_if>
+        <!-- NOTE: ActiveWork type check already done above (lines 4788-4800) - no need to check again -->
+        <do_if value="not global.$GT_Scheduler.$Processing?">
+          <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
+        </do_if>
+        
+        <!-- Add to queue -->
+        <append_to_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
+        
+        <!-- Update counters -->
+        <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+          <param name="counterName" value="'Queued'"/>
+          <param name="delta" value="1"/>
+        </run_actions>
+        
+        <!-- Log work item queued -->
+        <set_value name="$logTraceId" exact="if $traceId != '' then $traceId else (if $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$logTraceId"/>
+          <param name="stage" value="'Scheduler'"/>
+          <param name="action" value="'WorkItemQueued'"/>
+          <param name="details" value="'type=' + $workItem.$Type + ' key=' + $workItem.$Key + ' queue=' + global.$GT_Scheduler.$WorkQueue.count"/>
+          <param name="logLevel" value="2"/>
+        </run_actions>
+        
+        <!-- Trigger scheduler processing if not already running (single signal, no duplicate) -->
+        <!-- ROOT CAUSE FIX: Use ProcessWorkQueueDelayed instead of direct signal to prevent stutter -->
+        <!-- Direct signal can cause multiple ProcessWorkQueue instances in same frame -->
+        <do_if value="not global.$GT_Scheduler.$Processing">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueueDelayed"/>
+        </do_if>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Update Work Item State -->
+    <library name="GT_UpdateWorkItemState" purpose="run_actions">
+      <params>
+        <param name="key" comment="Work item key"/>
+        <param name="newState" comment="New state: 'queued', 'active', 'completed', 'failed'"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+        <param name="reason" default="''" comment="Failure reason (if state='failed')"/>
+        <param name="workItem" default="null" comment="Work item object (optional - if provided, skips lookup)"/>
+      </params>
+      <actions>
+        <!-- Validate scheduler exists - ERROR if missing -->
+        <do_if value="not global.$GT_Scheduler?">
+          <debug_text text="'[GT-ERROR] GT_UpdateWorkItemState: Scheduler not initialized - key=' + $key" chance="100"/>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Use provided work item or find it in WorkQueue -->
+        <!-- NOTE: ActiveWork is now keyed by ship, not by string key, so we can't look it up by key -->
+        <set_value name="$oldState" exact="'unknown'"/>
+        <set_value name="$workShip" exact="null"/>
+        
+        <do_if value="$workItem != null">
+          <!-- Use provided work item -->
+          <set_value name="$oldState" exact="if $workItem.$State? then $workItem.$State else 'unknown'"/>
+          <!-- Extract ship from payload for ActiveWork operations -->
+          <do_if value="$workItem.$Payload?">
+            <set_value name="$workShip" exact="@$workItem.$Payload.$Ship"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Find work item in WorkQueue (can't look up ActiveWork by key anymore - it's keyed by ship) -->
+          <set_value name="$workItem" exact="null"/>
+          
+          <!-- Check WorkQueue -->
+          <do_if value="global.$GT_Scheduler.$WorkQueue?">
+            <do_all exact="global.$GT_Scheduler.$WorkQueue.count" counter="$i">
+              <do_if value="global.$GT_Scheduler.$WorkQueue.{$i}.$Key == $key">
+                <set_value name="$workItem" exact="global.$GT_Scheduler.$WorkQueue.{$i}"/>
+                <set_value name="$oldState" exact="if $workItem.$State? then $workItem.$State else 'unknown'"/>
+                <!-- Extract ship from payload -->
+                <do_if value="$workItem.$Payload?">
+                  <set_value name="$workShip" exact="@$workItem.$Payload.$Ship"/>
+                </do_if>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <!-- ERROR if work item not found -->
+          <do_if value="not $workItem? or $workItem == null">
+            <do_if value="$traceId != ''">
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="$traceId"/>
+                <param name="stage" value="'Scheduler'"/>
+                <param name="action" value="'Error'"/>
+                <param name="details" value="'reason=workItem_not_found key=' + $key + ' newState=' + $newState"/>
+                <param name="logLevel" value="0"/>
+              </run_actions>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-ERROR] GT_UpdateWorkItemState: Work item not found - key=' + $key" chance="100"/>
+            </do_else>
+            <return value="false"/>
+          </do_if>
+        </do_else>
+        
+        <!-- CRITICAL FIX: Validate workItem is not null before accessing properties -->
+        <do_if value="not $workItem? or $workItem == null">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Scheduler'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=workItem_is_null key=' + $key + ' newState=' + $newState"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_UpdateWorkItemState: Work item is null - key=' + $key" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Update state -->
+        <set_value name="$workItem.$State" exact="$newState"/>
+        <set_value name="$workItem.$UpdatedAt" exact="player.age"/>
+        
+        <!-- Update in ActiveWork if present (keyed by ship, not by key) -->
+        <do_if value="$workShip? and global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.{$workShip}?">
+          <set_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}" exact="$workItem"/>
+        </do_if>
+        
+        <!-- Log state transition -->
+        <!-- CRITICAL FIX: Use safe property access for logging -->
+        <set_value name="$logTraceId" exact="if $traceId != '' then $traceId else (if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
+        <set_value name="$workItemType" exact="if $workItem? and $workItem.$Type? then $workItem.$Type else 'unknown'"/>
+        <set_value name="$details" exact="'type=' + $workItemType + ' key=' + $key + ' state=' + $oldState + '->' + $newState"/>
+        <do_if value="$newState == 'failed' and $reason != ''">
+          <set_value name="$details" exact="$details + ' reason=' + $reason"/>
+        </do_if>
+        <do_if value="$newState == 'completed'">
+          <!-- CRITICAL FIX: Use safe property access -->
+          <do_if value="$workItem? and $workItem.$CreatedAt?">
+            <set_value name="$duration" exact="player.age - $workItem.$CreatedAt"/>
+            <set_value name="$details" exact="$details + ' duration=' + ($duration / 1ms) + 'ms'"/>
+          </do_if>
+        </do_if>
+        
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$logTraceId"/>
+          <param name="stage" value="'Scheduler'"/>
+          <param name="action" value="'WorkItemStateChange'"/>
+          <param name="details" value="$details"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <!-- Update counters -->
+        <do_if value="$oldState == 'queued' and $newState == 'active'">
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Queued'"/>
+            <param name="delta" value="-1"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Active'"/>
+            <param name="delta" value="1"/>
+          </run_actions>
+        </do_if>
+        <do_elseif value="$oldState == 'active' and $newState == 'completed'">
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Active'"/>
+            <param name="delta" value="-1"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Completed'"/>
+            <param name="delta" value="1"/>
+          </run_actions>
+        </do_elseif>
+        <do_elseif value="$oldState == 'active' and $newState == 'failed'">
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Active'"/>
+            <param name="delta" value="-1"/>
+          </run_actions>
+          <run_actions ref="md.GT_Libraries_General.GT_UpdatePipelineCounter">
+            <param name="counterName" value="'Failed'"/>
+            <param name="delta" value="1"/>
+          </run_actions>
+        </do_elseif>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Generate Trade Key (Option A: BuyOffer.id + SellOffer.id) -->
+    <!-- Simple approach: uses offer IDs which are unique per offer instance -->
+    <!-- Trade key format: "buyOfferId_sellOfferId" or "null_sellOfferId" for sell-only -->
+    <library name="GT_GenerateTradeKey" purpose="run_actions">
+      <params>
+        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only trades)"/>
+        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <set_value name="$tradeKey" exact="''"/>
+        
+        <!-- Validate sell offer - ERROR if missing -->
+        <do_if value="not $sellOffer? or not $sellOffer.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=missing_sellOffer'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_GenerateTradeKey: sellOffer is null or missing - cannot generate trade key'" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <!-- Get offer IDs -->
+        <set_value name="$buyOfferId" exact="'null'"/>
+        <set_value name="$sellOfferId" exact="''"/>
+        
+        <do_if value="$buyOffer? and $buyOffer.exists">
+          <set_value name="$tempBuyId" exact="@$buyOffer.id"/>
+          <do_if value="$tempBuyId? and $tempBuyId != null">
+            <set_value name="$buyOfferId" exact="'' + $tempBuyId"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Validate sellOffer has valid ID before generating key -->
+        <!-- CRITICAL: Check if sellOffer.id exists and is not null before converting to string -->
+        <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+        <do_if value="$tempSellId? and $tempSellId != null and typeof $tempSellId != datatype.null">
+          <!-- Valid ID - convert to string -->
+          <set_value name="$sellOfferId" exact="'' + $tempSellId"/>
+          <!-- Double-check: ensure sellOfferId is not empty or 'null' string -->
+          <do_if value="$sellOfferId == '' or $sellOfferId == 'null'">
+            <!-- ID conversion failed - log error and return empty key -->
+            <do_if value="$traceId != ''">
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="$traceId"/>
+                <param name="stage" value="'CacheIndex'"/>
+                <param name="action" value="'Error'"/>
+                <param name="details" value="'reason=invalid_sellOffer_id_conversion tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ' sellOfferId=' + $sellOfferId"/>
+                <param name="logLevel" value="0"/>
+              </run_actions>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-ERROR] GT_GenerateTradeKey: sellOffer.id conversion failed - tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ', sellOfferId=' + $sellOfferId" chance="100"/>
+            </do_else>
+            <return value="''"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Fallback (Method B): offer.id is not available in many X4 trade-offer objects.
+               Use the SELL offer object itself as the reservation key.
+               This restores reservation behavior under fleet load and prevents mass cache collisions. -->
+          <set_value name="$tradeKey" exact="$sellOffer"/>
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'KeyGenerated'"/>
+              <param name="details" value="'trade=SellOfferObj method=B buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <return value="$tradeKey"/>
+        </do_else>
+        
+        <!-- Generate key: "buyOfferId_sellOfferId" -->
+        <!-- CRITICAL: Validate sellOfferId is not empty before generating key -->
+        <do_if value="$sellOfferId == ''">
+          <!-- sellOfferId is empty - this should have been caught earlier, but double-check -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_sellOfferId buyOfferId=' + $buyOfferId"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_GenerateTradeKey: sellOfferId is empty - cannot generate trade key'" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <set_value name="$tradeKey" exact="$buyOfferId + '_' + $sellOfferId"/>
+        
+        <!-- Validate generated key is not null_null (indicates invalid offer IDs) -->
+        <do_if value="$tradeKey == 'null_null'">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_offer_ids buyOfferId=' + $buyOfferId + ' sellOfferId=' + $sellOfferId"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_GenerateTradeKey: Generated invalid trade key null_null - buyOfferId=' + $buyOfferId + ', sellOfferId=' + $sellOfferId" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <!-- Log key generation -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheIndex'"/>
+            <param name="action" value="'KeyGenerated'"/>
+            <param name="details" value="'trade=' + $tradeKey + ' method=A buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
+            <param name="logLevel" value="3"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="$tradeKey"/>
+      </actions>
+    </library>
+    
+    <!-- Initialize Trade Index Structure -->
+    <library name="GT_InitializeTradeIndex" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_TradeIndex?">
+          <set_value name="global.$GT_TradeIndex" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Add Trade to Index -->
+    <!-- Called when writing to cache: adds home sector to index entry -->
+    <library name="GT_AddTradeToIndex" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+        <param name="homeSector" comment="Home sector where this trade is cached"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Initialize index if needed -->
+        <run_actions ref="md.GT_Libraries_General.GT_InitializeTradeIndex"/>
+        
+        <!-- Validate inputs - ERROR if missing or invalid (null_null indicates invalid offers) -->
+        <do_if value="$tradeKey == '' or $tradeKey == 'null_null'">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=' + (if $tradeKey == 'null_null' then 'invalid_tradeKey_null_null' else 'empty_tradeKey')"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_AddTradeToIndex: tradeKey is empty or invalid (' + $tradeKey + ') - cannot add to index'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_homeSector tradeKey=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_AddTradeToIndex: homeSector is null or invalid - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Get or create index entry -->
+        <set_value name="$indexEntry" exact="null"/>
+        <do_if value="global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="$indexEntry" exact="global.$GT_TradeIndex.{$tradeKey}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$indexEntry" exact="table[
+            $Homes = [],
+            $ReservedBy = null,
+            $ReservedUntil = null
+          ]"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}" exact="$indexEntry"/>
+        </do_else>
+        
+        <!-- Add home sector to list if not already present -->
+        <set_value name="$homeExists" exact="false"/>
+        <do_if value="$indexEntry.$Homes?">
+          <do_all exact="$indexEntry.$Homes.count" counter="$i">
+            <do_if value="$indexEntry.$Homes.{$i} == $homeSector">
+              <set_value name="$homeExists" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <do_if value="not $homeExists">
+          <append_to_list name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="$homeSector"/>
+          
+          <!-- Log index update -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Added'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' home=' + (if $homeSector? then @$homeSector.knownname else 'null') + ' homes=' + global.$GT_TradeIndex.{$tradeKey}.$Homes.count"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+        </do_if>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Remove Trade from Index -->
+    <!-- Called when invalidating: removes home sector from index entry, removes entry if empty -->
+    <library name="GT_RemoveTradeFromIndex" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+        <param name="homeSector" comment="Home sector to remove (null to remove all)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate index exists - ERROR if missing -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_not_initialized trade=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_RemoveTradeFromIndex: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Validate trade key entry exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}?">
+          <!-- This is expected if trade was never cached - log but don't error -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Warning'"/>
+              <param name="details" value="'reason=entry_not_found trade=' + $tradeKey"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <set_value name="$indexEntry" exact="global.$GT_TradeIndex.{$tradeKey}"/>
+        
+        <!-- Remove specific home sector or all -->
+        <do_if value="$homeSector? and $homeSector.exists">
+          <!-- Remove specific home sector -->
+          <do_if value="$indexEntry.$Homes?">
+            <remove_from_list name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="$homeSector"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Remove all home sectors (trade fully consumed) -->
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="[]"/>
+        </do_else>
+        
+        <!-- Remove index entry if no homes remain -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}.$Homes? or global.$GT_TradeIndex.{$tradeKey}.$Homes.count == 0">
+          <remove_value name="global.$GT_TradeIndex.{$tradeKey}"/>
+          
+          <!-- Log index removal -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Removed'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' reason=no_homes'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Log partial removal -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Updated'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' homes=' + global.$GT_TradeIndex.{$tradeKey}.$Homes.count"/>
+              <param name="logLevel" value="3"/>
+            </run_actions>
+          </do_if>
+        </do_else>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Get Home Sectors for Trade Key -->
+    <!-- Returns list of home sectors where this trade is cached -->
+    <!-- ERROR if index not initialized or entry missing -->
+    <library name="GT_GetTradeIndexHomes" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+      </params>
+      <actions>
+        <set_value name="$homes" exact="[]"/>
+        
+        <!-- Validate index exists -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <debug_text text="'[GT-ERROR] GT_GetTradeIndexHomes: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          <return value="$homes"/>
+        </do_if>
+        
+        <!-- Validate trade key entry exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}?">
+          <!-- This is expected if trade was never cached - return empty list -->
+          <return value="$homes"/>
+        </do_if>
+        
+        <!-- Validate Homes list exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}.$Homes?">
+          <debug_text text="'[GT-ERROR] GT_GetTradeIndexHomes: Index entry missing $Homes property - tradeKey=' + $tradeKey" chance="100"/>
+          <return value="$homes"/>
+        </do_if>
+        
+        <set_value name="$homes" exact="global.$GT_TradeIndex.{$tradeKey}.$Homes"/>
+        
+        <return value="$homes"/>
+      </actions>
+    </library>
+    
+    <!-- Failure Reason Constants -->
+    <!-- Standardized failure reasons for trade search pipeline -->
+    <library name="GT_GetFailureReason" purpose="run_actions">
+      <params>
+        <param name="reason" comment="Failure reason code"/>
+      </params>
+      <actions>
+        <!-- Initialize failure reason constants if not exists -->
+        <do_if value="not global.$GT_FailureReasons?">
+          <set_value name="global.$GT_FailureReasons" exact="table[
+            $NoSectors = 'no_sectors',
+            $NoOffers = 'no_offers',
+            $NoProfitableMatches = 'no_profitable_matches',
+            $DockingBlocked = 'docking_blocked',
+            $IllegalBlocked = 'illegal_blocked',
+            $BlacklistBlocked = 'blacklist_blocked',
+            $PathBlocked = 'path_blocked',
+            $ReservedConflict = 'reserved_conflict',
+            $CacheMiss = 'cache_miss',
+            $CacheEmpty = 'cache_empty',
+            $CacheNoValidTrades = 'cache_no_valid_trades',
+            $ShipDestroyed = 'ship_destroyed',
+            $NoGTOrder = 'no_gt_order',
+            $ShipBusy = 'ship_busy',
+            $InvalidParams = 'invalid_params',
+            $StaleState = 'stale_state',
+            $BatchStall = 'batch_stall',
+            $Timeout = 'timeout',
+            $StateCorruption = 'state_corruption',
+            $Unknown = 'unknown'
+          ]"/>
+        </do_if>
+        
+        <!-- Return failure reason string -->
+        <set_value name="$reasonStr" exact="'unknown'"/>
+        <do_if value="global.$GT_FailureReasons.{$reason}?">
+          <set_value name="$reasonStr" exact="global.$GT_FailureReasons.{$reason}"/>
+        </do_if>
+        <return value="$reasonStr"/>
+      </actions>
+    </library>
+    
+    <!-- Log Trade Search Event (Simple Format) -->
+    <library name="GT_LogTradeSearch" purpose="run_actions">
+      <params>
+        <param name="traceId" default="0" comment="Trace ID for request correlation"/>
+        <param name="stage" default="'Unknown'" comment="Stage name (Request, CacheQuery, HomeSearch, OfferCollect, Match, Finalize, Scheduler, Reservation, Cache, Error)"/>
+        <param name="action" default="'Event'" comment="Action name (Start, End, Hit, Miss, Error, etc.)"/>
+        <param name="details" default="''" comment="Details string (key=value pairs)"/>
+        <param name="chance" default="100" comment="Log chance (0-100)"/>
+        <param name="logLevel" default="1" comment="Log level (0=error/critical, 1=important, 2=info, 3=debug) - maps to chance if chance not provided"/>
+      </params>
+      <actions>
+        <!-- Map logLevel to chance if chance not explicitly provided (default 100) -->
+        <set_value name="$logChance" exact="$chance"/>
+        <do_if value="$chance == 100 and $logLevel != 1">
+          <!-- logLevel 0,1,2 = always log (100), logLevel 3 = debug (100 for now, user said "log all") -->
+          <set_value name="$logChance" exact="100"/>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$timestamp" exact="player.age"/>
+          <set_value name="$logMsg" exact="'[GT-TS] ' + $timestamp + ' ' + $traceId + ' ' + $stage + ' ' + $action + ' ' + $details"/>
+          <debug_text text="$logMsg" chance="$logChance"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Log Trade Search Event (Structured Format for PS Scripts) -->
+    <library name="GT_LogTradeSearchStructured" purpose="run_actions">
+      <params>
+        <param name="traceId" default="0" comment="Trace ID for request correlation"/>
+        <param name="stage" default="'Unknown'" comment="Stage name"/>
+        <param name="action" default="'Event'" comment="Action name"/>
+        <param name="fields" default="table[]" comment="Key-value pairs table for structured logging"/>
+      </params>
+      <actions>
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$timestamp" exact="player.age"/>
+          <set_value name="$detailStr" exact="''"/>
+          <do_if value="$fields? and $fields.keys?">
+            <do_all exact="$fields.keys.count" counter="$i">
+              <set_value name="$key" exact="$fields.keys.{$i}"/>
+              <set_value name="$value" exact="@$fields.{$key}"/>
+              <set_value name="$separator" exact="if $i lt $fields.keys.count then ' ' else ''"/>
+              <set_value name="$detailStr" exact="$detailStr + $key + '=' + $value + $separator"/>
+            </do_all>
+          </do_if>
+          <set_value name="$logMsg" exact="'[GT-TS] ' + $timestamp + ' ' + $traceId + ' ' + $stage + ' ' + $action + ' ' + $detailStr"/>
+          <debug_text text="$logMsg" chance="100"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Generate Next Trace ID -->
+    <library name="GT_GenerateTraceId" purpose="run_actions">
+      <params>
+      </params>
+      <actions>
+        <!-- Initialize trace ID counter if missing -->
+        <do_if value="not global.$GT_TraceIdCounter?">
+          <set_value name="global.$GT_TraceIdCounter" exact="1"/>
+        </do_if>
+        
+        <!-- Get current trace ID and increment -->
+        <set_value name="$traceId" exact="global.$GT_TraceIdCounter"/>
+        <set_value name="global.$GT_TraceIdCounter" operation="add"/>
+        
+        <!-- Return trace ID -->
+        <return value="$traceId"/>
+      </actions>
+    </library>
+    
+    <!-- Update Pipeline Counter -->
+    <library name="GT_UpdatePipelineCounter" purpose="run_actions">
+      <params>
+        <param name="counterName" comment="Counter name (Queued, Active, Completed, Failed)"/>
+        <param name="delta" default="1" comment="Delta value (positive to increment, negative to decrement)"/>
+      </params>
+      <actions>
+        <!-- Initialize counters structure if missing -->
+        <do_if value="not global.$GT_PipelineCounters?">
+          <set_value name="global.$GT_PipelineCounters" exact="table[
+            $Queued = 0,
+            $Active = 0,
+            $Completed = 0,
+            $Failed = 0
+          ]"/>
+        </do_if>
+        
+        <!-- Update counter -->
+        <do_if value="global.$GT_PipelineCounters.{$counterName}?">
+          <do_if value="$delta gt 0">
+            <do_all exact="$delta" counter="$i">
+              <set_value name="global.$GT_PipelineCounters.{$counterName}" operation="add"/>
+            </do_all>
+          </do_if>
+          <do_elseif value="$delta lt 0">
+            <set_value name="$absDelta" exact="-$delta"/>
+            <do_all exact="$absDelta" counter="$i">
+              <set_value name="global.$GT_PipelineCounters.{$counterName}" operation="subtract"/>
+            </do_all>
+          </do_elseif>
+          <!-- Clamp to zero (never negative) -->
+          <do_if value="global.$GT_PipelineCounters.{$counterName} lt 0">
+            <set_value name="global.$GT_PipelineCounters.{$counterName}" exact="0"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
+    <!-- RESERVATION SYSTEM (Phase 3) -->
+    <!-- ========================================= -->
+    
+    <!-- Reserve Trade -->
+    <!-- Creates a reservation for a trade key, preventing other ships from selecting it -->
+    <library name="GT_ReserveTrade" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+        <param name="ship" comment="Ship reserving the trade"/>
+        <param name="ttl" default="10s" comment="Time-to-live for reservation (default: 10 seconds)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate inputs - ERROR if missing -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_ReserveTrade: tradeKey is empty - cannot reserve'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <do_if value="not $ship? or not $ship.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_ship tradeKey=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_ReserveTrade: ship is null or invalid - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Initialize reservations if needed -->
+        <do_if value="not global.$GT_Reservations?">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+        </do_if>
+        
+        <!-- Check if already reserved -->
+        <set_value name="$alreadyReserved" exact="false"/>
+        <set_value name="$existingReservation" exact="null"/>
+        <do_if value="global.$GT_Reservations.{$tradeKey}?">
+          <set_value name="$existingReservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+          <set_value name="$reservedUntil" exact="@$existingReservation.$Until"/>
+          <do_if value="$reservedUntil? and player.age lt $reservedUntil">
+            <set_value name="$alreadyReserved" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- If already reserved by another ship, log conflict -->
+        <do_if value="$alreadyReserved">
+          <set_value name="$reservedBy" exact="@$existingReservation.$Ship"/>
+          <do_if value="$reservedBy? and $reservedBy != $ship">
+            <do_if value="not global.$GT_ReservationStats?">
+              <set_value name="global.$GT_ReservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0, $Created = 0, $Cleared = 0]"/>
+            </do_if>
+            <set_value name="global.$GT_ReservationStats.$Conflicts" operation="add"/>
+            
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Conflict'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' ship=' + $ship.idcode + ' reservedBy=' + $reservedBy.idcode + ' until=' + ($reservedUntil / 1s) + 's'"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+            <return value="false"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Create or update reservation -->
+        <set_value name="$reservationUntil" exact="player.age + $ttl"/>
+        <set_value name="global.$GT_Reservations.{$tradeKey}" exact="table[
+          $Ship = $ship,
+          $Until = $reservationUntil
+        ]"/>
+        
+        <!-- Update statistics -->
+        <do_if value="not global.$GT_ReservationStats?">
+          <set_value name="global.$GT_ReservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0, $Created = 0, $Cleared = 0]"/>
+        </do_if>
+        <set_value name="global.$GT_ReservationStats.$Created" operation="add"/>
+        <set_value name="global.$GT_ReservationStats.$Active" operation="add"/>
+        
+        <!-- Update trade index reservation fields (if index entry exists) -->
+        <do_if value="global.$GT_TradeIndex? and global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedBy" exact="$ship"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedUntil" exact="$reservationUntil"/>
+        </do_if>
+        
+        <!-- Log reservation creation -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'Reservation'"/>
+          <param name="action" value="'Create'"/>
+          <param name="details" value="'trade=' + $tradeKey + ' ship=' + $ship.idcode + ' ttl=' + ($ttl / 1s) + 's'"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Release Trade Reservation -->
+    <!-- Removes a reservation for a trade key -->
+    <library name="GT_ReleaseTrade" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+        <param name="reason" default="'consumed'" comment="Reason for release (consumed, invalidated, expired, etc.)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate trade key - ERROR if empty -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GT_ReleaseTrade: tradeKey is empty - cannot release'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Check if reservation exists -->
+        <do_if value="not global.$GT_Reservations? or not global.$GT_Reservations.{$tradeKey}?">
+          <!-- No reservation exists - this is OK, just log and return -->
+          <return value="true"/>
+        </do_if>
+        
+        <!-- Remove reservation -->
+        <remove_value name="global.$GT_Reservations.{$tradeKey}"/>
+        
+        <!-- Update statistics -->
+        <do_if value="global.$GT_ReservationStats?">
+          <set_value name="global.$GT_ReservationStats.$Cleared" operation="add"/>
+          <do_if value="global.$GT_ReservationStats.$Active gt 0">
+            <set_value name="global.$GT_ReservationStats.$Active" operation="subtract"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clear trade index reservation fields -->
+        <do_if value="global.$GT_TradeIndex? and global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedBy" exact="null"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedUntil" exact="null"/>
+        </do_if>
+        
+        <!-- Log reservation release -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'Reservation'"/>
+          <param name="action" value="'Clear'"/>
+          <param name="details" value="'trade=' + $tradeKey + ' reason=' + $reason"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Trade is Reserved -->
+    <!-- Returns true if trade is reserved by another ship, false otherwise -->
+    <library name="GT_IsTradeReserved" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GT_GenerateTradeKey)"/>
+        <param name="ship" default="null" comment="Ship checking reservation (if null, checks if reserved by any ship)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate trade key - ERROR if empty -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Check if reservation exists -->
+        <set_value name="$isReserved" exact="false"/>
+        <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$tradeKey}?">
+          <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+          <set_value name="$reservedUntil" exact="@$reservation.$Until"/>
+          <set_value name="$reservedBy" exact="@$reservation.$Ship"/>
+          
+          <!-- Check if reservation is still valid (not expired) -->
+          <do_if value="$reservedUntil? and player.age lt $reservedUntil">
+            <!-- Check if reserved by different ship -->
+            <do_if value="$ship == null or ($reservedBy? and $reservedBy != $ship)">
+              <set_value name="$isReserved" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Log reservation check -->
+        <do_if value="$traceId != ''">
+          <set_value name="$logDetails" exact="'trade=' + $tradeKey + ' reserved=' + $isReserved"/>
+          <do_if value="$isReserved and $reservedBy?">
+            <set_value name="$logDetails" exact="$logDetails + ' reservedBy=' + $reservedBy.idcode"/>
+          </do_if>
+          <do_if value="$ship?">
+            <set_value name="$logDetails" exact="$logDetails + ' ship=' + $ship.idcode"/>
+          </do_if>
+          
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Reservation'"/>
+            <param name="action" value="'Check'"/>
+            <param name="details" value="$logDetails"/>
+            <param name="logLevel" value="3"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="$isReserved"/>
+      </actions>
+    </library>
+    
+    <!-- Cleanup Expired Reservations -->
+    <!-- Called periodically to remove expired reservations and clean up invalid ones -->
+    <library name="GT_CleanupExpiredReservations" purpose="run_actions">
+      <params>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Ensure reservations table exists and is a table (savegame compatibility / corruption guard) -->
+        <do_if value="not global.$GT_Reservations? or typeof global.$GT_Reservations != datatype.table">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+          <return value="table[$Expired = 0, $Cleared = 0]"/>
+        </do_if>
+        
+        <set_value name="$expiredCount" exact="0"/>
+        <set_value name="$clearedCount" exact="0"/>
+        <set_value name="$keysToRemove" exact="[]"/>
+        
+        <!-- Check all reservations -->
+        <set_value name="$reservationKeysCount" exact="@global.$GT_Reservations.keys.count"/>
+        <do_if value="$reservationKeysCount != null and $reservationKeysCount gt 0">
+          <do_all exact="$reservationKeysCount" counter="$i">
+            <set_value name="$tradeKey" exact="global.$GT_Reservations.keys.{$i}"/>
+            <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+            <set_value name="$shouldRemove" exact="false"/>
+            <set_value name="$removeReason" exact="'unknown'"/>
+            
+            <!-- Check expiration -->
+            <set_value name="$reservedUntil" exact="@$reservation.$Until"/>
+            <do_if value="not $reservedUntil? or player.age ge $reservedUntil">
+              <set_value name="$shouldRemove" exact="true"/>
+              <set_value name="$removeReason" exact="'ttl_expired'"/>
+            </do_if>
+            
+            <!-- Check if ship still exists -->
+            <set_value name="$reservedShip" exact="@$reservation.$Ship"/>
+            <do_if value="not $reservedShip? or not $reservedShip.exists">
+              <set_value name="$shouldRemove" exact="true"/>
+              <set_value name="$removeReason" exact="'ship_destroyed'"/>
+            </do_if>
+            
+            <!-- Check if ship still has GT order -->
+            <do_if value="$reservedShip? and $reservedShip.exists">
+              <set_value name="$hasGTOrder" exact="false"/>
+              <do_if value="$reservedShip.orders.count gt 0">
+                <do_all exact="$reservedShip.orders.count" counter="$oi">
+                  <set_value name="$order" exact="$reservedShip.orders.{$oi}"/>
+                  <do_if value="$order? and $order.owner? and $order.owner == $reservedShip">
+                    <set_value name="$orderName" exact="@$order.name"/>
+                    <do_if value="$orderName == 'trade.galaxytrader'">
+                      <set_value name="$hasGTOrder" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="not $hasGTOrder">
+                <set_value name="$shouldRemove" exact="true"/>
+                <set_value name="$removeReason" exact="'no_gt_order'"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Remove if needed -->
+            <do_if value="$shouldRemove">
+              <append_to_list name="$keysToRemove" exact="$tradeKey"/>
+              <set_value name="$expiredCount" operation="add"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Remove expired reservations -->
+        <do_all exact="$keysToRemove.count" counter="$j">
+          <set_value name="$tradeKey" exact="$keysToRemove.{$j}"/>
+          <run_actions ref="md.GT_Libraries_General.GT_ReleaseTrade">
+            <param name="tradeKey" value="$tradeKey"/>
+            <param name="reason" value="if $removeReason == 'ttl_expired' then 'expired' else $removeReason"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+          <set_value name="$clearedCount" operation="add"/>
+          
+          <!-- Update statistics -->
+          <do_if value="global.$GT_ReservationStats?">
+            <set_value name="global.$GT_ReservationStats.$Expired" operation="add"/>
+          </do_if>
+        </do_all>
+        
+        <!-- Log cleanup results -->
+        <do_if value="$expiredCount gt 0 and $traceId != ''">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Reservation'"/>
+            <param name="action" value="'Expire'"/>
+            <param name="details" value="'count=' + $expiredCount + ' cleared=' + $clearedCount"/>
+            <param name="logLevel" value="2"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="table[$Expired = $expiredCount, $Cleared = $clearedCount]"/>
       </actions>
     </library>
     
