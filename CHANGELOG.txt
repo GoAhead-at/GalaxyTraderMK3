@@ -2,6 +2,121 @@
 ========================================
 
 
+Version 0.7.6 - 2026-01-04
+
+BUGFIX: Fix ship renaming not persisting custom names
+  - Symptom: Players reported that custom ship names set via "MK3 Rename" context menu were not being used when "Custom Name" schema was selected
+  - Root cause: Custom names were only stored in pilot registry (`global.$GT_Pilots.{$pilot}.$OriginalShipName`), but ship name building logic checked ship registry first (`global.$GT_Ships.{$ship}.$OriginalShipName`). If ship was registered before custom rename, ship registry had old name which took priority.
+  - Fix:
+    * `md/gt_context_rename.xml`: Updated `HandleRenameConfirmation` to store custom name in BOTH ship registry and pilot registry (lines ~163-174, ~204-215)
+    * Ensures custom name is found regardless of which registry is checked first
+  - Impact: Custom ship names now persist correctly and are used when "Custom Name" schema is selected
+
+BUGFIX: Fix nameSource setting not being used for ship name building
+  - Symptom: "Default Name Source" setting (Model Name, Type Name, Model Base, Custom Name) had no effect - ships always used stored OriginalShipName regardless of setting
+  - Root cause: `nameSource` variable was set from settings but never actually used to transform the ship name. Code always used stored `OriginalShipName` from registry.
+  - Fix:
+    * `md/gt_xp_training.xml`: Implemented proper nameSource handling in `UpdateShipName` cue (lines ~1322-1377)
+    * `nameSource == 'basename'` (Custom Name): Uses stored OriginalShipName from registry (preserves custom renames)
+    * `nameSource == 'macro.name'` (Model Name): Uses `ship.macro.name` directly (e.g., "Mercury Sentinel")
+    * `nameSource == 'typename'` (Type Name): Uses `ship.typename` (generic type name)
+    * `nameSource == 'macro.name.base'` (Model Base): Strips variant suffixes using `Extract_Base_Ship_Name` library (e.g., "Mercury Sentinel" → "Mercury")
+  - Impact: All 4 naming source options now work correctly, allowing players to choose their preferred ship name base
+
+IMPROVEMENT: Clarify naming schema options in UI
+  - Changed "Base Name" → "Model Base" (ID 9081) to clearly indicate it removes variant suffixes
+  - Changed "Basename" → "Custom Name" (ID 9083) to clearly indicate it uses stored custom names
+  - Updated tooltip to mention all 4 options: "Model Name (with variant), Type Name (generic), Model Base (without variant), or Custom Name (stored name)"
+  - Files Modified:
+    * `t/0001-l044.xml`: Updated translation strings for clarity
+  - Impact: Players can now easily distinguish between "Model Base" (strips variants) and "Custom Name" (uses stored name)
+
+BUGFIX: Fix trade restriction violations - traders picking up wares from restricted stations
+  - Symptom: Traders were picking up wares from stations with "internal only" trade rules and selling them to other factions, violating trade restrictions
+  - Root cause: Multiple validation gaps allowed restricted trades to pass through:
+    1. Cache entries missing `$TradeRulesRespected` field were assumed "respected" (wrong default)
+    2. Cached offers were not re-validated with `tradepartner` when used (only checked general availability)
+    3. No final validation immediately before order creation (trade rules could change between validation and creation)
+  - Fix:
+    * `md/gt_libraries_general.xml`: Changed cache validation to assume "NOT respected" for missing `$TradeRulesRespected` field (safer default, line ~2255)
+    * `md/gt_libraries_general.xml`: Added re-validation of cached offers with `tradepartner="$ship"` when using cache entries (line ~2398)
+    * `aiscripts/order.trade.galaxytrader.xml`: Added final validation immediately before `create_trade_order` calls to catch any violations (line ~4087)
+  - Impact: Three layers of validation now prevent trade restriction violations:
+    1. Cache metadata check (rejects entries without proper trade rules flag)
+    2. Cache offer re-validation (re-checks offers with tradepartner for specific ship)
+    3. Final validation (catches violations immediately before order creation)
+  - Debug logging: All validation points include debug messages to identify violations
+
+BUGFIX: Fix profit calculation inflation when trade amount is clamped due to cargo space
+  - Symptom: Logbook entries showed inflated profit (e.g., 1.1M Cr instead of 224k Cr) when trade amount was reduced due to cargo space limitations
+  - Root cause: Profit was calculated once with the original trade amount (e.g., 1993 units), but when amount was clamped down (e.g., to 410 units due to cargo space), the profit was never recalculated. The logbook displayed the original profit calculated for the larger amount.
+  - Example: Trade calculated with 1993 units → profit = 1,091,665 Cr (correct). Amount clamped to 410 units (cargo limit), but profit still showed 1,091,665 Cr instead of correct 224,680 Cr for 410 units.
+  - Fix:
+    * `aiscripts/order.trade.galaxytrader.xml`: Added profit recalculation after amount clamping (line ~3755)
+    * Detects when amount changes due to clamping (buy/sell amount syncing)
+    * Recalculates profit using formula: `(sellPrice - buyPrice) * finalAmount`
+    * Updates trade object profit before logbook entry creation
+    * Added debug logging to track profit recalculation for investigation
+  - Impact: Logbook entries now show correct profit matching the actual trade amount executed, not the original calculated amount. Fixes misleading profit displays that could affect trade prioritization decisions.
+
+FEATURE: Added comprehensive profit calculation debug logging throughout trade pipeline
+  - Purpose: Enable investigation of profit calculation issues by logging values at each step
+  - Changes:
+    * `md/gt_trading_batch_processor.xml`: Added profit calculation logging for intra-sector and cross-sector trades
+    * `md/gt_libraries_general.xml`: Added logging in `GT_CalculateProfit` and `GT_CreateTradeObject` libraries
+    * `aiscripts/order.trade.galaxytrader.xml`: Added logging for amount clamping, syncing, and logbook preparation
+    * `md/gt_trade_logging.xml`: Enhanced logbook display logging with verification calculations
+  - Log tags: `[GT-Batch-PROFIT]`, `[GT-CalcProfit]`, `[GT-CreateTrade]`, `[GT-AI-PROFIT]`, `[GT-TradeLogging-PROFIT]`
+  - Impact: Enables detailed analysis of profit calculation pipeline to identify issues. All logging conditional on debug settings.
+
+FEATURE: Added PowerShell script to analyze profit calculation issues from log files
+  - Purpose: Automatically detect profit calculation discrepancies (amount changes, profit changes, verification mismatches)
+  - File: `analyze_profit_calculation.ps1`
+  - Features:
+    * Searches for profit calculation debug logs across entire pipeline
+    * Tracks trades through pipeline (batch → create → clamp → logbook)
+    * Detects amount changes, profit changes, and verification mismatches
+    * Flags suspicious ratios (especially 22x inflation issue)
+    * Exports detailed results to CSV
+    * Generates summary reports
+  - Usage: `.\analyze_profit_calculation.ps1 [-ShipFilter "SHIP-ID"] [-ShowAllTrades] [-ExportCSV]`
+  - Impact: Enables quick identification of profit calculation issues without manual log analysis
+
+PERFORMANCE: A+B Trade Search Optimizations (B5, A2, B3)
+  - Implemented high-priority optimizations from A+B spec to reduce CPU overhead and improve trade search efficiency
+  - B5. Backpressure from batch processor backlog:
+    * Problem: New live searches were scheduled even when batch processor was overloaded, causing CPU spikes
+    * Solution: Added backpressure check before scheduling live searches
+    * Implementation:
+      - `md/gt_libraries_general.xml`: Added `GT_CheckBatchProcessorBackpressure` library to check batch processor state (line ~4861)
+      - `md/gt_trading_search.xml`: Integrated backpressure check before live search scheduling (line ~1690)
+      - `md/gt_global_settings.xml`: Added configurable thresholds `$BatchBackpressureSoftThreshold` (default: 10) and `$BatchBackpressureHardThreshold` (default: 25)
+    * Behavior:
+      - Soft threshold (10): Applies backpressure when batch processor is active and backlog >= 10
+      - Hard threshold (25): Always blocks new live searches when backlog >= 25
+      - Ships receive `busy_batch` signal when backpressure is active, prefer cache-only or wait
+    * Impact: Prevents CPU spikes by blocking new expensive live searches when batch processor is already overloaded
+  - A2. Per-home-sector refresh cooldown:
+    * Problem: Multiple ships requesting live refresh for the same home sector could trigger redundant refreshes, wasting CPU
+    * Solution: Added 30-second cooldown after home-sector refresh completion
+    * Implementation:
+      - `md/gt_trading_search.xml`: Added cooldown check before scheduling home-sector refresh (line ~1597)
+      - Subsequent requests for same home sector within 30s are queued as waiters instead of triggering new refresh
+      - Waiters are notified when refresh completes (fan-out mechanism)
+    * Impact: Reduces redundant live refreshes for same home sector, improving CPU efficiency
+  - B3. Reduce redundant continuation work:
+    * Problem: Continuation calls (live/fallback search resumes) re-initialized rejection statistics unnecessarily
+    * Solution: Skip redundant initialization for continuation calls
+    * Implementation:
+      - `md/gt_trading_search.xml`: Wrapped rejection statistics initialization in conditional (line ~1080)
+      - Skips initialization for `$searchState == 'live'` or `$searchState == 'fallback'` (stats retrieved from global storage)
+    * Impact: Reduces CPU overhead for continuation calls by skipping unnecessary work
+  - Files Modified:
+    * `md/gt_libraries_general.xml`: Added `GT_CheckBatchProcessorBackpressure` library
+    * `md/gt_trading_search.xml`: Integrated B5 backpressure check, A2 cooldown logic, B3 continuation optimization
+    * `md/gt_global_settings.xml`: Added backpressure threshold settings with validation
+  - Impact: Improved trade search CPU efficiency, reduced redundant work, better handling of batch processor overload
+
 Version 0.7.5 - 2026-01-01
 
 FEATURE: Enhanced "No Trades Found" analysis logbookmessage per ship

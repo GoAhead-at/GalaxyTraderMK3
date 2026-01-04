@@ -3600,6 +3600,17 @@
                 <set_value name="$sellClampReason" exact="null"/>
                 <set_value name="$clampFailed" exact="false"/>
                 
+                <!-- PROFIT DEBUG: Log original amount before clamping -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                  <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') AMOUNT CLAMPING START:' + 
+                    '\n  Ware: ' + $wareName +
+                    '\n  Original Amount (from trade object): ' + $currentTrade.$Amount + ' units' +
+                    '\n  Trade Profit (RAW): ' + (if $currentTrade.$Profit? then $currentTrade.$Profit else 'NULL') + ' = ' + (if $currentTrade.$Profit? then ($currentTrade.$Profit/100) + ' Cr' else 'NULL') +
+                    '\n  Trade BuyPrice (RAW): ' + (if $currentTrade.$BuyPrice? then $currentTrade.$BuyPrice else 'NULL') + ' = ' + (if $currentTrade.$BuyPrice? then ($currentTrade.$BuyPrice/100) + ' Cr' else 'NULL') +
+                    '\n  Trade SellPrice (RAW): ' + (if $currentTrade.$SellPrice? then $currentTrade.$SellPrice else 'NULL') + ' = ' + (if $currentTrade.$SellPrice? then ($currentTrade.$SellPrice/100) + ' Cr' else 'NULL')" chance="100"/>
+                </do_if>
+                
                 <!-- Clamp buy order amount (for non-sell-only trades) -->
                 <do_if value="not $isSellOnlyTrade and $currentTrade.$BuyOffer?">
                   <clamp_trade_amount 
@@ -3723,11 +3734,56 @@
                      Final executed amount must be the minimum of both. -->
                 <do_if value="not $isSellOnlyTrade">
                   <set_value name="$finalAmount" exact="[$finalBuyAmount, $finalSellAmount].min"/>
-                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $finalAmount != $finalBuyAmount">
-                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Syncing amounts (NORMAL): buy=' + $finalBuyAmount + ' sell=' + $finalSellAmount + ' -> final=' + $finalAmount" chance="100"/>
+                  
+                  <!-- PROFIT DEBUG: Log amount syncing details -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                    <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') AMOUNT SYNCING:' + 
+                      '\n  Ware: ' + $wareName +
+                      '\n  Original Amount: ' + $currentTrade.$Amount + ' units' +
+                      '\n  Clamped Buy Amount: ' + $finalBuyAmount + ' units' +
+                      '\n  Clamped Sell Amount: ' + $finalSellAmount + ' units' +
+                      '\n  Final Amount (min): ' + $finalAmount + ' units' +
+                      '\n  Amount changed: ' + (if $finalAmount != $currentTrade.$Amount then 'YES (was ' + $currentTrade.$Amount + ', now ' + $finalAmount + ')' else 'NO') +
+                      '\n  Trade Profit (unchanged): ' + (if $currentTrade.$Profit? then ($currentTrade.$Profit/100) + ' Cr' else 'NULL')" chance="100"/>
                   </do_if>
+                  
                   <set_value name="$finalBuyAmount" exact="$finalAmount"/>
                   <set_value name="$finalSellAmount" exact="$finalAmount"/>
+                </do_if>
+                
+                <!-- CRITICAL FIX: Recalculate profit if amount changed due to clamping -->
+                <!-- Profit was calculated with original amount, but amount may have been clamped -->
+                <!-- Recalculate profit using final amount and stored prices (more accurate than profit per unit) -->
+                <do_if value="$currentTrade.$Amount? and $currentTrade.$BuyPrice? and $currentTrade.$SellPrice?">
+                  <set_value name="$amountChanged" exact="if $isSellOnlyTrade then ($finalSellAmount != $currentTrade.$Amount) else ($finalBuyAmount != $currentTrade.$Amount)"/>
+                  <do_if value="$amountChanged">
+                    <!-- Store original values before recalculation -->
+                    <set_value name="$originalAmount" exact="$currentTrade.$Amount"/>
+                    <set_value name="$originalProfitRAW" exact="$currentTrade.$Profit"/>
+                    
+                    <!-- Recalculate profit with final amount using stored prices -->
+                    <!-- Note: Cannot use run_actions in AI scripts, so calculate directly -->
+                    <set_value name="$finalAmountForProfit" exact="if $isSellOnlyTrade then $finalSellAmount else $finalBuyAmount"/>
+                    
+                    <!-- Calculate profit: (sellPrice - buyPrice) * amount -->
+                    <set_value name="$recalculatedProfitRAW" exact="($currentTrade.$SellPrice - $currentTrade.$BuyPrice) * $finalAmountForProfit"/>
+                    
+                    <!-- Update trade object profit (for logbook display) -->
+                    <set_value name="$currentTrade.$Profit" exact="$recalculatedProfitRAW"/>
+                    
+                    <!-- PROFIT DEBUG: Log profit recalculation -->
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                      <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') PROFIT RECALCULATION:' + 
+                        '\n  Ware: ' + $wareName +
+                        '\n  Original Amount: ' + $originalAmount + ' units' +
+                        '\n  Final Amount: ' + $finalAmountForProfit + ' units' +
+                        '\n  Original Profit: ' + ($originalProfitRAW/100) + ' Cr (RAW: ' + $originalProfitRAW + ')' +
+                        '\n  Recalculated Profit: ' + ($recalculatedProfitRAW/100) + ' Cr (RAW: ' + $recalculatedProfitRAW + ')' +
+                        '\n  Verification: (' + ($currentTrade.$SellPrice/100) + ' - ' + ($currentTrade.$BuyPrice/100) + ') * ' + $finalAmountForProfit + ' = ' + (($currentTrade.$SellPrice - $currentTrade.$BuyPrice) * $finalAmountForProfit / 100) + ' Cr'" chance="100"/>
+                    </do_if>
+                  </do_if>
                 </do_if>
                 
                 <!-- FINAL DOCKING VERIFICATION: Use find_dockingbay for accurate dock size/permission check -->
@@ -4028,6 +4084,51 @@
             </do_if>
           </do_if>
           
+          <!-- CRITICAL FIX: Final validation immediately before order creation -->
+          <!-- This catches cases where trade rules changed between earlier validation and order creation -->
+          <!-- Re-check offers with tradepartner to ensure trade rules are still respected -->
+          <set_value name="$finalBuyOfferValid" exact="true"/>
+          <set_value name="$finalSellOfferValid" exact="true"/>
+          
+          <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
+            <set_value name="$finalBuyStation" exact="if $pendingTrade.$BuyStation? then $pendingTrade.$BuyStation else (if $pendingTrade.$BuyOffer.owner? then @$pendingTrade.$BuyOffer.owner else null)"/>
+            <set_value name="$finalBuyWare" exact="if $pendingTrade.$BuyOffer.ware? then @$pendingTrade.$BuyOffer.ware else null"/>
+            
+            <do_if value="$finalBuyStation? and $finalBuyStation.exists and $finalBuyWare != null">
+              <find_sell_offer seller="$finalBuyStation" wares="$finalBuyWare" tradepartner="this.ship" result="$finalValidatedBuyOffer"/>
+              <do_if value="not $finalValidatedBuyOffer.available">
+                <set_value name="$finalBuyOfferValid" exact="false"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - Buy offer invalid (trade rules?) - station: ' + @$finalBuyStation.knownname + ', ware: ' + @$finalBuyWare.name" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$pendingTrade.$SellOffer?">
+            <set_value name="$finalSellStation" exact="if $pendingTrade.$SellStation? then $pendingTrade.$SellStation else (if $pendingTrade.$SellOffer.owner? then @$pendingTrade.$SellOffer.owner else null)"/>
+            <set_value name="$finalSellWare" exact="if $pendingTrade.$SellOffer.ware? then @$pendingTrade.$SellOffer.ware else null"/>
+            
+            <do_if value="$finalSellStation? and $finalSellStation.exists and $finalSellWare != null">
+              <find_buy_offer buyer="$finalSellStation" wares="$finalSellWare" tradepartner="this.ship" result="$finalValidatedSellOffer"/>
+              <do_if value="not $finalValidatedSellOffer.available">
+                <set_value name="$finalSellOfferValid" exact="false"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - Sell offer invalid (trade rules?) - station: ' + @$finalSellStation.knownname + ', ware: ' + @$finalSellWare.name" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- If final validation failed, abort order creation -->
+          <do_if value="not $finalBuyOfferValid or not $finalSellOfferValid">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - Trade rules violation detected immediately before order creation - aborting'" chance="100"/>
+            </do_if>
+            <signal_objects object="this.ship" param="'GT_No_Trade_Found'"/>
+            <return/>
+          </do_if>
+          
           <!-- Offers valid - proceed with order creation -->
           <!-- CRITICAL FIX: Explicitly set internal="false" to ensure vanilla counts trade orders in "credits due from trades" -->
           <!-- Vanilla's GetCreditsDueFromPlayerTrades() only counts trade orders with internal="false" -->
@@ -4234,6 +4335,26 @@
           
           <do_if value="$logbookEnabled">
             <set_value name="$logAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
+            
+            <!-- PROFIT DEBUG: Log trade data before sending to logbook -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$wareName" exact="if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.ware? then @$pendingTrade.$BuyOffer.ware.name else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.ware? then @$pendingTrade.$SellOffer.ware.name else 'NULL')"/>
+              <set_value name="$buyStationName" exact="if $pendingTrade.$BuyStation? then @$pendingTrade.$BuyStation.knownname else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.owner? then @$pendingTrade.$BuyOffer.owner.knownname else 'NULL')"/>
+              <set_value name="$sellStationName" exact="if $pendingTrade.$SellStation? then @$pendingTrade.$SellStation.knownname else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.owner? then @$pendingTrade.$SellOffer.owner.knownname else 'NULL')"/>
+              <set_value name="$originalAmount" exact="if $pendingTrade.$Amount? then $pendingTrade.$Amount else 'NULL'"/>
+              <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') LOGBOOK ENTRY PREPARATION:' + 
+                '\n  Ware: ' + $wareName +
+                '\n  Buy Station: ' + $buyStationName + ' @ ' + ($pendingTrade.$BuyPrice/100) + ' Cr (RAW: ' + $pendingTrade.$BuyPrice + ')' +
+                '\n  Sell Station: ' + $sellStationName + ' @ ' + ($pendingTrade.$SellPrice/100) + ' Cr (RAW: ' + $pendingTrade.$SellPrice + ')' +
+                '\n  Original Amount (from trade): ' + $originalAmount + ' units' +
+                '\n  Final Buy Amount (clamped): ' + $finalBuyAmount + ' units' +
+                '\n  Final Sell Amount (clamped): ' + $finalSellAmount + ' units' +
+                '\n  Log Amount (used for display): ' + $logAmount + ' units' +
+                '\n  Profit (RAW): ' + $pendingTrade.$Profit + ' = ' + ($pendingTrade.$Profit/100) + ' Cr' +
+                '\n  Verification with original amount: (' + ($pendingTrade.$SellPrice/100) + ' - ' + ($pendingTrade.$BuyPrice/100) + ') * ' + $originalAmount + ' = ' + (if $originalAmount != 'NULL' then (($pendingTrade.$SellPrice - $pendingTrade.$BuyPrice) * $originalAmount / 100) + ' Cr' else 'N/A') +
+                '\n  Verification with log amount: (' + ($pendingTrade.$SellPrice/100) + ' - ' + ($pendingTrade.$BuyPrice/100) + ') * ' + $logAmount + ' = ' + (($pendingTrade.$SellPrice - $pendingTrade.$BuyPrice) * $logAmount / 100) + ' Cr'" chance="100"/>
+            </do_if>
+            
             <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
               $Ship = this.ship,
               $BuyOffer = $pendingTrade.$BuyOffer,
