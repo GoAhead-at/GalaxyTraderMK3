@@ -1077,18 +1077,35 @@
           </do_if>
         </do_if>
         
-        <!-- Initialize rejection statistics (for both cached and live searches) -->
-        <set_value name="$tradesRejectedDocking" exact="0"/>
-        <set_value name="$tradesRejectedBlacklist" exact="0"/>
-        <set_value name="$tradesRejectedProfit" exact="0"/>
-        <set_value name="$tradesRejectedDistance" exact="0"/>
-        <set_value name="$tradesRejectedAmount" exact="0"/>
-        <set_value name="$offersFound" exact="0"/>
-        <set_value name="$stationsEvaluated" exact="0"/>
-        <set_value name="$bestRejectedTrade" exact="null"/>
+        <!-- B3. OPTIMIZATION: Skip redundant work for continuations -->
+        <!-- Continuations already have results and stats - skip initialization -->
+        <set_value name="$isContinuation" exact="($searchState == 'live' or $searchState == 'fallback')"/>
+        
+        <!-- Initialize rejection statistics (for fresh searches only - continuations retrieve from global) -->
+        <!-- B3. OPTIMIZATION: Skip initialization for continuations (they retrieve from global below) -->
+        <do_if value="not $isContinuation">
+          <set_value name="$tradesRejectedDocking" exact="0"/>
+          <set_value name="$tradesRejectedBlacklist" exact="0"/>
+          <set_value name="$tradesRejectedProfit" exact="0"/>
+          <set_value name="$tradesRejectedDistance" exact="0"/>
+          <set_value name="$tradesRejectedAmount" exact="0"/>
+          <set_value name="$offersFound" exact="0"/>
+          <set_value name="$stationsEvaluated" exact="0"/>
+          <set_value name="$bestRejectedTrade" exact="null"/>
+        </do_if>
         
         <!-- If using live search continuation, retrieve rejection stats from global (includes filtering stats) -->
-        <do_if value="$searchState == 'live' or $searchState == 'fallback'">
+        <!-- B3. OPTIMIZATION: Continuations retrieve stats from global instead of initializing -->
+        <do_if value="$isContinuation">
+          <!-- Initialize with defaults first (will be overwritten by retrieval) -->
+          <set_value name="$tradesRejectedDocking" exact="0"/>
+          <set_value name="$tradesRejectedBlacklist" exact="0"/>
+          <set_value name="$tradesRejectedProfit" exact="0"/>
+          <set_value name="$tradesRejectedDistance" exact="0"/>
+          <set_value name="$tradesRejectedAmount" exact="0"/>
+          <set_value name="$offersFound" exact="0"/>
+          <set_value name="$stationsEvaluated" exact="0"/>
+          <set_value name="$bestRejectedTrade" exact="null"/>
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Search] (' + $ship.idcode + ') RETRIEVING STATS FROM CONTINUATION:' +
               '\n  TradesRejectedDocking exists: ' + (if global.$GT_SearchResult.{$ship}.$TradesRejectedDocking? then 'yes' else 'no') +
@@ -1577,8 +1594,78 @@
                   </do_if>
                 </do_else>
                 
-                <!-- Only mark as refresh initiator if ship has GT order -->
-                <do_if value="$hasGTOrder and not $shipIsIsolatedForCachePolicy and $homeSector? and $homeSector.exists">
+                <!-- A2. COOLDOWN: Check if refresh completed recently (30s cooldown) -->
+                <do_if value="$hasGTOrder and not $shipIsIsolatedForCachePolicy and $homeSector? and $homeSector.exists and not $denyHomeRefresh">
+                  <set_value name="$cooldownSeconds" exact="30"/>
+                  <set_value name="$refreshEntry" exact="null"/>
+                  <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
+                    <set_value name="$refreshEntry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+                  </do_if>
+                  
+                  <set_value name="$lastCompleted" exact="null"/>
+                  <do_if value="$refreshEntry? and $refreshEntry.$LastFinished?">
+                    <set_value name="$lastCompleted" exact="@$refreshEntry.$LastFinished"/>
+                  </do_if>
+                  
+                  <set_value name="$shouldRespectCooldown" exact="false"/>
+                  <do_if value="$lastCompleted? and (player.age - $lastCompleted) lt ($cooldownSeconds * 1s)">
+                    <set_value name="$shouldRespectCooldown" exact="true"/>
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') Refresh cooldown active (home=' + @$homeSector.knownname + ', completed ' + ((player.age - $lastCompleted) / 1s) + 's ago, cooldown=' + $cooldownSeconds + 's) - waiting'" chance="100"/>
+                    </do_if>
+                    
+                    <!-- Add to waiters instead of scheduling refresh -->
+                    <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
+                      <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
+                    </do_if>
+                    <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
+                      <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
+                    </do_if>
+                    
+                    <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+                      <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
+                      <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
+                        $Ship = $ship,
+                        $Params = $params,
+                        $EnqueuedAt = player.age
+                      ]"/>
+                    </do_if>
+                    
+                    <!-- Refresh the request timestamp while we are waiting -->
+                    <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+                      <set_value name="global.$GT_AIParameters.{$ship}.$RequestTime" exact="player.age"/>
+                      <set_value name="global.$GT_AIParameters.{$ship}.$WaitReason" exact="'refresh_cooldown'"/>
+                    </do_if>
+                    
+                    <!-- Release lock and wait -->
+                    <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                      <param name="ship" value="$ship"/>
+                      <param name="reason" value="'refresh_cooldown'"/>
+                    </run_actions>
+                    
+                    <!-- Release cache-search queue slot -->
+                    <do_if value="$useSearchQueueCounter">
+                      <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+                        <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+                      </do_if>
+                      <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveSearches">
+                        <param name="clampToZero" value="true"/>
+                        <param name="triggerQueueProcessor" value="true"/>
+                      </run_actions>
+                      <set_value name="$useSearchQueueCounter" exact="false"/>
+                    </do_if>
+                    
+                    <!-- Prevent fallthrough -->
+                    <set_value name="$denyHomeRefresh" exact="true"/>
+                    <set_value name="$liveSearchSkipped" exact="true"/>
+                    <set_value name="$waitingForLiveSearch" exact="true"/>
+                    <set_value name="$deferNoTradeFound" exact="true"/>
+                    <cancel_cue cue="this"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Only mark as refresh initiator if ship has GT order and cooldown not active -->
+                <do_if value="$hasGTOrder and not $shipIsIsolatedForCachePolicy and $homeSector? and $homeSector.exists and not $denyHomeRefresh">
                   <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
                     $Active = true,
                     $Initiator = $ship,
@@ -1599,6 +1686,58 @@
                     <set_value name="$denyHomeRefresh" exact="true"/>
                   </do_if>
                 </do_else>
+
+                <!-- B5. BACKPRESSURE: Check batch processor backlog before scheduling live search -->
+                <do_if value="$shouldDoLiveSearch and not $shipIsIsolatedForCachePolicy">
+                  <set_value name="$softThreshold" exact="10"/>
+                  <set_value name="$hardThreshold" exact="25"/>
+                  <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
+                    <do_if value="global.$GT_GlobalSettings.$Performance.$BatchBackpressureSoftThreshold?">
+                      <set_value name="$softThreshold" exact="@global.$GT_GlobalSettings.$Performance.$BatchBackpressureSoftThreshold"/>
+                    </do_if>
+                    <do_if value="global.$GT_GlobalSettings.$Performance.$BatchBackpressureHardThreshold?">
+                      <set_value name="$hardThreshold" exact="@global.$GT_GlobalSettings.$Performance.$BatchBackpressureHardThreshold"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <run_actions ref="md.GT_Libraries_General.GT_CheckBatchProcessorBackpressure" result="$backpressure">
+                    <param name="softThreshold" value="$softThreshold"/>
+                    <param name="hardThreshold" value="$hardThreshold"/>
+                  </run_actions>
+                  
+                  <do_if value="$backpressure? and $backpressure.$ShouldBlock? and $backpressure.$ShouldBlock">
+                    <!-- Backpressure active - prefer cache-only or return busy -->
+                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Search] (' + $ship.idcode + ') BACKPRESSURE: Batch backlog=' + $backpressure.$Backlog + ', active=' + $backpressure.$Active + '/' + $backpressure.$MaxConcurrent + ', level=' + $backpressure.$Level + ' - blocking live search'" chance="100"/>
+                    </do_if>
+                    
+                    <!-- Release lock and signal busy -->
+                    <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
+                      <param name="ship" value="$ship"/>
+                      <param name="reason" value="'batch_backpressure'"/>
+                    </run_actions>
+                    
+                    <!-- Signal AI with busy reason -->
+                    <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy_batch'"/>
+                    
+                    <!-- Release cache-search queue slot if used -->
+                    <do_if value="$useSearchQueueCounter">
+                      <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+                        <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+                      </do_if>
+                      <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveSearches">
+                        <param name="clampToZero" value="true"/>
+                        <param name="triggerQueueProcessor" value="true"/>
+                      </run_actions>
+                    </do_if>
+                    
+                    <!-- Prevent fallthrough -->
+                    <set_value name="$shouldDoLiveSearch" exact="false"/>
+                    <set_value name="$waitingForLiveSearch" exact="false"/>
+                    <set_value name="$deferNoTradeFound" exact="false"/>
+                    <cancel_cue cue="this"/>
+                  </do_if>
+                </do_if>
 
                 <!-- Central hub: live search scheduling is owned by scheduler HomeSearch work items. -->
                 <do_if value="$shouldDoLiveSearch">
