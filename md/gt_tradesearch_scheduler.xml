@@ -583,8 +583,9 @@
           <!-- Check budget for this work type -->
           <set_value name="$canProcess" exact="false"/>
           <do_if value="$workItem.$Type == 'CacheQuery'">
-            <!-- Hard per-tick cap (independent of concurrent cache search setting) -->
-            <do_if value="$cacheQueriesStartedThisTick lt $maxCacheQueriesPerTick">
+            <!-- CRITICAL FIX: Check BOTH per-tick limit AND concurrent active limit -->
+            <!-- Per-tick cap prevents frame spikes, concurrent limit prevents too many simultaneous searches -->
+            <do_if value="$cacheQueriesStartedThisTick lt $maxCacheQueriesPerTick and $activeCacheQueries lt $budgetCheapOps">
               <set_value name="$canProcess" exact="true"/>
               <set_value name="$cacheQueriesStartedThisTick" operation="add"/>
             </do_if>
@@ -951,6 +952,22 @@
         
         <!-- MIGRATION: Queue AI work unit for cache search processing -->
         <!-- AI script handles frame budgeting and chunking automatically -->
+        <!-- Get MaxEntries from global settings (default: 5) -->
+        <set_value name="$maxEntries" exact="5"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
+          <set_value name="$tmpMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
+          <do_if value="$tmpMaxEntries? and $tmpMaxEntries != null and $tmpMaxEntries gt 0">
+            <set_value name="$maxEntries" exact="$tmpMaxEntries"/>
+          </do_if>
+        </do_if>
+        <!-- Clamp to reasonable bounds -->
+        <do_if value="$maxEntries lt 1">
+          <set_value name="$maxEntries" exact="1"/>
+        </do_if>
+        <do_if value="$maxEntries gt 100">
+          <set_value name="$maxEntries" exact="100"/>
+        </do_if>
+        
         <set_value name="$workUnit" exact="table[
           $WorkType = 'cache_search',
           $Ship = $ship,
@@ -960,7 +977,7 @@
           $MinAbsoluteProfit = $minAbsoluteProfit,
           $IgnoreBuildStorage = $ignoreBuildStorage,
           $IgnoreCarrierAux = $ignoreCarrierAux,
-          $MaxEntries = 5,
+          $MaxEntries = $maxEntries,
           $WorkItemKey = $workItem.$Key,
           $TraceId = $traceId
         ]"/>
@@ -1133,6 +1150,15 @@
       <actions>
         <set_value name="$workItem" exact="event.param"/>
         
+        <!-- UNCONDITIONAL logging to track ALL entries - use GT_LogTradeSearch which always logs -->
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
+          <param name="stage" value="'ProcessHomeSearchWork'"/>
+          <param name="action" value="'ENTERED'"/>
+          <param name="details" value="'workItem=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'null')"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
         <!-- Validate work item - ERROR if missing -->
         <do_if value="not $workItem? or not $workItem.$Payload?">
           <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
@@ -1199,6 +1225,10 @@
         </run_actions>
 
         <!-- Hub status: home search evaluating / reserving per-home-sector slot -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: STARTED (home=' + (if $homeSector? then @$homeSector.knownname else 'unknown') + ')'" chance="100"/>
+        </do_if>
+        
         <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
           <param name="ship" value="$ship"/>
           <param name="stage" value="'home_search'"/>
@@ -1237,13 +1267,287 @@
         <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
           <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[]"/>
         </do_if>
-        <set_value name="$refreshEntry" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
-        <set_value name="$refreshActive" exact="false"/>
-        <do_if value="$refreshEntry? and $refreshEntry != null and $refreshEntry.$Active? and $refreshEntry.$Active">
-          <set_value name="$refreshActive" exact="true"/>
+        <!-- CRITICAL FIX: Atomic reservation with delay-based state propagation -->
+        <!-- Based on forum insight: MD script state changes need time to propagate to concurrent instances -->
+        <!-- Read entry once and check atomically - no duplicate checks that create race windows -->
+        <!-- Multiple ships might read simultaneously, but only one can successfully reserve -->
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Entering coalescing check (home=' + @$homeSector.knownname + ')'" chance="100"/>
         </do_if>
-        <do_if value="$refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
-          <!-- Queue as silent waiter for this home sector -->
+        
+        <set_value name="$refreshEntryDoubleCheck" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+        <set_value name="$alreadyReserved" exact="false"/>
+        <do_if value="$refreshEntryDoubleCheck? and $refreshEntryDoubleCheck != null and $refreshEntryDoubleCheck.$Active? and $refreshEntryDoubleCheck.$Active">
+          <set_value name="$initiatorCheck" exact="@$refreshEntryDoubleCheck.$Initiator"/>
+          <do_if value="$initiatorCheck? and $initiatorCheck.exists and $initiatorCheck != $ship">
+            <!-- Another ship reserved it - queue as waiter -->
+            <set_value name="$alreadyReserved" exact="true"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Refresh already reserved by ' + @$initiatorCheck.idcode + ' (home=' + @$homeSector.knownname + ') - queueing as waiter'" chance="100"/>
+            </do_if>
+            
+            <!-- Queue as waiter -->
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
+            </do_if>
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
+              <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
+                $Ship = $ship,
+                $Params = @$payload.$ResumeParams,
+                $EnqueuedAt = player.age
+              ]"/>
+            </do_if>
+            
+            <!-- Mark work item as completed (waiting) -->
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'completed'"/>
+              <param name="traceId" value="$traceId"/>
+              <param name="reason" value="'home_refresh_wait'"/>
+              <param name="workItem" value="$workItem"/>
+            </run_actions>
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only proceed if we successfully reserved the slot -->
+        <do_if value="not $alreadyReserved">
+          <!-- CRITICAL FIX: Atomic check-and-set with immediate verification -->
+          <!-- Multiple ships can all pass the "not active" check simultaneously -->
+          <!-- Solution: Set Active flag, then IMMEDIATELY check if we're still the initiator -->
+          <!-- If another ship overwrote us, we lost the race and must queue as waiter -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Attempting to reserve slot (home=' + @$homeSector.knownname + ')'" chance="100"/>
+          </do_if>
+          
+          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
+            $Active = true,
+            $Initiator = $ship,
+            $LastStarted = player.age
+          ]"/>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Set Active flag, verifying ownership immediately (home=' + @$homeSector.knownname + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL: Immediate check after setting - if another ship overwrote us, we lost the race -->
+          <set_value name="$immediateVerification" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+          <set_value name="$weOwnIt" exact="false"/>
+          <do_if value="$immediateVerification? and $immediateVerification != null and $immediateVerification.$Active? and $immediateVerification.$Active and $immediateVerification.$Initiator? and $immediateVerification.$Initiator == $ship">
+            <set_value name="$weOwnIt" exact="true"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: VERIFIED - we own the reservation (home=' + @$homeSector.knownname + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$currentInitiatorSched" exact="null"/>
+              <do_if value="$immediateVerification? and $immediateVerification != null and $immediateVerification.$Active? and $immediateVerification.$Active and $immediateVerification.$Initiator?">
+                <set_value name="$currentInitiatorSched" exact="@$immediateVerification.$Initiator"/>
+              </do_if>
+              <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: FAILED verification - reservation owned by ' + (if $currentInitiatorSched? then @$currentInitiatorSched.idcode else 'unknown') + ' (home=' + @$homeSector.knownname + ')'" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <do_if value="not $weOwnIt">
+            <!-- We lost the race - another ship overwrote us -->
+            <set_value name="$otherInitiator" exact="null"/>
+            <do_if value="$immediateVerification? and $immediateVerification != null and $immediateVerification.$Active? and $immediateVerification.$Active and $immediateVerification.$Initiator?">
+              <set_value name="$otherInitiator" exact="@$immediateVerification.$Initiator"/>
+            </do_if>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: lost race - refresh overwritten by ' + (if $otherInitiator? then @$otherInitiator.idcode else 'unknown') + ' (home=' + @$homeSector.knownname + ') - queueing as waiter'" chance="100"/>
+            </do_if>
+            
+            <!-- Queue as waiter -->
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
+            </do_if>
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
+              <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
+                $Ship = $ship,
+                $Params = @$payload.$ResumeParams,
+                $EnqueuedAt = player.age
+              ]"/>
+            </do_if>
+            
+            <!-- Mark work item as completed (waiting) -->
+            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
+              <param name="key" value="$workItem.$Key"/>
+              <param name="newState" value="'completed'"/>
+              <param name="traceId" value="$traceId"/>
+              <param name="reason" value="'home_refresh_wait'"/>
+              <param name="workItem" value="$workItem"/>
+            </run_actions>
+            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <!-- We own it - proceed with live search immediately (no delay needed since we verified immediately) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: RESERVED home-sector refresh slot atomically (home=' + @$homeSector.knownname + ') - starting live search'" chance="100"/>
+            </do_if>
+            
+            <!-- Hub status: initiator started home refresh -->
+            <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+              <param name="ship" value="$ship"/>
+              <param name="stage" value="'home_search'"/>
+              <param name="state" value="'running'"/>
+              <param name="reason" value="'initiator'"/>
+              <param name="traceId" value="$traceId"/>
+              <param name="homeSector" value="$homeSector"/>
+            </run_actions>
+            
+            <!-- Execute home search by signaling SearchLiveTrades -->
+            <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
+            <set_value name="$startTime" exact="player.age"/>
+            
+            <!-- Build params table for SearchLiveTrades -->
+            <set_value name="$searchParams" exact="table[]"/>
+            <do_if value="$payload.$Ship?">
+              <set_value name="$searchParams.$Ship" exact="$payload.$Ship"/>
+            </do_if>
+            <do_if value="$payload.$MaxDistance?">
+              <set_value name="$searchParams.$MaxDistance" exact="$payload.$MaxDistance"/>
+            </do_if>
+            <do_if value="$payload.$OriginalMaxDistance?">
+              <set_value name="$searchParams.$OriginalMaxDistance" exact="$payload.$OriginalMaxDistance"/>
+            </do_if>
+            <do_if value="$payload.$PilotSkillMaxDistance?">
+              <set_value name="$searchParams.$PilotSkillMaxDistance" exact="$payload.$PilotSkillMaxDistance"/>
+            </do_if>
+            <do_if value="$payload.$MinROI?">
+              <set_value name="$searchParams.$MinROI" exact="$payload.$MinROI"/>
+            </do_if>
+            <do_if value="$payload.$MinAbsoluteProfit?">
+              <set_value name="$searchParams.$MinAbsoluteProfit" exact="$payload.$MinAbsoluteProfit"/>
+            </do_if>
+            <do_if value="$payload.$FactionPriority?">
+              <set_value name="$searchParams.$FactionPriority" exact="$payload.$FactionPriority"/>
+            </do_if>
+            <do_if value="$payload.$FactionPriorityText?">
+              <set_value name="$searchParams.$FactionPriorityText" exact="$payload.$FactionPriorityText"/>
+            </do_if>
+            <do_if value="$payload.$DistancePenaltyMultiplier?">
+              <set_value name="$searchParams.$DistancePenaltyMultiplier" exact="$payload.$DistancePenaltyMultiplier"/>
+            </do_if>
+            <do_if value="$payload.$SkillLevel?">
+              <set_value name="$searchParams.$SkillLevel" exact="$payload.$SkillLevel"/>
+            </do_if>
+            <do_if value="$payload.$ThreatIntel?">
+              <set_value name="$searchParams.$ThreatIntel" exact="$payload.$ThreatIntel"/>
+            </do_if>
+            <do_if value="$payload.$FleetCoord?">
+              <set_value name="$searchParams.$FleetCoord" exact="$payload.$FleetCoord"/>
+            </do_if>
+            <do_if value="$payload.$AdvancedAnalytics?">
+              <set_value name="$searchParams.$AdvancedAnalytics" exact="$payload.$AdvancedAnalytics"/>
+            </do_if>
+            
+            <!-- Store work item reference in state for continuation -->
+            <do_if value="not global.$GT_SearchLiveTrades_State?">
+              <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
+              <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
+            </do_if>
+            <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
+            <!-- Store home sector for later cleanup -->
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$HomeSector" exact="$homeSector"/>
+            
+            <!-- Signal SearchLiveTrades (async operation) -->
+            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'HomeSearch'"/>
+              <param name="action" value="'Start'"/>
+              <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown')"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+            
+            <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
+            
+            <!-- Note: Work item remains active until SearchLiveTrades completes -->
+            <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
+          </do_else>
+        </do_if>
+        </do_else>
+        </do_else>
+      </actions>
+    </cue>
+
+    <!-- Verify Home Refresh Reservation (Delayed) -->
+    <!-- Purpose: Verify atomic reservation after delay to ensure state propagation across concurrent instances -->
+    <!-- Forum insight: MD script state changes need time to be visible to concurrent instances -->
+    <cue name="VerifyHomeRefreshReservation" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- CRITICAL: Delay ensures state change propagates before verification -->
+      <!-- Even 1ms delay ensures the write is committed and visible to concurrent instances -->
+      <delay exact="1ms"/>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="@$params.$Ship"/>
+        <set_value name="$homeSector" exact="@$params.$HomeSector"/>
+        <set_value name="$workItem" exact="@$params.$WorkItem"/>
+        <set_value name="$payload" exact="@$params.$Payload"/>
+        <set_value name="$traceId" exact="if $params.$TraceId? then $params.$TraceId else (if $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
+        
+        <!-- Validate parameters -->
+        <do_if value="not $ship? or not $ship.exists or not $homeSector? or not $homeSector.exists">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'HomeSearch'"/>
+            <param name="action" value="'Error'"/>
+            <param name="details" value="'reason=invalid_verification_params'"/>
+            <param name="logLevel" value="0"/>
+          </run_actions>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- CRITICAL FIX: Verify we still own the reservation after delay -->
+        <!-- Multiple ships may have tried to set Active simultaneously -->
+        <!-- After delay, check if we're still the Initiator - if not, another ship won the race -->
+        <set_value name="$weReservedIt" exact="false"/>
+        
+        <!-- Check if reservation is still ours -->
+        <set_value name="$finalCheck" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+        <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator? and $finalCheck.$Initiator == $ship">
+          <set_value name="$weReservedIt" exact="true"/>
+        </do_if>
+        
+        <do_if value="not $weReservedIt">
+          <!-- Another ship reserved it - clear our failed attempt and queue as waiter -->
+          <set_value name="$otherInitiator" exact="null"/>
+          <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator?">
+            <set_value name="$otherInitiator" exact="@$finalCheck.$Initiator"/>
+          </do_if>
+          
+          <!-- Clear our failed reservation attempt (if we set it but lost the race) -->
+          <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator? and $finalCheck.$Initiator != $ship">
+            <!-- Another ship owns it - leave it as is -->
+          </do_if>
+          <do_else>
+            <!-- No active reservation - clear any stale state we might have created -->
+            <remove_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
+          </do_else>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') VerifyHomeRefresh: lost race - refresh reserved by ' + (if $otherInitiator? then @$otherInitiator.idcode else 'unknown') + ' (home=' + @$homeSector.knownname + ') - queueing as waiter'" chance="100"/>
+          </do_if>
+          
+          <!-- Queue as waiter -->
           <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
             <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
           </do_if>
@@ -1258,21 +1562,8 @@
               $EnqueuedAt = player.age
             ]"/>
           </do_if>
-          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
-            <set_value name="global.$GT_AIParameters.{$ship}.$RequestTime" exact="player.age"/>
-            <set_value name="global.$GT_AIParameters.{$ship}.$WaitReason" exact="'home_refresh_wait'"/>
-          </do_if>
-
-          <!-- Hub status: waiting for home refresh -->
-          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-            <param name="ship" value="$ship"/>
-            <param name="stage" value="'home_search'"/>
-            <param name="state" value="'waiting'"/>
-            <param name="reason" value="'home_refresh_wait'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="homeSector" value="$homeSector"/>
-            <param name="extra" value="table[$Initiator = $refreshEntry.$Initiator]"/>
-          </run_actions>
+          
+          <!-- Mark work item as completed (waiting) -->
           <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
             <param name="key" value="$workItem.$Key"/>
             <param name="newState" value="'completed'"/>
@@ -1283,99 +1574,100 @@
           <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
           <cancel_cue cue="this"/>
         </do_if>
-
-        <!-- Mark as active initiator (best-effort) -->
-        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Active" exact="true"/>
-        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Initiator" exact="$ship"/>
-        <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$LastStarted" exact="player.age"/>
-
-        <!-- Hub status: initiator started home refresh -->
-        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-          <param name="ship" value="$ship"/>
-          <param name="stage" value="'home_search'"/>
-          <param name="state" value="'running'"/>
-          <param name="reason" value="'initiator'"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="homeSector" value="$homeSector"/>
-        </run_actions>
-        
-        <!-- Execute home search by signaling SearchLiveTrades -->
-        <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
-        <set_value name="$startTime" exact="player.age"/>
-        
-        <!-- Build params table for SearchLiveTrades -->
-        <set_value name="$searchParams" exact="table[]"/>
-        <do_if value="$payload.$Ship?">
-          <set_value name="$searchParams.$Ship" exact="$payload.$Ship"/>
-        </do_if>
-        <do_if value="$payload.$MaxDistance?">
-          <set_value name="$searchParams.$MaxDistance" exact="$payload.$MaxDistance"/>
-        </do_if>
-        <do_if value="$payload.$OriginalMaxDistance?">
-          <set_value name="$searchParams.$OriginalMaxDistance" exact="$payload.$OriginalMaxDistance"/>
-        </do_if>
-        <do_if value="$payload.$PilotSkillMaxDistance?">
-          <set_value name="$searchParams.$PilotSkillMaxDistance" exact="$payload.$PilotSkillMaxDistance"/>
-        </do_if>
-        <do_if value="$payload.$MinROI?">
-          <set_value name="$searchParams.$MinROI" exact="$payload.$MinROI"/>
-        </do_if>
-        <do_if value="$payload.$MinAbsoluteProfit?">
-          <set_value name="$searchParams.$MinAbsoluteProfit" exact="$payload.$MinAbsoluteProfit"/>
-        </do_if>
-        <do_if value="$payload.$FactionPriority?">
-          <set_value name="$searchParams.$FactionPriority" exact="$payload.$FactionPriority"/>
-        </do_if>
-        <do_if value="$payload.$FactionPriorityText?">
-          <set_value name="$searchParams.$FactionPriorityText" exact="$payload.$FactionPriorityText"/>
-        </do_if>
-        <do_if value="$payload.$DistancePenaltyMultiplier?">
-          <set_value name="$searchParams.$DistancePenaltyMultiplier" exact="$payload.$DistancePenaltyMultiplier"/>
-        </do_if>
-        <do_if value="$payload.$SkillLevel?">
-          <set_value name="$searchParams.$SkillLevel" exact="$payload.$SkillLevel"/>
-        </do_if>
-        <do_if value="$payload.$ThreatIntel?">
-          <set_value name="$searchParams.$ThreatIntel" exact="$payload.$ThreatIntel"/>
-        </do_if>
-        <do_if value="$payload.$FleetCoord?">
-          <set_value name="$searchParams.$FleetCoord" exact="$payload.$FleetCoord"/>
-        </do_if>
-        <do_if value="$payload.$AdvancedAnalytics?">
-          <set_value name="$searchParams.$AdvancedAnalytics" exact="$payload.$AdvancedAnalytics"/>
-        </do_if>
-        <do_if value="$payload.$TraceId?">
-          <set_value name="$searchParams.$TraceId" exact="$payload.$TraceId"/>
-        </do_if>
         <do_else>
-          <set_value name="$searchParams.$TraceId" exact="$traceId"/>
-        </do_else>
-        
-        <!-- Store work item reference in state for continuation -->
-        <do_if value="not global.$GT_SearchLiveTrades_State?">
-          <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
-        </do_if>
-        <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
-        <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
-        <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
-        
-        <!-- Signal SearchLiveTrades (async operation) -->
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="$traceId"/>
-          <param name="stage" value="'HomeSearch'"/>
-          <param name="action" value="'Start'"/>
-          <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown')"/>
-          <param name="logLevel" value="1"/>
-        </run_actions>
-        
-        <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
-        
-        <!-- Note: Work item remains active until SearchLiveTrades completes -->
-        <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
-        </do_else>
+          <!-- We successfully reserved it - proceed with live search -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') VerifyHomeRefresh: RESERVED home-sector refresh slot atomically (home=' + @$homeSector.knownname + ') - starting live search'" chance="100"/>
+          </do_if>
+          
+          <!-- Hub status: initiator started home refresh -->
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'home_search'"/>
+            <param name="state" value="'running'"/>
+            <param name="reason" value="'initiator'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="homeSector" value="$homeSector"/>
+          </run_actions>
+          
+          <!-- Execute home search by signaling SearchLiveTrades -->
+          <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
+          <set_value name="$startTime" exact="player.age"/>
+          
+          <!-- Build params table for SearchLiveTrades -->
+          <set_value name="$searchParams" exact="table[]"/>
+          <do_if value="$payload.$Ship?">
+            <set_value name="$searchParams.$Ship" exact="$payload.$Ship"/>
+          </do_if>
+          <do_if value="$payload.$MaxDistance?">
+            <set_value name="$searchParams.$MaxDistance" exact="$payload.$MaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$OriginalMaxDistance?">
+            <set_value name="$searchParams.$OriginalMaxDistance" exact="$payload.$OriginalMaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$PilotSkillMaxDistance?">
+            <set_value name="$searchParams.$PilotSkillMaxDistance" exact="$payload.$PilotSkillMaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$MinROI?">
+            <set_value name="$searchParams.$MinROI" exact="$payload.$MinROI"/>
+          </do_if>
+          <do_if value="$payload.$MinAbsoluteProfit?">
+            <set_value name="$searchParams.$MinAbsoluteProfit" exact="$payload.$MinAbsoluteProfit"/>
+          </do_if>
+          <do_if value="$payload.$FactionPriority?">
+            <set_value name="$searchParams.$FactionPriority" exact="$payload.$FactionPriority"/>
+          </do_if>
+          <do_if value="$payload.$FactionPriorityText?">
+            <set_value name="$searchParams.$FactionPriorityText" exact="$payload.$FactionPriorityText"/>
+          </do_if>
+          <do_if value="$payload.$DistancePenaltyMultiplier?">
+            <set_value name="$searchParams.$DistancePenaltyMultiplier" exact="$payload.$DistancePenaltyMultiplier"/>
+          </do_if>
+          <do_if value="$payload.$SkillLevel?">
+            <set_value name="$searchParams.$SkillLevel" exact="$payload.$SkillLevel"/>
+          </do_if>
+          <do_if value="$payload.$ThreatIntel?">
+            <set_value name="$searchParams.$ThreatIntel" exact="$payload.$ThreatIntel"/>
+          </do_if>
+          <do_if value="$payload.$FleetCoord?">
+            <set_value name="$searchParams.$FleetCoord" exact="$payload.$FleetCoord"/>
+          </do_if>
+          <do_if value="$payload.$AdvancedAnalytics?">
+            <set_value name="$searchParams.$AdvancedAnalytics" exact="$payload.$AdvancedAnalytics"/>
+          </do_if>
+          <do_if value="$payload.$TraceId?">
+            <set_value name="$searchParams.$TraceId" exact="$payload.$TraceId"/>
+          </do_if>
+          <do_else>
+            <set_value name="$searchParams.$TraceId" exact="$traceId"/>
+          </do_else>
+          
+          <!-- Store work item reference in state for continuation -->
+          <do_if value="not global.$GT_SearchLiveTrades_State?">
+            <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
+          </do_if>
+          <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
+          <!-- Store home sector for later cleanup -->
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$HomeSector" exact="$homeSector"/>
+          
+          <!-- Signal SearchLiveTrades (async operation) -->
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'HomeSearch'"/>
+            <param name="action" value="'Start'"/>
+            <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown')"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+          
+          <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
+          
+          <!-- Note: Work item remains active until SearchLiveTrades completes -->
+          <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
         </do_else>
       </actions>
     </cue>
@@ -1386,8 +1678,18 @@
         <event_cue_signalled/>
       </conditions>
       <!-- Ensure cross-frame execution; avoid same-frame avalanches after big live searches -->
-      <delay min="10ms" max="60ms"/>
+      <!-- CRITICAL FIX: Increased delay to throttle wake-ups and prevent CPU spikes -->
+      <!-- When many waiters wake simultaneously, this spreads them across multiple frames -->
+      <!-- Combined with reduced batch size (2 instead of 5), this prevents stuttering -->
+      <delay min="50ms" max="150ms"/>
       <actions>
+        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+          <param name="traceId" value="'0'"/>
+          <param name="stage" value="'HomeRefreshFinished'"/>
+          <param name="action" value="'ENTERED'"/>
+          <param name="details" value="'homeSector=' + (if event.param? and event.param.exists then @event.param.knownname else 'null')"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
         <set_value name="$homeSector" exact="event.param"/>
         <!-- IMPORTANT: cancel_cue does NOT stop the current actions block.
              Use an explicit flag to prevent fallthrough into $Waiters access. -->
@@ -1416,13 +1718,21 @@
 
         <!-- Nothing to do -->
         <do_if value="this.$Proceed and (not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count le 0)">
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="'0'"/>
+            <param name="stage" value="'HomeRefreshFinished'"/>
+            <param name="action" value="'NoWaiters'"/>
+            <param name="details" value="'homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null') + ' waiters.count=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0)"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
           <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
           <set_value name="this.$Proceed" exact="false"/>
         </do_if>
 
         <do_if value="this.$Proceed">
           <!-- Process a small batch per call to avoid spikes -->
-          <set_value name="$maxWake" exact="5"/>
+          <!-- CRITICAL: Reduce batch size to prevent CPU spikes when many waiters wake simultaneously -->
+          <set_value name="$maxWake" exact="2"/>
           <set_value name="$woke" exact="0"/>
 
           <do_while value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0 and $woke lt $maxWake">
@@ -1448,6 +1758,13 @@
                 <param name="homeSector" value="$homeSector"/>
               </run_actions>
               <!-- Resume search by re-enqueueing SearchTradeRoutes through the central scheduler (silent to player) -->
+              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                <param name="traceId" value="$traceId"/>
+                <param name="stage" value="'HomeRefreshFinished'"/>
+                <param name="action" value="'WakingShip'"/>
+                <param name="details" value="'ship=' + $ship.idcode + ' homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null')"/>
+                <param name="logLevel" value="1"/>
+              </run_actions>
               <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
             </do_if>
 
@@ -1458,7 +1775,10 @@
           <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
 
           <!-- If more waiters remain, schedule another pass -->
+          <!-- CRITICAL FIX: The cue already has delay at top (10-60ms), and reduced batch size (2 instead of 5) -->
+          <!-- This spreads out the cache search load over multiple frames instead of all at once -->
           <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0">
+            <!-- Re-signal with delay (cue has delay at top: 10-60ms) -->
             <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.HomeRefreshFinished" param="$homeSector"/>
           </do_if>
         </do_if>

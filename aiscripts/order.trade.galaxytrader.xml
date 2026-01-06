@@ -5507,6 +5507,11 @@
       <set_value name="$ignoreBuildStorage" exact="if $workUnit.$IgnoreBuildStorage? then $workUnit.$IgnoreBuildStorage else false"/>
       <set_value name="$ignoreCarrierAux" exact="if $workUnit.$IgnoreCarrierAux? then $workUnit.$IgnoreCarrierAux else false"/>
       
+      <!-- Get ship settings for filtering -->
+      <set_value name="$allowIllegal" exact="if $workUnit.$AllowIllegal? then $workUnit.$AllowIllegal else $effectiveAllowIllegal"/>
+      <set_value name="$ignoreTradeRules" exact="if $workUnit.$IgnoreTradeRules? then $workUnit.$IgnoreTradeRules else $effectiveIgnoreTradeRules"/>
+      <set_value name="$shipDockSize" exact="this.ship.docksize"/>
+      
       <!-- Get cache list -->
       <set_value name="$cacheList" exact="[]"/>
       <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
@@ -5524,19 +5529,61 @@
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache max distance insufficient: cached=' + $cacheMaxDistance + ', required=' + $maxDistance + ' - returning empty results'" chance="100"/>
         </do_if>
-        <!-- Return empty results (cache miss) -->
-        <set_value name="$result" exact="table[
-          $Found = false,
-          $Trade = null,
-          $BestScore = 0,
-          $Trades = [],
-          $ScanDone = true
+        <!-- Return empty results (cache miss) - signal to player.galaxy so work unit coordinator receives it -->
+        <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
+          $Ship = this.ship,
+          $WorkType = 'cache_search',
+          $Result = table[
+            $Found = false,
+            $Trade = null,
+            $BestScore = 0,
+            $Trades = [],
+            $ScanDone = true
+          ]
         ]"/>
-        <signal_objects object="this.ship" param="'GT_WorkUnit_Complete'" param2="$result"/>
         <resume label="main_loop"/>
       </do_if>
       
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', cacheEntries=' + $cacheList.count" chance="100"/>
+      
+      <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
+      <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
+      <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+      <!-- Ships in different sectors may still try (different path might exist) -->
+      <set_value name="$currentSector" exact="this.ship.sector"/>
+      <set_value name="$failedTrades" exact="[]"/>
+      <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
+        <set_value name="$failedTradesRaw" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
+        <set_value name="$failedTradesExpired" exact="[]"/>
+        <set_value name="$expirationTime" exact="1800s"/> <!-- 30 minutes -->
+        
+        <!-- Filter out expired entries -->
+        <do_all exact="$failedTradesRaw.count" counter="$f">
+          <set_value name="$failedTrade" exact="$failedTradesRaw.{$f}"/>
+          <set_value name="$tradeAge" exact="player.age - $failedTrade.$Timestamp"/>
+          <do_if value="$tradeAge le $expirationTime">
+            <!-- Entry still valid - keep it -->
+            <append_to_list name="$failedTrades" exact="$failedTrade"/>
+          </do_if>
+          <do_else>
+            <!-- Entry expired - mark for removal -->
+            <append_to_list name="$failedTradesExpired" exact="$f"/>
+          </do_else>
+        </do_all>
+        
+        <!-- Update global storage with cleaned list -->
+        <do_if value="$failedTradesExpired.count gt 0">
+          <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="$failedTrades"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cleaned ' + $failedTradesExpired.count + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (older than 30 minutes)'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_elseif value="$failedTrades.count == 0">
+          <!-- All entries expired - remove empty list -->
+          <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
+        </do_elseif>
+      </do_if>
       
       <!-- Process cache entries with frame budgeting -->
       <!-- Get chunk size from global settings (default: 20) -->
@@ -5583,20 +5630,230 @@
           <do_if value="$cacheEntry?">
             <set_value name="$cacheAge" exact="player.age - $cacheEntry.$Timestamp"/>
             <do_if value="$cacheAge le 600s">
-              <!-- Validate cache entry directly (simplified validation) -->
-              <!-- Check basic trade validity -->
+              <!-- Validate cache entry with full filtering (matching MD script's GT_TS_CachePickBest) -->
               <set_value name="$buyOffer" exact="@$cacheEntry.$BuyOffer"/>
               <set_value name="$sellOffer" exact="@$cacheEntry.$SellOffer"/>
               <set_value name="$profit" exact="@$cacheEntry.$Profit"/>
               <set_value name="$roi" exact="@$cacheEntry.$ROI"/>
               
-              <!-- Debug first few entries -->
-              <do_if value="$processedCount + $i le 3">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ': profit=' + (if $profit? then $profit else 'null') + ', minProfit=' + $minAbsoluteProfit + ', roi=' + (if $roi? then $roi else 'null') + ', minROI=' + $minROI + ', buyOffer=' + (if $buyOffer? then 'yes' else 'no') + ', sellOffer=' + (if $sellOffer? then 'yes' else 'no')" chance="100"/>
+              <!-- Track rejection reason for debugging -->
+              <set_value name="$rejectReason" exact="''"/>
+              <set_value name="$isValid" exact="true"/>
+              
+              <!-- Basic structure checks -->
+              <do_if value="not $buyOffer? or not $buyOffer.exists or not $sellOffer? or not $sellOffer.exists">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$rejectReason" exact="'offers_invalid'"/>
+              </do_if>
+              <do_elseif value="not @$buyOffer.owner.isoperational or not @$sellOffer.owner.isoperational">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$rejectReason" exact="'station_not_operational'"/>
+              </do_elseif>
+              
+              <!-- Docking permission (ship-specific) -->
+              <do_if value="$isValid">
+                <do_if value="not @$buyOffer.owner.dockingallowed.{this.ship} or not @$sellOffer.owner.dockingallowed.{this.ship}">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'docking_not_allowed'"/>
+                </do_if>
               </do_if>
               
-              <do_if value="$buyOffer? and $sellOffer? and $profit? and $profit ge $minAbsoluteProfit and $roi? and $roi ge $minROI">
-                <!-- Basic validation passed - add to valid trades -->
+              <!-- Illegal-ware filter (ship setting) -->
+              <do_if value="$isValid and not $allowIllegal">
+                <set_value name="$ware" exact="@$buyOffer.ware"/>
+                <do_if value="$ware != null and @$ware.illegal gt 0">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'illegal_ware'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Trade rules filter (cache metadata) -->
+              <do_if value="$isValid and not $ignoreTradeRules">
+                <set_value name="$tradeRulesRespected" exact="if $cacheEntry.$TradeRulesRespected? then $cacheEntry.$TradeRulesRespected else false"/>
+                <do_if value="not $tradeRulesRespected">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'trade_rules_not_respected'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Failure-distribution filter: skip if this ship already failed this entry -->
+              <do_if value="$isValid">
+                <set_value name="$failedShips" exact="@$cacheEntry.$FailedShips"/>
+                <do_if value="$failedShips == null">
+                  <set_value name="$failedShips" exact="[]"/>
+                </do_if>
+                <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
+                <do_all exact="$failedShips.count" counter="$f">
+                  <do_if value="$failedShips.{$f} == this.ship">
+                    <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$shipAlreadyFailedThisEntry">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'ship_already_failed'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - skip sector pairs that previously failed from this sector -->
+              <!-- This prevents revalidating entries that will fail due to blacklisted routes -->
+              <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
+              <!-- One failure in a sector pair blocks ALL station combinations in that route for ships in this sector -->
+              <do_if value="$isValid">
+                <set_value name="$skipFailedSectorPair" exact="false"/>
+                <do_if value="$failedTrades.count gt 0">
+                  <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
+                  <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
+                  <do_all exact="$failedTrades.count" counter="$failIdx">
+                    <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+                    <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
+                    <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                      <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
+                        <set_value name="$skipFailedSectorPair" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <do_if value="$skipFailedSectorPair">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'failed_sector_pair'"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Range validation (prefer precomputed distances) -->
+              <do_if value="$isValid">
+                <set_value name="$homeToBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
+                <set_value name="$homeToSell" exact="@$cacheEntry.$HomeToSellDistance"/>
+                <do_if value="not $homeToBuy? or not $homeToSell?">
+                  <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buyOffer.owner.sector}"/>
+                  <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellOffer.owner.sector}"/>
+                </do_if>
+                <set_value name="$maxHomeDist" exact="[$homeToBuy, $homeToSell].max"/>
+                <do_if value="$homeToBuy lt 0 or $homeToSell lt 0 or $maxHomeDist gt $maxDistance">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'distance_exceeded maxDist=' + $maxHomeDist + ' allowed=' + $maxDistance"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Target-type filters -->
+              <do_if value="$isValid and ($ignoreBuildStorage or $ignoreCarrierAux)">
+                <set_value name="$buyType" exact="@$cacheEntry.$BuyTargetType"/>
+                <set_value name="$sellType" exact="@$cacheEntry.$SellTargetType"/>
+                <do_if value="$ignoreBuildStorage and ($buyType == 'Buildstorage' or $sellType == 'Buildstorage')">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'build_storage_filtered'"/>
+                </do_if>
+                <do_elseif value="$ignoreCarrierAux and (($buyType == 'Aux' or $buyType == 'Carrier') or ($sellType == 'Aux' or $sellType == 'Carrier'))">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'carrier_aux_filtered'"/>
+                </do_elseif>
+              </do_if>
+              
+              <!-- Dock size compatibility -->
+              <do_if value="$isValid">
+                <set_value name="$buyCaps" exact="@$cacheEntry.$BuyDockCaps"/>
+                <set_value name="$sellCaps" exact="@$cacheEntry.$SellDockCaps"/>
+                <do_if value="$buyCaps == null or $sellCaps == null">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'dock_caps_missing'"/>
+                </do_if>
+                <do_elseif value="$shipDockSize == tag.dock_s and (not $buyCaps.$S or not $sellCaps.$S)">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'dock_size_s_incompatible'"/>
+                </do_elseif>
+                <do_elseif value="$shipDockSize == tag.dock_m and (not $buyCaps.$M or not $sellCaps.$M)">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'dock_size_m_incompatible'"/>
+                </do_elseif>
+                <do_elseif value="$shipDockSize == tag.dock_l and (not $buyCaps.$L or not $sellCaps.$L)">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'dock_size_l_incompatible'"/>
+                </do_elseif>
+                <do_elseif value="$shipDockSize == tag.dock_xl and (not $buyCaps.$XL or not $sellCaps.$XL)">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'dock_size_xl_incompatible'"/>
+                </do_elseif>
+              </do_if>
+              
+              <!-- Profit thresholds -->
+              <do_if value="$isValid">
+                <do_if value="$profit == null">
+                  <set_value name="$profit" exact="0Cr"/>
+                </do_if>
+                <do_if value="$roi == null">
+                  <set_value name="$roi" exact="0"/>
+                </do_if>
+                <do_if value="$profit lt $minAbsoluteProfit or $roi lt $minROI">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'profit_too_low profit=' + $profit + ' min=' + $minAbsoluteProfit + ' roi=' + $roi + ' minROI=' + $minROI"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Live offer sanity: ensure current offers are still available AND have enough amount -->
+              <do_if value="$isValid">
+                <set_value name="$tradeAmount" exact="@$cacheEntry.$Amount"/>
+                <do_if value="$tradeAmount == null or $tradeAmount le 0">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'trade_amount_invalid'"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$buyOfferObj" exact="@$cacheEntry.$BuyOffer"/>
+                  <set_value name="$sellOfferObj" exact="@$cacheEntry.$SellOffer"/>
+                  <do_if value="not $buyOfferObj? or $buyOfferObj == null or not $buyOfferObj.exists or not $sellOfferObj? or $sellOfferObj == null or not $sellOfferObj.exists">
+                    <set_value name="$isValid" exact="false"/>
+                    <set_value name="$rejectReason" exact="'offers_no_longer_exist'"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$buyAvailNow" exact="@$buyOfferObj.available"/>
+                    <set_value name="$sellAvailNow" exact="@$sellOfferObj.available"/>
+                    <set_value name="$buyAmtNow" exact="@$buyOfferObj.amount"/>
+                    <set_value name="$sellAmtNow" exact="@$sellOfferObj.amount"/>
+                    <do_if value="$buyAmtNow == null">
+                      <set_value name="$buyAmtNow" exact="0"/>
+                    </do_if>
+                    <do_if value="$sellAmtNow == null">
+                      <set_value name="$sellAmtNow" exact="0"/>
+                    </do_if>
+                    <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow lt $tradeAmount or $sellAmtNow lt $tradeAmount">
+                      <set_value name="$isValid" exact="false"/>
+                      <set_value name="$rejectReason" exact="'offers_insufficient_amount buyAvail=' + $buyAvailNow + ' buyAmt=' + $buyAmtNow + ' sellAvail=' + $sellAvailNow + ' sellAmt=' + $sellAmtNow + ' needed=' + $tradeAmount"/>
+                    </do_if>
+                  </do_else>
+                </do_else>
+              </do_if>
+              
+              <!-- CRITICAL: Re-validate offers with tradepartner to ensure trade rules are respected -->
+              <do_if value="$isValid and not $ignoreTradeRules">
+                <set_value name="$buyStation" exact="@$cacheEntry.$BuyOffer.owner"/>
+                <set_value name="$buyWare" exact="@$cacheEntry.$BuyOffer.ware"/>
+                <set_value name="$sellStation" exact="@$cacheEntry.$SellOffer.owner"/>
+                <set_value name="$sellWare" exact="@$cacheEntry.$SellOffer.ware"/>
+                
+                <do_if value="$buyStation? and $buyStation.exists and $buyWare != null">
+                  <find_sell_offer seller="$buyStation" wares="$buyWare" tradepartner="this.ship" result="$validatedBuyOffer"/>
+                  <do_if value="not $validatedBuyOffer.available">
+                    <set_value name="$isValid" exact="false"/>
+                    <set_value name="$rejectReason" exact="'trade_rules_buy_violation'"/>
+                  </do_if>
+                </do_if>
+                
+                <do_if value="$isValid and $sellStation? and $sellStation.exists and $sellWare != null">
+                  <find_buy_offer buyer="$sellStation" wares="$sellWare" tradepartner="this.ship" result="$validatedSellOffer"/>
+                  <do_if value="not $validatedSellOffer.available">
+                    <set_value name="$isValid" exact="false"/>
+                    <set_value name="$rejectReason" exact="'trade_rules_sell_violation'"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              
+              <!-- Debug first few entries -->
+              <do_if value="$processedCount + $i le 3">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ': profit=' + (if $profit? then $profit else 'null') + ', minProfit=' + $minAbsoluteProfit + ', roi=' + (if $roi? then $roi else 'null') + ', minROI=' + $minROI + ', valid=' + $isValid + (if not $isValid then ' reason=' + $rejectReason else '')" chance="100"/>
+              </do_if>
+              
+              <!-- Add to valid trades if all checks passed -->
+              <do_if value="$isValid">
                 <!-- Limit trades collected based on maxTradesToReturn -->
                 <do_if value="$validTrades.count lt $maxTradesToReturn">
                   <append_to_list name="$validTrades" exact="$cacheEntry"/>
@@ -5611,6 +5868,12 @@
                   <break/>
                 </do_else>
               </do_if>
+              <do_else>
+                <!-- Log rejection reason for first few rejected entries -->
+                <do_if value="$processedCount + $i le 5 and $rejectReason != ''">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ' REJECTED: ' + $rejectReason" chance="100"/>
+                </do_if>
+              </do_else>
             </do_if>
           </do_if>
         </do_all>
@@ -6178,6 +6441,9 @@
       </do_if>
       
       <!-- Signal completion -->
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade matching complete: processedPairs=' + $processedPairs + ', validTrades=' + $validTrades.count + ', bestTrade=' + (if $bestTrade != null then 'found' else 'null') + ', bestScore=' + $bestScore + ', wareKeys=' + $wareKeys.count" chance="100"/>
+      </do_if>
       <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
         $Ship = this.ship,
         $WorkType = 'trade_matching',

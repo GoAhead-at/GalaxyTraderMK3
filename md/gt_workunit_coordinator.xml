@@ -98,10 +98,16 @@
           </do_if>
           
           <!-- Route to search pipeline with cache result -->
+          <!-- CRITICAL FIX: Pass UseSearchQueueCounter so cache search slot is released when cache results are processed -->
+          <set_value name="$usedCacheSlot" exact="false"/>
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <set_value name="$usedCacheSlot" exact="true"/>
+          </do_if>
           <set_value name="$resumeParams" exact="table[
             $Ship = $ship,
             $SearchState = 'cache',
             $CacheResult = $cacheResult,
+            $UseSearchQueueCounter = $usedCacheSlot,
             $MaxDistance = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MaxDistance else 1,
             $MinROI = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinROI else 0,
             $MinAbsoluteProfit = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinAbsoluteProfit else 0,
@@ -310,10 +316,51 @@
             </do_all>
           </do_if>
           
+          <!-- CRITICAL FIX: Signal HomeRefreshFinished AFTER cache is populated -->
+          <!-- This ensures waiters check cache AFTER it's populated, not before -->
+          <!-- Cache is now populated, so ships waiting for home refresh can use it -->
+          <do_if value="$homeSector? and $homeSector.exists">
+            <!-- Initialize entry if missing (shouldn't happen, but be safe) -->
+            <do_if value="not global.$GT_TS_LiveRefreshBySector?">
+              <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[$Active = false, $Waiters = [], $WaiterQueued = table[]]"/>
+            </do_if>
+            
+            <!-- Log for debugging -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$hasWaiters" exact="false"/>
+              <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0">
+                <set_value name="$hasWaiters" exact="true"/>
+              </do_if>
+              <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Signaling HomeRefreshFinished for home=' + @$homeSector.knownname + ' (hasWaiters=' + $hasWaiters + ', waiters.count=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0) + ')'" chance="100"/>
+            </do_if>
+            
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Active" exact="false"/>
+            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$LastFinished" exact="player.age"/>
+            <!-- Wake any ships waiting silently for this home-sector refresh to finish -->
+            <!-- Cache is now populated, so waiters will find trades in cache -->
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.HomeRefreshFinished" param="$homeSector"/>
+          </do_if>
+          <do_else>
+            <!-- Log if homeSector is missing -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') WARNING: Cannot signal HomeRefreshFinished - homeSector is null or invalid (homeSector?=' + ($homeSector? and $homeSector.exists) + ')'" chance="100"/>
+            </do_if>
+          </do_else>
+          
           <!-- Signal search pipeline to process live results -->
+          <!-- CRITICAL FIX: Pass UseSearchQueueCounter so cache search slot is released when live results are processed -->
+          <!-- Note: Slot should already be released when live search was triggered, but pass flag for safety -->
+          <set_value name="$usedCacheSlot" exact="false"/>
+          <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+            <set_value name="$usedCacheSlot" exact="true"/>
+          </do_if>
           <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="table[
             $Ship = $ship,
             $SearchState = 'live',
+            $UseSearchQueueCounter = $usedCacheSlot,
             $MaxDistance = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MaxDistance else 1,
             $MinROI = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinROI else 0,
             $MinAbsoluteProfit = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinAbsoluteProfit else 0,

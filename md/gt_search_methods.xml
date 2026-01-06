@@ -68,6 +68,7 @@
         <set_value name="$isValidShip" exact="false"/>
         <do_if value="$ship? and $ship.exists">
           <!-- Check if it's actually a ship object (not a component) -->
+          <!-- Use direct isclass access like gt_threat_intelligence.xml does -->
           <do_if value="$ship.isclass.ship_s or $ship.isclass.ship_m or $ship.isclass.ship_l or $ship.isclass.ship_xl">
             <set_value name="$isValidShip" exact="true"/>
           </do_if>
@@ -130,7 +131,24 @@
         <!-- Check if this is a continuation from SearchLiveTrades_Resume -->
         <do_if value="$params.$ContinueFromSectorLists? and $params.$ContinueFromSectorLists == true">
           <!-- Continuation: Extract all state from params and skip to price range loading -->
+          <!-- CRITICAL: Re-validate ship in continuation path (ship may have changed or become invalid) -->
           <set_value name="$ship" exact="$params.$Ship"/>
+          <!-- Re-validate ship for continuation - use same pattern as initial validation -->
+          <set_value name="$isValidShip" exact="false"/>
+          <do_if value="$ship? and $ship.exists">
+            <!-- Check if it's actually a ship object (not a component) -->
+            <!-- Use direct isclass access like gt_threat_intelligence.xml does -->
+            <do_if value="$ship.isclass.ship_s or $ship.isclass.ship_m or $ship.isclass.ship_l or $ship.isclass.ship_xl">
+              <set_value name="$isValidShip" exact="true"/>
+            </do_if>
+          </do_if>
+          <!-- Exit if ship is invalid in continuation -->
+          <do_if value="not $isValidShip">
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] SearchLiveTrades: Invalid ship object in continuation (component reference or destroyed ship) - cancelling search'" chance="100"/>
+            </do_if>
+            <cancel_cue cue="this"/>
+          </do_if>
           <set_value name="$buyspaces" exact="$params.$BuySpaces"/>
           <set_value name="$sellspaces" exact="$params.$SellSpaces"/>
           <set_value name="$shipIsIsolated" exact="$params.$ShipIsIsolated"/>
@@ -149,6 +167,14 @@
           <set_value name="$tradeList" exact="$params.$TradeList"/>
           <set_value name="$maxTradesToReturn" exact="$params.$MaxTradesToReturn"/>
           <set_value name="$bestTrade" exact="$params.$BestTrade"/>
+          
+          <!-- CRITICAL FIX: Store BuySpaces/SellSpaces in state so SearchLiveTrades_AppendPendingOffers can access them -->
+          <do_if value="$buyspaces? and $buyspaces != null">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$BuySpaces" exact="$buyspaces"/>
+          </do_if>
+          <do_if value="$sellspaces? and $sellspaces != null">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$SellSpaces" exact="$sellspaces"/>
+          </do_if>
           <set_value name="$bestScore" exact="$params.$BestScore"/>
           <set_value name="$stationsEvaluated" exact="$params.$StationsEvaluated"/>
           <set_value name="$offersFound" exact="$params.$OffersFound"/>
@@ -1046,7 +1072,9 @@
               </do_if>
               <do_else>
                 <!-- Offers complete; fall through to filtering/matching -->
-              <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+                <!-- CRITICAL FIX: Clear deferOfferSlice so we can proceed to queue trade_matching work unit -->
+                <set_value name="$deferOfferSlice" exact="false"/>
               </do_else>
             </do_else>
             </do_else>
@@ -1613,18 +1641,76 @@
             </do_if>
           </do_if>
 
+          <!-- CRITICAL FIX: Filter illegal wares BEFORE queuing trade_matching work unit -->
+          <!-- If ship doesn't allow illegal trades, filter them out here so they don't end up in cache -->
+          <!-- Illegal trades should be filtered during search, not during execution -->
+          <set_value name="$filteredSellOffers" exact="$allSellOffers"/>
+          <set_value name="$filteredBuyOffers" exact="$allBuyOffers"/>
+          <set_value name="$illegalSellOffersFiltered" exact="0"/>
+          <set_value name="$illegalBuyOffersFiltered" exact="0"/>
+          
+          <do_if value="not $allowIllegal">
+            <!-- Filter sell offers (remove illegal wares) -->
+            <do_if value="$allSellOffers? and $allSellOffers.count gt 0">
+              <set_value name="$filteredSellOffers" exact="[]"/>
+              <do_all exact="$allSellOffers.count" counter="$i">
+                <set_value name="$offer" exact="$allSellOffers.{$i}"/>
+                <do_if value="$offer? and $offer.ware?">
+                  <do_if value="not @$offer.ware.isillegal">
+                    <append_to_list name="$filteredSellOffers" exact="$offer"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$illegalSellOffersFiltered" exact="$illegalSellOffersFiltered + 1"/>
+                  </do_else>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Filter buy offers (remove illegal wares) -->
+            <do_if value="$allBuyOffers? and $allBuyOffers.count gt 0">
+              <set_value name="$filteredBuyOffers" exact="[]"/>
+              <do_all exact="$allBuyOffers.count" counter="$i">
+                <set_value name="$offer" exact="$allBuyOffers.{$i}"/>
+                <do_if value="$offer? and $offer.ware?">
+                  <do_if value="not @$offer.ware.isillegal">
+                    <append_to_list name="$filteredBuyOffers" exact="$offer"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$illegalBuyOffersFiltered" exact="$illegalBuyOffersFiltered + 1"/>
+                  </do_else>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Debug logging -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <do_if value="$illegalSellOffersFiltered gt 0 or $illegalBuyOffersFiltered gt 0">
+                <debug_text text="'[GT-Search] (' + $ship.idcode + ') Filtered illegal wares: ' + $illegalSellOffersFiltered + ' sell, ' + $illegalBuyOffersFiltered + ' buy (AllowIllegal=' + $allowIllegal + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
           <!-- MIGRATION: Queue AI work unit for trade matching instead of batch processor -->
           <!-- Note: skipPrepareBatch check removed - work units handle their own state management -->
-          <!-- Store offers in state for work unit -->
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$SellOffers" exact="$allSellOffers"/>
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$BuyOffers" exact="$allBuyOffers"/>
+          <!-- Store FILTERED offers in state for work unit -->
+          <!-- CRITICAL: Ship validation done at cue start, but verify again before using as table key -->
+          <do_if value="$isValidShip and $ship? and $ship.exists">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$SellOffers" exact="$filteredSellOffers"/>
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$BuyOffers" exact="$filteredBuyOffers"/>
+          </do_if>
+          
+          <!-- DEBUG: Log before queuing trade matching work unit -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Queuing trade_matching work unit: sellOffers=' + (if $filteredSellOffers? then $filteredSellOffers.count else 'null') + ', buyOffers=' + (if $filteredBuyOffers? then $filteredBuyOffers.count else 'null')" chance="100"/>
+          </do_if>
           
           <!-- Queue trade matching work unit -->
+          <!-- CRITICAL: Use FILTERED offers (illegal wares already removed) -->
           <set_value name="$workUnit" exact="table[
             $WorkType = 'trade_matching',
             $Ship = $ship,
-            $SellOffers = $allSellOffers,
-            $BuyOffers = $allBuyOffers,
+            $SellOffers = $filteredSellOffers,
+            $BuyOffers = $filteredBuyOffers,
             $HomeSector = $homeSector,
             $MaxDistance = $maxDistance,
             $MinROI = $minROI,
@@ -1636,13 +1722,29 @@
           <!-- Queue work unit via coordinator -->
           <signal_cue_instantly cue="md.GT_WorkUnit_Coordinator.QueueWorkUnit" param="$workUnit"/>
           
+          <!-- DEBUG: Log after queuing -->
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') Trade matching work unit QUEUED successfully'" chance="100"/>
+          </do_if>
+          
           <!-- Mark as waiting for work unit completion -->
           <!-- CRITICAL: Ship validation already done at cue start, but double-check here for safety -->
           <!-- Only ship classes are valid - components can have idcode too, so don't use idcode as fallback -->
           <set_value name="$isValidShip" exact="false"/>
           <do_if value="$ship? and $ship.exists">
             <!-- Check if it's actually a ship object (not a component) -->
-            <do_if value="$ship.isclass.ship_s or $ship.isclass.ship_m or $ship.isclass.ship_l or $ship.isclass.ship_xl">
+            <!-- CRITICAL: Cannot combine @ and ? operators - check existence first, then use @ for access -->
+            <set_value name="$isShip" exact="false"/>
+            <set_value name="$hasShipClass" exact="false"/>
+            <do_if value="$ship.isclass?">
+              <do_if value="@$ship.isclass.ship_s or @$ship.isclass.ship_m or @$ship.isclass.ship_l or @$ship.isclass.ship_xl">
+                <set_value name="$hasShipClass" exact="true"/>
+              </do_if>
+            </do_if>
+            <!-- Additional safety: verify we can access ship-specific properties -->
+            <do_if value="$hasShipClass">
+              <set_value name="$testPilot" exact="@$ship.pilot"/>
+              <!-- If we can access pilot property (even if null), it's a ship -->
               <set_value name="$isValidShip" exact="true"/>
             </do_if>
           </do_if>
@@ -1650,7 +1752,11 @@
             <do_if value="not global.$GT_SearchResult?">
               <set_value name="global.$GT_SearchResult" exact="table[]"/>
             </do_if>
-            <set_value name="global.$GT_SearchResult.{$ship}.$WaitingForBatch" exact="true"/>
+            <!-- Use ship object as key - validated above to ensure it's a real ship object -->
+            <!-- Additional safety: verify ship still exists before using as key -->
+            <do_if value="$ship? and $ship.exists">
+              <set_value name="global.$GT_SearchResult.{$ship}.$WaitingForBatch" exact="true"/>
+            </do_if>
           </do_if>
           
           <!-- Exit - work unit will signal completion -->
@@ -1952,40 +2058,102 @@
           <set_value name="$offerPhase" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase"/>
           <set_value name="$buyIndex" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$BuyIndex"/>
           <set_value name="$sellIndex" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$SellIndex"/>
+          
+          <!-- CRITICAL FIX: Ensure indices are initialized (not null) -->
+          <do_if value="$buyIndex == null">
+            <set_value name="$buyIndex" exact="0"/>
+          </do_if>
+          <do_if value="$sellIndex == null">
+            <set_value name="$sellIndex" exact="0"/>
+          </do_if>
+          
           <set_value name="$allSellOffers" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$AllSellOffers"/>
           <set_value name="$allBuyOffers" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$AllBuyOffers"/>
+          
+          <!-- CRITICAL FIX: Get BuySpaces/SellSpaces from state (not params) since they're stored there -->
+          <set_value name="$buyspaces" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$BuySpaces"/>
+          <set_value name="$sellspaces" exact="@global.$GT_SearchLiveTrades_State.{$ship}.$SellSpaces"/>
+          <set_value name="$buyspacesCount" exact="0"/>
+          <set_value name="$sellspacesCount" exact="0"/>
+          <do_if value="$buyspaces? and $buyspaces != null">
+            <set_value name="$buyspacesCount" exact="$buyspaces.count"/>
+          </do_if>
+          <do_if value="$sellspaces? and $sellspaces != null">
+            <set_value name="$sellspacesCount" exact="$sellspaces.count"/>
+          </do_if>
+
+          <!-- DEBUG: Log index values to diagnose completion detection -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] AppendPendingOffers completion check: ship=' + $ship.idcode + ', phase=' + $offerPhase + ', buyIndex=' + $buyIndex + '/' + $buyspacesCount + ', sellIndex=' + $sellIndex + '/' + $sellspacesCount" chance="100"/>
+          </do_if>
 
           <!-- Helper: enqueue next offer slice via global fair queue -->
           <set_value name="$queueNextSlice" exact="false"/>
           <do_if value="$offerPhase == 'selloffers'">
-            <!-- Interleave: if both sides still have work, flip to buyoffers for the next slice -->
-            <do_if value="$buyIndex lt @$params.$BuySpaces.count">
-              <do_if value="$sellIndex lt @$params.$SellSpaces.count">
+            <!-- CRITICAL FIX: In 'selloffers' phase, we process $buyspaces using $buyIndex.
+                 So check $buyIndex to see if we've finished processing $buyspaces. -->
+            <do_if value="$buyIndex lt $buyspacesCount">
+              <!-- Still have buy sectors to process (for selloffers) -->
+              <!-- Interleave: if sell side also has work, flip to buyoffers for the next slice -->
+              <do_if value="$sellIndex lt $sellspacesCount">
                 <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'buyoffers'"/>
               </do_if>
               <set_value name="$queueNextSlice" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] AppendPendingOffers: Queuing next slice (selloffers phase, buyIndex=' + $buyIndex + ' lt ' + $buyspacesCount + ')'" chance="100"/>
+              </do_if>
             </do_if>
             <do_else>
-              <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'buyoffers'"/>
-              <set_value name="$queueNextSlice" exact="true"/>
+              <!-- Buy sectors complete (selloffers done) - check if sell sectors remain (buyoffers) -->
+              <do_if value="$sellIndex lt $sellspacesCount">
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'buyoffers'"/>
+                <set_value name="$queueNextSlice" exact="true"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] AppendPendingOffers: Buy sectors complete, switching to buyoffers (sellIndex=' + $sellIndex + ' lt ' + $sellspacesCount + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Both buy and sell sectors complete - offer collection is done -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] AppendPendingOffers: ALL SECTORS COMPLETE! Setting OfferPhase=done (buyIndex=' + $buyIndex + '/' + $buyspacesCount + ', sellIndex=' + $sellIndex + '/' + $sellspacesCount + ')'" chance="100"/>
+                </do_if>
+                <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
+                <!-- Continue SearchLiveTrades to proceed into filtering/matching -->
+                <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
+                <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$params"/>
+                <cancel_cue cue="this"/>
+              </do_else>
             </do_else>
           </do_if>
           <do_else>
             <do_if value="$offerPhase == 'buyoffers'">
-              <do_if value="$sellIndex lt @$params.$SellSpaces.count">
-                <!-- Interleave: if both sides still have work, flip back to selloffers for the next slice -->
-                <do_if value="$buyIndex lt @$params.$BuySpaces.count">
+              <!-- CRITICAL FIX: In 'buyoffers' phase, we process $sellspaces using $sellIndex.
+                   So check $sellIndex to see if we've finished processing $sellspaces. -->
+              <do_if value="$sellIndex lt $sellspacesCount">
+                <!-- Still have sell sectors to process (for buyoffers) -->
+                <!-- Interleave: if buy side also has work, flip back to selloffers for the next slice -->
+                <do_if value="$buyIndex lt $buyspacesCount">
                   <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
                 </do_if>
                 <set_value name="$queueNextSlice" exact="true"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] AppendPendingOffers: Queuing next slice (buyoffers phase, sellIndex=' + $sellIndex + ' lt ' + $sellspacesCount + ')'" chance="100"/>
+                </do_if>
               </do_if>
               <do_else>
-                <!-- If sellspaces are complete but buyspaces are not, switch to selloffers to finish remaining selloffer sectors -->
-                <do_if value="$buyIndex lt @$params.$BuySpaces.count">
+                <!-- Sell sectors complete (buyoffers done) - check if buy sectors remain (selloffers) -->
+                <do_if value="$buyIndex lt $buyspacesCount">
                   <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'selloffers'"/>
                   <set_value name="$queueNextSlice" exact="true"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] AppendPendingOffers: Sell sectors complete, switching to selloffers (buyIndex=' + $buyIndex + ' lt ' + $buyspacesCount + ')'" chance="100"/>
+                  </do_if>
                 </do_if>
                 <do_else>
+                  <!-- Both buy and sell sectors complete - offer collection is done -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] AppendPendingOffers: ALL SECTORS COMPLETE! Setting OfferPhase=done (buyIndex=' + $buyIndex + '/' + $buyspacesCount + ', sellIndex=' + $sellIndex + '/' + $sellspacesCount + ')'" chance="100"/>
+                  </do_if>
                   <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$OfferPhase" exact="'done'"/>
                   <!-- Continue SearchLiveTrades to proceed into filtering/matching -->
                   <set_value name="$params.$ContinueFromSectorLists" exact="true"/>
