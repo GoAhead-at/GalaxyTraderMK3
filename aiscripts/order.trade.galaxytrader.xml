@@ -5994,125 +5994,187 @@
         </do_if>
       </do_all>
       
-      <!-- Build trade pair list -->
-      <set_value name="$tradePairs" exact="[]"/>
+      <!-- OPTIMIZATION: Lazy pair generation - generate pairs on-demand instead of upfront -->
+      <!-- Get list of wares that have both sell and buy offers -->
+      <set_value name="$wareKeys" exact="[]"/>
       <do_all exact="$sellOffersByWare.keys.count" counter="$i">
         <set_value name="$ware" exact="$sellOffersByWare.keys.{$i}"/>
-        <set_value name="$sellList" exact="$sellOffersByWare.{$ware}"/>
-        <set_value name="$buyList" exact="if $buyOffersByWare.{$ware}? then $buyOffersByWare.{$ware} else []"/>
-        
-        <!-- Create pairs -->
-        <do_all exact="$sellList.count" counter="$j">
-          <set_value name="$sellOffer" exact="$sellList.{$j}"/>
-          <do_all exact="$buyList.count" counter="$k">
-            <set_value name="$buyOffer" exact="$buyList.{$k}"/>
-            <append_to_list name="$tradePairs" exact="table[$SellOffer = $sellOffer, $BuyOffer = $buyOffer, $Ware = $ware]"/>
-          </do_all>
-        </do_all>
+        <do_if value="$buyOffersByWare.{$ware}? and $buyOffersByWare.{$ware}.count gt 0">
+          <append_to_list name="$wareKeys" exact="$ware"/>
+        </do_if>
       </do_all>
       
-      <!-- Process trade pairs in chunks with frame budgeting -->
+      <!-- Initialize lazy generation state -->
+      <set_value name="$currentWareIndex" exact="0"/>
+      <set_value name="$currentSellIndex" exact="0"/>
+      <set_value name="$currentBuyIndex" exact="0"/>
+      
+      <!-- Process trade pairs in chunks with frame budgeting (lazy generation) -->
       <label name="matching_work_loop"/>
       <set_value name="$startTime" exact="player.age"/>
-      <set_value name="$chunkStart" exact="$processedPairs + 1"/>
-      <set_value name="$chunkEnd" exact="[$processedPairs + $chunkSize, $tradePairs.count].min"/>
+      <set_value name="$pairsProcessedThisChunk" exact="0"/>
       
-      <do_if value="$chunkStart le $tradePairs.count">
-        <do_all exact="($chunkEnd - $chunkStart + 1)" counter="$i">
-          <set_value name="$pairIndex" exact="$chunkStart + $i - 1"/>
-          <set_value name="$pair" exact="$tradePairs.{$pairIndex}"/>
-          
-          <!-- Evaluate trade -->
-          <set_value name="$sellOffer" exact="$pair.$SellOffer"/>
-          <set_value name="$buyOffer" exact="$pair.$BuyOffer"/>
-          
-          <!-- Calculate profit -->
-          <set_value name="$buyPrice" exact="$sellOffer.price"/>
-          <set_value name="$sellPrice" exact="$buyOffer.price"/>
-          <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
-          <set_value name="$amount" exact="[$sellOffer.amount, $buyOffer.amount].min"/>
-          <set_value name="$totalProfit" exact="$profitPerUnit * $amount"/>
-          
-          <!-- Check minimum profit thresholds -->
-          <do_if value="$totalProfit ge $minAbsoluteProfit">
-            <!-- Calculate ROI -->
-            <set_value name="$investment" exact="$buyPrice * $amount"/>
-            <set_value name="$roi" exact="if $investment gt 0 then (($totalProfit * 100) / $investment) else 0"/>
-            
-            <do_if value="$roi ge $minROI">
-              <!-- Simplified distance calculation (use sector distance if available) -->
-              <set_value name="$buyDistance" exact="0"/>
-              <set_value name="$sellDistance" exact="0"/>
-              <do_if value="$sellOffer.owner? and $sellOffer.owner.sector? and $homeSector?">
-                <set_value name="$buySector" exact="$sellOffer.owner.sector"/>
-                <do_if value="$buySector != $homeSector">
-                  <set_value name="$buyDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
-                </do_if>
-              </do_if>
-              <do_if value="$buyOffer.owner? and $buyOffer.owner.sector? and $homeSector?">
-                <set_value name="$sellSector" exact="$buyOffer.owner.sector"/>
-                <do_if value="$sellSector != $homeSector">
-                  <set_value name="$sellDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
-                </do_if>
-              </do_if>
-              
-              <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
-              <set_value name="$distancePenalty" exact="$totalDistance * $distancePenaltyMultiplier * 100"/> <!-- Scale penalty -->
-              <set_value name="$score" exact="$totalProfit - $distancePenalty"/>
-              
-              <!-- Check trades per ware limit -->
-              <set_value name="$ware" exact="@$pair.$Ware"/>
-              <set_value name="$wareTradeCount" exact="if $tradesPerWare.{$ware}? then $tradesPerWare.{$ware} else 0"/>
-              <do_if value="$wareTradeCount lt $maxTradesPerWare">
-                <!-- Create trade entry -->
-                <set_value name="$trade" exact="table[
-                  $BuyOffer = $sellOffer,
-                  $SellOffer = $buyOffer,
-                  $Profit = $totalProfit,
-                  $ROI = $roi,
-                  $Amount = $amount,
-                  $Score = $score,
-                  $Distance = $totalDistance
-                ]"/>
-                
-                <append_to_list name="$validTrades" exact="$trade"/>
-                <set_value name="$tradesPerWare.{$ware}" exact="$wareTradeCount + 1"/>
-                
-                <!-- Track best trade -->
-                <do_if value="$score gt $bestScore">
-                  <set_value name="$bestTrade" exact="$trade"/>
-                  <set_value name="$bestScore" exact="$score"/>
-                </do_if>
-              </do_if>
-            </do_if>
-          </do_if>
-        </do_all>
-        
-        <set_value name="$processedPairs" exact="$chunkEnd"/>
-        
-        <!-- Early exit if threshold reached -->
+      <!-- Generate and process pairs on-demand -->
+      <do_if value="$wareKeys.count gt 0">
+        <do_while value="$pairsProcessedThisChunk lt $chunkSize and ($currentWareIndex lt $wareKeys.count)">
+        <!-- Check early exit threshold -->
         <do_if value="$validTrades.count ge $earlyExitThreshold">
           <break/>
         </do_if>
         
-        <!-- Check frame budget (configurable, default 50ms) -->
-        <set_value name="$frameBudgetMs" exact="50"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
-          <set_value name="$tmpBudget" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
-          <!-- BatchProcessingDelay is in ms, use it as frame budget -->
-          <do_if value="$tmpBudget? and $tmpBudget != null and $tmpBudget gt 0">
-            <set_value name="$frameBudgetMs" exact="$tmpBudget"/>
-          </do_if>
-        </do_if>
-        <set_value name="$elapsedTime" exact="player.age - $startTime"/>
-        <do_if value="$elapsedTime gt ($frameBudgetMs * 1ms)">
-          <wait exact="1ms"/>
+        <!-- Get current ware with safe access -->
+        <set_value name="$ware" exact="@$wareKeys.{$currentWareIndex}"/>
+        <do_if value="not $ware?">
+          <!-- Invalid ware index, skip to next -->
+          <set_value name="$currentWareIndex" exact="$currentWareIndex + 1"/>
+          <set_value name="$currentSellIndex" exact="0"/>
+          <set_value name="$currentBuyIndex" exact="0"/>
+          <continue/>
         </do_if>
         
-        <!-- Continue if more to process -->
-        <do_if value="$processedPairs lt $tradePairs.count">
-          <resume label="matching_work_loop"/>
+        <!-- Validate lists exist and have items before accessing -->
+        <set_value name="$listsValid" exact="false"/>
+        <do_if value="$sellOffersByWare.{$ware}?">
+          <do_if value="$buyOffersByWare.{$ware}?">
+            <set_value name="$sellList" exact="$sellOffersByWare.{$ware}"/>
+            <set_value name="$buyList" exact="$buyOffersByWare.{$ware}"/>
+            <do_if value="$sellList.count gt 0">
+              <do_if value="$buyList.count gt 0">
+                <set_value name="$listsValid" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_if>
         </do_if>
+        
+        <do_if value="not $listsValid">
+          <!-- Invalid lists, skip to next ware -->
+          <set_value name="$currentWareIndex" exact="$currentWareIndex + 1"/>
+          <set_value name="$currentSellIndex" exact="0"/>
+          <set_value name="$currentBuyIndex" exact="0"/>
+          <continue/>
+        </do_if>
+        
+        <!-- At this point, $sellList and $buyList are guaranteed to be set and valid -->
+        
+        <!-- Check if current ware is complete (reached MaxTradesPerWare limit) -->
+        <set_value name="$wareTradeCount" exact="if $tradesPerWare.{$ware}? then $tradesPerWare.{$ware} else 0"/>
+        <do_if value="$wareTradeCount ge $maxTradesPerWare">
+          <!-- OPTIMIZATION: Early termination per ware - skip to next ware immediately -->
+          <set_value name="$currentWareIndex" exact="$currentWareIndex + 1"/>
+          <set_value name="$currentSellIndex" exact="0"/>
+          <set_value name="$currentBuyIndex" exact="0"/>
+          <continue/>
+        </do_if>
+        
+        <!-- Generate next pair on-demand -->
+        <do_if value="$listsValid and $currentSellIndex lt $sellList.count and $currentBuyIndex lt $buyList.count">
+          <set_value name="$sellOffer" exact="@$sellList.{$currentSellIndex}"/>
+          <set_value name="$buyOffer" exact="@$buyList.{$currentBuyIndex}"/>
+          
+          <!-- Validate offers exist -->
+          <do_if value="$sellOffer? and $buyOffer?">
+            <!-- OPTIMIZATION: Quick profit pre-filtering before full evaluation -->
+            <set_value name="$buyPrice" exact="@$sellOffer.price"/>
+            <set_value name="$sellPrice" exact="@$buyOffer.price"/>
+            <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
+            <set_value name="$amount" exact="[@$sellOffer.amount, @$buyOffer.amount].min"/>
+            <set_value name="$quickProfit" exact="$profitPerUnit * $amount"/>
+            
+            <!-- Quick profit check - skip if can't meet minimum -->
+            <do_if value="$quickProfit ge $minAbsoluteProfit">
+              <!-- Full evaluation -->
+              <!-- Calculate ROI -->
+              <set_value name="$investment" exact="$buyPrice * $amount"/>
+              <set_value name="$roi" exact="if $investment gt 0 then (($quickProfit * 100) / $investment) else 0"/>
+              
+              <do_if value="$roi ge $minROI">
+                <!-- Simplified distance calculation (use sector distance if available) -->
+                <set_value name="$buyDistance" exact="0"/>
+                <set_value name="$sellDistance" exact="0"/>
+                <do_if value="$sellOffer.owner? and $sellOffer.owner.sector? and $homeSector?">
+                  <set_value name="$buySector" exact="$sellOffer.owner.sector"/>
+                  <do_if value="$buySector != $homeSector">
+                    <set_value name="$buyDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
+                  </do_if>
+                </do_if>
+                <do_if value="$buyOffer.owner? and $buyOffer.owner.sector? and $homeSector?">
+                  <set_value name="$sellSector" exact="$buyOffer.owner.sector"/>
+                  <do_if value="$sellSector != $homeSector">
+                    <set_value name="$sellDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
+                  </do_if>
+                </do_if>
+                
+                <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
+                <set_value name="$distancePenalty" exact="$totalDistance * $distancePenaltyMultiplier * 100"/> <!-- Scale penalty -->
+                <set_value name="$score" exact="$quickProfit - $distancePenalty"/>
+                
+                <!-- Check trades per ware limit -->
+                <do_if value="$wareTradeCount lt $maxTradesPerWare">
+                  <!-- Create trade entry -->
+                  <set_value name="$trade" exact="table[
+                    $BuyOffer = $sellOffer,
+                    $SellOffer = $buyOffer,
+                    $Profit = $quickProfit,
+                    $ROI = $roi,
+                    $Amount = $amount,
+                    $Score = $score,
+                    $Distance = $totalDistance
+                  ]"/>
+                  
+                  <append_to_list name="$validTrades" exact="$trade"/>
+                  <set_value name="$tradesPerWare.{$ware}" exact="$wareTradeCount + 1"/>
+                  
+                  <!-- Track best trade -->
+                  <do_if value="$score gt $bestScore">
+                    <set_value name="$bestTrade" exact="$trade"/>
+                    <set_value name="$bestScore" exact="$score"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Advance to next pair -->
+          <set_value name="$currentBuyIndex" exact="$currentBuyIndex + 1"/>
+          <do_if value="$currentBuyIndex ge $buyList.count">
+            <set_value name="$currentBuyIndex" exact="0"/>
+            <set_value name="$currentSellIndex" exact="$currentSellIndex + 1"/>
+            <do_if value="$currentSellIndex ge $sellList.count">
+              <!-- Move to next ware -->
+              <set_value name="$currentWareIndex" exact="$currentWareIndex + 1"/>
+              <set_value name="$currentSellIndex" exact="0"/>
+              <set_value name="$currentBuyIndex" exact="0"/>
+            </do_if>
+          </do_if>
+          
+          <set_value name="$pairsProcessedThisChunk" exact="$pairsProcessedThisChunk + 1"/>
+        </do_if>
+        <do_else>
+          <!-- Current ware exhausted, move to next -->
+          <set_value name="$currentWareIndex" exact="$currentWareIndex + 1"/>
+          <set_value name="$currentSellIndex" exact="0"/>
+          <set_value name="$currentBuyIndex" exact="0"/>
+        </do_else>
+        </do_while>
+      </do_if>
+      
+      <!-- Check frame budget (configurable, default 50ms) -->
+      <set_value name="$frameBudgetMs" exact="50"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+        <set_value name="$tmpBudget" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+        <!-- BatchProcessingDelay is in ms, use it as frame budget -->
+        <do_if value="$tmpBudget? and $tmpBudget != null and $tmpBudget gt 0">
+          <set_value name="$frameBudgetMs" exact="$tmpBudget"/>
+        </do_if>
+      </do_if>
+      <set_value name="$elapsedTime" exact="player.age - $startTime"/>
+      <do_if value="$elapsedTime gt ($frameBudgetMs * 1ms)">
+        <wait exact="1ms"/>
+      </do_if>
+      
+      <!-- Continue if more to process -->
+      <do_if value="$currentWareIndex lt $wareKeys.count">
+        <resume label="matching_work_loop"/>
       </do_if>
       
       <!-- Signal completion -->
