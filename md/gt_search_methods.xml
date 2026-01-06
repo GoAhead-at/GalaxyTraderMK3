@@ -665,8 +665,16 @@
 
           <!-- Smoothness > speed:
                keep slice work very small to prevent microstutter (large offer lists => many append_to_list ops).
-               This is still globally throttled by LiveOfferSliceInterval + the fair slice queue. -->
+               This is still globally throttled by LiveOfferSliceInterval + the fair slice queue.
+               Consistent slicing regardless of jump distance for code simplicity. -->
           <set_value name="$sectorsPerSlice" exact="1"/>
+          <!-- Use global setting if available -->
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$SectorsPerSlice?">
+            <set_value name="$tmpSectors" exact="@global.$GT_GlobalSettings.$Performance.$SectorsPerSlice"/>
+            <do_if value="$tmpSectors? and $tmpSectors != null and $tmpSectors ge 1 and $tmpSectors le 5">
+              <set_value name="$sectorsPerSlice" exact="$tmpSectors"/>
+            </do_if>
+          </do_if>
           
           <!-- Phase 1: Collect SELL offers from buyspaces (ship buys FROM stations) -->
           <do_if value="$offerPhase == 'selloffers'">
@@ -849,7 +857,8 @@
             <set_value name="$sliceSectors" exact="[]"/>
             <set_value name="$remaining" exact="$sellspaces.count - $sellIndex"/>
             <set_value name="$sliceCount" exact="$sectorsPerSlice"/>
-            <do_if value="$remaining lt $sliceCount">
+            <!-- Clamp to remaining sectors -->
+            <do_if value="$sliceCount gt $remaining">
               <set_value name="$sliceCount" exact="$remaining"/>
             </do_if>
             
@@ -1586,147 +1595,40 @@
             </do_if>
           </do_if>
 
-          <do_if value="$skipPrepareBatch">
-            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') SKIP prepare: batch already queued/active - preventing reset'" chance="100"/>
-            </do_if>
-            <!-- Ensure queue processor runs (idempotent) -->
-            <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
-            <cancel_cue cue="this"/>
-          </do_if>
-          <do_else>
+          <!-- MIGRATION: Queue AI work unit for trade matching instead of batch processor -->
+          <!-- Note: skipPrepareBatch check removed - work units handle their own state management -->
+          <!-- Store offers in state for work unit -->
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$SellOffers" exact="$allSellOffers"/>
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$BuyOffers" exact="$allBuyOffers"/>
           
-          <set_value name="$stateData" exact="table[
-            $batchId = $batchIndex,
-            $batchStartTime = player.age,
-            $waitingCue = null,
-            $ship = $ship,
-            $wareKeysList = $wareKeysList,
-            $sellOffersList = $sellOffersList,
-            $buyOffersList = $buyOffersList,
-            $stationDistanceCache = $stationDistanceCache,
-            $tradeList = [],
-            $crossStationBestScore = 0,
-            $crossStationBestTrade = null,
-            $nonConflictedBestScore = 0,
-            $nonConflictedBestTrade = null,
-            $reservedRoutes = $reservedRoutes,
-            $failedTrades = $failedTrades,
-            $currentWareIndex = 0,
-            $tradesPerWare = table[],
-            $maxTradesPerWare = $maxTradesPerWare,
-            $batchSize = $optimizedBatchSize,
-            $earlyExitThreshold = $earlyExitThreshold,
-            $sellOfferChunkStart = 0,
-            $buyOfferChunkStart = 0,
-            $currentWareChunkStart = 0,
-            $maxDistance = $maxDistance,
-            $originalMaxDistance = $originalMaxDistance,
-            $PilotSkillMaxDistance = $pilotSkillMaxDistance,
-            $distancePenaltyMultiplier = $distancePenaltyMultiplier,
-            $factionPriority = $factionPriority,
-            $minROI = $minROI,
-            $minAbsoluteProfit = $minAbsoluteProfit,
-            $gt_AdvancedAnalytics = $gt_AdvancedAnalytics,
-            $availableMoney = $availableMoney,
-            $tradesRejectedProfit = 0,
-            $tradesRejectedDocking = 0,
-            $tradesRejectedAmount = 0,
-            $tradesRejectedDistance = 0,
-            $bestRejectedProfit = null,
-            $bestRejectedTrade = null,
-            $homeSector = $homeSector,
-            $IgnoreTradeRules = $ignoreTradeRules,
-            $TraceId = $batchTraceId
-          ]"/>
-          
-          <!-- CRITICAL FIX: Use ship object as table key (X4 supports object keys, not variable string keys) -->
-          <set_value name="global.$GT_BatchDataList.{$ship}" exact="$stateData"/>
-          
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <!-- Calculate ceiling division: (a + b - 1) / b for positive integers -->
-            <set_value name="$expectedBatchesCalc" exact="if $optimizedBatchSize gt 0 then (($wareKeysList.count + $optimizedBatchSize - 1) / $optimizedBatchSize)i else 1"/>
-            <set_value name="$expectedBatches" exact="[$expectedBatchesCalc, 1].max"/>
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Prepared batch data: ' + $wareKeysList.count + ' wares, batchIndex=' + $batchIndex + ', batchSize=' + $optimizedBatchSize + ', maxDistance=' + (if $maxDistance? then $maxDistance else 'NULL') + ', expectedBatches=' + $expectedBatches" chance="100"/>
-          </do_if>
-          
-          <!-- Queue batch processor request (enforces MaxConcurrent = 1 limit) -->
-          <do_if value="not global.$GT_BatchProcessorQueue?">
-            <set_value name="global.$GT_BatchProcessorQueue" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_BatchProcessorQueue.$Ships?">
-            <set_value name="global.$GT_BatchProcessorQueue.$Ships" exact="[]"/>
-          </do_if>
-          <do_if value="not global.$GT_BatchProcessorQueue.$ActiveProcessors?">
-            <set_value name="global.$GT_BatchProcessorQueue.$ActiveProcessors" exact="0"/>
-          </do_if>
-          <do_if value="not global.$GT_BatchProcessorQueue.$MaxConcurrent?">
-            <set_value name="global.$GT_BatchProcessorQueue.$MaxConcurrent" exact="1"/>
-          </do_if>
-          
-          <!-- Check if already in queue -->
-          <set_value name="$alreadyInQueue" exact="false"/>
-          <do_if value="global.$GT_BatchProcessorQueue.$Ships?">
-            <do_all exact="global.$GT_BatchProcessorQueue.$Ships.count" counter="$i">
-              <do_if value="global.$GT_BatchProcessorQueue.$Ships.{$i} == $ship">
-                <set_value name="$alreadyInQueue" exact="true"/>
-                <break/>
-              </do_if>
-            </do_all>
-          </do_if>
-          
-          <!-- Add to queue if not already there -->
-          <do_if value="not $alreadyInQueue">
-            <append_to_list name="global.$GT_BatchProcessorQueue.$Ships" exact="$ship"/>
-          </do_if>
-          
-          <!-- Signal queue processor -->
-          <signal_cue_instantly cue="md.GT_Trading_Batch_Processor.ProcessBatchProcessorQueue"/>
-          
-          <!-- Exit - SearchLiveTrades_Resume will handle results -->
-          <!-- Include offer counts for diagnostics (even though batch processing hasn't completed yet) -->
-          <set_value name="$totalSellOffers" exact="0"/>
-          <set_value name="$totalBuyOffers" exact="0"/>
-          <do_all exact="$sellOffersList.count" counter="$i">
-            <set_value name="$wareOffers" exact="$sellOffersList.{$i}.$offers"/>
-            <set_value name="$totalSellOffers" exact="$totalSellOffers + $wareOffers.count"/>
-          </do_all>
-          <do_all exact="$buyOffersList.count" counter="$i">
-            <set_value name="$wareOffers" exact="$buyOffersList.{$i}.$offers"/>
-            <set_value name="$totalBuyOffers" exact="$totalBuyOffers + $wareOffers.count"/>
-          </do_all>
-          
-          <!-- Note: StationsEvaluated not calculated during preparation, will be updated by batch processor -->
-          <!-- CRITICAL: global.$GT_SearchResult is a TABLE OF SHIP RESULTS (keyed by ship object) + optional $LastRejectionStats.
-               Do NOT overwrite the whole table here, or SearchTradeRoutes/SearchLiveTrades_Resume will never find per-ship results. -->
-          <do_if value="not global.$GT_SearchResult?">
-            <set_value name="global.$GT_SearchResult" exact="table[]"/>
-          </do_if>
-          
-          <!-- Preserve LastRejectionStats (stored on the root table) -->
-          <set_value name="$preservedLastRejectionStats" exact="null"/>
-          <do_if value="global.$GT_SearchResult.$LastRejectionStats?">
-            <set_value name="$preservedLastRejectionStats" exact="global.$GT_SearchResult.$LastRejectionStats"/>
-          </do_if>
-          
-          <!-- Store ship-specific "waiting for batch" placeholder -->
-          <set_value name="global.$GT_SearchResult.{$ship}" exact="table[
-            $Found = false,
-            $BestTrade = null,
-            $BestScore = 0,
-            $TradeList = [],
-            $WaitingForBatch = true,
+          <!-- Queue trade matching work unit -->
+          <set_value name="$workUnit" exact="table[
+            $WorkType = 'trade_matching',
             $Ship = $ship,
-            $OffersFound = $totalSellOffers + $totalBuyOffers,
-            $StationsEvaluated = 0
+            $SellOffers = $allSellOffers,
+            $BuyOffers = $allBuyOffers,
+            $HomeSector = $homeSector,
+            $MaxDistance = $maxDistance,
+            $MinROI = $minROI,
+            $MinAbsoluteProfit = $minAbsoluteProfit,
+            $DistancePenaltyMultiplier = $distancePenaltyMultiplier,
+            $FactionPriority = $factionPriority
           ]"/>
           
-          <!-- Restore LastRejectionStats after updating ship-specific result -->
-          <do_if value="$preservedLastRejectionStats?">
-            <set_value name="global.$GT_SearchResult.$LastRejectionStats" exact="$preservedLastRejectionStats"/>
+          <!-- Queue work unit via coordinator -->
+          <signal_cue_instantly cue="md.GT_WorkUnit_Coordinator.QueueWorkUnit" param="$workUnit"/>
+          
+          <!-- Mark as waiting for work unit completion -->
+          <!-- Ensure ship is valid and SearchResult table exists before accessing -->
+          <do_if value="$ship? and $ship.exists">
+            <do_if value="not global.$GT_SearchResult?">
+              <set_value name="global.$GT_SearchResult" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_SearchResult.{$ship}.$WaitingForBatch" exact="true"/>
           </do_if>
           
-          </do_else>
+          <!-- Exit - work unit will signal completion -->
+          <cancel_cue cue="this"/>
         </do_if>
           </do_if>
         </do_if>

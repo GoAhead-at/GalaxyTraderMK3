@@ -486,6 +486,22 @@
       </actions>
     </handler>
 
+    <!-- Work Unit Processing Handler -->
+    <handler>
+      <conditions>
+        <event_object_signalled object="this.ship" param="'GT_ProcessWorkUnit'"/>
+      </conditions>
+      <actions>
+        <!-- Process work unit in background -->
+        <set_value name="this.$workUnitPending" exact="true"/>
+        <set_value name="this.$workUnitData" exact="event.param2"/>
+        <set_value name="$workUnit" exact="event.param2"/>
+        <set_value name="$workType" exact="if $workUnit? and $workUnit.$WorkType? then $workUnit.$WorkType else 'unknown'"/>
+        <set_value name="$traceId" exact="if $workUnit? and $workUnit.$TraceId? then $workUnit.$TraceId else '0'"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Work unit RECEIVED type=' + $workType + ' traceId=' + $traceId" chance="100"/>
+      </actions>
+    </handler>
+
   </interrupts>
   
   <init>
@@ -1298,6 +1314,29 @@
       <!-- =============================================== -->
       
       <label name="main_loop"/>
+      
+      <!-- Check for pending work unit and process it -->
+      <do_if value="this.$workUnitPending? and this.$workUnitPending">
+        <set_value name="this.$workUnitPending" exact="false"/>
+        <set_value name="$workUnit" exact="this.$workUnitData"/>
+        <set_value name="$workType" exact="if $workUnit? and $workUnit.$WorkType? then $workUnit.$WorkType else 'unknown'"/>
+        <set_value name="$traceId" exact="if $workUnit? and $workUnit.$TraceId? then $workUnit.$TraceId else '0'"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Processing work unit type=' + $workType + ' traceId=' + $traceId" chance="100"/>
+        
+        <!-- Route to work unit processor -->
+        <do_if value="$workType == 'cache_search'">
+          <resume label="process_cache_workunit"/>
+        </do_if>
+        <do_elseif value="$workType == 'live_offers'">
+          <resume label="process_live_offers_workunit"/>
+        </do_elseif>
+        <do_elseif value="$workType == 'trade_matching'">
+          <resume label="process_trade_matching_workunit"/>
+        </do_elseif>
+        <do_else>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ERROR - Unknown work unit type=' + $workType" chance="100"/>
+        </do_else>
+      </do_if>
       
       <!-- Clear ESCAPE state once we are no longer in a blacklisted sector -->
       <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Escaping? and global.$GT_Ships.{this.ship}.$Escaping">
@@ -2521,6 +2560,8 @@
               <event_object_signalled object="this.ship" param="'GT_TradeSearch_Reset'"/>
               <!-- Destination threatened → abort and restart main loop -->
               <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
+              <!-- Work unit processing - interrupt wait to process work unit immediately -->
+              <event_object_signalled object="this.ship" param="'GT_ProcessWorkUnit'"/>
             </check_any>
           </conditions>
           <actions>
@@ -2571,6 +2612,16 @@
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_TradeSearch_Reset received at game time ' + player.age + ' - retrying request immediately (no backoff)'" chance="100"/>
               </do_if>
+              <resume label="main_loop"/>
+            </do_elseif>
+            <do_elseif value="event.param == 'GT_ProcessWorkUnit'">
+              <!-- Work unit received while waiting - process it in main loop -->
+              <set_value name="this.$workUnitPending" exact="true"/>
+              <set_value name="this.$workUnitData" exact="event.param2"/>
+              <set_value name="$workUnit" exact="event.param2"/>
+              <set_value name="$workType" exact="if $workUnit? and $workUnit.$WorkType? then $workUnit.$WorkType else 'unknown'"/>
+              <set_value name="$traceId" exact="if $workUnit? and $workUnit.$TraceId? then $workUnit.$TraceId else '0'"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_ProcessWorkUnit received while waiting - resuming to main_loop type=' + $workType + ' traceId=' + $traceId" chance="100"/>
               <resume label="main_loop"/>
             </do_elseif>
             <do_elseif value="event.param == 'GT_No_Trade_Found'">
@@ -4342,27 +4393,34 @@
               <set_value name="$buyStationName" exact="if $pendingTrade.$BuyStation? then @$pendingTrade.$BuyStation.knownname else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.owner? then @$pendingTrade.$BuyOffer.owner.knownname else 'NULL')"/>
               <set_value name="$sellStationName" exact="if $pendingTrade.$SellStation? then @$pendingTrade.$SellStation.knownname else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.owner? then @$pendingTrade.$SellOffer.owner.knownname else 'NULL')"/>
               <set_value name="$originalAmount" exact="if $pendingTrade.$Amount? then $pendingTrade.$Amount else 'NULL'"/>
+              <!-- Safe access to BuyPrice/SellPrice - may not exist in older trade objects -->
+              <set_value name="$buyPrice" exact="if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then $pendingTrade.$BuyOffer.unitprice else 0)"/>
+              <set_value name="$sellPrice" exact="if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then $pendingTrade.$SellOffer.unitprice else 0)"/>
               <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') LOGBOOK ENTRY PREPARATION:' + 
                 '\n  Ware: ' + $wareName +
-                '\n  Buy Station: ' + $buyStationName + ' @ ' + ($pendingTrade.$BuyPrice/100) + ' Cr (RAW: ' + $pendingTrade.$BuyPrice + ')' +
-                '\n  Sell Station: ' + $sellStationName + ' @ ' + ($pendingTrade.$SellPrice/100) + ' Cr (RAW: ' + $pendingTrade.$SellPrice + ')' +
+                '\n  Buy Station: ' + $buyStationName + ' @ ' + ($buyPrice/100) + ' Cr (RAW: ' + $buyPrice + ')' +
+                '\n  Sell Station: ' + $sellStationName + ' @ ' + ($sellPrice/100) + ' Cr (RAW: ' + $sellPrice + ')' +
                 '\n  Original Amount (from trade): ' + $originalAmount + ' units' +
                 '\n  Final Buy Amount (clamped): ' + $finalBuyAmount + ' units' +
                 '\n  Final Sell Amount (clamped): ' + $finalSellAmount + ' units' +
                 '\n  Log Amount (used for display): ' + $logAmount + ' units' +
-                '\n  Profit (RAW): ' + $pendingTrade.$Profit + ' = ' + ($pendingTrade.$Profit/100) + ' Cr' +
-                '\n  Verification with original amount: (' + ($pendingTrade.$SellPrice/100) + ' - ' + ($pendingTrade.$BuyPrice/100) + ') * ' + $originalAmount + ' = ' + (if $originalAmount != 'NULL' then (($pendingTrade.$SellPrice - $pendingTrade.$BuyPrice) * $originalAmount / 100) + ' Cr' else 'N/A') +
-                '\n  Verification with log amount: (' + ($pendingTrade.$SellPrice/100) + ' - ' + ($pendingTrade.$BuyPrice/100) + ') * ' + $logAmount + ' = ' + (($pendingTrade.$SellPrice - $pendingTrade.$BuyPrice) * $logAmount / 100) + ' Cr'" chance="100"/>
+                '\n  Profit (RAW): ' + (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 'NULL') + ' = ' + (if $pendingTrade.$Profit? then ($pendingTrade.$Profit/100) + ' Cr' else 'NULL') +
+                '\n  Verification with original amount: (' + ($sellPrice/100) + ' - ' + ($buyPrice/100) + ') * ' + $originalAmount + ' = ' + (if $originalAmount != 'NULL' then (($sellPrice - $buyPrice) * $originalAmount / 100) + ' Cr' else 'N/A') +
+                '\n  Verification with log amount: (' + ($sellPrice/100) + ' - ' + ($buyPrice/100) + ') * ' + $logAmount + ' = ' + (($sellPrice - $buyPrice) * $logAmount / 100) + ' Cr'" chance="100"/>
             </do_if>
+            
+            <!-- Safe access to BuyPrice/SellPrice - may not exist in older trade objects -->
+            <set_value name="$buyPriceForSignal" exact="if $pendingTrade.$BuyPrice? then ($pendingTrade.$BuyPrice / 100) else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then ($pendingTrade.$BuyOffer.unitprice / 100) else 0)"/>
+            <set_value name="$sellPriceForSignal" exact="if $pendingTrade.$SellPrice? then ($pendingTrade.$SellPrice / 100) else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then ($pendingTrade.$SellOffer.unitprice / 100) else 0)"/>
             
             <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
               $Ship = this.ship,
               $BuyOffer = $pendingTrade.$BuyOffer,
               $SellOffer = $pendingTrade.$SellOffer,
               $Amount = $logAmount,
-              $Profit = $pendingTrade.$Profit,
-              $BuyPrice = $pendingTrade.$BuyPrice / 100,
-              $SellPrice = $pendingTrade.$SellPrice / 100,
+              $Profit = if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0,
+              $BuyPrice = $buyPriceForSignal,
+              $SellPrice = $sellPriceForSignal,
               $IsSellOnly = $isSellOnlyTradeForPending
             ]"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -5431,6 +5489,621 @@
       <!-- Current implementation: Cargo check at line ~844 sends GT_Find_Sell      -->
       <!-- Threat handler now in interrupt section at lines ~917-941                -->
       <!-- ========================================================================= -->
+      
+      <!-- ========================================= -->
+      <!-- WORK UNIT PROCESSING                      -->
+      <!-- ========================================= -->
+      
+      <!-- Process cache search work unit -->
+      <label name="process_cache_workunit"/>
+      
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': STARTING cache_search work unit processing'" chance="100"/>
+      
+      <!-- Extract parameters -->
+      <set_value name="$homeSector" exact="@$workUnit.$HomeSector"/>
+      <set_value name="$maxDistance" exact="@$workUnit.$MaxDistance"/>
+      <set_value name="$minROI" exact="@$workUnit.$MinROI"/>
+      <set_value name="$minAbsoluteProfit" exact="@$workUnit.$MinAbsoluteProfit"/>
+      <set_value name="$ignoreBuildStorage" exact="if $workUnit.$IgnoreBuildStorage? then $workUnit.$IgnoreBuildStorage else false"/>
+      <set_value name="$ignoreCarrierAux" exact="if $workUnit.$IgnoreCarrierAux? then $workUnit.$IgnoreCarrierAux else false"/>
+      
+      <!-- Get cache list -->
+      <set_value name="$cacheList" exact="[]"/>
+      <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+        <set_value name="$cacheList" exact="global.$GT_TradeCache.{$homeSector}"/>
+      </do_if>
+      
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', cacheEntries=' + $cacheList.count" chance="100"/>
+      
+      <!-- Process cache entries with frame budgeting -->
+      <!-- Get chunk size from global settings (default: 20) -->
+      <set_value name="$chunkSize" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryChunkSize?">
+        <set_value name="$tmpChunk" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryChunkSize"/>
+        <do_if value="$tmpChunk? and $tmpChunk != null and $tmpChunk gt 0">
+          <set_value name="$chunkSize" exact="$tmpChunk"/>
+        </do_if>
+      </do_if>
+      <!-- Clamp to reasonable bounds -->
+      <do_if value="$chunkSize lt 10">
+        <set_value name="$chunkSize" exact="10"/>
+      </do_if>
+      <do_if value="$chunkSize gt 200">
+        <set_value name="$chunkSize" exact="200"/>
+      </do_if>
+      
+      <!-- Get max trades to return from global settings -->
+      <set_value name="$maxTradesToReturn" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+        <set_value name="$tmpMax" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        <do_if value="$tmpMax? and $tmpMax != null and $tmpMax gt 0">
+          <set_value name="$maxTradesToReturn" exact="$tmpMax"/>
+        </do_if>
+      </do_if>
+      
+      <set_value name="$processedCount" exact="0"/>
+      <set_value name="$validTrades" exact="[]"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+      
+      <label name="cache_work_loop"/>
+      <set_value name="$startTime" exact="player.age"/>
+      <set_value name="$chunkStart" exact="$processedCount + 1"/>
+      <set_value name="$chunkEnd" exact="[$processedCount + $chunkSize, $cacheList.count].min"/>
+      
+      <do_if value="$chunkStart le $cacheList.count">
+        <do_all exact="($chunkEnd - $chunkStart + 1)" counter="$i">
+          <set_value name="$cacheIndex" exact="$chunkStart + $i - 1"/>
+          <set_value name="$cacheEntry" exact="$cacheList.{$cacheIndex}"/>
+          
+          <!-- Validate cache entry -->
+          <do_if value="$cacheEntry?">
+            <set_value name="$cacheAge" exact="player.age - $cacheEntry.$Timestamp"/>
+            <do_if value="$cacheAge le 600s">
+              <!-- Validate cache entry directly (simplified validation) -->
+              <!-- Check basic trade validity -->
+              <set_value name="$buyOffer" exact="@$cacheEntry.$BuyOffer"/>
+              <set_value name="$sellOffer" exact="@$cacheEntry.$SellOffer"/>
+              <set_value name="$profit" exact="@$cacheEntry.$Profit"/>
+              <set_value name="$roi" exact="@$cacheEntry.$ROI"/>
+              
+              <!-- Debug first few entries -->
+              <do_if value="$processedCount + $i le 3">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ': profit=' + (if $profit? then $profit else 'null') + ', minProfit=' + $minAbsoluteProfit + ', roi=' + (if $roi? then $roi else 'null') + ', minROI=' + $minROI + ', buyOffer=' + (if $buyOffer? then 'yes' else 'no') + ', sellOffer=' + (if $sellOffer? then 'yes' else 'no')" chance="100"/>
+              </do_if>
+              
+              <do_if value="$buyOffer? and $sellOffer? and $profit? and $profit ge $minAbsoluteProfit and $roi? and $roi ge $minROI">
+                <!-- Basic validation passed - add to valid trades -->
+                <!-- Limit trades collected based on maxTradesToReturn -->
+                <do_if value="$validTrades.count lt $maxTradesToReturn">
+                  <append_to_list name="$validTrades" exact="$cacheEntry"/>
+                  <set_value name="$entryScore" exact="if $cacheEntry.$Score? then $cacheEntry.$Score else $profit"/>
+                  <do_if value="$entryScore gt $bestScore">
+                    <set_value name="$bestTrade" exact="$cacheEntry"/>
+                    <set_value name="$bestScore" exact="$entryScore"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <!-- Early exit if we have enough trades -->
+                  <break/>
+                </do_else>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <!-- Early exit if we have enough trades -->
+        <do_if value="$validTrades.count ge $maxTradesToReturn">
+          <break/>
+        </do_if>
+        
+        <set_value name="$processedCount" exact="$chunkEnd"/>
+        
+        <!-- Check frame budget (configurable, default 50ms) -->
+        <set_value name="$frameBudgetMs" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+          <set_value name="$tmpBudget" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+          <do_if value="$tmpBudget? and $tmpBudget != null and $tmpBudget gt 0">
+            <set_value name="$frameBudgetMs" exact="$tmpBudget"/>
+          </do_if>
+        </do_if>
+        <set_value name="$elapsedTime" exact="player.age - $startTime"/>
+        <do_if value="$elapsedTime gt ($frameBudgetMs * 1ms)">
+          <wait exact="1ms"/>
+        </do_if>
+        
+        <!-- Continue if more to process -->
+        <do_if value="$processedCount lt $cacheList.count">
+          <resume label="cache_work_loop"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Signal completion -->
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search complete: processed=' + $processedCount + '/' + $cacheList.count + ', validTrades=' + $validTrades.count + ', bestTrade=' + (if $bestTrade != null then 'found' else 'null') + ', bestScore=' + $bestScore" chance="100"/>
+      
+      <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
+        $Ship = this.ship,
+        $WorkType = 'cache_search',
+        $Result = table[
+          $Found = ($bestTrade != null),
+          $Trade = $bestTrade,
+          $Trades = $validTrades,
+          $BestScore = $bestScore
+        ]
+      ]"/>
+      <resume label="main_loop"/>
+      
+      <!-- Process live offers work unit -->
+      <label name="process_live_offers_workunit"/>
+      
+      <!-- Extract parameters -->
+      <set_value name="$homeSector" exact="@$workUnit.$HomeSector"/>
+      <set_value name="$sectors" exact="@$workUnit.$Sectors"/>
+      <set_value name="$maxDistance" exact="@$workUnit.$MaxDistance"/>
+      <set_value name="$wareBasket" exact="if $workUnit.$WareBasket? then $workUnit.$WareBasket else []"/>
+      <set_value name="$allowIllegal" exact="if $workUnit.$AllowIllegal? then $workUnit.$AllowIllegal else false"/>
+      <set_value name="$ignoreBuildStorage" exact="if $workUnit.$IgnoreBuildStorage? then $workUnit.$IgnoreBuildStorage else false"/>
+      <set_value name="$ignoreCarrierAux" exact="if $workUnit.$IgnoreCarrierAux? then $workUnit.$IgnoreCarrierAux else false"/>
+      
+      <!-- Initialize work state -->
+      <!-- Get chunk size from global settings (default: 3 sectors per chunk) -->
+      <set_value name="$chunkSize" exact="3"/>
+      <!-- Use LiveOfferSliceInterval to determine chunk size (convert ms to sectors) -->
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$LiveOfferSliceInterval?">
+        <set_value name="$sliceInterval" exact="@global.$GT_GlobalSettings.$Performance.$LiveOfferSliceInterval"/>
+        <!-- Smaller interval = smaller chunks for smoother performance -->
+        <do_if value="$sliceInterval? and $sliceInterval != null">
+          <do_if value="$sliceInterval le 100">
+            <set_value name="$chunkSize" exact="1"/>
+          </do_if>
+          <do_elseif value="$sliceInterval le 300">
+            <set_value name="$chunkSize" exact="2"/>
+          </do_elseif>
+          <do_elseif value="$sliceInterval le 500">
+            <set_value name="$chunkSize" exact="3"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$chunkSize" exact="5"/>
+          </do_else>
+        </do_if>
+      </do_if>
+      
+      <!-- Get max offers per ware from global settings -->
+      <set_value name="$maxOffersPerWare" exact="200"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWare?">
+        <set_value name="$tmpMax" exact="@global.$GT_GlobalSettings.$Performance.$MaxOffersPerWare"/>
+        <do_if value="$tmpMax? and $tmpMax != null and $tmpMax gt 0">
+          <set_value name="$maxOffersPerWare" exact="$tmpMax"/>
+        </do_if>
+      </do_if>
+      
+      <set_value name="$processedSectors" exact="0"/>
+      <set_value name="$sellOffers" exact="[]"/>
+      <set_value name="$buyOffers" exact="[]"/>
+      
+      <!-- Track offers per ware to enforce MaxOffersPerWare limit -->
+      <set_value name="$sellOffersPerWare" exact="table[]"/>
+      <set_value name="$buyOffersPerWare" exact="table[]"/>
+      
+      <!-- Process sectors in chunks with frame budgeting -->
+      <label name="offers_work_loop"/>
+      <set_value name="$startTime" exact="player.age"/>
+      <set_value name="$chunkStart" exact="$processedSectors + 1"/>
+      <set_value name="$chunkEnd" exact="[$processedSectors + $chunkSize, $sectors.count].min"/>
+      
+      <do_if value="$chunkStart le $sectors.count">
+        <do_all exact="($chunkEnd - $chunkStart + 1)" counter="$i">
+          <set_value name="$sectorIndex" exact="$chunkStart + $i - 1"/>
+          <set_value name="$sector" exact="$sectors.{$sectorIndex}"/>
+          
+          <!-- Collect offers from sector -->
+          <do_if value="$sector? and $sector.exists">
+            <!-- Find sell offers (for buying) -->
+            <find_sell_offer space="$sector" result="$sectorSellOffers"/>
+            <do_if value="$sectorSellOffers?">
+              <do_all exact="$sectorSellOffers.count" counter="$j">
+                <set_value name="$offer" exact="$sectorSellOffers.{$j}"/>
+                <set_value name="$isValid" exact="true"/>
+                
+                <!-- Check station type filters -->
+                <do_if value="$isValid and $offer.owner?">
+                  <set_value name="$station" exact="$offer.owner"/>
+                  <do_if value="$ignoreBuildStorage and $station.isbuildstorage">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                  <do_if value="$isValid and $ignoreCarrierAux">
+                    <do_if value="$station.isauxiliary or $station.iscarrier">
+                      <set_value name="$isValid" exact="false"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- Check ware basket filter -->
+                <do_if value="$isValid and $wareBasket.count gt 0">
+                  <set_value name="$wareMatch" exact="false"/>
+                  <do_all exact="$wareBasket.count" counter="$k">
+                    <do_if value="$wareBasket.{$k} == $offer.ware">
+                      <set_value name="$wareMatch" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $wareMatch">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Check illegal goods filter -->
+                <do_if value="$isValid and not $allowIllegal">
+                  <do_if value="$offer.ware.isillegal">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                </do_if>
+                
+                <do_if value="$isValid">
+                  <!-- Limit offers per ware -->
+                  <set_value name="$ware" exact="@$offer.ware"/>
+                  <set_value name="$wareOfferCount" exact="if $sellOffersPerWare.{$ware}? then $sellOffersPerWare.{$ware} else 0"/>
+                  <do_if value="$wareOfferCount lt $maxOffersPerWare">
+                    <append_to_list name="$sellOffers" exact="$offer"/>
+                    <set_value name="$sellOffersPerWare.{$ware}" exact="$wareOfferCount + 1"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Find buy offers (for selling) -->
+            <find_buy_offer space="$sector" result="$sectorBuyOffers"/>
+            <do_if value="$sectorBuyOffers?">
+              <do_all exact="$sectorBuyOffers.count" counter="$j">
+                <set_value name="$offer" exact="$sectorBuyOffers.{$j}"/>
+                <set_value name="$isValid" exact="true"/>
+                
+                <!-- Check station type filters -->
+                <do_if value="$isValid and $offer.owner?">
+                  <set_value name="$station" exact="$offer.owner"/>
+                  <do_if value="$ignoreBuildStorage and $station.isbuildstorage">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                  <do_if value="$isValid and $ignoreCarrierAux">
+                    <do_if value="$station.isauxiliary or $station.iscarrier">
+                      <set_value name="$isValid" exact="false"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- Check ware basket filter -->
+                <do_if value="$isValid and $wareBasket.count gt 0">
+                  <set_value name="$wareMatch" exact="false"/>
+                  <do_all exact="$wareBasket.count" counter="$k">
+                    <do_if value="$wareBasket.{$k} == $offer.ware">
+                      <set_value name="$wareMatch" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $wareMatch">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Check illegal goods filter -->
+                <do_if value="$isValid and not $allowIllegal">
+                  <do_if value="$offer.ware.isillegal">
+                    <set_value name="$isValid" exact="false"/>
+                  </do_if>
+                </do_if>
+                
+                <do_if value="$isValid">
+                  <!-- Limit offers per ware -->
+                  <set_value name="$ware" exact="@$offer.ware"/>
+                  <set_value name="$wareOfferCount" exact="if $buyOffersPerWare.{$ware}? then $buyOffersPerWare.{$ware} else 0"/>
+                  <do_if value="$wareOfferCount lt $maxOffersPerWare">
+                    <append_to_list name="$buyOffers" exact="$offer"/>
+                    <set_value name="$buyOffersPerWare.{$ware}" exact="$wareOfferCount + 1"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <set_value name="$processedSectors" exact="$chunkEnd"/>
+        
+        <!-- Check frame budget (configurable, default 50ms) -->
+        <set_value name="$frameBudgetMs" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+          <set_value name="$tmpBudget" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+          <do_if value="$tmpBudget? and $tmpBudget != null and $tmpBudget gt 0">
+            <set_value name="$frameBudgetMs" exact="$tmpBudget"/>
+          </do_if>
+        </do_if>
+        <set_value name="$elapsedTime" exact="player.age - $startTime"/>
+        <do_if value="$elapsedTime gt ($frameBudgetMs * 1ms)">
+          <wait exact="1ms"/>
+        </do_if>
+        
+        <!-- Continue if more to process -->
+        <do_if value="$processedSectors lt $sectors.count">
+          <resume label="offers_work_loop"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Filter offers by distance using MD library (via signal) -->
+      <!-- Store offers in global state for MD to filter -->
+      <set_value name="global.$GT_WorkUnitOffers.{$ship}" exact="table[
+        $SellOffers = $sellOffers,
+        $BuyOffers = $buyOffers,
+        $HomeSector = $homeSector,
+        $MaxDistance = $maxDistance
+      ]"/>
+      
+      <!-- Signal MD to filter offers by distance -->
+      <signal_objects object="player.galaxy" param="'GT_FilterWorkUnitOffers'" param2="table[$Ship = this.ship]"/>
+      
+      <!-- Wait for filtering to complete (will be signaled back) -->
+      <wait max="5s">
+        <interrupt>
+          <conditions>
+            <event_object_signalled object="this.ship" param="'GT_WorkUnitOffersFiltered'"/>
+          </conditions>
+          <actions>
+            <!-- Get filtered results -->
+            <set_value name="$filteredResult" exact="@global.$GT_WorkUnitOffersFiltered.{$ship}"/>
+            <remove_value name="global.$GT_WorkUnitOffersFiltered.{$ship}"/>
+            
+            <!-- Signal completion -->
+            <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
+              $Ship = this.ship,
+              $WorkType = 'live_offers',
+              $Result = if $filteredResult? then $filteredResult else table[$SellOffers = [], $BuyOffers = []]
+            ]"/>
+            <resume label="main_loop"/>
+          </actions>
+        </interrupt>
+      </wait>
+      
+      <!-- Timeout fallback -->
+      <set_value name="$filteredResult" exact="@global.$GT_WorkUnitOffersFiltered.{$ship}"/>
+      <do_if value="not $filteredResult?">
+        <set_value name="$filteredResult" exact="table[$SellOffers = $sellOffers, $BuyOffers = $buyOffers]"/>
+      </do_if>
+      <remove_value name="global.$GT_WorkUnitOffersFiltered.{$ship}"/>
+      <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
+        $Ship = this.ship,
+        $WorkType = 'live_offers',
+        $Result = $filteredResult
+      ]"/>
+      <resume label="main_loop"/>
+      
+      <!-- Process trade matching work unit -->
+      <label name="process_trade_matching_workunit"/>
+      
+      <!-- Extract parameters -->
+      <set_value name="$sellOffers" exact="@$workUnit.$SellOffers"/>
+      <set_value name="$buyOffers" exact="@$workUnit.$BuyOffers"/>
+      <set_value name="$homeSector" exact="@$workUnit.$HomeSector"/>
+      <set_value name="$maxDistance" exact="@$workUnit.$MaxDistance"/>
+      <set_value name="$minROI" exact="@$workUnit.$MinROI"/>
+      <set_value name="$minAbsoluteProfit" exact="@$workUnit.$MinAbsoluteProfit"/>
+      <set_value name="$distancePenaltyMultiplier" exact="if $workUnit.$DistancePenaltyMultiplier? then $workUnit.$DistancePenaltyMultiplier else 0.5"/>
+      
+      <!-- Initialize work state -->
+      <!-- Get chunk size from global settings (default: 10 trade pairs per chunk) -->
+      <set_value name="$chunkSize" exact="10"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchChunkSize?">
+        <set_value name="$tmpChunk" exact="@global.$GT_GlobalSettings.$Performance.$BatchChunkSize"/>
+        <do_if value="$tmpChunk? and $tmpChunk != null and $tmpChunk gt 0">
+          <!-- BatchChunkSize is for offers, scale for trade pairs (roughly square) -->
+          <set_value name="$chunkSize" exact="$tmpChunk * 2"/>
+        </do_if>
+      </do_if>
+      <!-- Clamp to reasonable bounds -->
+      <do_if value="$chunkSize lt 5">
+        <set_value name="$chunkSize" exact="5"/>
+      </do_if>
+      <do_if value="$chunkSize gt 50">
+        <set_value name="$chunkSize" exact="50"/>
+      </do_if>
+      
+      <!-- Get max trades per ware from global settings -->
+      <set_value name="$maxTradesPerWare" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+        <set_value name="$tmpMax" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+        <do_if value="$tmpMax? and $tmpMax != null and $tmpMax gt 0">
+          <set_value name="$maxTradesPerWare" exact="$tmpMax"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Get early exit threshold from global settings -->
+      <set_value name="$earlyExitThreshold" exact="2000"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold?">
+        <set_value name="$tmpThreshold" exact="@global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold"/>
+        <do_if value="$tmpThreshold? and $tmpThreshold != null and $tmpThreshold gt 0">
+          <set_value name="$earlyExitThreshold" exact="$tmpThreshold"/>
+        </do_if>
+      </do_if>
+      
+      <set_value name="$processedPairs" exact="0"/>
+      <set_value name="$validTrades" exact="[]"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+      
+      <!-- Get max offers per ware for matching from global settings -->
+      <set_value name="$maxOffersPerWareForMatching" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching?">
+        <set_value name="$tmpMaxOffers" exact="@global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching"/>
+        <do_if value="$tmpMaxOffers? and $tmpMaxOffers != null and $tmpMaxOffers gt 0">
+          <set_value name="$maxOffersPerWareForMatching" exact="$tmpMaxOffers"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Track trades per ware for limiting -->
+      <set_value name="$tradesPerWare" exact="table[]"/>
+      
+      <!-- Index offers by ware (simplified - no MD library call) -->
+      <!-- Limit offers per ware using MaxOffersPerWareForMatching -->
+      <set_value name="$sellOffersByWare" exact="table[]"/>
+      <do_all exact="$sellOffers.count" counter="$i">
+        <set_value name="$offer" exact="$sellOffers.{$i}"/>
+        <set_value name="$ware" exact="@$offer.ware"/>
+        <do_if value="$ware?">
+          <do_if value="not $sellOffersByWare.{$ware}?">
+            <set_value name="$sellOffersByWare.{$ware}" exact="[]"/>
+          </do_if>
+          <!-- Limit offers per ware -->
+          <do_if value="$sellOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
+            <append_to_list name="$sellOffersByWare.{$ware}" exact="$offer"/>
+          </do_if>
+        </do_if>
+      </do_all>
+      
+      <set_value name="$buyOffersByWare" exact="table[]"/>
+      <do_all exact="$buyOffers.count" counter="$i">
+        <set_value name="$offer" exact="$buyOffers.{$i}"/>
+        <set_value name="$ware" exact="@$offer.ware"/>
+        <do_if value="$ware?">
+          <do_if value="not $buyOffersByWare.{$ware}?">
+            <set_value name="$buyOffersByWare.{$ware}" exact="[]"/>
+          </do_if>
+          <!-- Limit offers per ware -->
+          <do_if value="$buyOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
+            <append_to_list name="$buyOffersByWare.{$ware}" exact="$offer"/>
+          </do_if>
+        </do_if>
+      </do_all>
+      
+      <!-- Build trade pair list -->
+      <set_value name="$tradePairs" exact="[]"/>
+      <do_all exact="$sellOffersByWare.keys.count" counter="$i">
+        <set_value name="$ware" exact="$sellOffersByWare.keys.{$i}"/>
+        <set_value name="$sellList" exact="$sellOffersByWare.{$ware}"/>
+        <set_value name="$buyList" exact="if $buyOffersByWare.{$ware}? then $buyOffersByWare.{$ware} else []"/>
+        
+        <!-- Create pairs -->
+        <do_all exact="$sellList.count" counter="$j">
+          <set_value name="$sellOffer" exact="$sellList.{$j}"/>
+          <do_all exact="$buyList.count" counter="$k">
+            <set_value name="$buyOffer" exact="$buyList.{$k}"/>
+            <append_to_list name="$tradePairs" exact="table[$SellOffer = $sellOffer, $BuyOffer = $buyOffer, $Ware = $ware]"/>
+          </do_all>
+        </do_all>
+      </do_all>
+      
+      <!-- Process trade pairs in chunks with frame budgeting -->
+      <label name="matching_work_loop"/>
+      <set_value name="$startTime" exact="player.age"/>
+      <set_value name="$chunkStart" exact="$processedPairs + 1"/>
+      <set_value name="$chunkEnd" exact="[$processedPairs + $chunkSize, $tradePairs.count].min"/>
+      
+      <do_if value="$chunkStart le $tradePairs.count">
+        <do_all exact="($chunkEnd - $chunkStart + 1)" counter="$i">
+          <set_value name="$pairIndex" exact="$chunkStart + $i - 1"/>
+          <set_value name="$pair" exact="$tradePairs.{$pairIndex}"/>
+          
+          <!-- Evaluate trade -->
+          <set_value name="$sellOffer" exact="$pair.$SellOffer"/>
+          <set_value name="$buyOffer" exact="$pair.$BuyOffer"/>
+          
+          <!-- Calculate profit -->
+          <set_value name="$buyPrice" exact="$sellOffer.price"/>
+          <set_value name="$sellPrice" exact="$buyOffer.price"/>
+          <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
+          <set_value name="$amount" exact="[$sellOffer.amount, $buyOffer.amount].min"/>
+          <set_value name="$totalProfit" exact="$profitPerUnit * $amount"/>
+          
+          <!-- Check minimum profit thresholds -->
+          <do_if value="$totalProfit ge $minAbsoluteProfit">
+            <!-- Calculate ROI -->
+            <set_value name="$investment" exact="$buyPrice * $amount"/>
+            <set_value name="$roi" exact="if $investment gt 0 then (($totalProfit * 100) / $investment) else 0"/>
+            
+            <do_if value="$roi ge $minROI">
+              <!-- Simplified distance calculation (use sector distance if available) -->
+              <set_value name="$buyDistance" exact="0"/>
+              <set_value name="$sellDistance" exact="0"/>
+              <do_if value="$sellOffer.owner? and $sellOffer.owner.sector? and $homeSector?">
+                <set_value name="$buySector" exact="$sellOffer.owner.sector"/>
+                <do_if value="$buySector != $homeSector">
+                  <set_value name="$buyDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
+                </do_if>
+              </do_if>
+              <do_if value="$buyOffer.owner? and $buyOffer.owner.sector? and $homeSector?">
+                <set_value name="$sellSector" exact="$buyOffer.owner.sector"/>
+                <do_if value="$sellSector != $homeSector">
+                  <set_value name="$sellDistance" exact="1"/> <!-- Simplified - assume 1 jump if different sector -->
+                </do_if>
+              </do_if>
+              
+              <set_value name="$totalDistance" exact="$buyDistance + $sellDistance"/>
+              <set_value name="$distancePenalty" exact="$totalDistance * $distancePenaltyMultiplier * 100"/> <!-- Scale penalty -->
+              <set_value name="$score" exact="$totalProfit - $distancePenalty"/>
+              
+              <!-- Check trades per ware limit -->
+              <set_value name="$ware" exact="@$pair.$Ware"/>
+              <set_value name="$wareTradeCount" exact="if $tradesPerWare.{$ware}? then $tradesPerWare.{$ware} else 0"/>
+              <do_if value="$wareTradeCount lt $maxTradesPerWare">
+                <!-- Create trade entry -->
+                <set_value name="$trade" exact="table[
+                  $BuyOffer = $sellOffer,
+                  $SellOffer = $buyOffer,
+                  $Profit = $totalProfit,
+                  $ROI = $roi,
+                  $Amount = $amount,
+                  $Score = $score,
+                  $Distance = $totalDistance
+                ]"/>
+                
+                <append_to_list name="$validTrades" exact="$trade"/>
+                <set_value name="$tradesPerWare.{$ware}" exact="$wareTradeCount + 1"/>
+                
+                <!-- Track best trade -->
+                <do_if value="$score gt $bestScore">
+                  <set_value name="$bestTrade" exact="$trade"/>
+                  <set_value name="$bestScore" exact="$score"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <set_value name="$processedPairs" exact="$chunkEnd"/>
+        
+        <!-- Early exit if threshold reached -->
+        <do_if value="$validTrades.count ge $earlyExitThreshold">
+          <break/>
+        </do_if>
+        
+        <!-- Check frame budget (configurable, default 50ms) -->
+        <set_value name="$frameBudgetMs" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay?">
+          <set_value name="$tmpBudget" exact="@global.$GT_GlobalSettings.$Performance.$BatchProcessingDelay"/>
+          <!-- BatchProcessingDelay is in ms, use it as frame budget -->
+          <do_if value="$tmpBudget? and $tmpBudget != null and $tmpBudget gt 0">
+            <set_value name="$frameBudgetMs" exact="$tmpBudget"/>
+          </do_if>
+        </do_if>
+        <set_value name="$elapsedTime" exact="player.age - $startTime"/>
+        <do_if value="$elapsedTime gt ($frameBudgetMs * 1ms)">
+          <wait exact="1ms"/>
+        </do_if>
+        
+        <!-- Continue if more to process -->
+        <do_if value="$processedPairs lt $tradePairs.count">
+          <resume label="matching_work_loop"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Signal completion -->
+      <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
+        $Ship = this.ship,
+        $WorkType = 'trade_matching',
+        $Result = table[
+          $Found = ($bestTrade != null),
+          $Trade = $bestTrade,
+          $Trades = $validTrades,
+          $BestScore = $bestScore
+        ]
+      ]"/>
+      <resume label="main_loop"/>
       
     </actions>
   </attention>

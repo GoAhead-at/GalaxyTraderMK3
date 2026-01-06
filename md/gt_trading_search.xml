@@ -173,9 +173,10 @@
              If a live search is already in progress for this ship, do NOT proceed with a fresh SearchTradeRoutes run.
              Reason: In MD, cancel_cue does not abort the current actions block immediately; the cue can still fall through
              and incorrectly signal GT_No_Trade_Found during the cache-miss cooldown window (seen for EDS-278).
-             Live completion runs with explicit SearchState='live'/'fallback' and will not have live-state present. -->
+             Live completion runs with explicit SearchState='live'/'fallback' and will not have live-state present.
+             Cache results (SearchState='cache') are continuations from work units and should be processed even if live state exists. -->
         <set_value name="$searchStateParam" exact="@$params.$SearchState"/>
-        <do_if value="$shouldProceed and global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$params.$Ship}? and not ($searchStateParam == 'live' or $searchStateParam == 'fallback')">
+        <do_if value="$shouldProceed and global.$GT_SearchLiveTrades_State? and global.$GT_SearchLiveTrades_State.{$params.$Ship}? and not ($searchStateParam == 'live' or $searchStateParam == 'fallback' or $searchStateParam == 'cache')">
           <!-- Distinguish real in-progress live search from stale leftover state.
                Real in-progress searches can be in multiple phases:
                - pathfinding queued/running (before batch markers exist),
@@ -330,8 +331,10 @@
         </do_if>
         
         <!-- Only exit if batch is in progress FOR THIS SHIP -->
+        <!-- CRITICAL: Cache results (SearchState='cache') are continuations from work units and should be processed
+             even if batch is in progress, because they're the result of a completed work unit, not a fresh search. -->
         <!-- If batch is for a different ship, proceed normally -->
-        <do_if value="$waitingForBatch and $batchStatus.$IsForThisShip">
+        <do_if value="$waitingForBatch and $batchStatus.$IsForThisShip and not ($searchStateParam == 'cache')">
           <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch">
             <debug_text text="'[GT-Search] (' + $params.$Ship.idcode + ')    Batch processing in progress FOR THIS SHIP - waiting for completion (will resume when batch completes)'" chance="100"/>
           </do_if>
@@ -899,13 +902,16 @@
           <set_value name="$cacheContinuation" exact="true"/>
         </do_if>
         
-        <!-- Only check cache if this is a fresh search (not live/fallback continuation) -->
-        <do_if value="$searchState == 'fresh' and not $forceLiveSearch and not $skipCacheBecauseIsolated">
+        <!-- Only check cache if this is a fresh search OR cache result provided (not live/fallback continuation) -->
+        <do_if value="($searchState == 'fresh' or $searchState == 'cache') and not $forceLiveSearch and not $skipCacheBecauseIsolated">
           <!-- Phase 4: Use scheduler for cache query instead of direct call -->
-          <!-- Check if cache result already provided (from scheduler continuation) -->
+          <!-- Check if cache result already provided (from scheduler continuation or work unit coordinator) -->
           <set_value name="$cacheResultFromScheduler" exact="@$params.$CacheResult"/>
           <do_if value="$cacheResultFromScheduler? and $cacheResultFromScheduler != null">
-            <!-- Cache query completed via scheduler - extract results -->
+            <!-- Cache query completed via scheduler/work unit - extract results -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') Processing cache result from work unit coordinator: SearchState=' + $searchState + ', Found=' + (if $cacheResultFromScheduler.$Found? then $cacheResultFromScheduler.$Found else false) + ', Trades=' + (if $cacheResultFromScheduler.$Trades? then $cacheResultFromScheduler.$Trades.count else 0)" chance="100"/>
+            </do_if>
             <set_value name="$cachePick" exact="$cacheResultFromScheduler"/>
             <set_value name="$foundCachedTrade" exact="false"/>
             <set_value name="$cacheBestTrade" exact="null"/>
@@ -1362,8 +1368,8 @@
           </do_else>
         </do_if>
         
-        <!-- Only trigger live search if this is a fresh search (not live/fallback continuation) -->
-        <do_if value="$searchState == 'fresh'">
+        <!-- Only trigger live search if this is a fresh search OR cache search returned no trades (not live/fallback continuation) -->
+        <do_if value="$searchState == 'fresh' or $searchState == 'cache'">
           <!-- Low diversity check removed - only trigger live search on cache miss -->
           <set_value name="$shouldDoLiveSearch" exact="not $foundCachedTrade"/>
         </do_if>
@@ -1594,9 +1600,16 @@
                   </do_if>
                 </do_else>
                 
-                <!-- A2. COOLDOWN: Check if refresh completed recently (30s cooldown) -->
+                <!-- A2. COOLDOWN: Check if refresh completed recently (configurable cooldown) -->
                 <do_if value="$hasGTOrder and not $shipIsIsolatedForCachePolicy and $homeSector? and $homeSector.exists and not $denyHomeRefresh">
                   <set_value name="$cooldownSeconds" exact="30"/>
+                  <!-- Use global setting if available -->
+                  <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$HomeRefreshCooldown?">
+                    <set_value name="$tmpCooldown" exact="@global.$GT_GlobalSettings.$Performance.$HomeRefreshCooldown"/>
+                    <do_if value="$tmpCooldown? and $tmpCooldown != null and $tmpCooldown ge 10 and $tmpCooldown le 120">
+                      <set_value name="$cooldownSeconds" exact="$tmpCooldown"/>
+                    </do_if>
+                  </do_if>
                   <set_value name="$refreshEntry" exact="null"/>
                   <do_if value="global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
                     <set_value name="$refreshEntry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
@@ -1741,6 +1754,94 @@
 
                 <!-- Central hub: live search scheduling is owned by scheduler HomeSearch work items. -->
                 <do_if value="$shouldDoLiveSearch">
+              <!-- CRITICAL: Check for home-sector coalescing BEFORE creating HomeSearch work item -->
+              <!-- This prevents multiple ships from the same home sector from triggering concurrent live searches -->
+              <!-- Apply coalescing for both 'fresh' and 'cache' search states -->
+              <set_value name="$checkHomeSectorCoalescing" exact="false"/>
+              <do_if value="$searchState == 'fresh' or $searchState == 'cache'">
+                <set_value name="$checkHomeSectorCoalescing" exact="true"/>
+              </do_if>
+              
+              <do_if value="$checkHomeSectorCoalescing">
+                <!-- Determine home sector for coalescing -->
+                <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSectorForCoalescing">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                
+                <!-- Check if another ship is already running a live search for this home sector -->
+                <set_value name="$refreshActive" exact="false"/>
+                <do_if value="$homeSectorForCoalescing? and $homeSectorForCoalescing.exists">
+                  <do_if value="not global.$GT_TS_LiveRefreshBySector?">
+                    <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
+                  </do_if>
+                  <set_value name="$refreshEntry" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}"/>
+                  <do_if value="$refreshEntry? and $refreshEntry != null and $refreshEntry.$Active? and $refreshEntry.$Active">
+                    <set_value name="$refreshActive" exact="true"/>
+                    <!-- Clear stale markers (same logic as fresh search) -->
+                    <set_value name="$initiator" exact="@$refreshEntry.$Initiator"/>
+                    <set_value name="$started" exact="@$refreshEntry.$LastStarted"/>
+                    <do_if value="not $initiator? or not $initiator.exists or not $started? or (player.age - $started) gt 60s">
+                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <debug_text text="'[GT-Search] Clearing stale home refresh marker (home=' + @$homeSectorForCoalescing.knownname + ', initiator=' + (if $initiator? then @$initiator.idcode else 'NULL') + ', age=' + (if $started? then (player.age - $started) else 'unknown') + 's)'" chance="100"/>
+                      </do_if>
+                      <remove_value name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}"/>
+                      <set_value name="$refreshActive" exact="false"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                
+                <!-- If another ship is already refreshing this home sector, queue as waiter -->
+                <do_if value="not $shipIsIsolatedForCachePolicy and $refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] (' + $ship.idcode + ') Home-sector live refresh already active (home=' + @$homeSectorForCoalescing.knownname + ', initiator=' + @$refreshEntry.$Initiator.idcode + ', searchState=' + $searchState + ') - waiting silently for refresh to complete'" chance="100"/>
+                  </do_if>
+                  
+                  <!-- Ensure waiter structures exist -->
+                  <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$Waiters == null">
+                    <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$Waiters" exact="[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$WaiterQueued == null">
+                    <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$WaiterQueued" exact="table[]"/>
+                  </do_if>
+                  
+                  <!-- O(1) dedupe: only queue once per ship -->
+                  <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$WaiterQueued.{$ship}?">
+                    <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$WaiterQueued.{$ship}" exact="true"/>
+                    <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}.$Waiters" exact="table[
+                      $Ship = $ship,
+                      $Params = $params,
+                      $EnqueuedAt = player.age
+                    ]"/>
+                  </do_if>
+                  
+                  <!-- Refresh the request timestamp while we are waiting silently -->
+                  <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}?">
+                    <set_value name="global.$GT_AIParameters.{$ship}.$RequestTime" exact="player.age"/>
+                    <set_value name="global.$GT_AIParameters.{$ship}.$WaitReason" exact="'home_refresh_wait'"/>
+                  </do_if>
+                  
+                  <!-- Mark that we're waiting (prevents fallthrough) -->
+                  <set_value name="$liveSearchSkipped" exact="true"/>
+                  <set_value name="$waitingForLiveSearch" exact="true"/>
+                  <set_value name="$deferNoTradeFound" exact="true"/>
+                  
+                  <!-- Release cache-search queue slot if used -->
+                  <do_if value="$useSearchQueueCounter">
+                    <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+                      <remove_value name="global.$GT_SearchQueue.$Params.{$ship}"/>
+                    </do_if>
+                    <run_actions ref="md.GT_Libraries_General.GT_DecrementActiveSearches">
+                      <param name="clampToZero" value="true"/>
+                      <param name="triggerQueueProcessor" value="true"/>
+                    </run_actions>
+                    <set_value name="$useSearchQueueCounter" exact="false"/>
+                  </do_if>
+                  
+                  <!-- Exit - will be woken when home refresh completes -->
+                  <cancel_cue cue="this"/>
+                </do_if>
+              </do_if>
+              
               <!-- Release cache-search queue slot immediately so other ships can run cache checks -->
               <do_if value="$useSearchQueueCounter">
                 <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
@@ -1758,6 +1859,15 @@
                    fallback/no-trade logic in the same invocation (which would start a stampede of live searches). -->
               <set_value name="$waitingForLiveSearch" exact="true"/>
               <set_value name="$deferNoTradeFound" exact="true"/>
+              
+              <!-- Mark this ship as the refresh initiator for this home sector -->
+              <do_if value="$checkHomeSectorCoalescing and $homeSectorForCoalescing? and $homeSectorForCoalescing.exists">
+                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSectorForCoalescing}" exact="table[
+                  $Active = true,
+                  $Initiator = $ship,
+                  $LastStarted = player.age
+                ]"/>
+              </do_if>
 
               <!-- Create HomeSearch work item for scheduler -->
               <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$homeSearchWorkItem">
@@ -1811,25 +1921,50 @@
               </do_if>
               
               <!-- Update cooldown for cache miss triggers -->
+              <!-- Use global setting if available, with optimization for small max distances -->
+              <set_value name="$baseCooldown" exact="10s"/>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheMissCooldownBase?">
+                <set_value name="$tmpCooldown" exact="@global.$GT_GlobalSettings.$Performance.$CacheMissCooldownBase"/>
+                <do_if value="$tmpCooldown? and $tmpCooldown != null and $tmpCooldown ge 1 and $tmpCooldown le 30">
+                  <set_value name="$baseCooldown" exact="$tmpCooldown * 1s"/>
+                </do_if>
+              </do_if>
+              <!-- OPTIMIZATION: Reduce cooldown for small max distances (faster retries) -->
+              <do_if value="$maxDistance le 2">
+                <!-- For small distances, use half the base cooldown (minimum 1s) -->
+                <set_value name="$baseCooldown" exact="[($baseCooldown / 1s) / 2, 1].max * 1s"/>
+              </do_if>
+              <do_elseif value="$maxDistance le 3">
+                <set_value name="$baseCooldown" exact="5s"/>
+              </do_elseif>
+              
               <do_if value="not $hasCooldown">
-                <!-- First live search trigger for this ship - start at 10 seconds -->
+                <!-- First live search trigger for this ship - use distance-based cooldown -->
                 <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
                   $LastLiveSearch = player.age,
-                  $CooldownDuration = 10s
+                  $CooldownDuration = $baseCooldown
                 ]"/>
               </do_if>
               <do_else>
-                <!-- Increase cooldown (double, max 60s) - cooldownData exists since hasCooldown is true -->
+                <!-- Increase cooldown (double, max based on distance) - cooldownData exists since hasCooldown is true -->
                 <set_value name="$newCooldown" exact="$cooldownData.$CooldownDuration * 2"/>
-                <do_if value="$newCooldown gt 60s">
-                  <set_value name="$newCooldown" exact="60s"/>
+                <!-- Cap cooldown based on max distance -->
+                <set_value name="$maxCooldown" exact="60s"/>
+                <do_if value="$maxDistance le 2">
+                  <set_value name="$maxCooldown" exact="10s"/>
+                </do_if>
+                <do_elseif value="$maxDistance le 3">
+                  <set_value name="$maxCooldown" exact="20s"/>
+                </do_elseif>
+                <do_if value="$newCooldown gt $maxCooldown">
+                  <set_value name="$newCooldown" exact="$maxCooldown"/>
                 </do_if>
                 <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
                   $LastLiveSearch = player.age,
                   $CooldownDuration = $newCooldown
                 ]"/>
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss   live search cooldown increased to ' + ($newCooldown / 1) + 's'" chance="100"/>
+                  <debug_text text="'[GalaxyTrader MK3 DEBUG] (' + $ship.idcode + ') Cache miss   live search cooldown increased to ' + ($newCooldown / 1) + 's (maxDistance=' + $maxDistance + ')'" chance="100"/>
                 </do_if>
               </do_else>
               
