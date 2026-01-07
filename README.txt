@@ -202,7 +202,6 @@ KNOWN ISSUES
 
 BUG REPORTS & SUGGESTIONS
 
-- GitHub: https://github.com/GoAhead-at/GalaxyTraderMK3/issues (best place for logs)
 - Nexus Mods discussion: https://www.nexusmods.com/x4foundations/mods/1857
 
 
