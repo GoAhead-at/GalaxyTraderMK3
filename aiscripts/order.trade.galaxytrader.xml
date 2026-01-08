@@ -5508,14 +5508,15 @@
       <set_value name="$ignoreCarrierAux" exact="if $workUnit.$IgnoreCarrierAux? then $workUnit.$IgnoreCarrierAux else false"/>
       
       <!-- Get ship settings for filtering -->
-      <set_value name="$allowIllegal" exact="if $workUnit.$AllowIllegal? then $workUnit.$AllowIllegal else $effectiveAllowIllegal"/>
-      <set_value name="$ignoreTradeRules" exact="if $workUnit.$IgnoreTradeRules? then $workUnit.$IgnoreTradeRules else $effectiveIgnoreTradeRules"/>
+      <!-- Use safe access with defaults in case effective variables aren't initialized in this code path -->
+      <set_value name="$allowIllegal" exact="if $workUnit.$AllowIllegal? then $workUnit.$AllowIllegal else (if $effectiveAllowIllegal? then @$effectiveAllowIllegal else false)"/>
+      <set_value name="$ignoreTradeRules" exact="if $workUnit.$IgnoreTradeRules? then $workUnit.$IgnoreTradeRules else (if $effectiveIgnoreTradeRules? then @$effectiveIgnoreTradeRules else false)"/>
       <set_value name="$shipDockSize" exact="this.ship.docksize"/>
       
       <!-- Get cache list -->
-      <set_value name="$cacheList" exact="[]"/>
+      <set_value name="$rawCacheList" exact="[]"/>
       <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
-        <set_value name="$cacheList" exact="global.$GT_TradeCache.{$homeSector}"/>
+        <set_value name="$rawCacheList" exact="global.$GT_TradeCache.{$homeSector}"/>
       </do_if>
       
       <!-- CRITICAL: Check if cache max distance covers ship's required max distance -->
@@ -5543,8 +5544,6 @@
         ]"/>
         <resume label="main_loop"/>
       </do_if>
-      
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', cacheEntries=' + $cacheList.count" chance="100"/>
       
       <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
       <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
@@ -5584,6 +5583,108 @@
           <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
         </do_elseif>
       </do_if>
+      
+      <!-- ==================================================================================== -->
+      <!-- CRITICAL: Pre-filter cache entries by ALL cheap restrictions BEFORE processing -->
+      <!-- This prevents validating entries that will never pass these checks -->
+      <!-- ==================================================================================== -->
+      <set_value name="$cacheList" exact="[]"/>
+      <set_value name="$rawCount" exact="$rawCacheList.count"/>
+      <do_if value="$rawCount gt 0">
+        <do_all exact="$rawCount" counter="$rawIdx">
+          <set_value name="$rawEntry" exact="$rawCacheList.{$rawIdx}"/>
+          <do_if value="$rawEntry?">
+            <set_value name="$entryPassesFilters" exact="true"/>
+            
+            <!-- 1. Distance filter (using precomputed values from cache entry) -->
+            <do_if value="$entryPassesFilters">
+              <set_value name="$entryHomeToBuy" exact="@$rawEntry.$HomeToBuyDistance"/>
+              <set_value name="$entryHomeToSell" exact="@$rawEntry.$HomeToSellDistance"/>
+              <do_if value="$entryHomeToBuy? and $entryHomeToSell?">
+                <!-- Both distances are cached - use them for filtering -->
+                <set_value name="$entryMaxDist" exact="[$entryHomeToBuy, $entryHomeToSell].max"/>
+                <do_if value="$entryHomeToBuy lt 0 or $entryHomeToSell lt 0 or $entryMaxDist gt $maxDistance">
+                  <set_value name="$entryPassesFilters" exact="false"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Distances not cached (shouldn't happen, but safety fallback) -->
+                <!-- Keep entry - it will be validated later with full distance calculation -->
+              </do_else>
+            </do_if>
+            
+            <!-- 2. Illegal ware filter (if ship doesn't allow illegal) -->
+            <do_if value="$entryPassesFilters and not $allowIllegal">
+              <set_value name="$buyOffer" exact="@$rawEntry.$BuyOffer"/>
+              <do_if value="$buyOffer? and $buyOffer.exists">
+                <set_value name="$ware" exact="@$buyOffer.ware"/>
+                <do_if value="$ware != null and @$ware.illegal gt 0">
+                  <set_value name="$entryPassesFilters" exact="false"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
+            <!-- 3. Trade rules filter (if ship requires trade rules) -->
+            <do_if value="$entryPassesFilters and not $ignoreTradeRules">
+              <set_value name="$tradeRulesRespected" exact="if $rawEntry.$TradeRulesRespected? then $rawEntry.$TradeRulesRespected else false"/>
+              <do_if value="not $tradeRulesRespected">
+                <set_value name="$entryPassesFilters" exact="false"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 4. Failed sector pairs filter (check against preloaded failed trades) -->
+            <do_if value="$entryPassesFilters and $failedTrades.count gt 0">
+              <set_value name="$buyOffer" exact="@$rawEntry.$BuyOffer"/>
+              <set_value name="$sellOffer" exact="@$rawEntry.$SellOffer"/>
+              <do_if value="$buyOffer? and $buyOffer.exists and $sellOffer? and $sellOffer.exists">
+                <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
+                <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
+                <do_all exact="$failedTrades.count" counter="$failIdx">
+                  <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
+                  <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
+                    <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
+                      <set_value name="$entryPassesFilters" exact="false"/>
+                      <break/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+            
+            <!-- 5. Ship already failed filter (check FailedShips list in cache entry) -->
+            <do_if value="$entryPassesFilters">
+              <set_value name="$failedShips" exact="@$rawEntry.$FailedShips"/>
+              <do_if value="$failedShips != null and $failedShips.count gt 0">
+                <do_all exact="$failedShips.count" counter="$f">
+                  <do_if value="$failedShips.{$f} == this.ship">
+                    <set_value name="$entryPassesFilters" exact="false"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+            
+            <!-- 6. Target type filters (build storage, carrier/aux) -->
+            <do_if value="$entryPassesFilters and ($ignoreBuildStorage or $ignoreCarrierAux)">
+              <set_value name="$buyType" exact="@$rawEntry.$BuyTargetType"/>
+              <set_value name="$sellType" exact="@$rawEntry.$SellTargetType"/>
+              <do_if value="$ignoreBuildStorage and ($buyType == 'Buildstorage' or $sellType == 'Buildstorage')">
+                <set_value name="$entryPassesFilters" exact="false"/>
+              </do_if>
+              <do_elseif value="$ignoreCarrierAux and (($buyType == 'Aux' or $buyType == 'Carrier') or ($sellType == 'Aux' or $sellType == 'Carrier'))">
+                <set_value name="$entryPassesFilters" exact="false"/>
+              </do_elseif>
+            </do_if>
+            
+            <!-- Add entry to filtered list if it passed all pre-filters -->
+            <do_if value="$entryPassesFilters">
+              <append_to_list name="$cacheList" exact="$rawEntry"/>
+            </do_if>
+          </do_if>
+        </do_all>
+      </do_if>
+      
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', rawEntries=' + $rawCount + ', preFilteredEntries=' + $cacheList.count" chance="100"/>
       
       <!-- Process cache entries with frame budgeting -->
       <!-- Get chunk size from global settings (default: 20) -->
@@ -5650,15 +5751,28 @@
                 <set_value name="$rejectReason" exact="'station_not_operational'"/>
               </do_elseif>
               
-              <!-- Docking permission (ship-specific) -->
+              <!-- ==================================================================================== -->
+              <!-- CHEAP CHECKS FIRST: Filter out invalid entries before expensive property lookups -->
+              <!-- ==================================================================================== -->
+              
+              <!-- CRITICAL: Distance check FIRST (before expensive checks like docking permissions) -->
+              <!-- Use precomputed distances from cache entry if available -->
               <do_if value="$isValid">
-                <do_if value="not @$buyOffer.owner.dockingallowed.{this.ship} or not @$sellOffer.owner.dockingallowed.{this.ship}">
+                <set_value name="$homeToBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
+                <set_value name="$homeToSell" exact="@$cacheEntry.$HomeToSellDistance"/>
+                <do_if value="not $homeToBuy? or not $homeToSell?">
+                  <!-- Fallback: calculate distances if not cached (shouldn't happen, but safety check) -->
+                  <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buyOffer.owner.sector}"/>
+                  <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellOffer.owner.sector}"/>
+                </do_if>
+                <set_value name="$maxHomeDist" exact="[$homeToBuy, $homeToSell].max"/>
+                <do_if value="$homeToBuy lt 0 or $homeToSell lt 0 or $maxHomeDist gt $maxDistance">
                   <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'docking_not_allowed'"/>
+                  <set_value name="$rejectReason" exact="'distance_exceeded maxDist=' + $maxHomeDist + ' allowed=' + $maxDistance"/>
                 </do_if>
               </do_if>
               
-              <!-- Illegal-ware filter (ship setting) -->
+              <!-- Illegal-ware filter (ship setting) - cheap property lookup -->
               <do_if value="$isValid and not $allowIllegal">
                 <set_value name="$ware" exact="@$buyOffer.ware"/>
                 <do_if value="$ware != null and @$ware.illegal gt 0">
@@ -5667,31 +5781,12 @@
                 </do_if>
               </do_if>
               
-              <!-- Trade rules filter (cache metadata) -->
+              <!-- Trade rules filter (cache metadata) - cheap cache lookup -->
               <do_if value="$isValid and not $ignoreTradeRules">
                 <set_value name="$tradeRulesRespected" exact="if $cacheEntry.$TradeRulesRespected? then $cacheEntry.$TradeRulesRespected else false"/>
                 <do_if value="not $tradeRulesRespected">
                   <set_value name="$isValid" exact="false"/>
                   <set_value name="$rejectReason" exact="'trade_rules_not_respected'"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Failure-distribution filter: skip if this ship already failed this entry -->
-              <do_if value="$isValid">
-                <set_value name="$failedShips" exact="@$cacheEntry.$FailedShips"/>
-                <do_if value="$failedShips == null">
-                  <set_value name="$failedShips" exact="[]"/>
-                </do_if>
-                <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
-                <do_all exact="$failedShips.count" counter="$f">
-                  <do_if value="$failedShips.{$f} == this.ship">
-                    <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
-                    <break/>
-                  </do_if>
-                </do_all>
-                <do_if value="$shipAlreadyFailedThisEntry">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'ship_already_failed'"/>
                 </do_if>
               </do_if>
               
@@ -5721,22 +5816,26 @@
                 </do_if>
               </do_if>
               
-              <!-- Range validation (prefer precomputed distances) -->
+              <!-- Failure-distribution filter: skip if this ship already failed this entry - cheap cache lookup -->
               <do_if value="$isValid">
-                <set_value name="$homeToBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
-                <set_value name="$homeToSell" exact="@$cacheEntry.$HomeToSellDistance"/>
-                <do_if value="not $homeToBuy? or not $homeToSell?">
-                  <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buyOffer.owner.sector}"/>
-                  <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellOffer.owner.sector}"/>
+                <set_value name="$failedShips" exact="@$cacheEntry.$FailedShips"/>
+                <do_if value="$failedShips == null">
+                  <set_value name="$failedShips" exact="[]"/>
                 </do_if>
-                <set_value name="$maxHomeDist" exact="[$homeToBuy, $homeToSell].max"/>
-                <do_if value="$homeToBuy lt 0 or $homeToSell lt 0 or $maxHomeDist gt $maxDistance">
+                <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
+                <do_all exact="$failedShips.count" counter="$f">
+                  <do_if value="$failedShips.{$f} == this.ship">
+                    <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$shipAlreadyFailedThisEntry">
                   <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'distance_exceeded maxDist=' + $maxHomeDist + ' allowed=' + $maxDistance"/>
+                  <set_value name="$rejectReason" exact="'ship_already_failed'"/>
                 </do_if>
               </do_if>
               
-              <!-- Target-type filters -->
+              <!-- Target-type filters (cache metadata) - cheap cache lookup -->
               <do_if value="$isValid and ($ignoreBuildStorage or $ignoreCarrierAux)">
                 <set_value name="$buyType" exact="@$cacheEntry.$BuyTargetType"/>
                 <set_value name="$sellType" exact="@$cacheEntry.$SellTargetType"/>
@@ -5748,6 +5847,18 @@
                   <set_value name="$isValid" exact="false"/>
                   <set_value name="$rejectReason" exact="'carrier_aux_filtered'"/>
                 </do_elseif>
+              </do_if>
+              
+              <!-- ==================================================================================== -->
+              <!-- EXPENSIVE CHECKS LAST: Property lookups on ship/station objects -->
+              <!-- ==================================================================================== -->
+              
+              <!-- Docking permission (ship-specific) - expensive property lookup -->
+              <do_if value="$isValid">
+                <do_if value="not @$buyOffer.owner.dockingallowed.{this.ship} or not @$sellOffer.owner.dockingallowed.{this.ship}">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'docking_not_allowed'"/>
+                </do_if>
               </do_if>
               
               <!-- Dock size compatibility (use cached caps - should always be present) -->
@@ -5815,9 +5926,12 @@
                     <do_if value="$sellAmtNow == null">
                       <set_value name="$sellAmtNow" exact="0"/>
                     </do_if>
-                    <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow lt $tradeAmount or $sellAmtNow lt $tradeAmount">
+                    <!-- CRITICAL: Only check if both stations have SOME stock available (> 0) -->
+                    <!-- Amount clamping and profit recalculation happen during execution -->
+                    <!-- This allows partial trades when stock is less than cached amount -->
+                    <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow le 0 or $sellAmtNow le 0">
                       <set_value name="$isValid" exact="false"/>
-                      <set_value name="$rejectReason" exact="'offers_insufficient_amount buyAvail=' + $buyAvailNow + ' buyAmt=' + $buyAmtNow + ' sellAvail=' + $sellAvailNow + ' sellAmt=' + $sellAmtNow + ' needed=' + $tradeAmount"/>
+                      <set_value name="$rejectReason" exact="'offers_insufficient_amount buyAvail=' + $buyAvailNow + ' buyAmt=' + $buyAmtNow + ' sellAvail=' + $sellAvailNow + ' sellAmt=' + $sellAmtNow + ' (both stations must have stock > 0)'"/>
                     </do_if>
                   </do_else>
                 </do_else>

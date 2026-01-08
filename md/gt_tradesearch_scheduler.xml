@@ -484,10 +484,15 @@
             </do_if>
           </do_if>
           
+          <set_value name="$defaultFallbackSearches" exact="1"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches?">
+            <set_value name="$defaultFallbackSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches"/>
+          </do_if>
           <set_value name="global.$GT_Scheduler.$Budgets" exact="table[
             $CheapOpsPerTick = $defaultCacheSearches,
             $OfferOpsPerTick = 5,
-            $MaxActiveHomeSearches = $defaultLiveSearches
+            $MaxActiveHomeSearches = $defaultLiveSearches,
+            $MaxActiveFallbackSearches = $defaultFallbackSearches
           ]"/>
         </do_if>
         <do_else>
@@ -499,12 +504,16 @@
             <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
               <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
             </do_if>
+            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches?">
+              <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches"/>
+            </do_if>
           </do_if>
         </do_else>
         
         <!-- Count active work by type -->
         <set_value name="$activeCacheQueries" exact="0"/>
         <set_value name="$activeHomeSearches" exact="0"/>
+        <set_value name="$activeFallbackSearches" exact="0"/>
         
         <!-- CRITICAL: Only count active work if ActiveWork is a table (has .keys property) -->
         <!-- ROOT CAUSE FIX: Store .keys.count in a variable BEFORE do_all to prevent corruption -->
@@ -520,7 +529,17 @@
                 <set_value name="$activeCacheQueries" operation="add"/>
               </do_if>
               <do_elseif value="$workItem.$Type == 'HomeSearch'">
-                <set_value name="$activeHomeSearches" operation="add"/>
+                <!-- Check if this is a fallback search -->
+                <set_value name="$isFallbackWorkItem" exact="false"/>
+                <do_if value="$workItem.$Payload? and $workItem.$Payload.$ResumeParams? and $workItem.$Payload.$ResumeParams.$IsFallback? and $workItem.$Payload.$ResumeParams.$IsFallback == true">
+                  <set_value name="$isFallbackWorkItem" exact="true"/>
+                </do_if>
+                <do_if value="$isFallbackWorkItem">
+                  <set_value name="$activeFallbackSearches" operation="add"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$activeHomeSearches" operation="add"/>
+                </do_else>
               </do_elseif>
             </do_if>
           </do_all>
@@ -535,6 +554,7 @@
         <set_value name="$continuationsStartedThisTick" exact="0"/>
         <set_value name="$budgetCheapOps" exact="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick"/>
         <set_value name="$budgetHomeSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches - $activeHomeSearches"/>
+        <set_value name="$budgetFallbackSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches - $activeFallbackSearches"/>
 
         <!-- Hard per-tick budgets (separate from "concurrent" budgets).
              Goal: prevent continuous stutter when many ships enqueue at once. -->
@@ -617,9 +637,20 @@
               <set_value name="$continuationsStartedThisTick" operation="add"/>
             </do_if>
           </do_elseif>
-          <do_elseif value="$workItem.$Type == 'HomeSearch' and $budgetHomeSearches gt 0">
-            <set_value name="$canProcess" exact="true"/>
-            <set_value name="$budgetHomeSearches" operation="subtract"/>
+          <do_elseif value="$workItem.$Type == 'HomeSearch'">
+            <!-- Check if this is a fallback search -->
+            <set_value name="$isFallbackWorkItem" exact="false"/>
+            <do_if value="$workItem.$Payload? and $workItem.$Payload.$ResumeParams? and $workItem.$Payload.$ResumeParams.$IsFallback? and $workItem.$Payload.$ResumeParams.$IsFallback == true">
+              <set_value name="$isFallbackWorkItem" exact="true"/>
+            </do_if>
+            <do_if value="$isFallbackWorkItem and $budgetFallbackSearches gt 0">
+              <set_value name="$canProcess" exact="true"/>
+              <set_value name="$budgetFallbackSearches" operation="subtract"/>
+            </do_if>
+            <do_elseif value="not $isFallbackWorkItem and $budgetHomeSearches gt 0">
+              <set_value name="$canProcess" exact="true"/>
+              <set_value name="$budgetHomeSearches" operation="subtract"/>
+            </do_elseif>
           </do_elseif>
           <do_elseif value="$workItem.$Type == 'Request' or $workItem.$Type == 'OfferCollect' or $workItem.$Type == 'Finalize'">
             <!-- These types don't have strict budgets yet -->
@@ -741,7 +772,7 @@
               <break/>
             </do_if>
 
-            <do_if value="$cacheBudgetExhausted and $continuationBudgetExhausted and $budgetHomeSearches le 0">
+            <do_if value="$cacheBudgetExhausted and $continuationBudgetExhausted and $budgetHomeSearches le 0 and $budgetFallbackSearches le 0">
               <!-- All budgets exhausted - break to prevent infinite loop -->
               <break/>
             </do_if>
@@ -1214,6 +1245,14 @@
         <set_value name="$ship" exact="@$payload.$Ship"/>
         <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
         
+        <!-- Check if this is a fallback search - fallback searches bypass home-sector lock -->
+        <set_value name="$isFallback" exact="false"/>
+        <do_if value="$payload.$ResumeParams?">
+          <do_if value="$payload.$ResumeParams.$IsFallback? and $payload.$ResumeParams.$IsFallback == true">
+            <set_value name="$isFallback" exact="true"/>
+          </do_if>
+        </do_if>
+        
         <!-- Validate required parameters - ERROR if missing -->
         <do_if value="not $ship? or not $ship.exists">
           <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
@@ -1239,11 +1278,102 @@
         </do_if>
         <do_else>
 
-        <!-- Central hub: enforce per-home-sector live-search exclusivity.
-             Only one ship may run HomeSearch/SearchLiveTrades per home sector at a time. Others wait silently and are resumed when the refresh completes. -->
+        <!-- Get home sector for logging -->
         <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
           <param name="ship" value="$ship"/>
         </run_actions>
+        
+        <!-- FALLBACK SEARCHES: Skip home-sector lock - each ship gets its own search -->
+        <do_if value="$isFallback">
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: FALLBACK search - bypassing home-sector lock (home=' + (if $homeSector? then @$homeSector.knownname else 'unknown') + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Hub status: fallback search starting (no lock) -->
+          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+            <param name="ship" value="$ship"/>
+            <param name="stage" value="'home_search'"/>
+            <param name="state" value="'running'"/>
+            <param name="reason" value="'fallback_no_lock'"/>
+            <param name="traceId" value="$traceId"/>
+            <param name="homeSector" value="$homeSector"/>
+          </run_actions>
+          
+          <!-- Build params table for SearchLiveTrades (same as normal search) -->
+          <set_value name="$startTime" exact="player.age"/>
+          <set_value name="$searchParams" exact="table[]"/>
+          <do_if value="$payload.$Ship?">
+            <set_value name="$searchParams.$Ship" exact="$payload.$Ship"/>
+          </do_if>
+          <do_if value="$payload.$MaxDistance?">
+            <set_value name="$searchParams.$MaxDistance" exact="$payload.$MaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$OriginalMaxDistance?">
+            <set_value name="$searchParams.$OriginalMaxDistance" exact="$payload.$OriginalMaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$PilotSkillMaxDistance?">
+            <set_value name="$searchParams.$PilotSkillMaxDistance" exact="$payload.$PilotSkillMaxDistance"/>
+          </do_if>
+          <do_if value="$payload.$MinROI?">
+            <set_value name="$searchParams.$MinROI" exact="$payload.$MinROI"/>
+          </do_if>
+          <do_if value="$payload.$MinAbsoluteProfit?">
+            <set_value name="$searchParams.$MinAbsoluteProfit" exact="$payload.$MinAbsoluteProfit"/>
+          </do_if>
+          <do_if value="$payload.$FactionPriority?">
+            <set_value name="$searchParams.$FactionPriority" exact="$payload.$FactionPriority"/>
+          </do_if>
+          <do_if value="$payload.$FactionPriorityText?">
+            <set_value name="$searchParams.$FactionPriorityText" exact="$payload.$FactionPriorityText"/>
+          </do_if>
+          <do_if value="$payload.$DistancePenaltyMultiplier?">
+            <set_value name="$searchParams.$DistancePenaltyMultiplier" exact="$payload.$DistancePenaltyMultiplier"/>
+          </do_if>
+          <do_if value="$payload.$SkillLevel?">
+            <set_value name="$searchParams.$SkillLevel" exact="$payload.$SkillLevel"/>
+          </do_if>
+          <do_if value="$payload.$ThreatIntel?">
+            <set_value name="$searchParams.$ThreatIntel" exact="$payload.$ThreatIntel"/>
+          </do_if>
+          <do_if value="$payload.$FleetCoord?">
+            <set_value name="$searchParams.$FleetCoord" exact="$payload.$FleetCoord"/>
+          </do_if>
+          <do_if value="$payload.$AdvancedAnalytics?">
+            <set_value name="$searchParams.$AdvancedAnalytics" exact="$payload.$AdvancedAnalytics"/>
+          </do_if>
+          <!-- Pass IsFallback flag through to SearchLiveTrades -->
+          <do_if value="$payload.$ResumeParams? and $payload.$ResumeParams.$IsFallback?">
+            <set_value name="$searchParams.$IsFallback" exact="$payload.$ResumeParams.$IsFallback"/>
+          </do_if>
+          
+          <!-- Store work item reference in state for continuation -->
+          <do_if value="not global.$GT_SearchLiveTrades_State?">
+            <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
+            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
+          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$HomeSector" exact="$homeSector"/>
+          
+          <!-- Signal SearchLiveTrades (async operation) -->
+          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'HomeSearch'"/>
+            <param name="action" value="'Start'"/>
+            <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown') + ' fallback=true'"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+          
+          <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
+          
+          <!-- Note: Work item remains active until SearchLiveTrades completes -->
+          <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
+        </do_if>
+        <do_else>
+          <!-- NORMAL LIVE SEARCHES: Enforce per-home-sector live-search exclusivity.
+               Only one ship may run HomeSearch/SearchLiveTrades per home sector at a time. Others wait silently and are resumed when the refresh completes. -->
 
         <!-- Hub status: home search evaluating / reserving per-home-sector slot -->
         <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1502,6 +1632,7 @@
             <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
           </do_else>
         </do_if>
+        </do_else>
         </do_else>
         </do_else>
       </actions>
