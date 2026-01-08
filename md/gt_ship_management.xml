@@ -1110,7 +1110,7 @@
         <param name="skillLevel" comment="Pilot skill level (1-15)"/>
       </params>
       <actions>
-        <set_value name="$rankTitle" exact="'Lehrling'"/>  <!-- Default rank -->
+        <set_value name="$rankTitle" exact="null"/>  <!-- Initialize to null - will be set by rank calculation or remain null if lookup fails -->
         <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
           <set_value name="$rankIndex" exact="($skillLevel / 3)i + 1"/>
           <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
@@ -1119,7 +1119,21 @@
           <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
             <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
           </do_if>
+          <do_else>
+            <!-- Rank lookup failed - log error instead of using fallback -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] ERROR: Calculate_Rank_Title - Rank lookup failed for skillLevel=' + $skillLevel + ', rankIndex=' + $rankIndex + ', TraderTitles.count=' + global.$GT_Config.$XP.$TraderTitles.keys.count" chance="100"/>
+            </do_if>
+            <!-- Keep rankTitle as null to make the issue visible -->
+          </do_else>
         </do_if>
+        <do_else>
+          <!-- Config or TraderTitles missing - log error -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] ERROR: Calculate_Rank_Title - Config or TraderTitles missing (Config=' + (if global.$GT_Config? then 'exists' else 'NULL') + ', XP=' + (if global.$GT_Config.$XP? then 'exists' else 'NULL') + ', TraderTitles=' + (if global.$GT_Config.$XP.$TraderTitles? then 'exists' else 'NULL') + ')'" chance="100"/>
+          </do_if>
+          <!-- Keep rankTitle as null to make the issue visible -->
+        </do_else>
         <return value="$rankTitle"/>
       </actions>
     </library>
@@ -1378,9 +1392,555 @@
         </do_elseif>
         
         <!-- Update ship name -->
-        <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[$ship=$ship, $pilot=$pilot, $xp=$currentXP, $level=$levelForRank, $rank=$rankTitle, $nameType=$nameType]"/>
+        <run_actions ref="md.GT_Ship_Management.Update_Ship_Name" result="$updateResult">
+          <param name="ship" value="$ship"/>
+          <param name="pilot" value="$pilot"/>
+          <param name="xp" value="$currentXP"/>
+          <param name="level" value="$levelForRank"/>
+          <param name="rank" value="$rankTitle"/>
+          <param name="nameType" value="$nameType"/>
+        </run_actions>
         
-        <return value="true"/>
+        <return value="$updateResult"/>
+      </actions>
+    </library>
+    
+    <!-- Update Ship Name - Core Renaming Logic -->
+    <!-- This library handles all ship renaming logic, replacing the old signal-based approach -->
+    <library name="Update_Ship_Name" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to rename"/>
+        <param name="pilot" default="null" comment="Pilot (optional, derived from ship if missing)"/>
+        <param name="xp" default="null" comment="XP value (optional, derived from pilot if missing)"/>
+        <param name="level" default="null" comment="Skill level (optional, derived from XP if missing)"/>
+        <param name="rank" default="null" comment="Rank title (optional, derived from level if missing)"/>
+        <param name="nameType" default="'trader'" comment="Name type: trader/isolated/fallback/blocked/training"/>
+        <param name="skillLevel" default="null" comment="Old format: skill level (for backward compatibility)"/>
+        <param name="forceUpdate" default="false" comment="Force update even if renaming disabled"/>
+      </params>
+      <actions>
+        <!-- Check if ship renaming is enabled -->
+        <do_if value="not $forceUpdate and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ShipNaming? and not @global.$GT_GlobalSettings.$ShipNaming.$Enabled">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Ship renaming disabled in settings - skipping rename'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- CRITICAL: Validate ship exists before proceeding -->
+        <do_if value="not $ship? or not $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Update_Ship_Name: Cannot rename - ship is null or does not exist (ship=' + (if $ship? then $ship.idcode else 'NULL') + ', exists=' + (if $ship.exists then 'yes' else 'no') + ')'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Robustness: if pilot not provided, derive from ship (subordinates often signal without pilot payload) -->
+        <do_if value="not $pilot?">
+          <set_value name="$pilot" exact="@$ship.pilot"/>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-ShipMgmt] Update_Ship_Name: ship=' + (if $ship? then $ship.idcode else 'NULL') + ', pilot=' + (if $pilot? then $pilot.name else 'NULL') + ', ship.exists=' + (if $ship.exists then 'yes' else 'no')" chance="100"/>
+        </do_if>
+        
+        <!-- Check which parameter format we're using -->
+        <set_value name="$useNewFormat" exact="$nameType != 'trader' or ($xp? or $level? or $rank?)"/>
+        <do_if value="not $useNewFormat and $skillLevel?">
+          <set_value name="$useNewFormat" exact="false"/>
+        </do_if>
+        
+        <!-- Extract parameters based on format -->
+        <do_if value="$useNewFormat">
+          <!-- New format - use provided parameters or calculate from pilot data if missing -->
+          <!-- For nameType='fallback', parameters may be missing - use current pilot data -->
+          <set_value name="$currentXP" exact="0"/>
+          <set_value name="$currentLevel" exact="1"/>
+          <set_value name="$rankTitle" exact="null"/>  <!-- Initialize to null - will be set by rank calculation or remain null if lookup fails -->
+          
+          <!-- Use provided values if available, otherwise get from pilot data -->
+          <do_if value="$xp?">
+            <set_value name="$currentXP" exact="$xp"/>
+          </do_if>
+          <do_else>
+            <set_value name="$currentXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+            <do_if value="not $currentXP?">
+              <set_value name="$currentXP" exact="0"/>
+            </do_if>
+          </do_else>
+          
+          <do_if value="$level?">
+            <set_value name="$currentLevel" exact="$level"/>
+          </do_if>
+          <do_else>
+            <!-- Calculate level from XP if not provided -->
+            <set_value name="$currentLevel" exact="1"/>
+            <do_all exact="15" counter="$lvl">
+              <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$lvl}">
+                <set_value name="$currentLevel" exact="$lvl"/>
+              </do_if>
+            </do_all>
+          </do_else>
+          
+          <do_if value="$rank?">
+            <set_value name="$rankTitle" exact="$rank"/>
+          </do_if>
+          <do_else>
+            <!-- Calculate rank title from skill level using unified mapping -->
+            <set_value name="$rankIndex" exact="($currentLevel / 3)i + 1"/>
+            <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+              <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+            </do_if>
+            <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+              <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+            </do_if>
+            <do_else>
+              <!-- Rank lookup failed - log error instead of using fallback -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-ShipMgmt] ERROR: Rank lookup failed for level=' + $currentLevel + ', rankIndex=' + $rankIndex + ', TraderTitles.count=' + (if global.$GT_Config.$XP.$TraderTitles? then global.$GT_Config.$XP.$TraderTitles.keys.count else 'NULL') + ' (ship=' + $ship.idcode + ', pilot=' + $pilot.name + ')'" chance="100"/>
+              </do_if>
+              <!-- Keep rankTitle as null to make the issue visible -->
+            </do_else>
+          </do_else>
+        </do_if>
+        <do_else>
+          <!-- Old format - calculate from skillLevel -->
+          <!-- CRITICAL: If skillLevel is null, derive from pilot data -->
+          <do_if value="$skillLevel?">
+            <set_value name="$currentLevel" exact="$skillLevel"/>
+          </do_if>
+          <do_else>
+            <!-- skillLevel not provided - calculate from pilot XP -->
+            <set_value name="$currentXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+            <do_if value="not $currentXP?">
+              <set_value name="$currentXP" exact="0"/>
+            </do_if>
+            <set_value name="$currentLevel" exact="1"/>
+            <do_all exact="15" counter="$lvl">
+              <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$lvl}">
+                <set_value name="$currentLevel" exact="$lvl"/>
+              </do_if>
+            </do_all>
+          </do_else>
+          
+          <!-- Get XP if not already set -->
+          <do_if value="not $currentXP?">
+            <set_value name="$currentXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+            <do_if value="not $currentXP?">
+              <set_value name="$currentXP" exact="0"/>
+            </do_if>
+          </do_if>
+          
+          <set_value name="$nameType" exact="'trader'"/>  <!-- Default to trader type -->
+          
+          <!-- Calculate rank title from skill level using unified mapping -->
+          <set_value name="$rankIndex" exact="($currentLevel / 3)i + 1"/>
+          <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+            <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+          </do_if>
+          <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
+            <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
+          </do_if>
+          <do_else>
+            <!-- Rank lookup failed - log error instead of using fallback -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] ERROR: Rank lookup failed for level=' + $currentLevel + ', rankIndex=' + $rankIndex + ', TraderTitles.count=' + (if global.$GT_Config.$XP.$TraderTitles? then global.$GT_Config.$XP.$TraderTitles.keys.count else 'NULL') + ' (ship=' + $ship.idcode + ', pilot=' + $pilot.name + ')'" chance="100"/>
+            </do_if>
+            <!-- Set to null to make the issue visible -->
+            <set_value name="$rankTitle" exact="null"/>
+          </do_else>
+        </do_else>
+
+        <!-- AUTHORITATIVE STATUS OVERRIDE (no parsing):
+             The caller-provided $nameType can be stale due to async signals (e.g. trade completion triggers 'trader' rename
+             while the ship is still isolated). Ensure the displayed status reflects the authoritative global flags. -->
+        <do_if value="$ship? and $ship.exists">
+          <set_value name="$isolatedFlagSet" exact="false"/>
+          <set_value name="$fallbackFlagSet" exact="false"/>
+          <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+            <set_value name="$isolatedFlagSet" exact="true"/>
+            <set_value name="$nameType" exact="'isolated'"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') AUTHORITATIVE OVERRIDE: Setting nameType=isolated (global flag is set)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{$ship}?">
+            <set_value name="$fallbackFlagSet" exact="true"/>
+            <set_value name="$nameType" exact="'fallback'"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') AUTHORITATIVE OVERRIDE: Setting nameType=fallback (global flag is set)'" chance="100"/>
+            </do_if>
+          </do_elseif>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') No authoritative override: isolatedFlag=' + $isolatedFlagSet + ', fallbackFlag=' + $fallbackFlagSet + ', using nameType=' + $nameType" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- Get ship's base name based on user setting -->
+        <!-- Options: 'macro.name' (Model Name - with variant), 'typename' (Type Name - generic), 'macro.name.base' (Model Base - without variant), 'basename' (Custom Name - stored name) -->
+        <set_value name="$nameSource" exact="'macro.name'"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ShipNaming? and global.$GT_GlobalSettings.$ShipNaming.$DefaultNameSource?">
+          <set_value name="$nameSource" exact="global.$GT_GlobalSettings.$ShipNaming.$DefaultNameSource"/>
+        </do_if>
+        
+        <!-- Resolve original name based on nameSource setting -->
+        <set_value name="$originalName" exact="''"/>
+    
+        <!-- Handle different nameSource options -->
+        <do_if value="$nameSource == 'basename'">
+          <!-- Custom Name: Use stored OriginalShipName from registry (preserves custom renames) -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') Custom Name mode: Checking for stored name. Ship registry exists: ' + (if global.$GT_Ships? and global.$GT_Ships.{$ship}? then 'yes' else 'no')" chance="100"/>
+          </do_if>
+          
+          <!-- Try ship registry first -->
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') Custom Name mode: Found in ship registry: ' + $originalName" chance="100"/>
+            </do_if>
+            <!-- Validate it's a non-empty string -->
+            <do_if value="not $originalName? or $originalName == ''">
+              <set_value name="$originalName" exact="''"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Fallback to pilot registry if ship registry doesn't have it -->
+          <do_if value="$originalName == '' and global.$GT_Pilots? and $pilot? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$pilot}.$OriginalShipName"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') Custom Name mode: Found in pilot registry: ' + $originalName" chance="100"/>
+            </do_if>
+            <!-- Validate it's a non-empty string -->
+            <do_if value="not $originalName? or $originalName == ''">
+              <set_value name="$originalName" exact="''"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Final fallback: use ship.macro.name if no stored name exists -->
+          <do_if value="$originalName == ''">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') Custom Name mode: No stored name found in either registry, using macro.name: ' + $originalName" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_elseif value="$nameSource == 'macro.name'">
+          <!-- Model Name: Use ship.macro.name directly (with variant, e.g., "Mercury Sentinel") -->
+          <set_value name="$originalName" exact="@$ship.macro.name"/>
+        </do_elseif>
+        <do_elseif value="$nameSource == 'typename'">
+          <!-- Type Name: Use ship.typename (generic type name) -->
+          <set_value name="$originalName" exact="@$ship.typename"/>
+          <do_if value="not $originalName? or $originalName == ''">
+            <!-- Fallback to macro.name if typename is missing -->
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_if>
+        </do_elseif>
+        <do_elseif value="$nameSource == 'macro.name.base'">
+          <!-- Model Base: Strip variant suffixes from macro.name (e.g., "Mercury Sentinel" -> "Mercury") -->
+          <run_actions ref="md.GT_Ship_Management.Extract_Base_Ship_Name" result="$originalName">
+            <param name="macroName" value="@$ship.macro.name"/>
+          </run_actions>
+        </do_elseif>
+        <do_else>
+          <!-- Unknown nameSource: fallback to macro.name -->
+          <set_value name="$originalName" exact="@$ship.macro.name"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] (' + $ship.idcode + ') Unknown nameSource: ' + $nameSource + ', using macro.name: ' + $originalName" chance="100"/>
+          </do_if>
+        </do_else>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-ShipMgmt] Building name from ' + $nameSource + ': ' + $originalName" chance="100"/>
+        </do_if>
+        
+        <!-- Build ship name using configurable naming system -->
+        <set_value name="$nameElements" exact="[]"/>
+        <set_value name="$prefixElements" exact="[]"/>
+        <set_value name="$suffixElements" exact="[]"/>
+        
+        <!-- Check if global settings exist, fallback to default if not -->
+        <set_value name="$useConfig" exact="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ShipNaming?"/>
+        
+        <!-- Status (training/blocked/advance indicators) -->
+        <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayStatus">
+          <set_value name="$statusText" exact="''"/>
+          <do_if value="$nameType == 'blocked'">
+            <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+              <param name="stateType" value="'Blocked'"/>
+            </run_actions>
+            <set_value name="$statusText" exact="'[' + $abbr + ']'"/>
+          </do_if>
+          <do_elseif value="$nameType == 'training'">
+            <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+              <param name="stateType" value="'Training'"/>
+            </run_actions>
+            <set_value name="$statusText" exact="'[' + $abbr + ']'"/>
+          </do_elseif>
+          <do_elseif value="$nameType == 'fallback'">
+            <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+              <param name="stateType" value="'Fallback'"/>
+            </run_actions>
+            <set_value name="$statusText" exact="'[' + $abbr + ']'"/>
+          </do_elseif>
+          <do_elseif value="$nameType == 'isolated'">
+            <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+              <param name="stateType" value="'Isolated'"/>
+            </run_actions>
+            <set_value name="$statusText" exact="'[' + $abbr + ']'"/>
+          </do_elseif>
+          
+          <do_if value="$statusText != ''">
+            <!-- No name parsing: always rebuild name from $OriginalShipName and apply desired status. -->
+            <do_if value="true">
+              <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$StatusPosition == 'prefix'">
+                <append_to_list name="$prefixElements" exact="$statusText"/>
+              </do_if>
+              <do_else>
+                <append_to_list name="$suffixElements" exact="$statusText"/>
+              </do_else>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Operational State Prefix (REPAIR, RESUPPLY, MAINTENANCE, ESCAPE, REROUTE, CLEARANCE) -->
+        <!-- These are ADDITIONAL to status prefixes and respect user configuration -->
+        <!-- Default to true if setting doesn't exist (backwards compatibility with older saves) -->
+        <do_if value="(not $useConfig) or not global.$GT_GlobalSettings.$ShipNaming.$DisplayOperationalState? or @global.$GT_GlobalSettings.$ShipNaming.$DisplayOperationalState">
+          <set_value name="$operationalState" exact="''"/>
+          
+          <!-- Check for repair/resupply state -->
+          <!-- IMPORTANT: Do not depend on GT_Ships entry existing (subordinates can temporarily drop out of GT_Ships). -->
+          <!-- Resupply state is tracked via GT_ResupplyOrders, so we can show [RESUPPLY] even if GT_Ships entry is missing. -->
+          <set_value name="$hasRepair" exact="false"/>
+          <set_value name="$hasResupply" exact="false"/>
+          
+          <!-- Check if ship has active resupply order (GT maintenance tracking) -->
+          <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+            <set_value name="$hasResupply" exact="true"/>
+          </do_if>
+
+          <!-- Fleet resupply / "Change Equipment" orders on subordinates may not be tracked in GT_ResupplyOrders.
+               Use vanilla active order IDs as a fallback, but only for GT ships or subordinates of GT ships. -->
+          <set_value name="$isGTRelated" exact="false"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="$isGTRelated" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$commander" exact="@$ship.commander"/>
+            <do_if value="$commander? and global.$GT_Ships? and global.$GT_Ships.{$commander}?">
+              <set_value name="$isGTRelated" exact="true"/>
+            </do_if>
+          </do_else>
+
+          <do_if value="$isGTRelated">
+            <set_value name="$activeOrderId" exact="@$ship.order.id"/>
+            <do_if value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
+              <set_value name="$hasResupply" exact="true"/>
+            </do_if>
+            <do_elseif value="$activeOrderId == 'Repair'">
+              <set_value name="$hasRepair" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <!-- GT_Ships-derived states (repair/reroute/clearance) are only available if ship is registered -->
+          <set_value name="$shipData" exact="null"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="$shipData" exact="global.$GT_Ships.{$ship}"/>
+            
+            <!-- Check if ship has active repair order -->
+            <do_if value="$shipData.$NeedsRepair? and $shipData.$NeedsRepair">
+              <set_value name="$hasRepair" exact="true"/>
+            </do_if>
+            
+            <!-- Check for escape state (ship is actively trying to leave a blacklisted sector) -->
+            <do_if value="$shipData.$Escaping? and $shipData.$Escaping">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Escape'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_if>
+
+            <!-- Check for reroute state (destination threatened/blacklisted) -->
+            <do_if value="$shipData.$Rerouting? and $shipData.$Rerouting">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Reroute'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_if>
+            
+            <!-- Check for cargo safety disposal state -->
+            <do_if value="$shipData.$CargoDisposal? and $shipData.$CargoDisposal">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Clearance'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Determine operational state text using abbreviations (only if not overridden by reroute/clearance above) -->
+          <do_if value="$operationalState == ''">
+            <do_if value="$hasRepair and $hasResupply">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Maintenance'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_if>
+            <do_elseif value="$hasRepair">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Repair'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_elseif>
+            <do_elseif value="$hasResupply">
+              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
+                <param name="stateType" value="'Resupply'"/>
+              </run_actions>
+              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
+            </do_elseif>
+          </do_if>
+          
+          <!-- Add operational state to appropriate list based on user config -->
+          <!-- Default to prefix if setting doesn't exist (backwards compatibility) -->
+          <do_if value="$operationalState != ''">
+            <do_if value="(not $useConfig) or not global.$GT_GlobalSettings.$ShipNaming.$OperationalStatePosition? or @global.$GT_GlobalSettings.$ShipNaming.$OperationalStatePosition == 'prefix'">
+              <append_to_list name="$prefixElements" exact="$operationalState"/>
+            </do_if>
+            <do_else>
+              <append_to_list name="$suffixElements" exact="$operationalState"/>
+            </do_else>
+          </do_if>
+        </do_if>
+        
+        <!-- Pilot Rank -->
+        <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayRank">
+          <!-- Calculate rank index from level -->
+          <set_value name="$rankIndex" exact="($currentLevel / 3)i + 1"/>
+          <do_if value="$rankIndex gt 6">
+            <set_value name="$rankIndex" exact="6"/>  <!-- Max 6 ranks -->
+          </do_if>
+          
+          <!-- Get translated rank title using conditional logic (X4 doesn't support variables in readtext) -->
+          <set_value name="$rankTitleText" exact="'Unknown'"/>
+          <do_if value="$rankIndex == 1">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6001}"/>
+          </do_if>
+          <do_elseif value="$rankIndex == 2">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6002}"/>
+          </do_elseif>
+          <do_elseif value="$rankIndex == 3">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6003}"/>
+          </do_elseif>
+          <do_elseif value="$rankIndex == 4">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6004}"/>
+          </do_elseif>
+          <do_elseif value="$rankIndex == 5">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6005}"/>
+          </do_elseif>
+          <do_elseif value="$rankIndex == 6">
+            <set_value name="$rankTitleText" exact="readtext.{77000}.{6006}"/>
+          </do_elseif>
+          
+          <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$RankPosition == 'prefix'">
+            <append_to_list name="$prefixElements" exact="$rankTitleText"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$suffixElements" exact="$rankTitleText"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Level -->
+        <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayLevel">
+          <set_value name="$levelText" exact="'Lv.' + $currentLevel"/>
+          <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$LevelPosition == 'prefix'">
+            <append_to_list name="$prefixElements" exact="$levelText"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$suffixElements" exact="$levelText"/>
+          </do_else>
+        </do_if>
+        
+        <!-- XP -->
+        <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayXP">
+          <set_value name="$xpText" exact="'XP:' + $currentXP"/>
+          <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$XPPosition == 'prefix'">
+            <append_to_list name="$prefixElements" exact="$xpText"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$suffixElements" exact="$xpText"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Ship Class -->
+        <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$DisplayShipClass">
+          <!-- Detect ship class using existing library -->
+          <run_actions ref="md.GT_Ship_Management.Detect_Ship_Class" result="$classInfo">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <set_value name="$shipClassText" exact="$classInfo.$Size"/> <!-- Returns 'S', 'M', 'L', or 'XL' -->
+          <do_if value="(not $useConfig) or global.$GT_GlobalSettings.$ShipNaming.$ShipClassPosition == 'prefix'">
+            <append_to_list name="$prefixElements" exact="$shipClassText"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$suffixElements" exact="$shipClassText"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Build final name -->
+        <set_value name="$newShipName" exact="$originalName"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-ShipMgmt] Update_Ship_Name: Building name - originalName=' + $originalName + ', nameType=' + $nameType + ', prefixElements.count=' + $prefixElements.count + ', suffixElements.count=' + $suffixElements.count" chance="100"/>
+        </do_if>
+        
+        <!-- Add prefix elements -->
+        <do_if value="$prefixElements.count gt 0">
+          <set_value name="$prefixString" exact="''"/>
+          <do_all exact="$prefixElements.count" counter="$j">
+            <do_if value="$j gt 1">
+              <set_value name="$prefixString" exact="$prefixString + ' '"/>
+            </do_if>
+            <set_value name="$prefixString" exact="$prefixString + $prefixElements.{$j}"/>
+          </do_all>
+          <set_value name="$newShipName" exact="$prefixString + ' ' + $newShipName"/>
+        </do_if>
+        
+        <!-- Add suffix elements -->
+        <do_if value="$suffixElements.count gt 0">
+          <!-- No parsing: always rebuild the complete suffix from scratch. -->
+          <set_value name="$suffixString" exact="''"/>
+          <do_all exact="$suffixElements.count" counter="$j">
+            <do_if value="$j gt 1">
+              <set_value name="$suffixString" exact="$suffixString + ' '"/>
+            </do_if>
+            <set_value name="$suffixString" exact="$suffixString + $suffixElements.{$j}"/>
+          </do_all>
+          <set_value name="$newShipName" exact="$newShipName + ' (' + $suffixString + ')'"/>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-ShipMgmt] Update_Ship_Name: Final name built - newShipName=' + $newShipName + ', ship.exists=' + (if $ship.exists then 'yes' else 'no')" chance="100"/>
+        </do_if>
+        
+        <!-- Update ship name -->
+        <!-- CRITICAL: Validate ship still exists before renaming (ship may have been destroyed between signal and processing) -->
+        <do_if value="$ship? and $ship.exists">
+          <set_object_name object="$ship" name="$newShipName"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Ship renamed: ' + $newShipName + ' (skill level ' + $currentLevel + ', rank: ' + $rankTitle + ', XP: ' + $currentXP + ', type: ' + $nameType + ') (Ship ID: ' + $ship.idcode + ')'" chance="100"/>
+          </do_if>
+          <return value="true"/>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Update_Ship_Name: Cannot rename - ship no longer exists (was: ' + (if $ship? then $ship.idcode else 'NULL') + ', ship?=' + (if $ship? then 'yes' else 'no') + ', ship.exists=' + (if $ship.exists then 'yes' else 'no') + ')'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_else>
       </actions>
     </library>
     
