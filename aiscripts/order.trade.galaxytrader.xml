@@ -2755,6 +2755,7 @@
       <set_value name="$tradesRejectedPath" exact="0"/>
       <set_value name="$tradesRejectedDistance" exact="0"/>
       <set_value name="$tradesRejectedCargo" exact="0"/>
+      <set_value name="$tradesRejectedProfit" exact="0"/>
       <!-- Initialize $tradeList to prevent property lookup failures -->
       <set_value name="$tradeList" exact="[]"/>
       
@@ -2796,6 +2797,7 @@
         <set_value name="$tradesRejectedPath" exact="0"/>
         <set_value name="$tradesRejectedDistance" exact="0"/>
         <set_value name="$tradesRejectedCargo" exact="0"/>
+        <set_value name="$tradesRejectedProfit" exact="0"/>
         
         <!-- Iterate through trade list -->
         <!-- Check if tradeList exists and has items before looping -->
@@ -3806,35 +3808,113 @@
                 <!-- CRITICAL FIX: Recalculate profit if amount changed due to clamping -->
                 <!-- Profit was calculated with original amount, but amount may have been clamped -->
                 <!-- Recalculate profit using final amount and stored prices (more accurate than profit per unit) -->
-                <do_if value="$currentTrade.$Amount? and $currentTrade.$BuyPrice? and $currentTrade.$SellPrice?">
-                  <set_value name="$amountChanged" exact="if $isSellOnlyTrade then ($finalSellAmount != $currentTrade.$Amount) else ($finalBuyAmount != $currentTrade.$Amount)"/>
+                <!-- FIX: Extract prices from offers if missing from trade object (handles old cache entries) -->
+                <set_value name="$buyPriceForRecalc" exact="null"/>
+                <set_value name="$sellPriceForRecalc" exact="null"/>
+                
+                <!-- Try to get prices from trade object first -->
+                <do_if value="$currentTrade.$BuyPrice?">
+                  <set_value name="$buyPriceForRecalc" exact="$currentTrade.$BuyPrice"/>
+                </do_if>
+                <do_else>
+                  <!-- Extract from buy offer if missing (handles old cache entries without stored prices) -->
+                  <do_if value="$currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.unitprice?">
+                    <set_value name="$buyPriceForRecalc" exact="$currentTrade.$BuyOffer.unitprice"/>
+                  </do_if>
+                </do_else>
+                
+                <do_if value="$currentTrade.$SellPrice?">
+                  <set_value name="$sellPriceForRecalc" exact="$currentTrade.$SellPrice"/>
+                </do_if>
+                <do_else>
+                  <!-- Extract from sell offer if missing (handles old cache entries without stored prices) -->
+                  <do_if value="$currentTrade.$SellOffer? and $currentTrade.$SellOffer.unitprice?">
+                    <set_value name="$sellPriceForRecalc" exact="$currentTrade.$SellOffer.unitprice"/>
+                  </do_if>
+                </do_else>
+                
+                <!-- Recalculate profit if amount changed AND we have prices (either from trade object or offers) -->
+                <set_value name="$amountChanged" exact="if $isSellOnlyTrade then ($finalSellAmount != $currentTrade.$Amount) else ($finalBuyAmount != $currentTrade.$Amount)"/>
+                <do_if value="$currentTrade.$Amount? and $buyPriceForRecalc? and $sellPriceForRecalc?">
                   <do_if value="$amountChanged">
                     <!-- Store original values before recalculation -->
                     <set_value name="$originalAmount" exact="$currentTrade.$Amount"/>
                     <set_value name="$originalProfitRAW" exact="$currentTrade.$Profit"/>
                     
-                    <!-- Recalculate profit with final amount using stored prices -->
+                    <!-- Recalculate profit with final amount using stored/extracted prices -->
                     <!-- Note: Cannot use run_actions in AI scripts, so calculate directly -->
                     <set_value name="$finalAmountForProfit" exact="if $isSellOnlyTrade then $finalSellAmount else $finalBuyAmount"/>
                     
                     <!-- Calculate profit: (sellPrice - buyPrice) * amount -->
-                    <set_value name="$recalculatedProfitRAW" exact="($currentTrade.$SellPrice - $currentTrade.$BuyPrice) * $finalAmountForProfit"/>
+                    <set_value name="$recalculatedProfitRAW" exact="($sellPriceForRecalc - $buyPriceForRecalc) * $finalAmountForProfit"/>
                     
                     <!-- Update trade object profit (for logbook display) -->
                     <set_value name="$currentTrade.$Profit" exact="$recalculatedProfitRAW"/>
                     
+                    <!-- Also update prices in trade object if they were missing (for future use) -->
+                    <do_if value="not $currentTrade.$BuyPrice?">
+                      <set_value name="$currentTrade.$BuyPrice" exact="$buyPriceForRecalc"/>
+                    </do_if>
+                    <do_if value="not $currentTrade.$SellPrice?">
+                      <set_value name="$currentTrade.$SellPrice" exact="$sellPriceForRecalc"/>
+                    </do_if>
+                    
                     <!-- PROFIT DEBUG: Log profit recalculation -->
                     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                      <set_value name="$priceSource" exact="if $currentTrade.$BuyPrice? then 'trade_object' else 'extracted_from_offers'"/>
                       <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') PROFIT RECALCULATION:' + 
                         '\n  Ware: ' + $wareName +
+                        '\n  Price Source: ' + $priceSource +
                         '\n  Original Amount: ' + $originalAmount + ' units' +
                         '\n  Final Amount: ' + $finalAmountForProfit + ' units' +
                         '\n  Original Profit: ' + ($originalProfitRAW/100) + ' Cr (RAW: ' + $originalProfitRAW + ')' +
                         '\n  Recalculated Profit: ' + ($recalculatedProfitRAW/100) + ' Cr (RAW: ' + $recalculatedProfitRAW + ')' +
-                        '\n  Verification: (' + ($currentTrade.$SellPrice/100) + ' - ' + ($currentTrade.$BuyPrice/100) + ') * ' + $finalAmountForProfit + ' = ' + (($currentTrade.$SellPrice - $currentTrade.$BuyPrice) * $finalAmountForProfit / 100) + ' Cr'" chance="100"/>
+                        '\n  Buy Price: ' + ($buyPriceForRecalc/100) + ' Cr (RAW: ' + $buyPriceForRecalc + ')' +
+                        '\n  Sell Price: ' + ($sellPriceForRecalc/100) + ' Cr (RAW: ' + $sellPriceForRecalc + ')' +
+                        '\n  Verification: (' + ($sellPriceForRecalc/100) + ' - ' + ($buyPriceForRecalc/100) + ') * ' + $finalAmountForProfit + ' = ' + (($sellPriceForRecalc - $buyPriceForRecalc) * $finalAmountForProfit / 100) + ' Cr'" chance="100"/>
                     </do_if>
                   </do_if>
+                </do_if>
+                
+                <!-- CRITICAL: Validate profit after recalculation - reject negative or zero profit trades -->
+                <!-- Get final profit value (recalculated if amount changed and prices available, otherwise original) -->
+                <set_value name="$finalProfitRAW" exact="$currentTrade.$Profit"/>
+                <do_if value="$amountChanged and $buyPriceForRecalc? and $sellPriceForRecalc?">
+                  <!-- Use recalculated profit (already updated in $currentTrade.$Profit above) -->
+                  <set_value name="$finalProfitRAW" exact="$recalculatedProfitRAW"/>
+                </do_if>
+                <do_elseif value="$amountChanged and (not $buyPriceForRecalc? or not $sellPriceForRecalc?)">
+                  <!-- Amount changed but prices missing - cannot recalculate, but original profit may be wrong -->
+                  <!-- Reject trade because we cannot verify profit is correct after clamping -->
+                  <set_value name="$tradesRejectedProfit" operation="add"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' REJECTED: Cannot validate profit after clamping' +
+                      '\n  Ware: ' + $wareName +
+                      '\n  Original Amount: ' + $currentTrade.$Amount + ' units' +
+                      '\n  Final Amount: ' + (if $isSellOnlyTrade then $finalSellAmount else $finalBuyAmount) + ' units' +
+                      '\n  Reason: Prices missing from trade object and offers, cannot recalculate profit' +
+                      '\n  → Trying next trade in list...'" 
+                      chance="100"/>
+                  </do_if>
+                  <continue/>
+                </do_elseif>
+                
+                <!-- Reject trade if profit is negative or zero -->
+                <do_if value="not $finalProfitRAW? or $finalProfitRAW le 0">
+                  <set_value name="$tradesRejectedProfit" operation="add"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
+                    <set_value name="$profitStatus" exact="if not $finalProfitRAW? then 'NULL' else if $finalProfitRAW == 0 then 'ZERO' else 'NEGATIVE (' + ($finalProfitRAW/100) + ' Cr)'"/>
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' REJECTED: Profit validation failed' +
+                      '\n  Ware: ' + $wareName +
+                      '\n  Final Profit: ' + $profitStatus +
+                      '\n  Reason: Trade is unprofitable after amount clamping' +
+                      '\n  → Trying next trade in list...'" 
+                      chance="100"/>
+                  </do_if>
+                  <continue/>
                 </do_if>
                 
                 <!-- FINAL DOCKING VERIFICATION: Use find_dockingbay for accurate dock size/permission check -->
