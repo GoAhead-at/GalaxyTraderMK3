@@ -101,6 +101,46 @@
     <handler ref="TargetInvalidHandler"/>
     <handler ref="TideHandler"/>
     
+    <!-- Trade Found Event Handler: Catches GT_Trade_Found signal regardless of ship state -->
+    <!-- This ensures trades are processed immediately even if ship is in main_loop or other code paths -->
+    <!-- Note: Cannot use <resume> in interrupt handlers, so we set a flag that main_loop checks -->
+    <!-- Trade data is passed in signal param2 (like GT_Training_Station_Found) -->
+    <handler>
+      <conditions>
+        <event_object_signalled object="this.ship" param="'GT_Trade_Found'"/>
+      </conditions>
+      <actions>
+        <!-- Extract trade data from signal param2 (like GT_Training_Station_Found handler) -->
+        <set_value name="$signalData" exact="event.param2"/>
+        <set_value name="$signalTradeList" exact="[]"/>
+        <set_value name="$signalSearchMethod" exact="''"/>
+        <do_if value="$signalData? and $signalData != null">
+          <set_value name="$signalTradeList" exact="@$signalData.$TradeList"/>
+          <set_value name="$signalSearchMethod" exact="@$signalData.$SearchMethod"/>
+        </do_if>
+        
+        <!-- FALLBACK: If param2 is empty or null, read from global storage (backward compatibility) -->
+        <!-- This handles cases where ProcessTradeFoundSignalQueue fails to populate param2 -->
+        <do_if value="($signalTradeList == null or $signalTradeList.count == 0) and global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+          <set_value name="$signalTradeList" exact="global.$GT_TradesAwaitingValidation.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+            <set_value name="$signalSearchMethod" exact="@global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Store in instance variables for main_loop to use -->
+        <set_value name="this.$tradeFoundViaInterrupt" exact="true"/>
+        <set_value name="this.$tradeListFromSignal" exact="if $signalTradeList != null then $signalTradeList else []"/>
+        <set_value name="this.$searchMethodFromSignal" exact="if $signalSearchMethod != null and $signalSearchMethod != '' then $signalSearchMethod else ''"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$tradeCountForDebug" exact="if $signalTradeList != null then $signalTradeList.count else 0"/>
+          <set_value name="$dataSource" exact="if ($signalTradeList != null and $signalTradeList.count gt 0 and event.param2? and event.param2 != null) then 'param2' else 'global storage'"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received via interrupt handler - stored ' + $tradeCountForDebug + ' trades from ' + $dataSource" chance="100"/>
+        </do_if>
+      </actions>
+    </handler>
+    
     <!-- High-Performance Training Event Handlers -->
     <handler>
       <conditions>
@@ -1350,6 +1390,14 @@
       
       <label name="main_loop"/>
       
+      <!-- NOTE: Signal check removed from here - maintenance must ALWAYS run before trade execution -->
+      <!-- Signals will be checked AFTER maintenance completes (line 2147) to ensure maintenance is never skipped -->
+      <!-- NOTE: Do NOT clear global.$GT_TradesAwaitingValidation here - it may contain fresh trade data -->
+      <!-- The data will be cleared after trade execution completes (in trade_completed label) -->
+      <!-- Cache will be checked by MD system when trade request is sent -->
+      <!-- MD system will trigger cache search work unit if cache entries exist -->
+      <!-- Cache search work unit will properly filter entries by distance/profit/etc before signaling back -->
+      
       <!-- Check for pending work unit and process it -->
       <do_if value="this.$workUnitPending? and this.$workUnitPending">
         <set_value name="this.$workUnitPending" exact="false"/>
@@ -2072,6 +2120,31 @@
         </do_if>
       </do_else>
       
+      <!-- CRITICAL: Check for signal that arrived during maintenance wait -->
+      <!-- This must happen AFTER maintenance completes but BEFORE proceeding to start_trading -->
+      <!-- Signals can arrive during the maintenance wait block (line 2118), so we check here -->
+      <do_if value="this.$tradeFoundViaInterrupt? and this.$tradeFoundViaInterrupt">
+        <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received during maintenance wait - processing from param2 data'" chance="100"/>
+        </do_if>
+        
+        <!-- Reset retry counter on successful trade -->
+        <set_value name="this.$searchFailed" exact="0"/>
+        
+        <!-- Clear per-ship no-trade attempt history on success -->
+        <do_if value="global.$GT_NoTradeHistory? and global.$GT_NoTradeHistory.{this.ship}?">
+          <remove_value name="global.$GT_NoTradeHistory.{this.ship}"/>
+        </do_if>
+        
+        <!-- CARGO DISPOSAL: Reset cargo disposal failure counter on successful trade -->
+        <do_if value="this.$cargoDisposalFailed?">
+          <set_value name="this.$cargoDisposalFailed" exact="0"/>
+        </do_if>
+        
+        <resume label="trade_found"/>
+      </do_if>
+      
       <!-- Proceed to trading -->
       <resume label="start_trading"/>
       
@@ -2370,18 +2443,19 @@
             <set_value name="$gt_logbookentries" exact="$effectiveLogbookEntries"/>
             <set_value name="$warebasket" exact="if $effectiveAutoWares then [] else $effectiveWareBasket"/>
 
-            <!-- CRITICAL: Drop stale pending results produced under the previous commander settings.
-                 Otherwise the AI can execute old trades (wrong ware filter, wrong distances, etc.) via the
-                 "Found X pending trades from earlier MD result - skipping new request" shortcut. -->
-            <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
-              <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
+            <!-- CRITICAL: Drop stale trades awaiting validation produced under the previous commander settings.
+                 Otherwise the AI can execute old trades (wrong ware filter, wrong distances, etc.) via stale data. -->
+            <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+              <remove_value name="global.$GT_TradesAwaitingValidation.{this.ship}"/>
             </do_if>
-            <do_if value="global.$GT_PendingTradesTimestamp? and global.$GT_PendingTradesTimestamp.{this.ship}?">
-              <remove_value name="global.$GT_PendingTradesTimestamp.{this.ship}"/>
+            <do_if value="global.$GT_TradesAwaitingValidationTimestamp? and global.$GT_TradesAwaitingValidationTimestamp.{this.ship}?">
+              <remove_value name="global.$GT_TradesAwaitingValidationTimestamp.{this.ship}"/>
             </do_if>
-            <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-              <remove_value name="global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+            <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+              <remove_value name="global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
             </do_if>
+            <!-- Clear interrupt flag when clearing trades awaiting validation (commander settings changed) -->
+            <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
             <!-- Reset retry counter: we want a clean fresh request under the new settings -->
             <do_if value="this.$searchFailed?">
               <set_value name="this.$searchFailed" exact="0"/>
@@ -2871,80 +2945,93 @@
       <set_value name="$tradesRejectedDistance" exact="0"/>
       <set_value name="$tradesRejectedCargo" exact="0"/>
       <set_value name="$tradesRejectedProfit" exact="0"/>
-      <!-- Initialize $tradeList to prevent property lookup failures -->
-      <set_value name="$tradeList" exact="[]"/>
       
       <!-- Iterate through trade list and validate each one -->
-      <!-- MD provided a list of up to 20 trades - we try each until we find a valid one -->
-      <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
-        <set_value name="$tradeList" exact="global.$GT_PendingTrades.{this.ship}"/>
-        
-        <!-- Ensure it's a list -->
-        <do_if value="typeof $tradeList != datatype.list">
-          <!-- Backward compat: single trade stored as table -->
-          <set_value name="$tradeList" exact="[$tradeList]"/>
-        </do_if>
-        
-        <!-- Use safe access for debug text -->
-        <set_value name="$tradeListCountForDebug" exact="if $tradeList != null then $tradeList.count else 0"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Received ' + $tradeListCountForDebug + ' trades to validate'" chance="100"/>
-        </do_if>
+      <!-- Priority order: Signal param2 (from cache search work unit or live search) > Global storage (for threat intelligence compatibility) -->
+      <!-- Cache search work units filter entries and signal results via GT_Trade_Found with param2 -->
+      <!-- Initialize $tradeList and $searchMethod to prevent property lookup failures -->
+      <set_value name="$tradeList" exact="[]"/>
+      <set_value name="$searchMethod" exact="''"/>
 
-        <!-- Capture search method early so per-trade validation logs can tell cache vs live -->
-        <set_value name="$searchMethod" exact="''"/>
-        <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-          <set_value name="$searchMethod" exact="@global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+      <!-- Priority 1: Use trade list from signal param2 (from cache search work unit or live search) -->
+      <do_if value="this.$tradeListFromSignal? and this.$tradeListFromSignal.count gt 0">
+        <set_value name="$tradeList" exact="this.$tradeListFromSignal"/>
+        <set_value name="$searchMethod" exact="if this.$searchMethodFromSignal? then this.$searchMethodFromSignal else ''"/>
+        <!-- Clear instance variables after use -->
+        <remove_value name="this.$tradeListFromSignal"/>
+        <remove_value name="this.$searchMethodFromSignal"/>
+      </do_if>
+      <do_else>
+        <!-- Priority 2: Fallback to global storage (for threat intelligence compatibility) -->
+        <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+          <set_value name="$tradeList" exact="global.$GT_TradesAwaitingValidation.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+            <set_value name="$searchMethod" exact="@global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
+          </do_if>
         </do_if>
-        <!-- Cap extra cache-detail logs to avoid spam -->
-        <set_value name="$cacheDetailLogMax" exact="8"/>
-        <set_value name="$cacheDetailLogCount" exact="0"/>
-        
-        <!-- Reset validation variables (already initialized above, but reset for clarity) -->
-        <set_value name="$validTradeFound" exact="false"/>
-        <set_value name="$pendingTrade" exact="null"/>
-        <set_value name="$buyStation" exact="null"/>
-        <set_value name="$sellStation" exact="null"/>
-        <set_value name="$tradesChecked" exact="0"/>
-        <set_value name="$tradesBlacklisted" exact="0"/>
-        <set_value name="$tradesRejectedDocking" exact="0"/>
-        <set_value name="$tradesRejectedOfferInvalid" exact="0"/>
-        <set_value name="$tradesRejectedPath" exact="0"/>
-        <set_value name="$tradesRejectedDistance" exact="0"/>
-        <set_value name="$tradesRejectedCargo" exact="0"/>
-        <set_value name="$tradesRejectedProfit" exact="0"/>
-        
-        <!-- Iterate through trade list -->
-        <!-- Check if tradeList exists and has items before looping -->
-        <do_if value="(if $tradeList != null then $tradeList.count else 0) gt 0">
-          <do_all exact="$tradeList.count" counter="$tradeIdx">
-            <set_value name="$currentTrade" exact="$tradeList.{$tradeIdx}"/>
-            <set_value name="$tradesChecked" operation="add"/>
-            
-            <!-- Cooperative multitasking: yield CPU between trade validations -->
-            <!-- Use global Performance.ValidationDelay setting (default: 50ms) -->
-            <!-- Ensure validationDelay is never null -->
-            <set_value name="$validationDelay" exact="50"/>
-            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ValidationDelay?">
-              <set_value name="$tempDelay" exact="@global.$GT_GlobalSettings.$Performance.$ValidationDelay"/>
-              <!-- Only use if tempDelay is not null and is a valid number -->
-              <do_if value="$tempDelay? and $tempDelay != null and $tempDelay gt 0">
-                <set_value name="$validationDelay" exact="$tempDelay"/>
-              </do_if>
+      </do_else>
+
+      <!-- Ensure it's a list -->
+      <do_if value="typeof $tradeList != datatype.list">
+        <!-- Backward compat: single trade stored as table -->
+        <set_value name="$tradeList" exact="[$tradeList]"/>
+      </do_if>
+      
+      <!-- Use safe access for debug text -->
+      <set_value name="$tradeListCountForDebug" exact="if $tradeList != null then $tradeList.count else 0"/>
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Received ' + $tradeListCountForDebug + ' trades to validate (source: ' + (if $searchMethod == 'cache' then 'CACHE' else if $searchMethod == 'live' then 'LIVE' else if $searchMethod != '' then $searchMethod else 'UNKNOWN') + ')'" chance="100"/>
+      </do_if>
+      
+      <!-- Cap extra cache-detail logs to avoid spam -->
+      <set_value name="$cacheDetailLogMax" exact="8"/>
+      <set_value name="$cacheDetailLogCount" exact="0"/>
+      
+      <!-- Reset validation variables (already initialized above, but reset for clarity) -->
+      <set_value name="$validTradeFound" exact="false"/>
+      <set_value name="$pendingTrade" exact="null"/>
+      <set_value name="$buyStation" exact="null"/>
+      <set_value name="$sellStation" exact="null"/>
+      <set_value name="$tradesChecked" exact="0"/>
+      <set_value name="$tradesBlacklisted" exact="0"/>
+      <set_value name="$tradesRejectedDocking" exact="0"/>
+      <set_value name="$tradesRejectedOfferInvalid" exact="0"/>
+      <set_value name="$tradesRejectedPath" exact="0"/>
+      <set_value name="$tradesRejectedDistance" exact="0"/>
+      <set_value name="$tradesRejectedCargo" exact="0"/>
+      <set_value name="$tradesRejectedProfit" exact="0"/>
+      
+      <!-- Iterate through trade list -->
+      <!-- Check if tradeList exists and has items before looping -->
+      <do_if value="(if $tradeList != null then $tradeList.count else 0) gt 0">
+        <do_all exact="$tradeList.count" counter="$tradeIdx">
+          <set_value name="$currentTrade" exact="$tradeList.{$tradeIdx}"/>
+          <set_value name="$tradesChecked" operation="add"/>
+          
+          <!-- Cooperative multitasking: yield CPU between trade validations -->
+          <!-- Use global Performance.ValidationDelay setting (default: 50ms) -->
+          <!-- Ensure validationDelay is never null -->
+          <set_value name="$validationDelay" exact="50"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ValidationDelay?">
+            <set_value name="$tempDelay" exact="@global.$GT_GlobalSettings.$Performance.$ValidationDelay"/>
+            <!-- Only use if tempDelay is not null and is a valid number -->
+            <do_if value="$tempDelay? and $tempDelay != null and $tempDelay gt 0">
+              <set_value name="$validationDelay" exact="$tempDelay"/>
             </do_if>
-            <!-- Convert to time value (milliseconds) - ensure result is never null -->
-            <!-- Add small jitter to desynchronize many ships validating in parallel (reduces frame spikes). -->
-            <set_value name="$validationDelayJitter" min="0" max="20"/>
-            <set_value name="$validationDelayTime" exact="($validationDelay + $validationDelayJitter) * 1ms"/>
-            <!-- Fallback to 50ms if validationDelayTime is null -->
-            <do_if value="not $validationDelayTime? or $validationDelayTime == null">
-              <set_value name="$validationDelayTime" exact="50ms"/>
-            </do_if>
-            <!-- CRITICAL: wait must be at top level of loop, NOT inside conditionals -->
-            <wait exact="$validationDelayTime"/>
-            
-            <!-- Check if currentTrade is valid before processing -->
-            <do_if value="$currentTrade? and $currentTrade != null">
+          </do_if>
+          <!-- Convert to time value (milliseconds) - ensure result is never null -->
+          <!-- Add small jitter to desynchronize many ships validating in parallel (reduces frame spikes). -->
+          <set_value name="$validationDelayJitter" min="0" max="20"/>
+          <set_value name="$validationDelayTime" exact="($validationDelay + $validationDelayJitter) * 1ms"/>
+          <!-- Fallback to 50ms if validationDelayTime is null -->
+          <do_if value="not $validationDelayTime? or $validationDelayTime == null">
+            <set_value name="$validationDelayTime" exact="50ms"/>
+          </do_if>
+          <!-- CRITICAL: wait must be at top level of loop, NOT inside conditionals -->
+          <wait exact="$validationDelayTime"/>
+          
+          <!-- Check if currentTrade is valid before processing -->
+          <do_if value="$currentTrade? and $currentTrade != null">
               <!-- Extract stations from trade (handle both new list format and old single-trade format) -->
               <!-- Initialize stations to null first, then extract -->
               <set_value name="$buyStation" exact="null"/>
@@ -3643,7 +3730,8 @@
                   <do_if value="$currentTrade.$SellOffer?">
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
                     <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
-                    <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and $sellOfferAmount ge $currentTrade.$Amount"/>
+                    <!-- Only reject if offer is unavailable OR amount is 0/null - let clamping handle partial amounts -->
+                    <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and ($sellOfferAmount? and $sellOfferAmount gt 0)"/>
                     <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <set_value name="$sellDesiredBefore" exact="@$currentTrade.$SellOffer.desiredamount"/>
                       <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': pre-validate SELL-ONLY' +
@@ -3661,15 +3749,17 @@
                 <do_else>
                   <!-- Normal trade: check both offers -->
                   <do_if value="$currentTrade.$BuyOffer? and $currentTrade.$SellOffer?">
-                    <!-- Check buy offer: available AND has enough amount for this ship (after reservations) -->
+                    <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$buyOfferAvailable" exact="$currentTrade.$BuyOffer.available"/>
                     <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
-                    <set_value name="$buyOfferStillValid" exact="$buyOfferAvailable and $buyOfferAmount ge $currentTrade.$Amount"/>
+                    <!-- Only reject if offer is unavailable OR amount is 0/null - let clamping handle partial amounts -->
+                    <set_value name="$buyOfferStillValid" exact="$buyOfferAvailable and ($buyOfferAmount? and $buyOfferAmount gt 0)"/>
                     
-                    <!-- Check sell offer: available AND has enough amount for this ship (after reservations) -->
+                    <!-- Check sell offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
                     <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
-                    <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and $sellOfferAmount ge $currentTrade.$Amount"/>
+                    <!-- Only reject if offer is unavailable OR amount is 0/null - let clamping handle partial amounts -->
+                    <set_value name="$sellOfferStillValid" exact="$sellOfferAvailable and ($sellOfferAmount? and $sellOfferAmount gt 0)"/>
                     
                     <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <set_value name="$buyDesiredBefore" exact="@$currentTrade.$BuyOffer.desiredamount"/>
@@ -3750,7 +3840,7 @@
                       '\n  Buy offer: ' + (if $isSellOnlyTrade then 'N/A' else (if $buyOfferAvailable? then ('available=' + $buyOfferAvailable + ', amount=' + (if $buyOfferAmount? then $buyOfferAmount else 'null') + ' (needed: ' + $currentTrade.$Amount + ')') else 'MISSING')) +
                       '\n  Sell offer: available=' + (if $sellOfferAvailable? then $sellOfferAvailable else 'null') + ', amount=' + (if $sellOfferAmount? then $sellOfferAmount else 'null') + ' (needed: ' + $currentTrade.$Amount + ')' +
                       '\n  Failure: ' + $offerInvalidReason +
-                      '\n  Reason: offer constraints changed since selection (availability/reservations/stock)' +
+                      '\n  Reason: offer unavailable or amount is 0/null (clamping would handle partial amounts, but offer is completely unavailable)' +
                       '\n  → Trying next trade in list...'" 
                       chance="100"/>
                   </do_if>
@@ -4409,17 +4499,19 @@
             </do_if>
           </do_if>
           
-          <!-- Purge pending SEARCH RESULTS after we successfully queued trade orders.
-               Keeping them causes stale execution via "Found X pending trades from earlier MD result". -->
-          <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
-            <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
+          <!-- Purge trades awaiting validation after we successfully queued trade orders.
+               Keeping them causes stale execution via old trade data. -->
+          <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidation.{this.ship}"/>
           </do_if>
-          <do_if value="global.$GT_PendingTradesTimestamp? and global.$GT_PendingTradesTimestamp.{this.ship}?">
-            <remove_value name="global.$GT_PendingTradesTimestamp.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationTimestamp? and global.$GT_TradesAwaitingValidationTimestamp.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidationTimestamp.{this.ship}"/>
           </do_if>
-          <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-            <remove_value name="global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
           </do_if>
+          <!-- Clear interrupt flag when clearing trades awaiting validation (trades successfully processed) -->
+          <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
 
           <!-- Add state update signal AFTER order creation -->
           <!-- This tests if sending a signal immediately after create_trade_order interferes with TradePerform initialization -->
@@ -4632,11 +4724,8 @@
           <!-- Use safe access for $tradeList.count -->
           <set_value name="$tradeListCountSafe" exact="if $tradeList != null then $tradeList.count else 0"/>
           
-          <!-- Determine search method (cache vs live) for detailed logging -->
-          <set_value name="$searchMethod" exact="''"/>
-          <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-            <set_value name="$searchMethod" exact="@global.$GT_PendingTradesSearchMethod.{this.ship}"/>
-          </do_if>
+          <!-- Search method already captured earlier in trade_found label -->
+          <!-- (from cache, signal param2, or global storage) -->
           
           <!-- Enhanced logging for cache trade rejections -->
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -4654,17 +4743,19 @@
           </do_if>
           
           <!-- CRITICAL:
-               If ALL pending trades were rejected (often because offers changed), we MUST purge pending trade results.
-               Otherwise the ship can loop forever on stale global.$GT_PendingTrades.{this.ship} and never request fresh trades. -->
-          <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
-            <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
+               If ALL trades were rejected (often because offers changed), we MUST purge trades awaiting validation.
+               Otherwise the ship can loop forever on stale global.$GT_TradesAwaitingValidation.{this.ship} and never request fresh trades. -->
+          <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidation.{this.ship}"/>
           </do_if>
-          <do_if value="global.$GT_PendingTradesTimestamp? and global.$GT_PendingTradesTimestamp.{this.ship}?">
-            <remove_value name="global.$GT_PendingTradesTimestamp.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationTimestamp? and global.$GT_TradesAwaitingValidationTimestamp.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidationTimestamp.{this.ship}"/>
           </do_if>
-          <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-            <remove_value name="global.$GT_PendingTradesSearchMethod.{this.ship}"/>
+          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+            <remove_value name="global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
           </do_if>
+          <!-- Clear interrupt flag when clearing trades awaiting validation to prevent re-entry loop -->
+          <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
           <!-- Reduce escalating backoff after purging stale results: next retry will start at 10s again -->
           <set_value name="this.$searchFailed" exact="0"/>
           
@@ -4763,23 +4854,16 @@
               $IgnoreTradeRules = $effectiveIgnoreTradeRules,
               $ForceLiveSearch = true
             ]"/>
-            <!-- Resume main loop to wait for live search result -->
-            <resume label="main_loop"/>
+            <!-- CRITICAL: Resume to wait_for_response instead of main_loop -->
+            <!-- This ensures the ship waits for the live search result instead of sending a duplicate request -->
+            <!-- The wait block will catch GT_Trade_Found signal when live search completes -->
+            <resume label="wait_for_response"/>
           </do_if>
           <do_else>
             <!-- Trades came from live search or search method unknown - use normal retry -->
             <resume label="no_trade_retry"/>
           </do_else>
         </do_else>
-      </do_if>
-      <do_else>
-        <!-- No pending trade data - this shouldn't happen -->
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  GT_Trade_Found received but no pending trade data!'" chance="100"/>
-        </do_if>
-        <wait exact="5s"/>
-        <resume label="main_loop"/>
-      </do_else>
       
       <!-- Stability: vanilla-style micro-yield after creating trade orders -->
       <!-- NOTE: wait must be at top level (not inside any do_if/do_else) -->
@@ -4885,6 +4969,22 @@
       </do_if>
       
       <label name="trade_completed"/>
+      
+      <!-- CRITICAL: Clear trades awaiting validation after trade execution completes -->
+      <!-- This ensures ships always check cache first on next search, not stale pending trades -->
+      <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+        <remove_value name="global.$GT_TradesAwaitingValidation.{this.ship}"/>
+      </do_if>
+      <do_if value="global.$GT_TradesAwaitingValidationTimestamp? and global.$GT_TradesAwaitingValidationTimestamp.{this.ship}?">
+        <remove_value name="global.$GT_TradesAwaitingValidationTimestamp.{this.ship}"/>
+      </do_if>
+      <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}?">
+        <remove_value name="global.$GT_TradesAwaitingValidationSearchMethod.{this.ship}"/>
+      </do_if>
+      <!-- Clear active trade tracking -->
+      <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{this.ship}?">
+        <remove_value name="global.$GT_ActiveTrade.{this.ship}"/>
+      </do_if>
       
       <!-- ======================================= -->
       <!-- PILOT CHANGE DETECTION (After Trade)   -->
@@ -5797,11 +5897,24 @@
                 <do_if value="$entryHomeToBuy lt 0 or $entryHomeToSell lt 0 or $entryMaxDist gt $maxDistance">
                   <set_value name="$entryPassesFilters" exact="false"/>
                   <set_value name="$filterRejectCount.$Distance" operation="add"/>
+                  <!-- Debug logging for distance rejections - log more entries to diagnose filtering issues -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($filterRejectCount.$Distance le 20 or ($entryMaxDist le $maxDistance + 1 and $filterRejectCount.$Distance le 50))">
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter REJECTED (distance): entryMaxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', homeToBuy=' + $entryHomeToBuy + ', homeToSell=' + $entryHomeToSell + ', rawIdx=' + $rawIdx" chance="100"/>
+                  </do_if>
                 </do_if>
+                <do_else>
+                  <!-- Entry passed distance filter - log all passes to see what's getting through -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter PASSED (distance): entryMaxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', homeToBuy=' + $entryHomeToBuy + ', homeToSell=' + $entryHomeToSell + ', rawIdx=' + $rawIdx" chance="100"/>
+                  </do_if>
+                </do_else>
               </do_if>
               <do_else>
                 <!-- Distances not cached (shouldn't happen, but safety fallback) -->
                 <!-- Keep entry - it will be validated later with full distance calculation -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($rawIdx le 3)">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter WARNING: distances not cached for entry (will validate later)'" chance="100"/>
+                </do_if>
               </do_else>
             </do_if>
             
@@ -6161,7 +6274,11 @@
               
               <!-- Debug first few entries -->
               <do_if value="$processedCount + $i le 3">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ': profit=' + (if $profit? then $profit else 'null') + ', minProfit=' + $minAbsoluteProfit + ', roi=' + (if $roi? then $roi else 'null') + ', minROI=' + $minROI + ', valid=' + $isValid + (if not $isValid then ' reason=' + $rejectReason else '')" chance="100"/>
+                <!-- Log cache entry with distance information for debugging -->
+                <set_value name="$entryHomeToBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
+                <set_value name="$entryHomeToSell" exact="@$cacheEntry.$HomeToSellDistance"/>
+                <set_value name="$entryMaxDist" exact="if ($entryHomeToBuy? and $entryHomeToSell? and $entryHomeToBuy ge 0 and $entryHomeToSell ge 0) then [$entryHomeToBuy, $entryHomeToSell].max else -1"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache entry ' + ($processedCount + $i) + ': profit=' + (if $profit? then $profit else 'null') + ', minProfit=' + $minAbsoluteProfit + ', roi=' + (if $roi? then $roi else 'null') + ', minROI=' + $minROI + ', homeToBuy=' + (if $entryHomeToBuy? then $entryHomeToBuy else 'null') + ', homeToSell=' + (if $entryHomeToSell? then $entryHomeToSell else 'null') + ', maxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', valid=' + $isValid + (if not $isValid then ' reason=' + $rejectReason else '')" chance="100"/>
               </do_if>
               
               <!-- Add to valid trades if all checks passed -->

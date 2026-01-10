@@ -783,7 +783,7 @@
             -->
             <!-- NEW: Store complete trade LIST for AI validation and execution -->
             <!-- AI script will iterate through list and validate blacklist for each trade -->
-            <!-- SIMPLIFIED: Initialization guarantees global.$GT_PendingTrades exists -->
+            <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradesAwaitingValidation exists -->
             
             <!-- Get trade list from params (if available, otherwise use single trade for backward compat) -->
             <set_value name="$tradeList" exact="@event.param.$TradeList"/>
@@ -796,18 +796,22 @@
               <set_value name="$tradeList" exact="[$trade]"/>
             </do_if>
             
-            <!-- Store the full trade list -->
-            <set_value name="global.$GT_PendingTrades.{$ship}" exact="$tradeList"/>
-            
-            <!-- Store timestamp to detect stale pending trades -->
-            <do_if value="not global.$GT_PendingTradesTimestamp?">
-              <set_value name="global.$GT_PendingTradesTimestamp" exact="table[]"/>
+            <!-- Store the full trade list in global storage (for threat intelligence compatibility) -->
+            <!-- Initialize table if it doesn't exist -->
+            <do_if value="not global.$GT_TradesAwaitingValidation?">
+              <set_value name="global.$GT_TradesAwaitingValidation" exact="table[]"/>
             </do_if>
-            <set_value name="global.$GT_PendingTradesTimestamp.{$ship}" exact="player.age"/>
+            <set_value name="global.$GT_TradesAwaitingValidation.{$ship}" exact="$tradeList"/>
+            
+            <!-- Store timestamp to detect stale trades awaiting validation -->
+            <do_if value="not global.$GT_TradesAwaitingValidationTimestamp?">
+              <set_value name="global.$GT_TradesAwaitingValidationTimestamp" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_TradesAwaitingValidationTimestamp.{$ship}" exact="player.age"/>
             
             <!-- DIAGNOSTIC: Log trade storage -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Execution] STORED ' + $tradeList.count + ' trades in global.$GT_PendingTrades for ' + $ship.idcode + ' (will signal GT_Trade_Found, timestamp=' + player.age + ')'" chance="100"/>
+              <debug_text text="'[GT-Execution] STORED ' + $tradeList.count + ' trades in global.$GT_TradesAwaitingValidation for ' + $ship.idcode + ' (will signal GT_Trade_Found with param2, timestamp=' + player.age + ')'" chance="100"/>
             </do_if>
             
             <!-- NEW: Store search method so AI knows if trades came from cache or live search -->
@@ -815,11 +819,11 @@
             <set_value name="$searchMethod" exact="@event.param.$SearchMethod"/>
             <do_if value="$searchMethod != null">
               <!-- RACE CONDITION FIX: Ensure table exists before accessing (handles race condition) -->
-              <do_if value="not global.$GT_PendingTradesSearchMethod?">
-                <set_value name="global.$GT_PendingTradesSearchMethod" exact="table[]"/>
+              <do_if value="not global.$GT_TradesAwaitingValidationSearchMethod?">
+                <set_value name="global.$GT_TradesAwaitingValidationSearchMethod" exact="table[]"/>
               </do_if>
               <!-- Store search method in a separate table keyed by ship -->
-              <set_value name="global.$GT_PendingTradesSearchMethod.{$ship}" exact="$searchMethod"/>
+              <set_value name="global.$GT_TradesAwaitingValidationSearchMethod.{$ship}" exact="$searchMethod"/>
             </do_if>
             
             <!-- CRITICAL FIX: Remove cache entry when trade order is created from cache -->
@@ -1112,15 +1116,30 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Execution] SENDING GT_Trade_Found (queued) to ' + $ship.idcode + ' at ' + player.age" chance="100"/>
           </do_if>
+          
+          <!-- Read trade data from global storage (stored by ExecuteTrade cue) -->
+          <set_value name="$tradeList" exact="[]"/>
+          <set_value name="$searchMethod" exact="''"/>
+          <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{$ship}?">
+            <set_value name="$tradeList" exact="global.$GT_TradesAwaitingValidation.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{$ship}?">
+            <set_value name="$searchMethod" exact="@global.$GT_TradesAwaitingValidationSearchMethod.{$ship}"/>
+          </do_if>
+          
           <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
             <param name="ship" value="$ship"/>
             <param name="stage" value="'result'"/>
             <param name="state" value="'trade_found'"/>
             <param name="reason" value="''"/>
             <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
-            <param name="extra" value="table[$PendingTrades = (if global.$GT_PendingTrades? and global.$GT_PendingTrades.{$ship}? then global.$GT_PendingTrades.{$ship}.count else 0)]"/>
+            <param name="extra" value="table[$PendingTrades = (if $tradeList != null then $tradeList.count else 0)]"/>
           </run_actions>
-          <signal_objects object="$ship" param="'GT_Trade_Found'"/>
+          <!-- Pass trade data directly in signal param2 (like GT_Training_Station_Found) -->
+          <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
+            $TradeList = $tradeList,
+            $SearchMethod = $searchMethod
+          ]"/>
         </do_if>
 
         <!-- Yield between signals to smooth FPS (hardcoded for now) -->
