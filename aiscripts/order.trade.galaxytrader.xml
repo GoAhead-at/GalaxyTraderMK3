@@ -6381,6 +6381,10 @@
       <set_value name="$bestTrade" exact="null"/>
       <set_value name="$bestScore" exact="0"/>
       
+      <!-- Initialize rejection counters for logging -->
+      <set_value name="$profitRejectionCount" exact="0"/>
+      <set_value name="$roiRejectionCount" exact="0"/>
+      
       <!-- Get max offers per ware for matching from global settings -->
       <set_value name="$maxOffersPerWareForMatching" exact="20"/>
       <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching?">
@@ -6395,17 +6399,21 @@
       
       <!-- Index offers by ware (simplified - no MD library call) -->
       <!-- Limit offers per ware using MaxOffersPerWareForMatching -->
+      <!-- FIX: Validate offers are available before indexing (prevents NULL owner/price issues) -->
       <set_value name="$sellOffersByWare" exact="table[]"/>
       <do_all exact="$sellOffers.count" counter="$i">
         <set_value name="$offer" exact="$sellOffers.{$i}"/>
-        <set_value name="$ware" exact="@$offer.ware"/>
-        <do_if value="$ware?">
-          <do_if value="not $sellOffersByWare.{$ware}?">
-            <set_value name="$sellOffersByWare.{$ware}" exact="[]"/>
-          </do_if>
-          <!-- Limit offers per ware -->
-          <do_if value="$sellOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
-            <append_to_list name="$sellOffersByWare.{$ware}" exact="$offer"/>
+        <!-- Validate offer exists and is available before indexing -->
+        <do_if value="$offer? and $offer.available">
+          <set_value name="$ware" exact="@$offer.ware"/>
+          <do_if value="$ware?">
+            <do_if value="not $sellOffersByWare.{$ware}?">
+              <set_value name="$sellOffersByWare.{$ware}" exact="[]"/>
+            </do_if>
+            <!-- Limit offers per ware -->
+            <do_if value="$sellOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
+              <append_to_list name="$sellOffersByWare.{$ware}" exact="$offer"/>
+            </do_if>
           </do_if>
         </do_if>
       </do_all>
@@ -6413,14 +6421,17 @@
       <set_value name="$buyOffersByWare" exact="table[]"/>
       <do_all exact="$buyOffers.count" counter="$i">
         <set_value name="$offer" exact="$buyOffers.{$i}"/>
-        <set_value name="$ware" exact="@$offer.ware"/>
-        <do_if value="$ware?">
-          <do_if value="not $buyOffersByWare.{$ware}?">
-            <set_value name="$buyOffersByWare.{$ware}" exact="[]"/>
-          </do_if>
-          <!-- Limit offers per ware -->
-          <do_if value="$buyOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
-            <append_to_list name="$buyOffersByWare.{$ware}" exact="$offer"/>
+        <!-- Validate offer exists and is available before indexing -->
+        <do_if value="$offer? and $offer.available">
+          <set_value name="$ware" exact="@$offer.ware"/>
+          <do_if value="$ware?">
+            <do_if value="not $buyOffersByWare.{$ware}?">
+              <set_value name="$buyOffersByWare.{$ware}" exact="[]"/>
+            </do_if>
+            <!-- Limit offers per ware -->
+            <do_if value="$buyOffersByWare.{$ware}.count lt $maxOffersPerWareForMatching">
+              <append_to_list name="$buyOffersByWare.{$ware}" exact="$offer"/>
+            </do_if>
           </do_if>
         </do_if>
       </do_all>
@@ -6502,14 +6513,19 @@
           <set_value name="$sellOffer" exact="@$sellList.{$currentSellIndex}"/>
           <set_value name="$buyOffer" exact="@$buyList.{$currentBuyIndex}"/>
           
-          <!-- Validate offers exist -->
-          <do_if value="$sellOffer? and $buyOffer?">
+          <!-- Validate offers exist AND are available (prevents NULL owner/price issues) -->
+          <!-- FIX: Check offer.available - offers can exist but not be available, causing NULL owner/price -->
+          <do_if value="$sellOffer? and $buyOffer? and $sellOffer.available and $buyOffer.available">
             <!-- OPTIMIZATION: Quick profit pre-filtering before full evaluation -->
-            <set_value name="$buyPrice" exact="@$sellOffer.price"/>
-            <set_value name="$sellPrice" exact="@$buyOffer.price"/>
+            <!-- FIX: Use unitprice (price per unit) instead of price (total price) - price is total for entire offer amount -->
+            <set_value name="$buyPrice" exact="@$sellOffer.unitprice"/>
+            <set_value name="$sellPrice" exact="@$buyOffer.unitprice"/>
             <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
             <set_value name="$amount" exact="[@$sellOffer.amount, @$buyOffer.amount].min"/>
             <set_value name="$quickProfit" exact="$profitPerUnit * $amount"/>
+            
+            <!-- Increment processed pairs counter -->
+            <set_value name="$processedPairs" exact="$processedPairs + 1"/>
             
             <!-- Quick profit check - skip if can't meet minimum -->
             <do_if value="$quickProfit ge $minAbsoluteProfit">
@@ -6542,9 +6558,12 @@
                 <!-- Check trades per ware limit -->
                 <do_if value="$wareTradeCount lt $maxTradesPerWare">
                   <!-- Create trade entry -->
+                  <!-- FIX: Store BuyPrice and SellPrice in trade object for profit recalculation -->
                   <set_value name="$trade" exact="table[
                     $BuyOffer = $sellOffer,
                     $SellOffer = $buyOffer,
+                    $BuyPrice = $buyPrice,
+                    $SellPrice = $sellPrice,
                     $Profit = $quickProfit,
                     $ROI = $roi,
                     $Amount = $amount,
@@ -6562,7 +6581,43 @@
                   </do_if>
                 </do_if>
               </do_if>
+              <do_else>
+                <!-- ROI check failed - log first few rejections -->
+                <set_value name="$roiRejectionCount" exact="$roiRejectionCount + 1"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $roiRejectionCount le 10">
+                  <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                  <set_value name="$buyStationName" exact="if $sellOffer.owner? then @$sellOffer.owner.knownname else 'NULL'"/>
+                  <set_value name="$sellStationName" exact="if $buyOffer.owner? then @$buyOffer.owner.knownname else 'NULL'"/>
+                  <debug_text text="'[GT-AI-TradeMatching] ' + this.ship.idcode + ': Pair REJECTED (ROI): #' + $roiRejectionCount +
+                    '\n  Ware: ' + $wareName +
+                    '\n  Buy: ' + $buyStationName + ' @ ' + ($buyPrice/100) + ' Cr' +
+                    '\n  Sell: ' + $sellStationName + ' @ ' + ($sellPrice/100) + ' Cr' +
+                    '\n  ProfitPerUnit: ' + ($profitPerUnit/100) + ' Cr' +
+                    '\n  Amount: ' + $amount + ' units' +
+                    '\n  QuickProfit: ' + ($quickProfit/100) + ' Cr' +
+                    '\n  Investment: ' + ($investment/100) + ' Cr' +
+                    '\n  ROI: ' + $roi + '%' +
+                    '\n  MinROI: ' + $minROI + '%'" chance="100"/>
+                </do_if>
+              </do_else>
             </do_if>
+            <do_else>
+              <!-- Quick profit check failed - log first few rejections -->
+              <set_value name="$profitRejectionCount" exact="$profitRejectionCount + 1"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $profitRejectionCount le 10">
+                <set_value name="$wareName" exact="if $ware? then @$ware.name else 'NULL'"/>
+                <set_value name="$buyStationName" exact="if $sellOffer.owner? then @$sellOffer.owner.knownname else 'NULL'"/>
+                <set_value name="$sellStationName" exact="if $buyOffer.owner? then @$buyOffer.owner.knownname else 'NULL'"/>
+                <debug_text text="'[GT-AI-TradeMatching] ' + this.ship.idcode + ': Pair REJECTED (profit): #' + $profitRejectionCount +
+                  '\n  Ware: ' + $wareName +
+                  '\n  Buy: ' + $buyStationName + ' @ ' + ($buyPrice/100) + ' Cr' +
+                  '\n  Sell: ' + $sellStationName + ' @ ' + ($sellPrice/100) + ' Cr' +
+                  '\n  ProfitPerUnit: ' + ($profitPerUnit/100) + ' Cr' +
+                  '\n  Amount: ' + $amount + ' units' +
+                  '\n  QuickProfit: ' + ($quickProfit/100) + ' Cr' +
+                  '\n  MinProfit: ' + ($minAbsoluteProfit/100) + ' Cr'" chance="100"/>
+              </do_if>
+            </do_else>
           </do_if>
           
           <!-- Advance to next pair -->
@@ -6610,7 +6665,14 @@
       
       <!-- Signal completion -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade matching complete: processedPairs=' + $processedPairs + ', validTrades=' + $validTrades.count + ', bestTrade=' + (if $bestTrade != null then 'found' else 'null') + ', bestScore=' + $bestScore + ', wareKeys=' + $wareKeys.count" chance="100"/>
+        <debug_text text="'[GT-AI-TradeMatching] ' + this.ship.idcode + ': Trade matching complete:' +
+          '\n  ProcessedPairs: ' + $processedPairs +
+          '\n  ValidTrades: ' + $validTrades.count +
+          '\n  BestTrade: ' + (if $bestTrade != null then 'found' else 'null') +
+          '\n  BestScore: ' + $bestScore +
+          '\n  WareKeys: ' + $wareKeys.count +
+          '\n  Rejected (profit): ' + $profitRejectionCount +
+          '\n  Rejected (ROI): ' + $roiRejectionCount" chance="100"/>
       </do_if>
       <signal_objects object="player.galaxy" param="'GT_WorkUnit_Complete'" param2="table[
         $Ship = this.ship,
