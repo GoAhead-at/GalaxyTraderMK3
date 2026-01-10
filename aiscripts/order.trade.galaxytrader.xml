@@ -518,6 +518,13 @@
     <set_order_syncpoint_reached order="this.ship.order"/>
     <set_command command="command.searchtrades"/>
     <set_command_action commandaction="commandaction.searchingtrades"/>
+
+    <!-- CRITICAL: Ensure instance wait time storage ALWAYS exists before any <wait ...> evaluates it.
+         Vanilla pattern: instance vars are accessed with safe operator @this.$var (e.g. @this.$resupplier...). -->
+    <!-- Purpose A: Pre-request wait for GT_Trade_Found signal (milliseconds) -->
+    <set_value name="this.$tradeFoundSignalWaitTime" exact="5ms"/>
+    <!-- Purpose B: No-trade retry cooldown (seconds) -->
+    <set_value name="this.$retryCooldown" exact="10s"/>
     
     <!-- Legacy persistent variables removed - no longer needed with unified maintenance system -->
     
@@ -609,19 +616,31 @@
     </do_if>
     
     <!-- Ignore Carrier/Aux -->
-    <set_value name="$effectiveIgnoreCarrierAux" exact="$ignorecarrieraux"/>
+    <!-- Initialize with safe default first to prevent property lookup errors -->
+    <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
+    <do_if value="$ignorecarrieraux?">
+      <set_value name="$effectiveIgnoreCarrierAux" exact="$ignorecarrieraux"/>
+    </do_if>
     <do_if value="$isSubordinate and $commanderOrder and $commanderOrder.$ignorecarrieraux?">
       <set_value name="$effectiveIgnoreCarrierAux" exact="$commanderOrder.$ignorecarrieraux"/>
     </do_if>
     
     <!-- Ignore Build Storage -->
-    <set_value name="$effectiveIgnoreBuildStorage" exact="$ignorebuildstorage"/>
+    <!-- Initialize with safe default first to prevent property lookup errors -->
+    <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
+    <do_if value="$ignorebuildstorage?">
+      <set_value name="$effectiveIgnoreBuildStorage" exact="$ignorebuildstorage"/>
+    </do_if>
     <do_if value="$isSubordinate and $commanderOrder and $commanderOrder.$ignorebuildstorage?">
       <set_value name="$effectiveIgnoreBuildStorage" exact="$commanderOrder.$ignorebuildstorage"/>
     </do_if>
 
     <!-- Ignore Trade Rules -->
-    <set_value name="$effectiveIgnoreTradeRules" exact="$ignoretraderules"/>
+    <!-- Initialize with safe default first to prevent property lookup errors -->
+    <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
+    <do_if value="$ignoretraderules?">
+      <set_value name="$effectiveIgnoreTradeRules" exact="$ignoretraderules"/>
+    </do_if>
     <do_if value="$isSubordinate and $commanderOrder and $commanderOrder.$ignoretraderules?">
       <set_value name="$effectiveIgnoreTradeRules" exact="$commanderOrder.$ignoretraderules"/>
     </do_if>
@@ -886,6 +905,12 @@
       
       <!-- Subordinate reinitialization: Jump here to restart and re-inherit commander settings -->
       <label name="init"/>
+
+      <!-- CRITICAL: Ensure instance wait time storage ALWAYS exists on restarts/resumes. -->
+      <!-- Purpose A: Pre-request wait for GT_Trade_Found signal (milliseconds) -->
+      <set_value name="this.$tradeFoundSignalWaitTime" exact="5ms"/>
+      <!-- Purpose B: No-trade retry cooldown (seconds) -->
+      <set_value name="this.$retryCooldown" exact="10s"/>
       
       <!-- ======================================= -->
       <!-- PILOT CHANGE DETECTION (Script Restart) -->
@@ -2470,6 +2495,23 @@
             ]"/>
           </do_if>
           
+          <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
+          <do_if value="not $effectiveIgnoreCarrierAux?">
+            <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveIgnoreBuildStorage?">
+            <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveIgnoreTradeRules?">
+            <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveDistancePenalty?">
+            <set_value name="$effectiveDistancePenalty" exact="if $distancepenalty? then $distancepenalty else 50"/>
+          </do_if>
+          <do_if value="not $effectiveFleetCoordination?">
+            <set_value name="$effectiveFleetCoordination" exact="if $fleetcoordination? then $fleetcoordination else false"/>
+          </do_if>
+          
           <signal_objects object="player.galaxy" param="'GT_Find_Sell'" param2="table[
             $Ship = this.ship,
             $HomeBase = this.$effectiveHome,
@@ -2487,51 +2529,6 @@
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cargo empty - looking for trade opportunities...'" chance="100"/>
           </do_if>
 
-          <!-- IMPORTANT: If the MD system produced trade results while we were NOT in the wait interrupt (e.g. after an MD timeout),
-               the GT_Trade_Found signal can be missed, but the results remain in global.$GT_PendingTrades.
-               Catch those here to avoid "stops assigning trades" under heavy fleet load.
-               CRITICAL: Check timestamp to avoid using stale pending trades from previous trade cycles. -->
-          <set_value name="$pendingTradesValid" exact="false"/>
-          <do_if value="global.$GT_PendingTrades? and global.$GT_PendingTrades.{this.ship}?">
-            <set_value name="$pendingCount" exact="0"/>
-            <do_if value="global.$GT_PendingTrades.{this.ship}.count?">
-              <set_value name="$pendingCount" exact="global.$GT_PendingTrades.{this.ship}.count"/>
-            </do_if>
-            <do_if value="$pendingCount gt 0">
-              <!-- Check if pending trades are fresh (within last 30 seconds) -->
-              <set_value name="$pendingTimestamp" exact="0"/>
-              <do_if value="global.$GT_PendingTradesTimestamp? and global.$GT_PendingTradesTimestamp.{this.ship}?">
-                <set_value name="$pendingTimestamp" exact="global.$GT_PendingTradesTimestamp.{this.ship}"/>
-              </do_if>
-              <set_value name="$pendingAge" exact="player.age - $pendingTimestamp"/>
-              <set_value name="$maxPendingAge" exact="30"/>
-              <do_if value="$pendingTimestamp gt 0 and $pendingAge le $maxPendingAge">
-                <!-- Pending trades are fresh - use them -->
-                <set_value name="$pendingTradesValid" exact="true"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Found ' + $pendingCount + ' pending trades from earlier MD result (age=' + $pendingAge + 's) - skipping new request and executing now'" chance="100"/>
-                </do_if>
-              </do_if>
-              <do_else>
-                <!-- Pending trades are stale - clear them and make fresh request -->
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Found ' + $pendingCount + ' stale pending trades (age=' + $pendingAge + 's > ' + $maxPendingAge + 's) - clearing and making fresh request'" chance="100"/>
-                </do_if>
-                <remove_value name="global.$GT_PendingTrades.{this.ship}"/>
-                <do_if value="global.$GT_PendingTradesTimestamp? and global.$GT_PendingTradesTimestamp.{this.ship}?">
-                  <remove_value name="global.$GT_PendingTradesTimestamp.{this.ship}"/>
-                </do_if>
-                <do_if value="global.$GT_PendingTradesSearchMethod? and global.$GT_PendingTradesSearchMethod.{this.ship}?">
-                  <remove_value name="global.$GT_PendingTradesSearchMethod.{this.ship}"/>
-                </do_if>
-              </do_else>
-            </do_if>
-          </do_if>
-          <!-- Use pending trades if they're valid and fresh -->
-          <do_if value="$pendingTradesValid">
-            <resume label="trade_found"/>
-          </do_if>
-          
           <!-- Clear cargo disposal flag (cargo is now empty) -->
           <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
             <remove_value name="global.$GT_Ships.{this.ship}.$CargoDisposal"/>
@@ -2552,6 +2549,82 @@
                 $nameType='trader'
               ]"/>
             </do_if>
+          </do_if>
+          
+          <!-- CRITICAL: Always wait briefly for any pending GT_Trade_Found signals before sending new request -->
+          <!-- Wait (configured delay + 5ms buffer) to catch delayed signals and prevent race conditions -->
+          <!-- Even with 0ms delay, MD system needs processing time to queue and send signals -->
+          <!-- If signal arrives during wait, it will interrupt and process the trade immediately -->
+          <!-- Initialize tradeFoundSignalWaitTime with safe default FIRST to prevent property lookup errors -->
+          <!-- IMPORTANT (AI script lifetime): persist on instance; do NOT rely on local $vars across <wait/> yields. -->
+          <!-- Purpose A: Pre-request wait for GT_Trade_Found signal (milliseconds) -->
+          <set_value name="this.$tradeFoundSignalWaitTime" exact="5ms"/>
+          <set_value name="$signalDelayMs" exact="0"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$TradeFoundSignalDelay?">
+            <set_value name="$tmpDelay" exact="@global.$GT_GlobalSettings.$Performance.$TradeFoundSignalDelay"/>
+            <do_if value="$tmpDelay? and $tmpDelay ge 0 and $tmpDelay le 1000">
+              <set_value name="$signalDelayMs" exact="$tmpDelay"/>
+            </do_if>
+          </do_if>
+          <!-- Always wait at least 5ms to give MD system time to process and send signals -->
+          <!-- Calculate waitTime: configured delay + 5ms buffer (minimum 5ms) -->
+          <!-- Ensure signalDelayMs is valid number before calculation to prevent expression errors -->
+          <do_if value="not $signalDelayMs? or $signalDelayMs == null">
+            <set_value name="$signalDelayMs" exact="0"/>
+          </do_if>
+          <!-- Calculate wait time in milliseconds first, then convert to time value -->
+          <!-- This avoids potential expression evaluation issues -->
+          <!-- CRITICAL: Ensure waitMs is initialized before calculation -->
+          <set_value name="$waitMs" exact="5"/>
+          <do_if value="$signalDelayMs? and $signalDelayMs ge 0">
+            <set_value name="$waitMs" exact="$signalDelayMs + 5"/>
+          </do_if>
+          <!-- CRITICAL: Calculate waitTime safely - if expression fails, tradeFoundSignalWaitTime keeps its default value of 5ms -->
+          <!-- Use proper null/existence check pattern from cursor rules: not $var? or $var == null checks if invalid -->
+          <!-- For positive check: variable exists AND is not null AND is valid -->
+          <set_value name="$calculatedWaitTime" exact="$waitMs * 1ms"/>
+          <!-- Only update tradeFoundSignalWaitTime if calculation succeeded (follows cursor rules pattern) -->
+          <do_if value="not (not $calculatedWaitTime? or $calculatedWaitTime == null) and $calculatedWaitTime gt 0ms">
+            <set_value name="this.$tradeFoundSignalWaitTime" exact="$calculatedWaitTime"/>
+          </do_if>
+          <!-- If calculation failed (variable doesn't exist or is null), tradeFoundSignalWaitTime remains at safe default of 5ms set above -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Waiting ' + $waitMs + 'ms for GT_Trade_Found signal (configured delay=' + $signalDelayMs + 'ms + 5ms buffer) before sending new request'" chance="100"/>
+          </do_if>
+          <wait max="if @this.$tradeFoundSignalWaitTime != null then @this.$tradeFoundSignalWaitTime else 5ms" comment="Wait for GT_Trade_Found signal before sending new request">
+            <interrupt>
+              <conditions>
+                <event_object_signalled object="this.ship" param="'GT_Trade_Found'"/>
+              </conditions>
+              <actions>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received during pre-request wait - processing trade'" chance="100"/>
+                </do_if>
+                <!-- Signal received - jump to trade_found label to process it -->
+                <resume label="trade_found"/>
+              </actions>
+            </interrupt>
+          </wait>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-request wait completed - no signal received, sending new request'" chance="100"/>
+          </do_if>
+          
+          <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
+          <!-- These should be initialized in <init> block, but add safety checks here to prevent property lookup errors -->
+          <do_if value="not $effectiveIgnoreCarrierAux?">
+            <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveIgnoreBuildStorage?">
+            <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveIgnoreTradeRules?">
+            <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
+          </do_if>
+          <do_if value="not $effectiveDistancePenalty?">
+            <set_value name="$effectiveDistancePenalty" exact="if $distancepenalty? then $distancepenalty else 50"/>
+          </do_if>
+          <do_if value="not $effectiveFleetCoordination?">
+            <set_value name="$effectiveFleetCoordination" exact="if $fleetcoordination? then $fleetcoordination else false"/>
           </do_if>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -2579,7 +2652,7 @@
       </do_else>
       
       <!-- Wait for MD system response with interrupt -->
-      <!-- Under large fleets, serialized batch matching can exceed 90s. Use a longer fixed wait to avoid premature timeouts. -->
+      <!-- Under large fleets, serialized batch matching can exceed 90s. Use 60s timeout to balance reliability with responsiveness. -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait state for MD response at game time ' + player.age" chance="100"/>
       </do_if>
@@ -2590,7 +2663,7 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Wait interrupt handler ACTIVE at game time ' + player.age" chance="100"/>
       </do_if>
       <!-- IMPORTANT: In X4, wait without min is RANDOM (0..max). Use min=max to avoid instant timeouts. -->
-      <wait min="180s" max="180s" comment="Wait for MD system response (fixed 180s; interrupted immediately on response)">
+      <wait min="60s" max="60s" comment="Wait for MD system response (60s; interrupted immediately on response)">
         <interrupt>
           <conditions>
             <check_any>
@@ -4669,6 +4742,17 @@
             <do_if value="this.$effectiveMaxSell?">
               <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
             </do_if>
+            <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
+            <do_if value="not $effectiveIgnoreCarrierAux?">
+              <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
+            </do_if>
+            <do_if value="not $effectiveIgnoreBuildStorage?">
+              <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
+            </do_if>
+            <do_if value="not $effectiveIgnoreTradeRules?">
+              <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
+            </do_if>
+            
             <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
               $Ship = this.ship,
               $HomeBase = this.$effectiveHome,
@@ -5010,6 +5094,12 @@
       
       <label name="no_trade_retry"/>
 
+      <!-- CRITICAL: Initialize retryCooldown with safe default FIRST to prevent property lookup errors -->
+      <!-- Purpose B: No-trade retry cooldown (seconds) -->
+      <!-- IMPORTANT (AI script lifetime): local $vars may not persist across <wait/> yields. -->
+      <!-- Persist the computed cooldown time on the order instance for any post-wait logic. -->
+      <set_value name="this.$retryCooldown" exact="10s"/>
+
       <!-- SPECIAL CASE: system busy / home refresh in progress (MD queues are saturated OR a home-sector cache refresh is running)
            → fixed retry, do NOT escalate cooldown.
            Smooth gameplay > throughput: wait longer here to reduce request churn and let the scheduler/queues drain.
@@ -5021,9 +5111,9 @@
         <!-- Fixed retry for all busy-style reasons (do NOT use escalating cooldown). -->
         <!-- For home_refresh: shorter wait (3s) to allow cache retry while home refresh populates cache -->
         <!-- For busy/busy_batch: longer wait (10s) to let queues drain -->
-        <set_value name="$waitTime" exact="if $noTradeReason == 'home_refresh' then 3s else 10s"/>
+        <set_value name="this.$retryCooldown" exact="if $noTradeReason == 'home_refresh' then 3s else 10s"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh - waiting ' + ($waitTime/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh - waiting ' + (this.$retryCooldown/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
         </do_if>
         
         <!-- Record attempt summary (bounded history) -->
@@ -5036,7 +5126,7 @@
         <append_to_list name="global.$GT_NoTradeHistory.{this.ship}" exact="table[
           $Time = player.age,
           $Reason = $noTradeReason,
-          $Wait = $waitTime,
+          $Wait = this.$retryCooldown,
           $Sector = @this.ship.sector.knownname,
           $Home = if @this.$effectiveHome != null then @this.$effectiveHome.knownname else (if @this.ship.defaultorder.$home != null then @this.ship.defaultorder.$home.knownname else ''),
           $MaxDistance = if this.$effectiveMaxDistance? then this.$effectiveMaxDistance else null
@@ -5050,7 +5140,7 @@
         <set_command command="command.wait"/>
         <set_command_action commandaction="commandaction.standingby"/>
         <!-- CRITICAL: Use min=max to ensure fixed wait time (wait without min is RANDOM 0..max in X4) -->
-        <wait min="$waitTime" max="$waitTime"/>
+        <wait min="if @this.$retryCooldown != null then @this.$retryCooldown else 10s" max="if @this.$retryCooldown != null then @this.$retryCooldown else 10s"/>
         <resume label="main_loop"/>
       </do_if>
       
@@ -5075,7 +5165,8 @@
       <!-- Use cargo disposal counter if this is cargo disposal, otherwise use normal counter -->
       <set_value name="$failureCount" exact="if $isCargoDisposal then this.$cargoDisposalFailed else this.$searchFailed"/>
       <!-- Escalating cooldown (cap 60s). This is also required for "no trade found" logbook notifications (they trigger at 60s). -->
-      <set_value name="$waitTime" exact="([$failureCount, 6].min) * 10s"/>
+      <!-- Purpose B: No-trade retry cooldown (seconds) -->
+      <set_value name="this.$retryCooldown" exact="([$failureCount, 6].min) * 10s"/>
       
       <!-- Record attempt summary (bounded history).
            We capture the most recent MD rejection statistics (if available) so the 60s logbook report can show a timeline. -->
@@ -5104,7 +5195,7 @@
       <append_to_list name="global.$GT_NoTradeHistory.{this.ship}" exact="table[
         $Time = player.age,
         $Reason = $noTradeReason,
-        $Wait = $waitTime,
+        $Wait = this.$retryCooldown,
         $Sector = $rsSector,
         $Home = if @this.$effectiveHome != null then @this.$effectiveHome.knownname else (if @this.ship.defaultorder.$home != null then @this.ship.defaultorder.$home.knownname else ''),
         $MaxDistance = $rsMaxDist,
@@ -5123,7 +5214,7 @@
       </do_if>
       
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No ' + (if $isCargoDisposal then 'cargo buyer' else 'profitable trades') + ' found (attempt ' + $failureCount + ') - waiting ' + ($waitTime/1s) + 's before retry'" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': No ' + (if $isCargoDisposal then 'cargo buyer' else 'profitable trades') + ' found (attempt ' + $failureCount + ') - waiting ' + (this.$retryCooldown/1s) + 's before retry'" chance="100"/>
       </do_if>
       
       <!-- Set ship to waiting state -->
@@ -5135,9 +5226,9 @@
       <set_value name="$waitInterrupted" exact="false"/>
       <set_value name="$tradeFoundDuringWait" exact="false"/>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait for ' + ($waitTime/1s) + 's at game time ' + player.age" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait for ' + (this.$retryCooldown/1s) + 's at game time ' + player.age" chance="100"/>
       </do_if>
-      <wait max="$waitTime" comment="Use max to allow interrupt">
+      <wait max="if @this.$retryCooldown != null then @this.$retryCooldown else 10s" comment="Use max to allow interrupt">
         <interrupt>
           <conditions>
             <!-- Only GT_Trade_Found should interrupt retry wait -->
@@ -5165,7 +5256,7 @@
       <set_value name="$shouldWriteCargoDisposalLogbook" exact="false"/>
       
       <!-- CARGO DISPOSAL: Separate logbook entry for cargo disposal failures -->
-      <do_if value="$isCargoDisposal and $waitTime == 60s and not $tradeFoundDuringWait">
+      <do_if value="$isCargoDisposal and this.$retryCooldown == 60s and not $tradeFoundDuringWait">
         <!-- Check if we've already written a cargo disposal failure logbook entry in the last 5 minutes (300s) -->
         <set_value name="$lastCargoDisposalLogbookTime" exact="0"/>
         <do_if value="this.$lastCargoDisposalLogbookEntryTime?">
@@ -5179,7 +5270,7 @@
       </do_if>
       
       <!-- Normal trade search logbook entry -->
-      <do_if value="not $isCargoDisposal and $waitTime == 60s and not $tradeFoundDuringWait">
+      <do_if value="not $isCargoDisposal and this.$retryCooldown == 60s and not $tradeFoundDuringWait">
         <!-- Check if we've already written a logbook entry in the last 5 minutes (300s) -->
         <set_value name="$lastLogbookTime" exact="0"/>
         <do_if value="this.$lastLogbookEntryTime?">
