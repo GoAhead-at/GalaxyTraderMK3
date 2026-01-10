@@ -1603,8 +1603,20 @@
               </do_if>
               <set_value name="$refreshEntry" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
               <set_value name="$refreshActive" exact="false"/>
+              <set_value name="$refreshRecentlyCompleted" exact="false"/>
               <do_if value="$refreshEntry? and $refreshEntry != null and $refreshEntry.$Active? and $refreshEntry.$Active">
                 <set_value name="$refreshActive" exact="true"/>
+              </do_if>
+              <!-- FIX: Check if refresh completed recently (within last 5 seconds) -->
+              <!-- This catches ships that check after Active flag is cleared but cache is still fresh -->
+              <do_if value="not $refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$LastFinished?">
+                <set_value name="$timeSinceCompletion" exact="player.age - $refreshEntry.$LastFinished"/>
+                <do_if value="$timeSinceCompletion ge 0 and $timeSinceCompletion le 5s">
+                  <set_value name="$refreshRecentlyCompleted" exact="true"/>
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] (' + $ship.idcode + ') Home-sector refresh completed recently (home=' + @$homeSector.knownname + ', completed ' + ($timeSinceCompletion / 1s) + 's ago) - cache should be fresh, skipping new search'" chance="100"/>
+                  </do_if>
+                </do_if>
               </do_if>
               <!-- Clear stale/invalid active markers -->
               <!-- CRITICAL FIX: Reduce stale timeout from 300s to 60s to prevent stuck refresh markers -->
@@ -1621,12 +1633,24 @@
                 </do_if>
               </do_if>
 
+              <!-- FIX: If refresh completed recently, skip starting new search and use fresh cache -->
+              <!-- This catches ships that check after Active flag is cleared but cache is still fresh -->
+              <do_if value="$refreshRecentlyCompleted">
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Skipping live search - refresh completed recently, cache should be fresh (home=' + @$homeSector.knownname + ')'" chance="100"/>
+                </do_if>
+                <!-- Mark that we're skipping live search to use fresh cache -->
+                <set_value name="$denyHomeRefresh" exact="true"/>
+                <set_value name="$shouldDoLiveSearch" exact="false"/>
+                <!-- Ship will proceed to use cache instead of starting new search -->
+              </do_if>
+
               <!-- If another ship is already refreshing this home sector:
                    - DO NOT enqueue another live search for this same home sector.
                    - DO NOT signal the AI (silent waiting).
                    - Keep the request lock; the ship will be resumed automatically when the home refresh finishes.
                    EXCEPTION: isolated ships must not be blocked by home_refresh; they run their own cheap 1-sector live search. -->
-              <do_if value="not $shipIsIsolatedForCachePolicy and $refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
+              <do_if value="not $denyHomeRefresh and not $shipIsIsolatedForCachePolicy and $refreshActive and $refreshEntry? and $refreshEntry != null and $refreshEntry.$Initiator? and $refreshEntry.$Initiator != $ship">
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Search] (' + $ship.idcode + ') Home-sector live refresh already active (home=' + @$homeSector.knownname + ', initiator=' + @$refreshEntry.$Initiator.idcode + ') - waiting silently for refresh to complete'" chance="100"/>
                 </do_if>
@@ -1639,14 +1663,34 @@
                   <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
                 </do_if>
 
-                <!-- O(1) dedupe: only queue once per ship -->
-                <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
-                  <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
-                  <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
-                    $Ship = $ship,
-                    $Params = $params,
-                    $EnqueuedAt = player.age
-                  ]"/>
+                <!-- FIX: Force re-registration if already queued (remove old entry first) -->
+                <!-- This ensures ships register even if they were queued from a previous attempt -->
+                <set_value name="$wasAlreadyQueued" exact="false"/>
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
+                  <set_value name="$wasAlreadyQueued" exact="true"/>
+                  <!-- Remove old waiter entry if it exists -->
+                  <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters?">
+                    <do_all exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count" counter="$w">
+                      <set_value name="$waiterEntry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.{$w}"/>
+                      <do_if value="$waiterEntry? and $waiterEntry.$Ship == $ship">
+                        <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="$waiterEntry"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                </do_if>
+                
+                <!-- Register as waiter (or re-register if was already queued) -->
+                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
+                <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
+                  $Ship = $ship,
+                  $Params = $params,
+                  $EnqueuedAt = player.age
+                ]"/>
+                
+                <!-- Log registration for debugging -->
+                <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] (' + $ship.idcode + ') Registered as waiter for home=' + @$homeSector.knownname + ' (wasAlreadyQueued=' + $wasAlreadyQueued + ', totalWaiters=' + global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count + ')'" chance="100"/>
                 </do_if>
                 
                 <!-- Refresh the request timestamp while we are waiting silently.
