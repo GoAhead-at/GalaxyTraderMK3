@@ -2378,25 +2378,48 @@
             <continue/>
           </do_elseif>
 
-          <!-- Profit thresholds -->
-          <set_value name="$profit" exact="@$entry.$Profit"/>
-          <set_value name="$roi" exact="@$entry.$ROI"/>
-          <do_if value="$profit == null">
-            <set_value name="$profit" exact="0Cr"/>
+          <!-- ==================================================================================== -->
+          <!-- SHIP-AGNOSTIC CACHE VALIDATION: Use ship-agnostic fields for prefiltering -->
+          <!-- ==================================================================================== -->
+          
+          <!-- Get ship-agnostic fields from cache entry -->
+          <set_value name="$offerMaxAmount" exact="@$entry.$OfferMaxAmount"/>
+          <set_value name="$profitPerUnit" exact="@$entry.$ProfitPerUnit"/>
+          <set_value name="$volumePerUnit" exact="@$entry.$VolumePerUnit"/>
+          <set_value name="$buyPrice" exact="@$entry.$BuyPrice"/>
+          <set_value name="$sellPrice" exact="@$entry.$SellPrice"/>
+          
+          <!-- Fallback to ship-biased fields for old cache entries (backward compatibility) -->
+          <do_if value="not $offerMaxAmount? or $offerMaxAmount == null or $offerMaxAmount le 0">
+            <set_value name="$offerMaxAmount" exact="@$entry.$Amount"/>
           </do_if>
-          <do_if value="$roi == null">
-            <set_value name="$roi" exact="0"/>
+          <do_if value="not $profitPerUnit? or $profitPerUnit == null">
+            <set_value name="$cachedProfit" exact="@$entry.$Profit"/>
+            <set_value name="$cachedAmount" exact="@$entry.$Amount"/>
+            <do_if value="$cachedAmount? and $cachedAmount gt 0">
+              <set_value name="$profitPerUnit" exact="$cachedProfit / $cachedAmount"/>
+            </do_if>
+            <do_else>
+              <set_value name="$profitPerUnit" exact="0"/>
+            </do_else>
           </do_if>
-          <do_if value="$profit lt $minAbsoluteProfit or $roi lt $minROI">
-            <continue/>
+          <do_if value="not $volumePerUnit? or $volumePerUnit == null">
+            <set_value name="$ware" exact="@$entry.$BuyOffer.ware"/>
+            <set_value name="$volumePerUnit" exact="if $ware? and $ware.volume? then $ware.volume else 1"/>
           </do_if>
-
-          <!-- Live offer sanity: cached trade entries can become stale under fleet load.
-               Ensure current offers are still available AND have enough amount for this trade. -->
-          <set_value name="$tradeAmount" exact="@$entry.$Amount"/>
-          <do_if value="$tradeAmount == null or $tradeAmount le 0">
-            <continue/>
+          <do_if value="not $buyPrice? or $buyPrice == null">
+            <set_value name="$buyOfferObj" exact="@$entry.$BuyOffer"/>
+            <set_value name="$buyPrice" exact="if $buyOfferObj? and $buyOfferObj.price? then $buyOfferObj.price else 0"/>
           </do_if>
+          <do_if value="not $sellPrice? or $sellPrice == null">
+            <set_value name="$sellOfferObj" exact="@$entry.$SellOffer"/>
+            <set_value name="$sellPrice" exact="if $sellOfferObj? and $sellOfferObj.price? then $sellOfferObj.price else 0"/>
+            <do_if value="$profitPerUnit == 0 and $sellPrice gt 0 and $buyPrice gt 0">
+              <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Validate offers are still available -->
           <set_value name="$buyOfferObj" exact="@$entry.$BuyOffer"/>
           <set_value name="$sellOfferObj" exact="@$entry.$SellOffer"/>
           <do_if value="not $buyOfferObj? or $buyOfferObj == null or not $buyOfferObj.exists or not $sellOfferObj? or $sellOfferObj == null or not $sellOfferObj.exists">
@@ -2412,7 +2435,55 @@
           <do_if value="$sellAmtNow == null">
             <set_value name="$sellAmtNow" exact="0"/>
           </do_if>
-          <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow lt $tradeAmount or $sellAmtNow lt $tradeAmount">
+          <do_if value="not $buyAvailNow or not $sellAvailNow or $buyAmtNow le 0 or $sellAmtNow le 0">
+            <continue/>
+          </do_if>
+          
+          <!-- Update offerMaxAmount with current offer amounts (may have changed since cache creation) -->
+          <set_value name="$currentOfferMaxAmount" exact="[$buyAmtNow, $sellAmtNow].min"/>
+          <do_if value="$currentOfferMaxAmount lt $offerMaxAmount">
+            <set_value name="$offerMaxAmount" exact="$currentOfferMaxAmount"/>
+          </do_if>
+          
+          <!-- ==================================================================================== -->
+          <!-- SHIP-SPECIFIC PREFILTERING: Calculate max tradeable amount for THIS ship -->
+          <!-- ==================================================================================== -->
+          
+          <!-- Calculate ship's max tradeable amount based on cargo capacity -->
+          <set_value name="$shipMaxByCargo" exact="0"/>
+          <do_if value="$volumePerUnit gt 0">
+            <set_value name="$shipCargoCapacity" exact="$ship.cargo.capacity.all"/>
+            <set_value name="$shipCargoFree" exact="$ship.cargo.free.all"/>
+            <set_value name="$shipMaxByCargo" exact="$shipCargoFree / $volumePerUnit"/>
+          </do_if>
+          
+          <!-- Calculate ship's max tradeable amount based on money (if applicable) -->
+          <set_value name="$shipMaxByMoney" exact="999999999"/>
+          <do_if value="$buyPrice gt 0">
+            <set_value name="$playerMoney" exact="player.money"/>
+            <set_value name="$shipMaxByMoney" exact="$playerMoney / $buyPrice"/>
+          </do_if>
+          
+          <!-- Calculate ship's actual max tradeable amount -->
+          <set_value name="$shipMaxAmount" exact="[$offerMaxAmount, $shipMaxByCargo, $shipMaxByMoney].min"/>
+          
+          <!-- Early rejection: ship cannot trade any amount -->
+          <do_if value="$shipMaxAmount le 0">
+            <continue/>
+          </do_if>
+          
+          <!-- Calculate ship-specific profit and ROI -->
+          <set_value name="$shipMaxProfit" exact="$profitPerUnit * $shipMaxAmount"/>
+          <set_value name="$shipROI" exact="0"/>
+          <do_if value="$buyPrice gt 0 and $shipMaxAmount gt 0">
+            <set_value name="$shipInvestment" exact="$buyPrice * $shipMaxAmount"/>
+            <do_if value="$shipInvestment gt 0">
+              <set_value name="$shipROI" exact="($shipMaxProfit * 100) / $shipInvestment"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Profit thresholds: use ship-specific calculated values -->
+          <do_if value="$shipMaxProfit lt $minAbsoluteProfit or $shipROI lt $minROI">
             <continue/>
           </do_if>
 
@@ -2468,16 +2539,17 @@
           </do_if>
 
           <!-- Build canonical trade object for execution -->
+          <!-- Use ship-specific calculated values (not ship-biased cached values) -->
           <set_value name="$trade" exact="table[
             $BuyOffer = $entry.$BuyOffer,
             $SellOffer = $entry.$SellOffer,
-            $Amount = $entry.$Amount,
-            $BuyPrice = $entry.$BuyPrice,
-            $SellPrice = $entry.$SellPrice,
-            $Profit = $entry.$Profit,
-            $ROI = $entry.$ROI,
+            $Amount = $shipMaxAmount,
+            $BuyPrice = $buyPrice,
+            $SellPrice = $sellPrice,
+            $Profit = $shipMaxProfit,
+            $ROI = $shipROI,
             $Distance = $entry.$Distance,
-            $Score = $entry.$Profit
+            $Score = $shipMaxProfit
           ]"/>
 
           <!-- Collect candidate(s) with the LOWEST failcount only (tie-breaker keeps profit order from cache). -->
@@ -3314,24 +3386,13 @@
         <param name="shipOwner" default="null" comment="Optional: Ship owner for license check"/>
       </params>
       <actions>
-        <!-- Context-aware illegal check when zone and ship owner are provided -->
+        <!-- Illegal ware check: Always use global check when allowIllegal=false -->
+        <!-- CRITICAL: Illegal wares are NEVER allowed if AllowIllegal=false, regardless of faction or licenses -->
         <do_if value="not $allowIllegal">
-          <do_if value="$zone and $shipOwner">
-            <!-- Check if ware is illegal to police faction in this zone, considering ship owner's licenses -->
-            <set_value name="$policeFaction" exact="$zone.policefaction"/>
-            <do_if value="$policeFaction and $policeFaction != $shipOwner">
-              <do_if value="$ware.illegalto.{$policeFaction}.{$shipOwner}">
-                <return value="false"/>
-              </do_if>
-            </do_if>
+          <!-- FIX: Use safe operator and explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
+          <do_if value="@$ware.illegal gt 0">
+            <return value="false"/>
           </do_if>
-          <do_else>
-            <!-- Fallback: Global illegal check (may be overly restrictive - use context-aware check when possible) -->
-            <!-- FIX: Use safe operator and explicit gt 0 check to ensure legal wares (illegal=0) are not filtered -->
-            <do_if value="@$ware.illegal gt 0">
-              <return value="false"/>
-            </do_if>
-          </do_else>
         </do_if>
         
         <!-- Check blacklist -->
@@ -3423,12 +3484,10 @@
         <param name="allowIllegal" default="true" comment="Whether to allow illegal wares"/>
       </params>
       <actions>
-        <!-- Check if ware is allowed (with context for illegal check) -->
+        <!-- Check if ware is allowed (global illegal check) -->
         <run_actions ref="GT_IsWareAllowed" result="$wareAllowed">
           <param name="ware" value="$offer.ware"/>
           <param name="allowIllegal" value="$allowIllegal"/>
-          <param name="zone" value="$offer.owner.zone"/>
-          <param name="shipOwner" value="$ship.owner"/>
         </run_actions>
         <do_if value="not $wareAllowed">
           <return value="false"/>
