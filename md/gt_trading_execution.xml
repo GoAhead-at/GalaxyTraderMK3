@@ -18,6 +18,7 @@
         <set_value name="$tradeList" exact="@$params.$TradeList"/> <!-- Trade list for fallback -->
         <set_value name="$tradeKey" exact="@$params.$TradeKey"/> <!-- Trade key for reservation cleanup (Phase 3) -->
         <set_value name="$traceId" exact="@$params.$TraceId"/> <!-- Trace ID for logging -->
+        <set_value name="$abort" exact="false"/>
         
         <!-- DIAGNOSTIC: Log ExecuteTrade entry -->
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -51,9 +52,10 @@
             <param name="reason" value="'null_trade'"/>
             <param name="traceId" value="if $traceId? and $traceId != null then $traceId else ''"/>
           </run_actions>
-          <cancel_cue cue="this"/>
+          <set_value name="$abort" exact="true"/>
         </do_if>
         
+        <do_if value="not $abort">
         <!-- Validate trade has required properties -->
         <!-- Support sell-only trades (forced sell) where BuyOffer is null -->
         <set_value name="$tradeValid" exact="false"/>
@@ -89,9 +91,11 @@
             <param name="reason" value="'invalid_trade'"/>
             <param name="traceId" value="if $traceId? and $traceId != null then $traceId else ''"/>
           </run_actions>
-          <cancel_cue cue="this"/>
+          <set_value name="$abort" exact="true"/>
         </do_if>
+        </do_if> <!-- close first $abort gate -->
         
+        <do_if value="not $abort">
         <!-- Enhanced execution logging (will be updated if fallback trade is used) -->
         <set_value name="$executionLogDone" exact="false"/>
         <set_value name="$searchMethod" exact="@$params.$SearchMethod"/>
@@ -148,6 +152,12 @@
           </do_else>
           <set_value name="$canExecute" exact="true"/>
           
+          <!-- P7 optimization: Compute home sector ONCE for all cache operations -->
+          <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <set_value name="$homeSectorObj" exact="$homeSector"/>
+          
           <!-- Log original trade execution (only if trade is still valid) -->
           <do_if value="$buyOfferValid and $sellOfferValid">
             <do_if value="$isSellOnly">
@@ -170,10 +180,6 @@
 
             <!-- Objective invalidation: if the chosen offers are no longer available/valid, purge the matching cache entry.
                  This prevents other ships from repeatedly picking the same stale entry. -->
-            <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-              <param name="ship" value="$ship"/>
-            </run_actions>
-            <set_value name="$homeSectorObj" exact="$homeSector"/>
             <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
               <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
               <set_value name="$purged" exact="false"/>
@@ -303,10 +309,6 @@
 
               <!-- Purge attempted cache entry (if we have offer handles + a home-sector cache). -->
               <do_if value="$buyOffer? and $sellOffer?">
-                <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-                  <param name="ship" value="$ship"/>
-                </run_actions>
-                <set_value name="$homeSectorObj" exact="$homeSector"/>
                 <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}?">
                   <set_value name="$oldCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
                   <set_value name="$newCache" exact="[]"/>
@@ -340,7 +342,7 @@
                 </do_if>
                 <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Enqueue" param="$req"/>
                 <!-- Keep AI waiting for a real result; don't send GT_No_Trade_Found here. -->
-                <cancel_cue cue="this"/>
+                <set_value name="$abort" exact="true"/>
               </do_if>
               <do_else>
                 <!-- If we cannot re-enqueue (missing request), fall back to notifying AI. -->
@@ -349,6 +351,7 @@
             </do_if>
           </do_if>
           
+          <do_if value="not $abort">
           <!-- Verify ship can carry the ware -->
           <!-- Handle sell-only trades (ware comes from $trade.$Ware, not $buyOffer.ware) -->
           <do_if value="$canExecute">
@@ -377,10 +380,6 @@
                     <debug_text text="'[GalaxyTrader MK3] ⚠ Ship ' + $ship.knownname + ' cannot carry ware ' + @$ware.name + ' - aborting trade'" chance="100"/>
                   </do_if>
                   <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
-                  <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-                    <param name="ship" value="$ship"/>
-                  </run_actions>
-                  <set_value name="$homeSectorObj" exact="$homeSector"/>
                   <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
                     <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
                     <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
@@ -390,18 +389,19 @@
                         <do_if value="$failCount == null">
                           <set_value name="$failCount" exact="0"/>
                         </do_if>
-                        <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
-                        <do_if value="$failedShips == null">
-                          <set_value name="$failedShips" exact="[]"/>
+                        <!-- E7 optimization: O(1) table lookup instead of O(n) linear scan -->
+                        <set_value name="$failedShipSet" exact="@$entry.$FailedShipSet"/>
+                        <do_if value="$failedShipSet == null">
+                          <set_value name="$failedShipSet" exact="table[]"/>
                         </do_if>
-                        <set_value name="$already" exact="false"/>
-                        <do_all exact="$failedShips.count" counter="$f">
-                          <do_if value="$failedShips.{$f} == $ship">
-                            <set_value name="$already" exact="true"/>
-                            <break/>
+                        <do_if value="not $failedShipSet.{$ship}?">
+                          <set_value name="$failedShipSet.{$ship}" exact="true"/>
+                          <set_value name="$entry.$FailedShipSet" exact="$failedShipSet"/>
+                          <!-- Maintain legacy list for AI script compatibility -->
+                          <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                          <do_if value="$failedShips == null">
+                            <set_value name="$failedShips" exact="[]"/>
                           </do_if>
-                        </do_all>
-                        <do_if value="not $already">
                           <append_to_list name="$failedShips" exact="$ship"/>
                           <set_value name="$entry.$FailedShips" exact="$failedShips"/>
                           <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
@@ -432,10 +432,6 @@
                 <debug_text text="'[GT-Execution]   ILLEGAL WARE BLOCKED: ' + $ship.knownname + ' attempted to trade ' + @$ware.name + ' (ware type is illegal, AllowIllegal: ' + @$params.$AllowIllegal + ')'" chance="100"/>
               </do_if>
               <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
-              <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-                <param name="ship" value="$ship"/>
-              </run_actions>
-              <set_value name="$homeSectorObj" exact="$homeSector"/>
               <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
                 <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
                 <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
@@ -445,18 +441,19 @@
                     <do_if value="$failCount == null">
                       <set_value name="$failCount" exact="0"/>
                     </do_if>
-                    <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
-                    <do_if value="$failedShips == null">
-                      <set_value name="$failedShips" exact="[]"/>
+                    <!-- E7 optimization: O(1) table lookup instead of O(n) linear scan -->
+                    <set_value name="$failedShipSet" exact="@$entry.$FailedShipSet"/>
+                    <do_if value="$failedShipSet == null">
+                      <set_value name="$failedShipSet" exact="table[]"/>
                     </do_if>
-                    <set_value name="$already" exact="false"/>
-                    <do_all exact="$failedShips.count" counter="$f">
-                      <do_if value="$failedShips.{$f} == $ship">
-                        <set_value name="$already" exact="true"/>
-                        <break/>
+                    <do_if value="not $failedShipSet.{$ship}?">
+                      <set_value name="$failedShipSet.{$ship}" exact="true"/>
+                      <set_value name="$entry.$FailedShipSet" exact="$failedShipSet"/>
+                      <!-- Maintain legacy list for AI script compatibility -->
+                      <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                      <do_if value="$failedShips == null">
+                        <set_value name="$failedShips" exact="[]"/>
                       </do_if>
-                    </do_all>
-                    <do_if value="not $already">
                       <append_to_list name="$failedShips" exact="$ship"/>
                       <set_value name="$entry.$FailedShips" exact="$failedShips"/>
                       <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
@@ -708,10 +705,6 @@
                 chance="100"/>
             </do_if>
             <!-- Ship-specific failure: mark cache entry as failed for this ship (prevents ping-pong). -->
-            <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-              <param name="ship" value="$ship"/>
-            </run_actions>
-            <set_value name="$homeSectorObj" exact="$homeSector"/>
             <do_if value="$homeSectorObj? and $homeSectorObj.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSectorObj}? and $buyOffer != null and $sellOffer != null">
               <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$homeSectorObj}"/>
               <do_all exact="$sectorCache.count" counter="$fi" reverse="true">
@@ -721,18 +714,19 @@
                   <do_if value="$failCount == null">
                     <set_value name="$failCount" exact="0"/>
                   </do_if>
-                  <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
-                  <do_if value="$failedShips == null">
-                    <set_value name="$failedShips" exact="[]"/>
+                  <!-- E7 optimization: O(1) table lookup instead of O(n) linear scan -->
+                  <set_value name="$failedShipSet" exact="@$entry.$FailedShipSet"/>
+                  <do_if value="$failedShipSet == null">
+                    <set_value name="$failedShipSet" exact="table[]"/>
                   </do_if>
-                  <set_value name="$already" exact="false"/>
-                  <do_all exact="$failedShips.count" counter="$f">
-                    <do_if value="$failedShips.{$f} == $ship">
-                      <set_value name="$already" exact="true"/>
-                      <break/>
+                  <do_if value="not $failedShipSet.{$ship}?">
+                    <set_value name="$failedShipSet.{$ship}" exact="true"/>
+                    <set_value name="$entry.$FailedShipSet" exact="$failedShipSet"/>
+                    <!-- Maintain legacy list for AI script compatibility -->
+                    <set_value name="$failedShips" exact="@$entry.$FailedShips"/>
+                    <do_if value="$failedShips == null">
+                      <set_value name="$failedShips" exact="[]"/>
                     </do_if>
-                  </do_all>
-                  <do_if value="not $already">
                     <append_to_list name="$failedShips" exact="$ship"/>
                     <set_value name="$entry.$FailedShips" exact="$failedShips"/>
                     <set_value name="$entry.$FailCount" exact="$failCount + 1"/>
@@ -994,8 +988,10 @@
             <!-- Signal via delayed cue ensures wait block is definitely active -->
             <signal_cue_instantly cue="md.GT_Trading_Execution.SignalTradeFound" param="table[$Ship = $ship]"/>
           </do_if>
+        </do_if> <!-- close post-fallback $abort gate -->
         <!-- Close $tradeValid block -->
       </do_if>
+      </do_if> <!-- close outer $abort gate -->
       </actions>
     </cue>
     
@@ -1076,30 +1072,40 @@
         <event_cue_signalled/>
       </conditions>
       <actions>
-        <do_if value="not global.$GT_TS_OutputQueue? or not global.$GT_TS_OutputQueue.$TradeFoundQueue?">
-          <cancel_cue cue="this"/>
-        </do_if>
-        <!-- SAFEGUARD: Reset processing flag if stuck (prevents infinite stall after crash/reload) -->
-        <!-- Check if processing flag is stuck (set but queue is empty or no active processing) -->
-        <do_if value="global.$GT_TS_OutputQueue.$TradeFoundProcessing and global.$GT_TS_OutputQueue.$TradeFoundQueue.count le 0">
-          <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
-        </do_if>
-        <do_if value="global.$GT_TS_OutputQueue.$TradeFoundProcessing">
-          <cancel_cue cue="this"/>
-        </do_if>
-        <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="true"/>
-
-        <do_if value="global.$GT_TS_OutputQueue.$TradeFoundQueue.count le 0">
-          <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <set_value name="$entry" exact="global.$GT_TS_OutputQueue.$TradeFoundQueue.{1}"/>
-        <set_value name="$ship" exact="@$entry.$Ship"/>
-        <set_value name="$readyAt" exact="@$entry.$ReadyAt"/>
+        <!-- P6 fix: Restructured to avoid cancel_cue fallthrough.
+             Uses nested positive-flow checks; single cancel_cue at the very end (fallthrough-safe). -->
+        <set_value name="$proceed" exact="false"/>
         <set_value name="this.$DelayTime" exact="0ms"/>
-        <do_if value="$readyAt? and $readyAt != null and player.age lt $readyAt">
-          <set_value name="this.$DelayTime" exact="$readyAt - player.age"/>
+        
+        <do_if value="global.$GT_TS_OutputQueue? and global.$GT_TS_OutputQueue.$TradeFoundQueue?">
+          <!-- SAFEGUARD: Reset processing flag if stuck (prevents infinite stall after crash/reload) -->
+          <do_if value="global.$GT_TS_OutputQueue.$TradeFoundProcessing and global.$GT_TS_OutputQueue.$TradeFoundQueue.count le 0">
+            <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
+          </do_if>
+          
+          <do_if value="not global.$GT_TS_OutputQueue.$TradeFoundProcessing">
+            <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="true"/>
+            
+            <do_if value="global.$GT_TS_OutputQueue.$TradeFoundQueue.count gt 0">
+              <set_value name="$entry" exact="global.$GT_TS_OutputQueue.$TradeFoundQueue.{1}"/>
+              <set_value name="$ship" exact="@$entry.$Ship"/>
+              <set_value name="$readyAt" exact="@$entry.$ReadyAt"/>
+              <do_if value="$readyAt? and $readyAt != null and player.age lt $readyAt">
+                <set_value name="this.$DelayTime" exact="$readyAt - player.age"/>
+              </do_if>
+              <set_value name="$proceed" exact="true"/>
+            </do_if>
+            
+            <do_if value="not $proceed">
+              <!-- Queue was empty after acquiring lock — release it -->
+              <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Single cancel_cue as LAST statement — fallthrough is harmless (nothing after it) -->
+        <do_if value="not $proceed">
+          <cancel_cue cue="this"/>
         </do_if>
       </actions>
       <delay exact="this.$DelayTime"/>

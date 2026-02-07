@@ -97,9 +97,6 @@ function gtMenu.sortPilots(pilots)
     local sortColumn = gtMenu.currentSort.column
     local descending = gtMenu.currentSort.descending
     
-    DebugError(string.format("[GT Menu] Sorting %d pilots by '%s' (descending=%s)", 
-        #pilots, sortColumn, tostring(descending)))
-    
     -- Use pcall to protect against sort failures
     local success, err = pcall(function()
         table.sort(pilots, function(a, b)
@@ -184,14 +181,6 @@ function gtMenu.sortPilots(pilots)
     
     if not success then
         DebugError("[GT Menu] Sort failed: " .. tostring(err))
-    else
-        -- Debug: Show first 5 pilots after sorting
-        local debugStr = "[GT Menu] After sort, first 5 pilots: "
-        for i = 1, math.min(5, #pilots) do
-            if i > 1 then debugStr = debugStr .. ", " end
-            debugStr = debugStr .. tostring(pilots[i].pilotName or "???")
-        end
-        DebugError(debugStr)
     end
 end
 

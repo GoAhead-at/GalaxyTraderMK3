@@ -155,8 +155,7 @@ function L.OnUpdate()
     local idcode_ptr = C.GetObjectIDCode(ship)
     local shipIDCode = (idcode_ptr ~= nil) and ffi.string(idcode_ptr) or "UNKNOWN"
     
-    if not (C.IsComponentClass(ship, "ship_s") or C.IsComponentClass(ship, "ship_m") or 
-            C.IsComponentClass(ship, "ship_l") or C.IsComponentClass(ship, "ship_xl")) then
+    if not C.IsComponentClass(ship, "ship") then
         return
     end
     
@@ -276,11 +275,6 @@ function L.OnUpdate()
     end
     
     if not L.cleanupTriggered[ship] and not shouldKeepShip then
-        -- Debug logging for YOY-274
-        if shipIDCode == "YOY-274" then
-            DebugError("[GT-OrderMonitor] DEBUG YOY-274 CLEANUP: currentOrderID=" .. currentOrderID .. ", hasGTOrder=" .. tostring(hasGTOrder) .. ", commanderHasGTOrder=" .. tostring(commanderHasGTOrder) .. ", currentPilotID=" .. currentPilotID .. ", shouldKeepShip=" .. tostring(shouldKeepShip))
-        end
-        
         L.cleanupTriggered[ship] = true
         if hasGTOrder and currentPilotID == "NONE" then
             AddUITriggeredEvent("GT_OrderMonitor", "MissingPilot", {
