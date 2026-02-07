@@ -1587,6 +1587,33 @@
           </do_if>
           <set_value name="$woke" exact="0"/>
 
+          <!-- PERFORMANCE FIX: Check player money ONCE before waking waiters.
+               When player is broke, re-enqueueing triggers expensive O(n) cache scans per ship that ALL
+               return 0 trades. Instead, apply ZeroTradeCooldown and signal GT_No_Trade_Found directly.
+               This prevents the cache-scan storm that causes game stutter with large fleets. -->
+          <set_value name="$playerMoneyForWake" exact="player.money"/>
+          <!-- Use the configurable MinPlayerMoney threshold (default: 1000 Cr) -->
+          <set_value name="$wakeMinPlayerMoney" exact="1000"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+            <set_value name="$tmpWakeMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+            <do_if value="$tmpWakeMin? and $tmpWakeMin != null and $tmpWakeMin gt 0">
+              <set_value name="$wakeMinPlayerMoney" exact="$tmpWakeMin"/>
+            </do_if>
+          </do_if>
+          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix -->
+          <set_value name="$playerIsBroke" exact="$playerMoneyForWake lt ($wakeMinPlayerMoney)Cr"/>
+
+          <!-- Get ZeroTradeCooldown base duration (used when player is broke) -->
+          <set_value name="$wakeZeroTradeCooldownBase" exact="30s"/>
+          <do_if value="$playerIsBroke and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown?">
+            <set_value name="$wakeZeroTradeCooldownBase" exact="global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown"/>
+          </do_if>
+          <!-- JITTER: Compute min/max range for per-ship cooldown (±33% of base).
+               Each ship gets a different cooldown duration, so they don't all retry at the same time.
+               This is the MD-side complement to the AI-side jitter (20s-40s wait). -->
+          <set_value name="$wakeJitterMin" exact="$wakeZeroTradeCooldownBase * 0.67"/>
+          <set_value name="$wakeJitterMax" exact="$wakeZeroTradeCooldownBase * 1.33"/>
+
           <do_while value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0 and $woke lt $maxWake">
             <set_value name="$entry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.{1}"/>
             <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="$entry"/>
@@ -1600,25 +1627,59 @@
             </do_if>
 
             <do_if value="$ship? and $ship.exists and $params?">
-              <!-- Log which ship is being woken -->
-              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                <param name="traceId" value="$traceId"/>
-                <param name="stage" value="'HomeRefreshFinished'"/>
-                <param name="action" value="'WakingShip'"/>
-                <param name="details" value="'ship=' + $ship.idcode + ' homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null') + ' waitersRemaining=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0)"/>
-                <param name="logLevel" value="1"/>
-              </run_actions>
-              <!-- Hub status: woke after home refresh, re-queueing -->
-              <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-                <param name="ship" value="$ship"/>
-                <param name="stage" value="'home_search'"/>
-                <param name="state" value="'woken'"/>
-                <param name="reason" value="'home_refresh_finished'"/>
-                <param name="traceId" value="$traceId"/>
-                <param name="homeSector" value="$homeSector"/>
-              </run_actions>
-              <!-- Resume search by re-enqueueing SearchTradeRoutes through the central scheduler (silent to player) -->
-              <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
+              <!-- PERFORMANCE FIX: When player is broke, don't re-enqueue (avoids expensive cache scan).
+                   Apply ZeroTradeCooldown and signal GT_No_Trade_Found to let AI script handle the backoff. -->
+              <do_if value="$playerIsBroke">
+                <!-- Apply ZeroTradeCooldown to this ship with per-ship jitter -->
+                <do_if value="not global.$GT_CacheMissCooldowns?">
+                  <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
+                </do_if>
+                <!-- JITTER: Each ship gets a different cooldown (±33% of base) to stagger retries -->
+                <set_value name="$shipCooldown" exact="[$wakeJitterMin, $wakeJitterMax].randominrange"/>
+                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
+                  $LastLiveSearch = player.age,
+                  $CooldownDuration = $shipCooldown
+                ]"/>
+
+                <!-- Log that we're applying cooldown instead of re-enqueueing -->
+                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                  <param name="traceId" value="$traceId"/>
+                  <param name="stage" value="'HomeRefreshFinished'"/>
+                  <param name="action" value="'BrokeCooldown'"/>
+                  <param name="details" value="'ship=' + $ship.idcode + ' playerMoney=' + $playerMoneyForWake + ' cooldown=' + ($shipCooldown / 1) + 's homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null')"/>
+                  <param name="logLevel" value="1"/>
+                </run_actions>
+
+                <!-- Release any search lock this ship holds -->
+                <do_if value="global.$GT_TS? and global.$GT_TS.$Requests? and global.$GT_TS.$Requests.{$ship}?">
+                  <remove_value name="global.$GT_TS.$Requests.{$ship}"/>
+                </do_if>
+
+                <!-- Signal AI script: no trade found (triggers escalating wait on AI side) -->
+                <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'insufficient_funds'"/>
+              </do_if>
+              <do_else>
+                <!-- Player has money - normal wake: re-enqueue for cache search -->
+                <!-- Log which ship is being woken -->
+                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
+                  <param name="traceId" value="$traceId"/>
+                  <param name="stage" value="'HomeRefreshFinished'"/>
+                  <param name="action" value="'WakingShip'"/>
+                  <param name="details" value="'ship=' + $ship.idcode + ' homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null') + ' waitersRemaining=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0)"/>
+                  <param name="logLevel" value="1"/>
+                </run_actions>
+                <!-- Hub status: woke after home refresh, re-queueing -->
+                <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+                  <param name="ship" value="$ship"/>
+                  <param name="stage" value="'home_search'"/>
+                  <param name="state" value="'woken'"/>
+                  <param name="reason" value="'home_refresh_finished'"/>
+                  <param name="traceId" value="$traceId"/>
+                  <param name="homeSector" value="$homeSector"/>
+                </run_actions>
+                <!-- Resume search by re-enqueueing SearchTradeRoutes through the central scheduler (silent to player) -->
+                <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
+              </do_else>
             </do_if>
             <do_else>
               <!-- Log if ship/params are invalid -->

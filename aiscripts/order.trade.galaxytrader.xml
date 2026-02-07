@@ -2630,6 +2630,26 @@
             </do_if>
           </do_if>
           
+          <!-- ==================================================================================== -->
+          <!-- PERFORMANCE: Early money gate - skip entire trade search pipeline if player is broke -->
+          <!-- This prevents the expensive pre-filter loop (1810+ cache entries) and work loop from running -->
+          <!-- when there is no money to buy anything. Ships go directly to insufficient_funds cooldown. -->
+          <!-- ==================================================================================== -->
+          <set_value name="$earlyMoneyCheck" exact="player.money"/>
+          <set_value name="$minPlayerMoney" exact="1000"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+            <set_value name="$tmpMinMoney" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+            <do_if value="$tmpMinMoney? and $tmpMinMoney != null and $tmpMinMoney gt 0">
+              <set_value name="$minPlayerMoney" exact="$tmpMinMoney"/>
+            </do_if>
+          </do_if>
+          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix -->
+          <do_if value="$earlyMoneyCheck lt ($minPlayerMoney)Cr">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr below threshold=' + $minPlayerMoney + ' Cr - skipping trade search'" chance="100"/>
+            <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+            <resume label="no_trade_retry"/>
+          </do_if>
+          
           <!-- CRITICAL: Always wait briefly for any pending GT_Trade_Found signals before sending new request -->
           <!-- Wait (configured delay + 5ms buffer) to catch delayed signals and prevent race conditions -->
           <!-- Even with 0ms delay, MD system needs processing time to queue and send signals -->
@@ -5122,15 +5142,20 @@
            Smooth gameplay > throughput: wait longer here to reduce request churn and let the scheduler/queues drain.
            TODO: keep hardcoded for now; consider exposing as tuning later. -->
       <set_value name="$noTradeReason" exact="if this.$lastNoTradeReason? then this.$lastNoTradeReason else ''"/>
-      <do_if value="$noTradeReason == 'busy' or $noTradeReason == 'busy_batch' or $noTradeReason == 'home_refresh'">
+      <do_if value="$noTradeReason == 'busy' or $noTradeReason == 'busy_batch' or $noTradeReason == 'home_refresh' or $noTradeReason == 'insufficient_funds'">
         <set_value name="this.$lastNoTradeReason" exact="''"/>
-        <!-- TODO: keep hardcoded for now. Balance between throughput and request churn. -->
-        <!-- Fixed retry for all busy-style reasons (do NOT use escalating cooldown). -->
+        <!-- Fixed retry for special reasons (do NOT use escalating cooldown). -->
         <!-- For home_refresh: shorter wait (3s) to allow cache retry while home refresh populates cache -->
-        <!-- For busy/busy_batch: longer wait (10s) to let queues drain -->
-        <set_value name="this.$retryCooldown" exact="if $noTradeReason == 'home_refresh' then 3s else 10s"/>
+        <!-- For busy/busy_batch: longer wait (8-12s) to let queues drain -->
+        <!-- For insufficient_funds: longer wait (20-40s) - player is broke, no point retrying quickly.
+             Jitter prevents thundering herd: 250 ships spread across 20s window instead of all waking simultaneously. -->
+        <set_value name="this.$retryCooldown" exact="if $noTradeReason == 'home_refresh' then 3s else (if $noTradeReason == 'insufficient_funds' then 30s else 10s)"/>
+        <!-- JITTER: Compute per-ship min/max wait for <wait> element.
+             insufficient_funds: 20s-40s (±33%), busy: 8s-12s (±20%), home_refresh: 3s (no jitter, needs responsiveness) -->
+        <set_value name="this.$retryWaitMin" exact="if $noTradeReason == 'insufficient_funds' then 20s else (if $noTradeReason == 'home_refresh' then 3s else 8s)"/>
+        <set_value name="this.$retryWaitMax" exact="if $noTradeReason == 'insufficient_funds' then 40s else (if $noTradeReason == 'home_refresh' then 3s else 12s)"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh - waiting ' + (this.$retryCooldown/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh/insufficient funds - waiting ' + (this.$retryWaitMin/1s) + '-' + (this.$retryWaitMax/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
         </do_if>
         
         <!-- Record attempt summary (bounded history) -->
@@ -5154,10 +5179,40 @@
           <remove_from_list name="global.$GT_NoTradeHistory.{this.ship}" exact="$old"/>
         </do_if>
         
+        <!-- Logbook entry for insufficient funds (throttled: once per 5 minutes per ship) -->
+        <do_if value="$noTradeReason == 'insufficient_funds' and $gt_logbookentries">
+          <set_value name="$lastInsufficientFundsLogbook" exact="0"/>
+          <do_if value="this.$lastInsufficientFundsLogbookTime?">
+            <set_value name="$lastInsufficientFundsLogbook" exact="this.$lastInsufficientFundsLogbookTime"/>
+          </do_if>
+          <set_value name="$timeSinceLastInsufficientFundsLogbook" exact="player.age - $lastInsufficientFundsLogbook"/>
+          <do_if value="$timeSinceLastInsufficientFundsLogbook ge 300s or $lastInsufficientFundsLogbook == 0">
+            <set_value name="$playerMoneyDisplay" exact="player.money / 100"/>
+            <set_value name="$thresholdDisplay" exact="1000"/>
+            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+              <set_value name="$tmpThreshold" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+              <do_if value="$tmpThreshold? and $tmpThreshold != null and $tmpThreshold gt 0">
+                <set_value name="$thresholdDisplay" exact="$tmpThreshold"/>
+              </do_if>
+            </do_if>
+            <set_value name="$logbookMessage" exact="'Commander,\n\nTrading operations paused — insufficient funds.\n\nPlayer account: ' + $playerMoneyDisplay + ' Cr\nMinimum required: ' + $thresholdDisplay + ' Cr\n\nI will resume trading automatically once funds are above the threshold.\n\nYou can adjust the minimum in:\nGalaxyTrader Settings &gt; Fleet &gt; Min Player Money\n\nStanding by,\nAboard ' + this.ship.knownname"/>
+            <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+              $Message = $logbookMessage,
+              $Category = 'alerts',
+              $Title = 'Insufficient Funds: ' + this.ship.knownname,
+              $Object = this.ship,
+              $Interaction = 'showonmap',
+              $CheckGlobalSettings = false
+            ]"/>
+            <set_value name="this.$lastInsufficientFundsLogbookTime" exact="player.age"/>
+          </do_if>
+        </do_if>
+
         <set_command command="command.wait"/>
         <set_command_action commandaction="commandaction.standingby"/>
-        <!-- CRITICAL: Use min=max to ensure fixed wait time (wait without min is RANDOM 0..max in X4) -->
-        <wait min="if @this.$retryCooldown != null then @this.$retryCooldown else 10s" max="if @this.$retryCooldown != null then @this.$retryCooldown else 10s"/>
+        <!-- JITTER: Use per-ship min/max to spread retries across a time window (prevents thundering herd).
+             For insufficient_funds: 20s-40s window. For busy: 8s-12s. For home_refresh: fixed 3s. -->
+        <wait min="if @this.$retryWaitMin != null then @this.$retryWaitMin else 10s" max="if @this.$retryWaitMax != null then @this.$retryWaitMax else 10s"/>
         <resume label="main_loop"/>
       </do_if>
       
@@ -5178,12 +5233,17 @@
         <set_value name="this.$searchFailed" exact="this.$searchFailed + 1"/>
       </do_else>
       
-      <!-- Calculate escalating wait time: 10s, 20s, 30s, 40s, 50s, 60s (max) -->
+      <!-- Calculate escalating wait time: ~10s, ~20s, ~30s, ~40s, ~50s, ~60s (max) -->
       <!-- Use cargo disposal counter if this is cargo disposal, otherwise use normal counter -->
       <set_value name="$failureCount" exact="if $isCargoDisposal then this.$cargoDisposalFailed else this.$searchFailed"/>
       <!-- Escalating cooldown (cap 60s). This is also required for "no trade found" logbook notifications (they trigger at 60s). -->
       <!-- Purpose B: No-trade retry cooldown (seconds) -->
       <set_value name="this.$retryCooldown" exact="([$failureCount, 6].min) * 10s"/>
+      <!-- JITTER: ±20% around the base cooldown to prevent ships at the same escalation level
+           from all retrying in the same frame (thundering herd prevention).
+           Example: failureCount=3 → base=30s → min=24s, max=36s -->
+      <set_value name="this.$retryCooldownMin" exact="[this.$retryCooldown * 0.8, 5s].max"/>
+      <set_value name="this.$retryCooldownMax" exact="this.$retryCooldown * 1.2"/>
       
       <!-- Record attempt summary (bounded history).
            We capture the most recent MD rejection statistics (if available) so the 60s logbook report can show a timeline. -->
@@ -5248,9 +5308,10 @@
       <set_value name="this.$waitInterrupted" exact="$waitInterrupted"/>
       <set_value name="this.$tradeFoundDuringWait" exact="$tradeFoundDuringWait"/>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait for ' + (this.$retryCooldown/1s) + 's at game time ' + player.age" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait for ' + (this.$retryCooldownMin/1s) + '-' + (this.$retryCooldownMax/1s) + 's at game time ' + player.age" chance="100"/>
       </do_if>
-      <wait max="if @this.$retryCooldown != null then @this.$retryCooldown else 10s" comment="Use max to allow interrupt">
+      <!-- JITTER: Use min/max range (±20%) to spread ships across a time window instead of all waking together -->
+      <wait min="if @this.$retryCooldownMin != null then @this.$retryCooldownMin else 8s" max="if @this.$retryCooldownMax != null then @this.$retryCooldownMax else 12s" comment="Jittered escalating wait with interrupt">
         <interrupt>
           <conditions>
             <!-- Only GT_Trade_Found should interrupt retry wait -->
@@ -5801,6 +5862,23 @@
       </do_if>
       
       <!-- ==================================================================================== -->
+      <!-- PERFORMANCE: Secondary money gate before expensive pre-filter loop -->
+      <!-- If player money is below threshold, skip the entire cache iteration (safety net) -->
+      <!-- ==================================================================================== -->
+      <set_value name="$moneyBeforePrefilter" exact="player.money"/>
+      <set_value name="$minMoneyPrefilter" exact="1000"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+        <set_value name="$tmpMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+        <do_if value="$tmpMin? and $tmpMin != null and $tmpMin gt 0">
+          <set_value name="$minMoneyPrefilter" exact="$tmpMin"/>
+        </do_if>
+      </do_if>
+      <do_if value="$moneyBeforePrefilter lt $minMoneyPrefilter and $rawCacheList.count gt 0">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': CACHE PRE-FILTER SKIP: player money=' + $moneyBeforePrefilter + ' below threshold=' + $minMoneyPrefilter + ' - skipping ' + $rawCacheList.count + ' cache entries'" chance="100"/>
+        <set_value name="$rawCacheList" exact="[]"/>
+      </do_if>
+      
+      <!-- ==================================================================================== -->
       <!-- CRITICAL: Pre-filter cache entries by ALL cheap restrictions BEFORE processing -->
       <!-- This prevents validating entries that will never pass these checks -->
       <!-- ==================================================================================== -->
@@ -5836,8 +5914,9 @@
                   </do_if>
                 </do_if>
                 <do_else>
-                  <!-- Entry passed distance filter - log all passes to see what's getting through -->
-                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <!-- Entry passed distance filter - throttle logging to first 5 entries to prevent log spam -->
+                  <!-- (1810+ PASSED lines per ship provided no diagnostic value; REJECTED logs are more useful) -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $rawIdx le 5">
                     <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter PASSED (distance): entryMaxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', homeToBuy=' + $entryHomeToBuy + ', homeToSell=' + $entryHomeToSell + ', rawIdx=' + $rawIdx" chance="100"/>
                   </do_if>
                 </do_else>
