@@ -1511,26 +1511,20 @@
     </library>
     
     <!-- Check Failed Sector Pair -->
+    <!-- OPTIMIZATION: O(1) hash-based lookup using nested table (was O(N) linear scan) -->
+    <!-- failedTrades format: table[ {buySector} = table[ {sellSector} = table[$Reason, $Timestamp] ] ] -->
     <library name="GT_CheckFailedSectorPair" purpose="run_actions">
       <params>
         <param name="buySector" comment="Buy station sector"/>
         <param name="sellSector" comment="Sell station sector"/>
-        <param name="failedTrades" comment="List of failed trades to check against"/>
+        <param name="failedTrades" comment="Nested table of failed trades: failedTrades.{buySector}.{sellSector}"/>
       </params>
       <actions>
-        <set_value name="$isFailed" exact="false"/>
-        <do_if value="$failedTrades.count gt 0">
-          <do_all exact="$failedTrades.count" counter="$failIdx">
-            <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-            <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-              <do_if value="$buySector == $failedTrade.$BuySector and $sellSector == $failedTrade.$SellSector">
-                <set_value name="$isFailed" exact="true"/>
-                <break/>
-              </do_if>
-            </do_if>
-          </do_all>
+        <!-- O(1) hash-based lookup: check if buySector key exists, then sellSector sub-key -->
+        <do_if value="$failedTrades? and $failedTrades.{$buySector}? and $failedTrades.{$buySector}.{$sellSector}?">
+          <return value="true"/>
         </do_if>
-        <return value="$isFailed"/>
+        <return value="false"/>
       </actions>
     </library>
     
@@ -2191,37 +2185,52 @@
         <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
         <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
         <!-- Ships in different sectors may still try (different path might exist) -->
+        <!-- Format: nested table failedTrades.{buySector}.{sellSector} for O(1) lookup -->
         <set_value name="$currentSector" exact="$ship.sector"/>
-        <set_value name="$failedTrades" exact="[]"/>
+        <set_value name="$failedTrades" exact="table[]"/>
         <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
           <set_value name="$failedTradesRaw" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
-          <set_value name="$failedTradesExpired" exact="[]"/>
+          <set_value name="$expiredCount" exact="0"/>
+          <set_value name="$keptCount" exact="0"/>
           <set_value name="$expirationTime" exact="1800s"/> <!-- 30 minutes -->
           
-          <!-- Filter out expired entries -->
-          <do_all exact="$failedTradesRaw.count" counter="$f">
-            <set_value name="$failedTrade" exact="$failedTradesRaw.{$f}"/>
-            <set_value name="$tradeAge" exact="player.age - $failedTrade.$Timestamp"/>
-            <do_if value="$tradeAge le $expirationTime">
-              <!-- Entry still valid - keep it -->
-              <append_to_list name="$failedTrades" exact="$failedTrade"/>
+          <!-- Filter expired entries from nested table: {buySector} -> {sellSector} -> record -->
+          <set_value name="$buyKeys" exact="$failedTradesRaw.keys"/>
+          <do_all exact="$buyKeys.count" counter="$bki">
+            <set_value name="$buyKey" exact="$buyKeys.{$bki}"/>
+            <do_if value="$failedTradesRaw.{$buyKey}?">
+              <set_value name="$innerTable" exact="$failedTradesRaw.{$buyKey}"/>
+              <set_value name="$sellKeys" exact="$innerTable.keys"/>
+              <do_all exact="$sellKeys.count" counter="$ski">
+                <set_value name="$sellKey" exact="$sellKeys.{$ski}"/>
+                <set_value name="$record" exact="@$innerTable.{$sellKey}"/>
+                <do_if value="$record? and $record.$Timestamp?">
+                  <set_value name="$tradeAge" exact="player.age - $record.$Timestamp"/>
+                  <do_if value="$tradeAge le $expirationTime">
+                    <do_if value="not $failedTrades.{$buyKey}?">
+                      <set_value name="$failedTrades.{$buyKey}" exact="table[]"/>
+                    </do_if>
+                    <set_value name="$failedTrades.{$buyKey}.{$sellKey}" exact="$record"/>
+                    <set_value name="$keptCount" exact="$keptCount + 1"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$expiredCount" exact="$expiredCount + 1"/>
+                  </do_else>
+                </do_if>
+              </do_all>
             </do_if>
-            <do_else>
-              <!-- Entry expired - mark for removal -->
-              <append_to_list name="$failedTradesExpired" exact="$f"/>
-            </do_else>
           </do_all>
           
-          <!-- Update global storage with cleaned list -->
-          <do_if value="$failedTradesExpired.count gt 0">
+          <!-- Update global storage with cleaned table -->
+          <do_if value="$expiredCount gt 0 and $keptCount gt 0">
             <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="$failedTrades"/>
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$sectorName" exact="@$currentSector.knownname"/>
-              <debug_text text="'[GT-Cache] Cleaned ' + $failedTradesExpired.count + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (older than 30 minutes)'" chance="100"/>
+              <debug_text text="'[GT-Cache] Cleaned ' + $expiredCount + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (kept ' + $keptCount + ')'" chance="100"/>
             </do_if>
           </do_if>
-          <do_elseif value="$failedTrades.count == 0">
-            <!-- All entries expired - clear the list entirely -->
+          <do_elseif value="$keptCount == 0">
+            <!-- All entries expired - clear the table entirely -->
             <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
           </do_elseif>
         </do_if>
@@ -2305,20 +2314,12 @@
           <!-- This prevents revalidating entries that will fail due to blacklisted routes -->
           <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
           <!-- One failure in a sector pair blocks ALL station combinations in that route for ships in this sector -->
+          <!-- O(1) hash-based lookup using nested table format -->
           <set_value name="$skipFailedSectorPair" exact="false"/>
-          <do_if value="$failedTrades.count gt 0">
-            <set_value name="$entryBuySector" exact="$entry.$BuyOffer.owner.sector"/>
-            <set_value name="$entrySellSector" exact="$entry.$SellOffer.owner.sector"/>
-            <do_all exact="$failedTrades.count" counter="$failIdx">
-              <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-              <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
-              <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-                <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
-                  <set_value name="$skipFailedSectorPair" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_if>
-            </do_all>
+          <set_value name="$entryBuySector" exact="$entry.$BuyOffer.owner.sector"/>
+          <set_value name="$entrySellSector" exact="$entry.$SellOffer.owner.sector"/>
+          <do_if value="$failedTrades? and $failedTrades.{$entryBuySector}? and $failedTrades.{$entryBuySector}.{$entrySellSector}?">
+            <set_value name="$skipFailedSectorPair" exact="true"/>
           </do_if>
           <do_if value="$skipFailedSectorPair">
             <!-- Debug logging: cache entry skipped due to failed sector pair -->
@@ -2545,7 +2546,63 @@
 
           <!-- Build canonical trade object for execution -->
           <!-- Use ship-specific calculated values (not ship-biased cached values) -->
-          <!-- Score uses cached efficiency (profit/distance ratio) - ship-agnostic but correct for sorting -->
+          <!-- LAZY SCORING: Recalculate efficiency with ship-specific position and parameters -->
+          <!-- This ensures scoring accounts for actual ship-to-buy distance, not just route distance -->
+          
+          <!-- Calculate ship-to-buy distance using global sector distance cache -->
+          <set_value name="$shipCurrentSector" exact="$ship.sector"/>
+          <set_value name="$entryBuyStation" exact="@$entry.$BuyOffer.owner"/>
+          <set_value name="$entryBuySector" exact="@$entryBuyStation.sector"/>
+          <set_value name="$entrySellStation" exact="@$entry.$SellOffer.owner"/>
+          <set_value name="$entrySellSector" exact="@$entrySellStation.sector"/>
+          <set_value name="$shipToBuyDist" exact="0"/>
+          <do_if value="$shipCurrentSector? and $entryBuySector? and $shipCurrentSector != $entryBuySector">
+            <!-- Use global sector distance cache for O(1) lookup -->
+            <do_if value="global.$GT_SectorDistanceCache? and global.$GT_SectorDistanceCache.{$shipCurrentSector}? and global.$GT_SectorDistanceCache.{$shipCurrentSector}.{$entryBuySector}?">
+              <set_value name="$shipToBuyDist" exact="global.$GT_SectorDistanceCache.{$shipCurrentSector}.{$entryBuySector}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$shipToBuyDist" exact="$shipCurrentSector.gatedistance.{$entryBuySector}"/>
+              <!-- Store in global cache -->
+              <do_if value="not global.$GT_SectorDistanceCache?">
+                <set_value name="global.$GT_SectorDistanceCache" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_SectorDistanceCache.{$shipCurrentSector}?">
+                <set_value name="global.$GT_SectorDistanceCache.{$shipCurrentSector}" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_SectorDistanceCache.{$shipCurrentSector}.{$entryBuySector}" exact="$shipToBuyDist"/>
+            </do_else>
+          </do_if>
+          
+          <!-- Get buy-to-sell distance from cache entry or global cache -->
+          <set_value name="$buyToSellDist" exact="@$entry.$Distance"/>
+          <do_if value="not $buyToSellDist? or $buyToSellDist lt 0">
+            <set_value name="$buyToSellDist" exact="0"/>
+          </do_if>
+          
+          <!-- Get distance penalty multiplier for this ship -->
+          <run_actions ref="md.GT_Libraries_General.GT_GetDistancePenaltyMultiplier" result="$shipDistPenalty">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <!-- Calculate ship-specific efficiency score using full multi-factor formula -->
+          <run_actions ref="md.GT_Libraries_General.GT_CalculateTradeEfficiency" result="$shipScore">
+            <param name="profit" value="$shipMaxProfit"/>
+            <param name="distance" value="$shipToBuyDist + $buyToSellDist"/>
+            <param name="distancePenaltyMultiplier" value="$shipDistPenalty"/>
+            <param name="factionPriority" value="2"/>
+            <param name="buyStationOwner" value="@$entryBuyStation.owner"/>
+            <param name="sellStationOwner" value="@$entrySellStation.owner"/>
+            <param name="homeSector" value="$homeSector"/>
+            <param name="shipSector" value="$shipCurrentSector"/>
+            <param name="buySector" value="$entryBuySector"/>
+            <param name="sellSector" value="$entrySellSector"/>
+            <param name="shipToBuyDistance" value="$shipToBuyDist"/>
+            <param name="buyToSellDistance" value="$buyToSellDist"/>
+            <param name="homeToBuyDistance" value="$homeToBuy"/>
+            <param name="homeToSellDistance" value="$homeToSell"/>
+          </run_actions>
+          
           <set_value name="$trade" exact="table[
             $BuyOffer = $entry.$BuyOffer,
             $SellOffer = $entry.$SellOffer,
@@ -2555,7 +2612,7 @@
             $Profit = $shipMaxProfit,
             $ROI = $shipROI,
             $Distance = $entry.$Distance,
-            $Score = if $entry.$Score? then $entry.$Score else $shipMaxProfit
+            $Score = $shipScore
           ]"/>
 
           <!-- Collect candidate(s) with the LOWEST failcount only (tie-breaker keeps score order from cache). -->
