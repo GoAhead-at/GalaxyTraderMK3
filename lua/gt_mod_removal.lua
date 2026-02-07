@@ -105,10 +105,11 @@ local function GT_DismantleMod(_, params)
             C.DismantleShieldMod(shipId, contextId, group)
             logDebug(string.format("Removed shield mod from ship ID: %s => %s, group: %s", tostring(shipId), shipIdCode, group))
         else
-            -- Try removing with nil group (may remove from all groups)
-            -- Note: This might need iteration through actual shield groups
-            C.DismantleShieldMod(shipId, contextId, nil)
-            logDebug(string.format("Removed shield mod from ship ID: %s => %s (all groups)", tostring(shipId), shipIdCode))
+            -- Cannot pass nil to const char* parameter - FFI will crash
+            -- Pass empty string instead (X4 may interpret this as "all groups" or skip if not supported)
+            -- Note: This might need iteration through actual shield groups if empty string doesn't work
+            C.DismantleShieldMod(shipId, contextId, "")
+            logDebug(string.format("Removed shield mod from ship ID: %s => %s (all groups - using empty string)", tostring(shipId), shipIdCode))
         end
     elseif type == "weapon" then
         -- For weapon mods, we need the component ID

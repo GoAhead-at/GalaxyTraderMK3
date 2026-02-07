@@ -160,7 +160,12 @@ function gtMenu.sortPilots(pilots)
                 else
                     result = safeStringCompare(aVal, bVal)
                 end
-                return descending and not result or result
+                -- Fix: Proper strict weak ordering - when descending, invert result
+                if descending then
+                    return not result
+                else
+                    return result
+                end
             end
             
             -- Secondary sort by pilot name (always ascending for stability)

@@ -61,7 +61,14 @@ function L.UpdateShipList(eventName, shipListString)
             if shipPair and shipPair ~= "" then
                 local colonPos = string.find(shipPair, ":")
                 local shipIDStr = colonPos and string.sub(shipPair, 1, colonPos - 1) or shipPair
-                local num = string.sub(shipIDStr, 1, 2) == "0x" and tonumber(shipIDStr, 16) or tonumber(shipIDStr)
+                -- Fix: tonumber("0x1234", 16) returns nil - strip "0x" before calling with base, or use auto-detect
+                local num
+                if string.sub(shipIDStr, 1, 2) == "0x" then
+                    -- Strip "0x" prefix before calling tonumber with base 16
+                    num = tonumber(string.sub(shipIDStr, 3), 16)
+                else
+                    num = tonumber(shipIDStr)
+                end
                 if num and num ~= 0 then
                     table.insert(L.shipList, num)
                 end
@@ -82,7 +89,9 @@ function L.UpdateShipList(eventName, shipListString)
     for _, ship in ipairs(L.shipList) do
         local orderBuf = ffi.new("Order")
         if C.GetDefaultOrder(orderBuf, ship) and orderBuf.orderdef then
-            L.previousOrders[ship] = ffi.string(orderBuf.orderdef) or "NONE"
+            -- Check for NULL pointer before calling ffi.string (prevents crash)
+            local orderdef_ptr = orderBuf.orderdef
+            L.previousOrders[ship] = (orderdef_ptr ~= nil) and ffi.string(orderdef_ptr) or "NONE"
         else
             L.previousOrders[ship] = "NONE"
         end
@@ -115,6 +124,9 @@ function L.StopMonitoring()
     L.shipList = {}
     L.currentShipIndex = 0
     L.previousOrders = {}
+    L.previousPilots = {}
+    L.previousCommanders = {}
+    L.cleanupTriggered = {}
     L.isMonitoring = false
 end
 
@@ -139,7 +151,9 @@ function L.OnUpdate()
         return
     end
     
-    local shipIDCode = ffi.string(C.GetObjectIDCode(ship)) or "UNKNOWN"
+    -- Check for NULL pointer before calling ffi.string (prevents crash)
+    local idcode_ptr = C.GetObjectIDCode(ship)
+    local shipIDCode = (idcode_ptr ~= nil) and ffi.string(idcode_ptr) or "UNKNOWN"
     
     if not (C.IsComponentClass(ship, "ship_s") or C.IsComponentClass(ship, "ship_m") or 
             C.IsComponentClass(ship, "ship_l") or C.IsComponentClass(ship, "ship_xl")) then
@@ -149,7 +163,9 @@ function L.OnUpdate()
     local orderBuf = ffi.new("Order")
     local currentOrderID = "NONE"
     if C.GetDefaultOrder(orderBuf, ship) and orderBuf.orderdef then
-        currentOrderID = ffi.string(orderBuf.orderdef) or "NONE"
+        -- Check for NULL pointer before calling ffi.string (prevents crash)
+        local orderdef_ptr = orderBuf.orderdef
+        currentOrderID = (orderdef_ptr ~= nil) and ffi.string(orderdef_ptr) or "NONE"
     end
     
     local currentPilot = GetComponentData(ship, "assignedpilot")
@@ -220,7 +236,9 @@ function L.OnUpdate()
             local commanderOrderBuf = ffi.new("Order")
             local getOrderSuccess = C.GetDefaultOrder(commanderOrderBuf, currentCommanderNum)
             if getOrderSuccess and commanderOrderBuf.orderdef then
-                local commanderOrderID = ffi.string(commanderOrderBuf.orderdef)
+                -- Check for NULL pointer before calling ffi.string (prevents crash)
+                local orderdef_ptr = commanderOrderBuf.orderdef
+                local commanderOrderID = (orderdef_ptr ~= nil) and ffi.string(orderdef_ptr) or nil
                 if commanderOrderID == "GalaxyTraderMK3" then
                     hasGTOrder = true
                     commanderHasGTOrder = true

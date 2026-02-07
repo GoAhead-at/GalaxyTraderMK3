@@ -137,10 +137,22 @@ local function onReceivePilotData(_, param)
     for i = startIndex, #pilotStrings do
         local pilotStr = pilotStrings[i]
         
-        -- Split pilot data by pipe
+        -- Split pilot data by pipe (handling empty fields correctly)
+        -- Pattern [^|]+ skips empty fields, causing field misalignment
+        -- Use manual splitting to preserve empty fields
         local fields = {}
-        for field in string.gmatch(pilotStr, "[^|]+") do
-            table.insert(fields, field)
+        local startPos = 1
+        while startPos <= #pilotStr do
+            local endPos = string.find(pilotStr, "|", startPos)
+            if endPos == nil then
+                -- Last field (no trailing pipe)
+                table.insert(fields, string.sub(pilotStr, startPos))
+                break
+            else
+                -- Field ends at pipe (includes empty fields)
+                table.insert(fields, string.sub(pilotStr, startPos, endPos - 1))
+                startPos = endPos + 1
+            end
         end
         
         if #fields >= 13 then

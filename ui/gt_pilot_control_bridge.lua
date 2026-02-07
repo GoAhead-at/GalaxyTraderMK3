@@ -25,7 +25,7 @@ function Mods.GalaxyTrader.PilotControl.sendToTraining(shipId)
     -- Send signal to MD
     -- Format: "action|shipId"
     local param = "training|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Training signal sent for ship: " .. tostring(shipId))
 end
@@ -36,7 +36,7 @@ function Mods.GalaxyTrader.PilotControl.deregisterShip(shipId)
     
     -- Send signal to MD
     local param = "deregister|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Deregister signal sent for ship: " .. tostring(shipId))
 end
@@ -47,7 +47,7 @@ function Mods.GalaxyTrader.PilotControl.forceSellCargo(shipId)
     
     -- Send signal to MD
     local param = "sellcargo|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Force sell cargo signal sent for ship: " .. tostring(shipId))
 end
@@ -58,7 +58,7 @@ function Mods.GalaxyTrader.PilotControl.sendToRepair(shipId)
     
     -- Send signal to MD
     local param = "repair|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Repair signal sent for ship: " .. tostring(shipId))
 end
@@ -69,7 +69,7 @@ function Mods.GalaxyTrader.PilotControl.sendToResupply(shipId)
     
     -- Send signal to MD
     local param = "resupply|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Resupply signal sent for ship: " .. tostring(shipId))
 end
@@ -80,7 +80,7 @@ function Mods.GalaxyTrader.PilotControl.stopAllOrders(shipId)
     
     -- Send signal to MD
     local param = "stoporders|" .. tostring(shipId)
-    RaiseNPCEvent("GT_PilotControl.Action", param)
+    AddUITriggeredEvent("GT_PilotControl", "Action", param)
     
     debugLog("Stop orders signal sent for ship: " .. tostring(shipId))
 end

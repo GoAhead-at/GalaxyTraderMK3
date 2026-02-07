@@ -137,7 +137,7 @@ menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, st
         menu.contextMenuData = menu.contextMenuData or {}
         menu.contextMenuData.xoffset = xoffset or (mousepos.x + Helper.viewWidth / 2)
         menu.contextMenuData.yoffset = yoffset or (mousepos.y + Helper.viewHeight / 2)
-        menu.contextMenuData.width = width or Helper.scaleX(config.renameWidth or 400)
+        menu.contextMenuData.width = width or Helper.scaleX(400)
         
         -- Adjust position if needed
         if menu.contextMenuData.xoffset + menu.contextMenuData.width > Helper.viewWidth then
@@ -237,7 +237,7 @@ function menu.openGTRenameContext(component, originalName)
     
     DebugError(string.format("[GT Context Rename] Context menu data: xoffset=%d, yoffset=%d", menu.contextMenuData.xoffset, menu.contextMenuData.yoffset))
     
-    local width = Helper.scaleX(config.renameWidth or 400)
+    local width = Helper.scaleX(400)
     DebugError(string.format("[GT Context Rename] Width: %d", width))
     
     if menu.contextMenuData.xoffset + width > Helper.viewWidth then
@@ -293,7 +293,7 @@ if originalOnInteractMenuCallback then
                 yoffset = mousepos.y + Helper.viewHeight / 2 
             }
             
-            local width = Helper.scaleX(config.renameWidth or 400)
+            local width = Helper.scaleX(400)
             if menu.contextMenuData.xoffset + width > Helper.viewWidth then
                 menu.contextMenuData.xoffset = Helper.viewWidth - width - Helper.frameBorder
             end

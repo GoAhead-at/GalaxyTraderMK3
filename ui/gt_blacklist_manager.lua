@@ -554,6 +554,12 @@ local function onCleanupExpired(_, event_data)
         return false
     end
     
+    -- Check for nil/empty event_data before parsing (prevents crash)
+    if not event_data or event_data == "" then
+        debugLog("Invalid cleanup parameters: event_data is nil or empty", "ERROR")
+        return false
+    end
+    
     -- Format: "current_time:expiry_time"
     local parts = {}
     for part in string.gmatch(event_data, "([^:]+)") do

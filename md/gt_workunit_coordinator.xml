@@ -189,6 +189,9 @@
             <set_value name="$cacheMaxDistance" exact="global.$GT_SearchLiveTrades_State.{$ship}.$MaxDistance"/>
           </do_if>
           
+          <!-- Track whether batch cache insertion is running (finalization deferred if so) -->
+          <set_value name="$batchCacheInsert" exact="false"/>
+          
           <!-- Propagate trades to cache if we have valid home sector and trade list -->
           <do_if value="$homeSector? and $homeSector.exists and $homeSector.isclass.sector and $tradeList? and $tradeList != null and $tradeList.count gt 0">
             <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -219,241 +222,27 @@
               </do_if>
             </do_if>
             
-            <!-- Loop through trades and add to cache -->
-            <do_all exact="$tradeList.count" counter="$i">
-              <set_value name="$trade" exact="$tradeList.{$i}"/>
-              <do_if value="$trade? and $trade != null">
-                <!-- Extract buy/sell offers from trade -->
-                <set_value name="$buyOffer" exact="@$trade.$BuyOffer"/>
-                <set_value name="$sellOffer" exact="@$trade.$SellOffer"/>
-                
-                <!-- Generate trade key and add to cache -->
-                <do_if value="$buyOffer? and $buyOffer.exists and $sellOffer? and $sellOffer.exists">
-                  <set_value name="$tradeKey" exact="''"/>
-                  <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
-                    <param name="buyOffer" value="$buyOffer"/>
-                    <param name="sellOffer" value="$sellOffer"/>
-                    <param name="traceId" value="''"/>
-                  </run_actions>
-                  
-                  <!-- Add to cache if trade key is valid -->
-                  <do_if value="$tradeKey != '' and $tradeKey != 'null_null'">
-                    <!-- Extract trade data -->
-                    <set_value name="$ware" exact="null"/>
-                    <do_if value="$sellOffer? and $sellOffer.ware?">
-                      <set_value name="$ware" exact="$sellOffer.ware"/>
-                    </do_if>
-                    <do_elseif value="$buyOffer? and $buyOffer.ware?">
-                      <set_value name="$ware" exact="$buyOffer.ware"/>
-                    </do_elseif>
-                    <!-- FIX: Use unitprice (price per unit) instead of price (total price) - price is total for entire offer amount -->
-                    <set_value name="$buyPrice" exact="if $trade.$BuyPrice? then $trade.$BuyPrice else (if $buyOffer.unitprice? then $buyOffer.unitprice else 0)"/>
-                    <set_value name="$sellPrice" exact="if $trade.$SellPrice? then $trade.$SellPrice else (if $sellOffer.unitprice? then $sellOffer.unitprice else 0)"/>
-                    <set_value name="$profit" exact="if $trade.$Profit? then $trade.$Profit else 0"/>
-                    <set_value name="$roi" exact="if $trade.$ROI? then $trade.$ROI else 0"/>
-                    <set_value name="$amount" exact="if $trade.$Amount? then $trade.$Amount else (if $buyOffer.amount? and $sellOffer.amount? then [$buyOffer.amount, $sellOffer.amount].min else 0)"/>
-                    <set_value name="$distance" exact="if $trade.$Distance? then $trade.$Distance else 0"/>
-                    <set_value name="$score" exact="if $trade.$Score? then $trade.$Score else $profit"/>
-                    
-                    <!-- Extract station IDs -->
-                    <set_value name="$buyStationId" exact="if $buyOffer.owner? and $buyOffer.owner.exists then $buyOffer.owner.idcode else ''"/>
-                    <set_value name="$sellStationId" exact="if $sellOffer.owner? and $sellOffer.owner.exists then $sellOffer.owner.idcode else ''"/>
-                    
-                    <!-- Compute distances from home sector to buy/sell stations (matching batch processor logic) -->
-                    <set_value name="$buySector" exact="null"/>
-                    <set_value name="$sellSector" exact="null"/>
-                    <do_if value="$buyOffer.owner? and $buyOffer.owner.exists">
-                      <set_value name="$buySector" exact="$buyOffer.owner.sector"/>
-                    </do_if>
-                    <do_if value="$sellOffer.owner? and $sellOffer.owner.exists">
-                      <set_value name="$sellSector" exact="$sellOffer.owner.sector"/>
-                    </do_if>
-                    <set_value name="$homeToBuyDistance" exact="-1"/>
-                    <set_value name="$homeToSellDistance" exact="-1"/>
-                    <do_if value="$buySector? and $sellSector? and $homeSector? and $homeSector.exists and $homeSector.isclass.sector">
-                      <set_value name="$homeToBuyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
-                      <set_value name="$homeToSellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
-                      <!-- Handle invalid distances -->
-                      <do_if value="$homeToBuyDistance lt 0">
-                        <set_value name="$homeToBuyDistance" exact="-1"/>
-                      </do_if>
-                      <do_if value="$homeToSellDistance lt 0">
-                        <set_value name="$homeToSellDistance" exact="-1"/>
-                      </do_if>
-                      <!-- DEBUG: Log distance calculation for first few entries to verify correctness -->
-                      <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                        <set_value name="$tradeIdx" exact="if $tradeList? then $tradeList.count else 0"/>
-                        <do_if value="$tradeIdx le 5">
-                          <set_value name="$buySectorName" exact="if $buySector? then @$buySector.knownname else 'null'"/>
-                          <set_value name="$sellSectorName" exact="if $sellSector? then @$sellSector.knownname else 'null'"/>
-                          <set_value name="$homeSectorName" exact="if $homeSector? then @$homeSector.knownname else 'null'"/>
-                          <debug_text text="'[GT-WorkUnit] (' + $ship.idcode + ') Cache entry ' + $tradeIdx + ' distances: homeSector=' + $homeSectorName + ', buySector=' + $buySectorName + ' (dist=' + $homeToBuyDistance + '), sellSector=' + $sellSectorName + ' (dist=' + $homeToSellDistance + '), maxDist=' + ([$homeToBuyDistance, $homeToSellDistance].max)" chance="100"/>
-                        </do_if>
-                      </do_if>
-                    </do_if>
-                    
-                    <!-- Get ship's ignoreTradeRules setting to determine TradeRulesRespected -->
-                    <!-- Trade rules are respected if ignoreTradeRules=false (default) -->
-                    <set_value name="$ignoreTradeRules" exact="false"/>
-                    <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreTradeRules?">
-                      <set_value name="$ignoreTradeRules" exact="global.$GT_AIParameters.{$ship}.$IgnoreTradeRules"/>
-                    </do_if>
-                    <set_value name="$tradeRulesRespected" exact="not $ignoreTradeRules"/>
-                    
-                    <!-- Compute dock caps for buy and sell stations (matching batch processor logic) -->
-                    <!-- Buy station (= seller of BuyOffer / where we buy from) -->
-                    <set_value name="$buyStation" exact="@$buyOffer.owner"/>
-                    <set_value name="$buyDockCaps" exact="null"/>
-                    <do_if value="$buyStation? and $buyStation.exists">
-                      <do_if value="not global.$GT_DockCapsCache?">
-                        <set_value name="global.$GT_DockCapsCache" exact="table[]"/>
-                      </do_if>
-                      <do_if value="global.$GT_DockCapsCache.{$buyStation}?">
-                        <set_value name="$buyDockCaps" exact="global.$GT_DockCapsCache.{$buyStation}"/>
-                      </do_if>
-                      <do_else>
-                        <set_value name="$buyDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
-                        <find_dockingbay name="$buyDockS" object="$buyStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_s" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$buyDockS">
-                          <set_value name="$buyDockCaps.$S" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$buyDockM" object="$buyStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_m" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$buyDockM">
-                          <set_value name="$buyDockCaps.$M" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$buyDockL" object="$buyStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_l" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$buyDockL">
-                          <set_value name="$buyDockCaps.$L" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$buyDockXL" object="$buyStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_xl" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$buyDockXL">
-                          <set_value name="$buyDockCaps.$XL" exact="true"/>
-                        </do_if>
-                        <set_value name="global.$GT_DockCapsCache.{$buyStation}" exact="$buyDockCaps"/>
-                      </do_else>
-                    </do_if>
-                    
-                    <!-- Sell station (= buyer of SellOffer / where we sell to) -->
-                    <set_value name="$sellStation" exact="@$sellOffer.owner"/>
-                    <set_value name="$sellDockCaps" exact="null"/>
-                    <do_if value="$sellStation? and $sellStation.exists">
-                      <do_if value="not global.$GT_DockCapsCache?">
-                        <set_value name="global.$GT_DockCapsCache" exact="table[]"/>
-                      </do_if>
-                      <do_if value="global.$GT_DockCapsCache.{$sellStation}?">
-                        <set_value name="$sellDockCaps" exact="global.$GT_DockCapsCache.{$sellStation}"/>
-                      </do_if>
-                      <do_else>
-                        <set_value name="$sellDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
-                        <find_dockingbay name="$sellDockS" object="$sellStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_s" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$sellDockS">
-                          <set_value name="$sellDockCaps.$S" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$sellDockM" object="$sellStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_m" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$sellDockM">
-                          <set_value name="$sellDockCaps.$M" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$sellDockL" object="$sellStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_l" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$sellDockL">
-                          <set_value name="$sellDockCaps.$L" exact="true"/>
-                        </do_if>
-                        <find_dockingbay name="$sellDockXL" object="$sellStation" checkoperational="true" multiple="false">
-                          <match_dock size="tag.dock_xl" storage="false"/>
-                        </find_dockingbay>
-                        <do_if value="$sellDockXL">
-                          <set_value name="$sellDockCaps.$XL" exact="true"/>
-                        </do_if>
-                        <set_value name="global.$GT_DockCapsCache.{$sellStation}" exact="$sellDockCaps"/>
-                      </do_else>
-                    </do_if>
-                    
-                    <!-- Create cache entry matching batch processor format -->
-                    <set_value name="$cacheEntry" exact="table[
-                      $WareId = if $ware? then (if $ware.id? then $ware.id else '') else '',
-                      $Ware = $ware,
-                      $WareName = if $ware? then (if $ware.name? then $ware.name else '') else '',
-                      $SellStationId = $buyStationId,
-                      $BuyStationId = $sellStationId,
-                      $BuyOffer = $buyOffer,
-                      $SellOffer = $sellOffer,
-                      $BuyTargetType = if $buyOffer.owner? and $buyOffer.owner.exists then $buyOffer.owner.class else null,
-                      $SellTargetType = if $sellOffer.owner? and $sellOffer.owner.exists then $sellOffer.owner.class else null,
-                      $BuyDockCaps = $buyDockCaps,
-                      $SellDockCaps = $sellDockCaps,
-                      $TradeRulesRespected = $tradeRulesRespected,
-                      $OfferMaxAmount = $amount,
-                      $ProfitPerUnit = if $amount gt 0 then ($profit / $amount) else 0,
-                      $VolumePerUnit = if $ware? and $ware.volume? then $ware.volume else 0,
-                      $Amount = $amount,
-                      $TotalVolume = if $ware? and $ware.volume? then ($ware.volume * $amount) else 0,
-                      $Profit = $profit,
-                      $ROI = $roi,
-                      $BuyPrice = $buyPrice,
-                      $SellPrice = $sellPrice,
-                      $Distance = $distance,
-                      $Timestamp = player.age,
-                      $HomeSector = $homeSector,
-                      $HomeToBuyDistance = $homeToBuyDistance,
-                      $HomeToSellDistance = $homeToSellDistance,
-                      $FailCount = 0,
-                      $FailedShips = [],
-                      $Score = $score
-                    ]"/>
-                    
-                    <!-- Insert cache entry in sorted order (by score descending) -->
-                    <!-- Score = efficiency (profit/distance ratio) - better metric than raw profit -->
-                    <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
-                    <set_value name="$insertIndex" exact="0"/>
-                    <set_value name="$insertionFound" exact="false"/>
-                    <do_if value="$homeSectorCache.count gt 0">
-                      <do_all exact="$homeSectorCache.count" counter="$j">
-                        <set_value name="$existingScore" exact="if $homeSectorCache.{$j}.$Score? then $homeSectorCache.{$j}.$Score else 0"/>
-                        <do_if value="$score gt $existingScore">
-                          <set_value name="$insertIndex" exact="$j"/>
-                          <set_value name="$insertionFound" exact="true"/>
-                          <break/>
-                        </do_if>
-                      </do_all>
-                    </do_if>
-                    
-                    <!-- Insert or append cache entry -->
-                    <do_if value="$insertionFound">
-                      <set_value name="global.$GT_TradeCache.{$homeSector}.{$insertIndex}" exact="$cacheEntry" operation="insert"/>
-                    </do_if>
-                    <do_else>
-                      <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="$cacheEntry"/>
-                    </do_else>
-                    
-                    <!-- Add to cache index -->
-                    <run_actions ref="md.GT_Libraries_General.GT_AddTradeToIndex">
-                      <param name="tradeKey" value="$tradeKey"/>
-                      <param name="homeSector" value="$homeSector"/>
-                      <param name="traceId" value="if $ship? then $ship.idcode else '0'"/>
-                    </run_actions>
-                    
-                    <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Added trade to cache: ' + $tradeKey + ' for home sector ' + $homeSector.knownname + ' (profit=' + ($profit/100) + ' Cr, cache size=' + global.$GT_TradeCache.{$homeSector}.count + ')'" chance="10"/>
-                    </do_if>
-                  </do_if>
-                </do_if>
-              </do_if>
-            </do_all>
+            <!-- Cooperative multitasking: insert trades into cache in batches -->
+            <!-- Store batch state and signal batch cue instead of processing all in one frame -->
+            <do_if value="not global.$GT_CacheInsertState?">
+              <set_value name="global.$GT_CacheInsertState" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_CacheInsertState.{$ship}" exact="table[
+              $TradeList = $tradeList,
+              $HomeSector = $homeSector,
+              $Ship = $ship,
+              $Index = 1,
+              $BatchSize = 10
+            ]"/>
+            <set_value name="$batchCacheInsert" exact="true"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Starting batched cache insertion for ' + $tradeList.count + ' trades (home=' + @$homeSector.knownname + ')'" chance="100"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_WorkUnit_Coordinator.InsertTradesToCache_Batch" param="$ship"/>
           </do_if>
           
+          <!-- Only do immediate finalization if NOT batching (deferred to batch completion otherwise) -->
+          <do_if value="not $batchCacheInsert">
           <!-- CRITICAL FIX: Signal HomeRefreshFinished AFTER cache is populated -->
           <!-- This ensures waiters check cache AFTER it's populated, not before -->
           <!-- Cache is now populated, so ships waiting for home refresh can use it -->
@@ -504,7 +293,309 @@
             $MinAbsoluteProfit = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinAbsoluteProfit else 0,
             $FactionPriority = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$FactionPriority else 1
           ]"/>
+          </do_if>
         </do_elseif>
+      </actions>
+    </cue>
+    
+    <!-- ===================================================================== -->
+    <!-- Batched Cache Insertion                                                -->
+    <!-- Inserts trades into cache in batches for cooperative multitasking      -->
+    <!-- ===================================================================== -->
+    <cue name="InsertTradesToCache_Batch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="1ms"/>
+      <actions>
+        <set_value name="$ship" exact="event.param"/>
+        
+        <!-- Validate batch state exists -->
+        <do_if value="not global.$GT_CacheInsertState? or not global.$GT_CacheInsertState.{$ship}?">
+          <!-- Batch state missing - nothing to process -->
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+          <set_value name="$state" exact="global.$GT_CacheInsertState.{$ship}"/>
+          <set_value name="$tradeList" exact="$state.$TradeList"/>
+          <set_value name="$homeSector" exact="$state.$HomeSector"/>
+          <set_value name="$batchStart" exact="$state.$Index"/>
+          <set_value name="$batchEnd" exact="[$batchStart + $state.$BatchSize - 1, $tradeList.count].min"/>
+          
+          <!-- Process batch of trades -->
+          <do_all exact="$batchEnd - $batchStart + 1" counter="$offset">
+            <set_value name="$idx" exact="$batchStart + $offset - 1"/>
+            <set_value name="$trade" exact="$tradeList.{$idx}"/>
+            <do_if value="$trade? and $trade != null">
+              <!-- Extract buy/sell offers from trade -->
+              <set_value name="$buyOffer" exact="@$trade.$BuyOffer"/>
+              <set_value name="$sellOffer" exact="@$trade.$SellOffer"/>
+              
+              <!-- Generate trade key and add to cache -->
+              <do_if value="$buyOffer? and $buyOffer.exists and $sellOffer? and $sellOffer.exists">
+                <set_value name="$tradeKey" exact="''"/>
+                <run_actions ref="md.GT_Libraries_General.GT_GenerateTradeKey" result="$tradeKey">
+                  <param name="buyOffer" value="$buyOffer"/>
+                  <param name="sellOffer" value="$sellOffer"/>
+                  <param name="traceId" value="''"/>
+                </run_actions>
+                
+                <do_if value="$tradeKey != '' and $tradeKey != 'null_null'">
+                  <set_value name="$ware" exact="null"/>
+                  <do_if value="$sellOffer? and $sellOffer.ware?">
+                    <set_value name="$ware" exact="$sellOffer.ware"/>
+                  </do_if>
+                  <do_elseif value="$buyOffer? and $buyOffer.ware?">
+                    <set_value name="$ware" exact="$buyOffer.ware"/>
+                  </do_elseif>
+                  <set_value name="$buyPrice" exact="if $trade.$BuyPrice? then $trade.$BuyPrice else (if $buyOffer.unitprice? then $buyOffer.unitprice else 0)"/>
+                  <set_value name="$sellPrice" exact="if $trade.$SellPrice? then $trade.$SellPrice else (if $sellOffer.unitprice? then $sellOffer.unitprice else 0)"/>
+                  <set_value name="$profit" exact="if $trade.$Profit? then $trade.$Profit else 0"/>
+                  <set_value name="$roi" exact="if $trade.$ROI? then $trade.$ROI else 0"/>
+                  <set_value name="$amount" exact="if $trade.$Amount? then $trade.$Amount else (if $buyOffer.amount? and $sellOffer.amount? then [$buyOffer.amount, $sellOffer.amount].min else 0)"/>
+                  <set_value name="$distance" exact="if $trade.$Distance? then $trade.$Distance else 0"/>
+                  <set_value name="$score" exact="if $trade.$Score? then $trade.$Score else $profit"/>
+                  
+                  <set_value name="$buyStationId" exact="if $buyOffer.owner? and $buyOffer.owner.exists then $buyOffer.owner.idcode else ''"/>
+                  <set_value name="$sellStationId" exact="if $sellOffer.owner? and $sellOffer.owner.exists then $sellOffer.owner.idcode else ''"/>
+                  
+                  <!-- Compute distances from home sector -->
+                  <set_value name="$buySector" exact="null"/>
+                  <set_value name="$sellSector" exact="null"/>
+                  <do_if value="$buyOffer.owner? and $buyOffer.owner.exists">
+                    <set_value name="$buySector" exact="$buyOffer.owner.sector"/>
+                  </do_if>
+                  <do_if value="$sellOffer.owner? and $sellOffer.owner.exists">
+                    <set_value name="$sellSector" exact="$sellOffer.owner.sector"/>
+                  </do_if>
+                  <set_value name="$homeToBuyDistance" exact="-1"/>
+                  <set_value name="$homeToSellDistance" exact="-1"/>
+                  <do_if value="$buySector? and $sellSector? and $homeSector? and $homeSector.exists and $homeSector.isclass.sector">
+                    <set_value name="$homeToBuyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+                    <set_value name="$homeToSellDistance" exact="$homeSector.gatedistance.{$sellSector}"/>
+                    <do_if value="$homeToBuyDistance lt 0">
+                      <set_value name="$homeToBuyDistance" exact="-1"/>
+                    </do_if>
+                    <do_if value="$homeToSellDistance lt 0">
+                      <set_value name="$homeToSellDistance" exact="-1"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Get trade rules setting -->
+                  <set_value name="$ignoreTradeRules" exact="false"/>
+                  <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreTradeRules?">
+                    <set_value name="$ignoreTradeRules" exact="global.$GT_AIParameters.{$ship}.$IgnoreTradeRules"/>
+                  </do_if>
+                  <set_value name="$tradeRulesRespected" exact="not $ignoreTradeRules"/>
+                  
+                  <!-- Compute dock caps (with DockCapsCache) -->
+                  <set_value name="$buyStation" exact="@$buyOffer.owner"/>
+                  <set_value name="$buyDockCaps" exact="null"/>
+                  <do_if value="$buyStation? and $buyStation.exists">
+                    <do_if value="not global.$GT_DockCapsCache?">
+                      <set_value name="global.$GT_DockCapsCache" exact="table[]"/>
+                    </do_if>
+                    <do_if value="global.$GT_DockCapsCache.{$buyStation}?">
+                      <set_value name="$buyDockCaps" exact="global.$GT_DockCapsCache.{$buyStation}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$buyDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
+                      <find_dockingbay name="$buyDockS" object="$buyStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_s" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$buyDockS">
+                        <set_value name="$buyDockCaps.$S" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$buyDockM" object="$buyStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_m" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$buyDockM">
+                        <set_value name="$buyDockCaps.$M" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$buyDockL" object="$buyStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_l" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$buyDockL">
+                        <set_value name="$buyDockCaps.$L" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$buyDockXL" object="$buyStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_xl" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$buyDockXL">
+                        <set_value name="$buyDockCaps.$XL" exact="true"/>
+                      </do_if>
+                      <set_value name="global.$GT_DockCapsCache.{$buyStation}" exact="$buyDockCaps"/>
+                    </do_else>
+                  </do_if>
+                  
+                  <set_value name="$sellStation" exact="@$sellOffer.owner"/>
+                  <set_value name="$sellDockCaps" exact="null"/>
+                  <do_if value="$sellStation? and $sellStation.exists">
+                    <do_if value="not global.$GT_DockCapsCache?">
+                      <set_value name="global.$GT_DockCapsCache" exact="table[]"/>
+                    </do_if>
+                    <do_if value="global.$GT_DockCapsCache.{$sellStation}?">
+                      <set_value name="$sellDockCaps" exact="global.$GT_DockCapsCache.{$sellStation}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$sellDockCaps" exact="table[$S=false, $M=false, $L=false, $XL=false]"/>
+                      <find_dockingbay name="$sellDockS" object="$sellStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_s" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$sellDockS">
+                        <set_value name="$sellDockCaps.$S" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$sellDockM" object="$sellStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_m" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$sellDockM">
+                        <set_value name="$sellDockCaps.$M" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$sellDockL" object="$sellStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_l" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$sellDockL">
+                        <set_value name="$sellDockCaps.$L" exact="true"/>
+                      </do_if>
+                      <find_dockingbay name="$sellDockXL" object="$sellStation" checkoperational="true" multiple="false">
+                        <match_dock size="tag.dock_xl" storage="false"/>
+                      </find_dockingbay>
+                      <do_if value="$sellDockXL">
+                        <set_value name="$sellDockCaps.$XL" exact="true"/>
+                      </do_if>
+                      <set_value name="global.$GT_DockCapsCache.{$sellStation}" exact="$sellDockCaps"/>
+                    </do_else>
+                  </do_if>
+                  
+                  <!-- Create cache entry -->
+                  <set_value name="$cacheEntry" exact="table[
+                    $WareId = if $ware? then (if $ware.id? then $ware.id else '') else '',
+                    $Ware = $ware,
+                    $WareName = if $ware? then (if $ware.name? then $ware.name else '') else '',
+                    $SellStationId = $buyStationId,
+                    $BuyStationId = $sellStationId,
+                    $BuyOffer = $buyOffer,
+                    $SellOffer = $sellOffer,
+                    $BuyTargetType = if $buyOffer.owner? and $buyOffer.owner.exists then $buyOffer.owner.class else null,
+                    $SellTargetType = if $sellOffer.owner? and $sellOffer.owner.exists then $sellOffer.owner.class else null,
+                    $BuyDockCaps = $buyDockCaps,
+                    $SellDockCaps = $sellDockCaps,
+                    $TradeRulesRespected = $tradeRulesRespected,
+                    $OfferMaxAmount = $amount,
+                    $ProfitPerUnit = if $amount gt 0 then ($profit / $amount) else 0,
+                    $VolumePerUnit = if $ware? and $ware.volume? then $ware.volume else 0,
+                    $Amount = $amount,
+                    $TotalVolume = if $ware? and $ware.volume? then ($ware.volume * $amount) else 0,
+                    $Profit = $profit,
+                    $ROI = $roi,
+                    $BuyPrice = $buyPrice,
+                    $SellPrice = $sellPrice,
+                    $Distance = $distance,
+                    $Timestamp = player.age,
+                    $HomeSector = $homeSector,
+                    $HomeToBuyDistance = $homeToBuyDistance,
+                    $HomeToSellDistance = $homeToSellDistance,
+                    $FailCount = 0,
+                    $FailedShips = [],
+                    $Score = $score
+                  ]"/>
+                  
+                  <!-- Insert in sorted order (by score descending) -->
+                  <set_value name="$homeSectorCache" exact="global.$GT_TradeCache.{$homeSector}"/>
+                  <set_value name="$insertIndex" exact="0"/>
+                  <set_value name="$insertionFound" exact="false"/>
+                  <do_if value="$homeSectorCache.count gt 0">
+                    <do_all exact="$homeSectorCache.count" counter="$j">
+                      <set_value name="$existingScore" exact="if $homeSectorCache.{$j}.$Score? then $homeSectorCache.{$j}.$Score else 0"/>
+                      <do_if value="$score gt $existingScore">
+                        <set_value name="$insertIndex" exact="$j"/>
+                        <set_value name="$insertionFound" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                  
+                  <do_if value="$insertionFound">
+                    <set_value name="global.$GT_TradeCache.{$homeSector}.{$insertIndex}" exact="$cacheEntry" operation="insert"/>
+                  </do_if>
+                  <do_else>
+                    <append_to_list name="global.$GT_TradeCache.{$homeSector}" exact="$cacheEntry"/>
+                  </do_else>
+                  
+                  <run_actions ref="md.GT_Libraries_General.GT_AddTradeToIndex">
+                    <param name="tradeKey" value="$tradeKey"/>
+                    <param name="homeSector" value="$homeSector"/>
+                    <param name="traceId" value="if $ship? then $ship.idcode else '0'"/>
+                  </run_actions>
+                  
+                  <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Added trade to cache: ' + $tradeKey + ' for home sector ' + $homeSector.knownname + ' (profit=' + ($profit/100) + ' Cr, cache size=' + global.$GT_TradeCache.{$homeSector}.count + ')'" chance="10"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+          
+          <!-- Update batch state -->
+          <set_value name="global.$GT_CacheInsertState.{$ship}.$Index" exact="$batchEnd + 1"/>
+          
+          <!-- Check if more batches needed -->
+          <do_if value="$batchEnd lt $tradeList.count">
+            <!-- More trades to process - signal next batch -->
+            <signal_cue_instantly cue="md.GT_WorkUnit_Coordinator.InsertTradesToCache_Batch" param="$ship"/>
+          </do_if>
+          <do_else>
+            <!-- All trades inserted - do finalization (HomeRefreshFinished + SearchTradeRoutes) -->
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Batched cache insertion complete (' + $tradeList.count + ' trades). Signaling finalization.'" chance="100"/>
+            </do_if>
+            
+            <!-- Cleanup batch state -->
+            <remove_value name="global.$GT_CacheInsertState.{$ship}"/>
+            
+            <!-- Signal HomeRefreshFinished -->
+            <do_if value="$homeSector? and $homeSector.exists">
+              <do_if value="not global.$GT_TS_LiveRefreshBySector?">
+                <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
+                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[$Active = false, $Waiters = [], $WaiterQueued = table[]]"/>
+              </do_if>
+              
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$hasWaiters" exact="false"/>
+                <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0">
+                  <set_value name="$hasWaiters" exact="true"/>
+                </do_if>
+                <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') Signaling HomeRefreshFinished for home=' + @$homeSector.knownname + ' (hasWaiters=' + $hasWaiters + ', waiters.count=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0) + ')'" chance="100"/>
+              </do_if>
+              
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Active" exact="false"/>
+              <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$LastFinished" exact="player.age"/>
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.HomeRefreshFinished" param="$homeSector"/>
+            </do_if>
+            <do_else>
+              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Coordinator] (' + $ship.idcode + ') WARNING: Cannot signal HomeRefreshFinished - homeSector is null or invalid'" chance="100"/>
+              </do_if>
+            </do_else>
+            
+            <!-- Signal search pipeline to process live results -->
+            <set_value name="$usedCacheSlot" exact="false"/>
+            <do_if value="global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}?">
+              <set_value name="$usedCacheSlot" exact="true"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="table[
+              $Ship = $ship,
+              $SearchState = 'live',
+              $UseSearchQueueCounter = $usedCacheSlot,
+              $MaxDistance = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MaxDistance else 1,
+              $MinROI = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinROI else 0,
+              $MinAbsoluteProfit = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$MinAbsoluteProfit else 0,
+              $FactionPriority = if global.$GT_SearchQueue? and global.$GT_SearchQueue.$Params? and global.$GT_SearchQueue.$Params.{$ship}? then @global.$GT_SearchQueue.$Params.{$ship}.$FactionPriority else 1
+            ]"/>
+          </do_else>
+        </do_else>
       </actions>
     </cue>
     

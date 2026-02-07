@@ -589,11 +589,63 @@
             </do_if>
         
         <!-- Find affected ships (those with destinations in threatened sector) -->
-        <do_if value="global.$GT_Ships?">
-          <set_value name="$shipsNotified" exact="0"/>
+        <!-- Cooperative multitasking: process ships in batches to prevent frame stutter -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <!-- Snapshot ship keys and store batch state -->
+          <do_if value="not global.$GT_ThreatNotifyState?">
+            <set_value name="global.$GT_ThreatNotifyState" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_ThreatNotifyState.{$threatenedSector}" exact="table[
+            $Sector = $threatenedSector,
+            $ThreatData = $threatData,
+            $ThreatLevel = $threatLevel,
+            $ShipKeys = global.$GT_Ships.keys.list,
+            $Index = 1,
+            $BatchSize = 10,
+            $ShipsNotified = 0
+          ]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Threat] Starting batched notification for ' + global.$GT_Ships.keys.count + ' ships (sector: ' + $threatenedSector.knownname + ', level: ' + $threatLevel + ')'" chance="100"/>
+          </do_if>
+          <signal_cue_instantly cue="md.GT_ThreatIntelligence.NotifyShipsOfThreat_Batch" param="$threatenedSector"/>
+        </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- ========================================================================= -->
+    <!-- BATCHED NOTIFICATION PROCESSING                                           -->
+    <!-- Processes ship threat notifications in batches for cooperative multitasking -->
+    <!-- ========================================================================= -->
+    
+    <cue name="NotifyShipsOfThreat_Batch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="1ms"/>
+      <actions>
+        <set_value name="$sector" exact="event.param"/>
+        
+        <!-- Validate batch state exists -->
+        <do_if value="not global.$GT_ThreatNotifyState? or not global.$GT_ThreatNotifyState.{$sector}?">
+          <!-- Batch state missing - nothing to process -->
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+          <set_value name="$state" exact="global.$GT_ThreatNotifyState.{$sector}"/>
+          <set_value name="$shipKeys" exact="$state.$ShipKeys"/>
+          <set_value name="$threatData" exact="$state.$ThreatData"/>
+          <set_value name="$threatLevel" exact="$state.$ThreatLevel"/>
+          <set_value name="$threatenedSector" exact="$state.$Sector"/>
+          <set_value name="$batchStart" exact="$state.$Index"/>
+          <set_value name="$batchEnd" exact="[$batchStart + $state.$BatchSize - 1, $shipKeys.count].min"/>
+          <set_value name="$batchNotified" exact="0"/>
           
-          <do_all exact="global.$GT_Ships.keys.count" counter="$i">
-            <set_value name="$ship" exact="global.$GT_Ships.keys.list.{$i}"/>
+          <!-- Process batch of ships -->
+          <do_all exact="$batchEnd - $batchStart + 1" counter="$offset">
+            <set_value name="$idx" exact="$batchStart + $offset - 1"/>
+            <set_value name="$ship" exact="$shipKeys.{$idx}"/>
             
             <!-- Validate ship exists and is operational -->
             <do_if value="@$ship.exists and @$ship.isoperational">
@@ -606,59 +658,47 @@
               
               <!-- Only Level 12+ pilots have tactical awareness for mid-trade route analysis -->
               <do_if value="$pilotLevel ge 12">
-              <set_value name="$shipHasDestination" exact="false"/>
-              <set_value name="$destinationSector" exact="null"/>
-              
-              <!-- Check if ship has pending trades where preferred route goes through threatened sector -->
-              <!-- Strategy: Compare normal gatedistance vs blacklist-aware gatedistance -->
-              <!-- If blacklist distance > normal distance, preferred path goes through threat! -->
-              <!-- Prefer trades awaiting validation (if any), otherwise fall back to active trade tracking -->
-              <set_value name="$buyStation" exact="null"/>
-              <set_value name="$sellStation" exact="null"/>
+                <set_value name="$shipHasDestination" exact="false"/>
+                <set_value name="$destinationSector" exact="null"/>
+                
+                <!-- Check if ship has pending trades where preferred route goes through threatened sector -->
+                <!-- Strategy: Compare normal gatedistance vs blacklist-aware gatedistance -->
+                <!-- If blacklist distance > normal distance, preferred path goes through threat! -->
+                <set_value name="$buyStation" exact="null"/>
+                <set_value name="$sellStation" exact="null"/>
 
-              <do_if value="global.$GT_TradesAwaitingValidation.{$ship}?">
-                <set_value name="$tradeList" exact="@global.$GT_TradesAwaitingValidation.{$ship}"/>
-                <do_if value="$tradeList == null">
-                  <set_value name="$tradeList" exact="[]"/>
+                <do_if value="global.$GT_TradesAwaitingValidation.{$ship}?">
+                  <set_value name="$tradeList" exact="@global.$GT_TradesAwaitingValidation.{$ship}"/>
+                  <do_if value="$tradeList == null">
+                    <set_value name="$tradeList" exact="[]"/>
+                  </do_if>
+                  <do_if value="$tradeList.count gt 0">
+                    <set_value name="$trade" exact="$tradeList.{1}"/>
+                    <set_value name="$buyStation" exact="@$trade.$BuyOffer.owner"/>
+                    <set_value name="$sellStation" exact="@$trade.$SellOffer.owner"/>
+                  </do_if>
                 </do_if>
-                <do_if value="$tradeList.count gt 0">
-                  <set_value name="$trade" exact="$tradeList.{1}"/>
-                  <!-- Get buy and sell stations -->
-                  <set_value name="$buyStation" exact="@$trade.$BuyOffer.owner"/>
-                  <set_value name="$sellStation" exact="@$trade.$SellOffer.owner"/>
-                </do_if>
-              </do_if>
 
-              <do_if value="($buyStation == null or $sellStation == null) and global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}?">
-                <do_if value="global.$GT_ActiveTrade.{$ship}.$BuyStation? and global.$GT_ActiveTrade.{$ship}.$SellStation?">
-                  <set_value name="$buyStation" exact="global.$GT_ActiveTrade.{$ship}.$BuyStation"/>
-                  <set_value name="$sellStation" exact="global.$GT_ActiveTrade.{$ship}.$SellStation"/>
+                <do_if value="($buyStation == null or $sellStation == null) and global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}?">
+                  <do_if value="global.$GT_ActiveTrade.{$ship}.$BuyStation? and global.$GT_ActiveTrade.{$ship}.$SellStation?">
+                    <set_value name="$buyStation" exact="global.$GT_ActiveTrade.{$ship}.$BuyStation"/>
+                    <set_value name="$sellStation" exact="global.$GT_ActiveTrade.{$ship}.$SellStation"/>
+                  </do_if>
                 </do_if>
-              </do_if>
 
-              <do_if value="$buyStation != null or $sellStation != null">
-                  
+                <do_if value="$buyStation != null or $sellStation != null">
                   <!-- Check route to buy station (if different sector) -->
                   <do_if value="$buyStation != null and @$buyStation.sector != null and @$ship.sector != null and @$ship.sector != @$buyStation.sector">
-                    <!-- Extract sector before gatedistance calculation (property chains in curly braces can fail) -->
                     <set_value name="$buySector" exact="@$buyStation.sector"/>
                     <do_if value="$buySector?">
-                      <!-- Calculate distance WITHOUT blacklist (shortest/preferred path) -->
-                      <!-- Vanilla pattern: order.dock.xml:503 -->
                       <set_value name="$normalDistanceToBuy" exact="$ship.gatedistance.{$buySector}"/>
-                      
-                      <!-- Calculate distance WITH blacklist (avoiding threats) -->
-                      <!-- Vanilla pattern: order.dock.xml:503 -->
                       <set_value name="$blacklistDistanceToBuy" exact="$ship.gatedistance.{$buySector}.{blacklistgroup.civilian}.{$ship}"/>
                     </do_if>
                     <do_else>
-                      <!-- Sector extraction failed - skip threat check -->
                       <set_value name="$normalDistanceToBuy" exact="-1"/>
                       <set_value name="$blacklistDistanceToBuy" exact="-1"/>
                     </do_else>
                     
-                    <!-- If blacklist distance > normal distance, preferred path goes through threat! -->
-                    <!-- If blacklist distance == -1, no safe path exists at all -->
                     <do_if value="($normalDistanceToBuy ge 0) and ($blacklistDistanceToBuy gt $normalDistanceToBuy or $blacklistDistanceToBuy lt 0)">
                       <set_value name="$shipHasDestination" exact="true"/>
                       <set_value name="$destinationSector" exact="@$buyStation.sector"/>
@@ -670,14 +710,12 @@
                   
                   <!-- Also check route to sell station (if different sector and not already threatened) -->
                   <do_if value="not $shipHasDestination and $sellStation != null and @$sellStation.sector != null and @$ship.sector != null and @$ship.sector != @$sellStation.sector">
-                    <!-- Extract sector before gatedistance calculation (property chains in curly braces can fail) -->
                     <set_value name="$sellSector" exact="@$sellStation.sector"/>
                     <do_if value="$sellSector?">
                       <set_value name="$normalDistanceToSell" exact="$ship.gatedistance.{$sellSector}"/>
                       <set_value name="$blacklistDistanceToSell" exact="$ship.gatedistance.{$sellSector}.{blacklistgroup.civilian}.{$ship}"/>
                     </do_if>
                     <do_else>
-                      <!-- Sector extraction failed - skip threat check -->
                       <set_value name="$normalDistanceToSell" exact="-1"/>
                       <set_value name="$blacklistDistanceToSell" exact="-1"/>
                     </do_else>
@@ -691,22 +729,22 @@
                     </do_if>
                   </do_if>
                 </do_if>
-              
-              <!-- If ship has threatened sector in travel path, signal it -->
-              <do_if value="$shipHasDestination">
-                <signal_objects object="$ship" param="'GT_Destination_Threatened'" param2="table[
-                  $Sector = $threatenedSector,
-                  $ThreatLevel = $threatLevel,
-                  $ThreatType = $threatData.$ThreatType,
-                  $AttackerFaction = @$threatData.$AttackerFaction
-                ]"/>
                 
-                <set_value name="$shipsNotified" operation="add"/>
-                
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Threat]   Signaled ' + $ship.idcode + ' (Pilot Lv.' + $pilotLevel + '): Threatened sector in travel path - aborting trade!'" chance="100"/>
+                <!-- If ship has threatened sector in travel path, signal it -->
+                <do_if value="$shipHasDestination">
+                  <signal_objects object="$ship" param="'GT_Destination_Threatened'" param2="table[
+                    $Sector = $threatenedSector,
+                    $ThreatLevel = $threatLevel,
+                    $ThreatType = $threatData.$ThreatType,
+                    $AttackerFaction = @$threatData.$AttackerFaction
+                  ]"/>
+                  
+                  <set_value name="$batchNotified" operation="add"/>
+                  
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Threat]   Signaled ' + $ship.idcode + ' (Pilot Lv.' + $pilotLevel + '): Threatened sector in travel path - aborting trade!'" chance="100"/>
+                  </do_if>
                 </do_if>
-              </do_if>
               </do_if>
               <do_else>
                 <!-- Lower level pilots lack tactical awareness for mid-trade route analysis -->
@@ -717,19 +755,32 @@
             </do_if>
           </do_all>
           
-          <do_if value="$shipsNotified gt 0">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Threat] Notified ' + $shipsNotified + ' ships about threat in ' + $threatenedSector.knownname" chance="100"/>
-            </do_if>
+          <!-- Update batch state: accumulate notified count and advance index -->
+          <set_value name="global.$GT_ThreatNotifyState.{$sector}.$ShipsNotified" exact="global.$GT_ThreatNotifyState.{$sector}.$ShipsNotified + $batchNotified"/>
+          <set_value name="global.$GT_ThreatNotifyState.{$sector}.$Index" exact="$batchEnd + 1"/>
+          
+          <!-- Check if more batches needed -->
+          <do_if value="$batchEnd lt $shipKeys.count">
+            <!-- More ships to process - signal next batch -->
+            <signal_cue_instantly cue="md.GT_ThreatIntelligence.NotifyShipsOfThreat_Batch" param="$sector"/>
           </do_if>
           <do_else>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Threat] No ships affected by threat in ' + $threatenedSector.knownname" chance="100"/>
+            <!-- All ships processed - log summary and clean up state -->
+            <set_value name="$totalNotified" exact="global.$GT_ThreatNotifyState.{$sector}.$ShipsNotified"/>
+            <do_if value="$totalNotified gt 0">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Threat] Notified ' + $totalNotified + ' ships about threat in ' + $threatenedSector.knownname" chance="100"/>
+              </do_if>
             </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Threat] No ships affected by threat in ' + $threatenedSector.knownname" chance="100"/>
+              </do_if>
+            </do_else>
+            <!-- Cleanup batch state -->
+            <remove_value name="global.$GT_ThreatNotifyState.{$sector}"/>
           </do_else>
-        </do_if>
-          </do_if>
-        </do_if>
+        </do_else>
       </actions>
     </cue>
     
