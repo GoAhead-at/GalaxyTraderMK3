@@ -2901,6 +2901,13 @@
       <set_value name="$cacheDetailLogMax" exact="8"/>
       <set_value name="$cacheDetailLogCount" exact="0"/>
       
+      <!-- gatedistance memoization: cache results per (fromSector, toSector) to avoid
+           redundant C++ pathfinding calls when multiple trades share the same sectors.
+           Separate tables for non-blacklist vs blacklist-aware variants.
+           Valid for the duration of this validation loop (ship doesn't move). -->
+      <set_value name="$gdCache" exact="table[]"/>
+      <set_value name="$gdCacheBL" exact="table[]"/>
+      
       <!-- Iterate through trade list -->
       <!-- Check if tradeList exists and has items before looping -->
       <do_if value="(if $tradeList != null then $tradeList.count else 0) gt 0">
@@ -3056,45 +3063,74 @@
         <!-- For sell-only trades, buy distance is always 0 (ship already has cargo, no buy travel needed) -->
         <set_value name="$buyDistance" exact="-1"/>
         <do_if value="$isSellOnlyTrade">
-          <!-- Sell-only trade: Ship already has cargo, no buy travel needed -->
           <set_value name="$buyDistance" exact="0"/>
         </do_if>
         <do_elseif value="$buySector == $currentSector">
-          <!-- Ship already in buy sector - no travel needed -->
           <set_value name="$buyDistance" exact="0"/>
         </do_elseif>
         <do_elseif value="$currentSectorIsBlacklisted">
-          <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
-          <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}"/>
+          <!-- Escape: non-blacklist gatedistance (memoized) -->
+          <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$buySector}?">
+            <set_value name="$buyDistance" exact="$gdCache.{$currentSector}.{$buySector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}"/>
+            <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+            <set_value name="$gdCache.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+          </do_else>
         </do_elseif>
         <do_else>
-          <!-- Normal case: Ship needs to travel TO buy sector - use blacklist-aware pathfinding -->
-          <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}.{$blacklistgroup}.{this.ship}"/>
+          <!-- Normal: blacklist-aware gatedistance (memoized) -->
+          <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$buySector}?">
+            <set_value name="$buyDistance" exact="$gdCacheBL.{$currentSector}.{$buySector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}.{$blacklistgroup}.{this.ship}"/>
+            <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+            <set_value name="$gdCacheBL.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+          </do_else>
         </do_else>
         
         <!-- Sell path: Calculate based on buy location -->
         <set_value name="$sellDistance" exact="-1"/>
         <do_if value="$sellSector == $buySector">
-          <!-- Buy and sell in same sector -->
           <set_value name="$sellDistance" exact="0"/>
         </do_if>
         <do_elseif value="$buySector == $currentSector">
-          <!-- Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
-          <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
-          <!-- If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
-          <!-- This allows escape even if all paths go through blacklisted sectors -->
+          <!-- Ship in buy sector: escape vs normal path to sell sector -->
           <do_if value="$currentSectorIsBlacklisted">
-            <!-- Escape case: Use non-blacklist-aware distance to check if ANY path exists -->
-            <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}"/>
+            <!-- Escape: non-blacklist gatedistance (memoized) -->
+            <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$sellSector}?">
+              <set_value name="$sellDistance" exact="$gdCache.{$currentSector}.{$sellSector}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}"/>
+              <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+              <set_value name="$gdCache.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+            </do_else>
           </do_if>
           <do_else>
-            <!-- Normal case: Use blacklist-aware distance -->
-            <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+            <!-- Normal: blacklist-aware gatedistance (memoized) -->
+            <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$sellSector}?">
+              <set_value name="$sellDistance" exact="$gdCacheBL.{$currentSector}.{$sellSector}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+              <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+              <set_value name="$gdCacheBL.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+            </do_else>
           </do_else>
         </do_elseif>
         <do_else>
-          <!-- Normal case: Need to travel from buy to sell sector -->
-          <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+          <!-- Normal: buy→sell blacklist-aware gatedistance (memoized) -->
+          <do_if value="$gdCacheBL.{$buySector}? and $gdCacheBL.{$buySector}.{$sellSector}?">
+            <set_value name="$sellDistance" exact="$gdCacheBL.{$buySector}.{$sellSector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+            <do_if value="not $gdCacheBL.{$buySector}?"><set_value name="$gdCacheBL.{$buySector}" exact="table[]"/></do_if>
+            <set_value name="$gdCacheBL.{$buySector}.{$sellSector}" exact="$sellDistance"/>
+          </do_else>
         </do_else>
         
         <!-- Always log distance check to diagnose issues -->
@@ -3227,41 +3263,71 @@
                   <!-- Buy path: If ship is already in buy sector, distance is 0 (no travel needed) -->
                   <set_value name="$buyDistance" exact="-1"/>
                   <do_if value="$buySector == $currentSector">
-                    <!-- Ship already in buy sector - no travel needed -->
                     <set_value name="$buyDistance" exact="0"/>
                   </do_if>
                   <do_elseif value="$currentSectorIsBlacklisted">
-                    <!-- Ship escaping from blacklisted sector - use non-blacklist-aware gatedistance to find ANY path -->
-            <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}"/>
+                    <!-- Escape: non-blacklist gatedistance (memoized) -->
+                    <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$buySector}?">
+                      <set_value name="$buyDistance" exact="$gdCache.{$currentSector}.{$buySector}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}"/>
+                      <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+                      <set_value name="$gdCache.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+                    </do_else>
                   </do_elseif>
                   <do_else>
-                    <!-- Normal case: Ship needs to travel TO buy sector - use blacklist-aware pathfinding -->
-            <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}.{$blacklistgroup}.{this.ship}"/>
+                    <!-- Normal: blacklist-aware gatedistance (memoized) -->
+                    <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$buySector}?">
+                      <set_value name="$buyDistance" exact="$gdCacheBL.{$currentSector}.{$buySector}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$buyDistance" exact="this.ship.gatedistance.{$buySector}.{$blacklistgroup}.{this.ship}"/>
+                      <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+                      <set_value name="$gdCacheBL.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+                    </do_else>
                   </do_else>
                   
                   <!-- Sell path: Calculate based on buy location -->
                   <set_value name="$sellDistance" exact="-1"/>
                   <do_if value="$sellSector == $buySector">
-                    <!-- Buy and sell in same sector -->
                     <set_value name="$sellDistance" exact="0"/>
                   </do_if>
                   <do_elseif value="$buySector == $currentSector">
-                    <!-- Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
-                    <!-- This allows escape: ship in Lasting Vengeance → buy in Lasting Vengeance → sell in safe sector -->
-                    <!-- If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
-                    <!-- This allows escape even if all paths go through blacklisted sectors -->
+                    <!-- Ship in buy sector: escape vs normal path to sell sector -->
                     <do_if value="$currentSectorIsBlacklisted">
-                      <!-- Escape case: Use non-blacklist-aware distance to check if ANY path exists -->
-            <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}"/>
+                      <!-- Escape: non-blacklist gatedistance (memoized) -->
+                      <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$sellSector}?">
+                        <set_value name="$sellDistance" exact="$gdCache.{$currentSector}.{$sellSector}"/>
+                      </do_if>
+                      <do_else>
+                        <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}"/>
+                        <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+                        <set_value name="$gdCache.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+                      </do_else>
                     </do_if>
                     <do_else>
-                      <!-- Normal case: Use blacklist-aware distance -->
-            <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+                      <!-- Normal: blacklist-aware gatedistance (memoized) -->
+                      <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$sellSector}?">
+                        <set_value name="$sellDistance" exact="$gdCacheBL.{$currentSector}.{$sellSector}"/>
+                      </do_if>
+                      <do_else>
+                        <set_value name="$sellDistance" exact="this.ship.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+                        <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+                        <set_value name="$gdCacheBL.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+                      </do_else>
                     </do_else>
                   </do_elseif>
                   <do_else>
-                    <!-- Normal case: Need to travel from buy to sell sector -->
-          <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+                    <!-- Normal: buy→sell blacklist-aware gatedistance (memoized) -->
+                    <do_if value="$gdCacheBL.{$buySector}? and $gdCacheBL.{$buySector}.{$sellSector}?">
+                      <set_value name="$sellDistance" exact="$gdCacheBL.{$buySector}.{$sellSector}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{this.ship}"/>
+                      <do_if value="not $gdCacheBL.{$buySector}?"><set_value name="$gdCacheBL.{$buySector}" exact="table[]"/></do_if>
+                      <set_value name="$gdCacheBL.{$buySector}.{$sellSector}" exact="$sellDistance"/>
+                    </do_else>
                   </do_else>
                   
                   <!-- Always log distance check to diagnose issues -->
@@ -3350,22 +3416,36 @@
               <set_value name="$sellDistanceFromHome" exact="-1"/>
               
               <do_if value="not $isSellOnlyTrade">
-                <!-- Normal trade: check buy distance from home -->
+                <!-- Normal trade: check buy distance from home (memoized) -->
                 <set_value name="$buyDistanceFromHome" exact="-1"/>
                 <do_if value="$buySector == $homeSector">
                   <set_value name="$buyDistanceFromHome" exact="0"/>
                 </do_if>
                 <do_else>
-                  <set_value name="$buyDistanceFromHome" exact="$homeSector.gatedistance.{$buySector}"/>
+                  <do_if value="$gdCache.{$homeSector}? and $gdCache.{$homeSector}.{$buySector}?">
+                    <set_value name="$buyDistanceFromHome" exact="$gdCache.{$homeSector}.{$buySector}"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$buyDistanceFromHome" exact="$homeSector.gatedistance.{$buySector}"/>
+                    <do_if value="not $gdCache.{$homeSector}?"><set_value name="$gdCache.{$homeSector}" exact="table[]"/></do_if>
+                    <set_value name="$gdCache.{$homeSector}.{$buySector}" exact="$buyDistanceFromHome"/>
+                  </do_else>
                 </do_else>
               </do_if>
               
-              <!-- Always check sell distance from home -->
+              <!-- Always check sell distance from home (memoized) -->
               <do_if value="$sellSector == $homeSector">
                 <set_value name="$sellDistanceFromHome" exact="0"/>
               </do_if>
               <do_else>
-                <set_value name="$sellDistanceFromHome" exact="$homeSector.gatedistance.{$sellSector}"/>
+                <do_if value="$gdCache.{$homeSector}? and $gdCache.{$homeSector}.{$sellSector}?">
+                  <set_value name="$sellDistanceFromHome" exact="$gdCache.{$homeSector}.{$sellSector}"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$sellDistanceFromHome" exact="$homeSector.gatedistance.{$sellSector}"/>
+                  <do_if value="not $gdCache.{$homeSector}?"><set_value name="$gdCache.{$homeSector}" exact="table[]"/></do_if>
+                  <set_value name="$gdCache.{$homeSector}.{$sellSector}" exact="$sellDistanceFromHome"/>
+                </do_else>
               </do_else>
               
               <!-- Show calculated distances for diagnosis -->
@@ -5920,9 +6000,17 @@
         $FailedShips = 0,
         $TargetType = 0
       ]"/>
-      <do_if value="$rawCount gt 0">
-        <do_all exact="$rawCount" counter="$rawIdx">
-          <set_value name="$rawEntry" exact="$rawCacheList.{$rawIdx}"/>
+      <!-- Chunked pre-filter: process 50 entries per chunk with cooperative yielding to prevent frame spikes -->
+      <set_value name="$pfProcessed" exact="0"/>
+      <label name="prefilter_work_loop"/>
+      <set_value name="$pfChunkStart" exact="$pfProcessed + 1"/>
+      <set_value name="$pfChunkEnd" exact="[$pfProcessed + 50, $rawCount].min"/>
+      
+      <do_if value="$pfChunkStart le $rawCount">
+        <do_all exact="($pfChunkEnd - $pfChunkStart + 1)" counter="$pfIdx">
+          <set_value name="$rawIdx" exact="$pfChunkStart + $pfIdx - 1"/>
+          <!-- Safe access: global cache list may shrink during cooperative yield between chunks -->
+          <set_value name="$rawEntry" exact="@$rawCacheList.{$rawIdx}"/>
           <do_if value="$rawEntry?">
             <set_value name="$entryPassesFilters" exact="true"/>
             
@@ -5931,27 +6019,21 @@
               <set_value name="$entryHomeToBuy" exact="@$rawEntry.$HomeToBuyDistance"/>
               <set_value name="$entryHomeToSell" exact="@$rawEntry.$HomeToSellDistance"/>
               <do_if value="$entryHomeToBuy? and $entryHomeToSell?">
-                <!-- Both distances are cached - use them for filtering -->
                 <set_value name="$entryMaxDist" exact="[$entryHomeToBuy, $entryHomeToSell].max"/>
                 <do_if value="$entryHomeToBuy lt 0 or $entryHomeToSell lt 0 or $entryMaxDist gt $maxDistance">
                   <set_value name="$entryPassesFilters" exact="false"/>
                   <set_value name="$filterRejectCount.$Distance" operation="add"/>
-                  <!-- Debug logging for distance rejections - log more entries to diagnose filtering issues -->
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($filterRejectCount.$Distance le 20 or ($entryMaxDist le $maxDistance + 1 and $filterRejectCount.$Distance le 50))">
                     <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter REJECTED (distance): entryMaxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', homeToBuy=' + $entryHomeToBuy + ', homeToSell=' + $entryHomeToSell + ', rawIdx=' + $rawIdx" chance="100"/>
                   </do_if>
                 </do_if>
                 <do_else>
-                  <!-- Entry passed distance filter - throttle logging to first 5 entries to prevent log spam -->
-                  <!-- (1810+ PASSED lines per ship provided no diagnostic value; REJECTED logs are more useful) -->
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $rawIdx le 5">
                     <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter PASSED (distance): entryMaxDist=' + $entryMaxDist + ', allowed=' + $maxDistance + ', homeToBuy=' + $entryHomeToBuy + ', homeToSell=' + $entryHomeToSell + ', rawIdx=' + $rawIdx" chance="100"/>
                   </do_if>
                 </do_else>
               </do_if>
               <do_else>
-                <!-- Distances not cached (shouldn't happen, but safety fallback) -->
-                <!-- Keep entry - it will be validated later with full distance calculation -->
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($rawIdx le 3)">
                   <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-filter WARNING: distances not cached for entry (will validate later)'" chance="100"/>
                 </do_if>
@@ -5979,23 +6061,17 @@
               </do_if>
             </do_if>
             
-            <!-- 4. Failed sector pairs filter (check against preloaded failed trades) -->
-            <do_if value="$entryPassesFilters and $failedTrades.count gt 0">
+            <!-- 4. Failed sector pairs filter — O(1) nested table lookup (matching B2 pattern) -->
+            <do_if value="$entryPassesFilters and $failedTrades.keys.count gt 0">
               <set_value name="$buyOffer" exact="@$rawEntry.$BuyOffer"/>
               <set_value name="$sellOffer" exact="@$rawEntry.$SellOffer"/>
               <do_if value="$buyOffer? and $buyOffer.exists and $sellOffer? and $sellOffer.exists">
                 <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
                 <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
-                <do_all exact="$failedTrades.count" counter="$failIdx">
-                  <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-                  <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-                    <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
-                      <set_value name="$entryPassesFilters" exact="false"/>
-                      <set_value name="$filterRejectCount.$FailedSectorPairs" operation="add"/>
-                      <break/>
-                    </do_if>
-                  </do_if>
-                </do_all>
+                <do_if value="$failedTrades.{$entryBuySector}? and $failedTrades.{$entryBuySector}.{$entrySellSector}?">
+                  <set_value name="$entryPassesFilters" exact="false"/>
+                  <set_value name="$filterRejectCount.$FailedSectorPairs" operation="add"/>
+                </do_if>
               </do_if>
             </do_if>
             
@@ -6033,6 +6109,16 @@
             </do_if>
           </do_if>
         </do_all>
+        
+        <set_value name="$pfProcessed" exact="$pfChunkEnd"/>
+        
+        <!-- Cooperative yield between pre-filter chunks -->
+        <wait exact="1ms"/>
+        
+        <!-- Continue if more entries to process -->
+        <do_if value="$pfProcessed lt $rawCount">
+          <resume label="prefilter_work_loop"/>
+        </do_if>
       </do_if>
       
       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', rawEntries=' + $rawCount + ', preFilteredEntries=' + $cacheList.count + ', filterRejections: Distance=' + $filterRejectCount.$Distance + ', IllegalWare=' + $filterRejectCount.$IllegalWare + ', TradeRules=' + $filterRejectCount.$TradeRules + ', FailedSectorPairs=' + $filterRejectCount.$FailedSectorPairs + ', FailedShips=' + $filterRejectCount.$FailedShips + ', TargetType=' + $filterRejectCount.$TargetType" chance="100"/>
@@ -6136,88 +6222,10 @@
                 <set_value name="$rejectReason" exact="'station_not_operational'"/>
               </do_elseif>
               
-              <!-- ==================================================================================== -->
-              <!-- CHEAP CHECKS FIRST: Filter out invalid entries before expensive property lookups -->
-              <!-- ==================================================================================== -->
-              
-              <!-- CRITICAL: Distance check FIRST (before expensive checks like docking permissions) -->
-              <!-- Use precomputed distances from cache entry if available -->
-              <do_if value="$isValid">
-                <set_value name="$homeToBuy" exact="@$cacheEntry.$HomeToBuyDistance"/>
-                <set_value name="$homeToSell" exact="@$cacheEntry.$HomeToSellDistance"/>
-                <do_if value="not $homeToBuy? or not $homeToSell?">
-                  <!-- Fallback: calculate distances if not cached (shouldn't happen, but safety check) -->
-                  <set_value name="$homeToBuy" exact="$homeSector.gatedistance.{$buyOffer.owner.sector}"/>
-                  <set_value name="$homeToSell" exact="$homeSector.gatedistance.{$sellOffer.owner.sector}"/>
-                </do_if>
-                <set_value name="$maxHomeDist" exact="[$homeToBuy, $homeToSell].max"/>
-                <do_if value="$homeToBuy lt 0 or $homeToSell lt 0 or $maxHomeDist gt $maxDistance">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'distance_exceeded maxDist=' + $maxHomeDist + ' allowed=' + $maxDistance"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Illegal-ware filter (ship setting) - cheap property lookup -->
-              <do_if value="$isValid and not $allowIllegal">
-                <set_value name="$ware" exact="@$buyOffer.ware"/>
-                <do_if value="$ware != null and @$ware.illegal gt 0">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'illegal_ware'"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Trade rules filter (cache metadata) - cheap cache lookup -->
-              <do_if value="$isValid and not $ignoreTradeRules">
-                <set_value name="$tradeRulesRespected" exact="if $cacheEntry.$TradeRulesRespected? then $cacheEntry.$TradeRulesRespected else false"/>
-                <do_if value="not $tradeRulesRespected">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'trade_rules_not_respected'"/>
-                </do_if>
-              </do_if>
-              
-              <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - O(1) nested table lookup -->
-              <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
-              <do_if value="$isValid and $failedTrades.keys.count gt 0">
-                <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
-                <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
-                <do_if value="$failedTrades.{$entryBuySector}? and $failedTrades.{$entryBuySector}.{$entrySellSector}?">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'failed_sector_pair'"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Failure-distribution filter: skip if this ship already failed this entry - cheap cache lookup -->
-              <do_if value="$isValid">
-                <set_value name="$failedShips" exact="@$cacheEntry.$FailedShips"/>
-                <do_if value="$failedShips == null">
-                  <set_value name="$failedShips" exact="[]"/>
-                </do_if>
-                <set_value name="$shipAlreadyFailedThisEntry" exact="false"/>
-                <do_all exact="$failedShips.count" counter="$f">
-                  <do_if value="$failedShips.{$f} == this.ship">
-                    <set_value name="$shipAlreadyFailedThisEntry" exact="true"/>
-                    <break/>
-                  </do_if>
-                </do_all>
-                <do_if value="$shipAlreadyFailedThisEntry">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'ship_already_failed'"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Target-type filters (cache metadata) - cheap cache lookup -->
-              <do_if value="$isValid and ($ignoreBuildStorage or $ignoreCarrierAux)">
-                <set_value name="$buyType" exact="@$cacheEntry.$BuyTargetType"/>
-                <set_value name="$sellType" exact="@$cacheEntry.$SellTargetType"/>
-                <do_if value="$ignoreBuildStorage and ($buyType == 'Buildstorage' or $sellType == 'Buildstorage')">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'build_storage_filtered'"/>
-                </do_if>
-                <do_elseif value="$ignoreCarrierAux and (($buyType == 'Aux' or $buyType == 'Carrier') or ($sellType == 'Aux' or $sellType == 'Carrier'))">
-                  <set_value name="$isValid" exact="false"/>
-                  <set_value name="$rejectReason" exact="'carrier_aux_filtered'"/>
-                </do_elseif>
-              </do_if>
+              <!-- NOTE: Distance, illegal ware, trade rules, failed sector pairs, failed ships,
+                   and target type checks are SKIPPED here — already verified by the pre-filter
+                   loop (prefilter_work_loop). Only time-sensitive and ship-specific expensive
+                   checks remain below (docking, dock size, offer availability, profit/ROI). -->
               
               <!-- ==================================================================================== -->
               <!-- EXPENSIVE CHECKS LAST: Property lookups on ship/station objects -->
