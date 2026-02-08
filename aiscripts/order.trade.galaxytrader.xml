@@ -2631,9 +2631,13 @@
           </do_if>
           
           <!-- ==================================================================================== -->
-          <!-- PERFORMANCE: Early money gate - skip entire trade search pipeline if player is broke -->
-          <!-- This prevents the expensive pre-filter loop (1810+ cache entries) and work loop from running -->
-          <!-- when there is no money to buy anything. Ships go directly to insufficient_funds cooldown. -->
+          <!-- MECHANIC 2: Early money gate - skip entire trade search pipeline when player is broke -->
+          <!-- Threshold: MinPlayerMoney + 100 Cr safety buffer.                                   -->
+          <!-- This prevents the expensive cache search / work loop from running when there is      -->
+          <!-- no meaningful budget left. Ships go directly to insufficient_funds cooldown.          -->
+          <!-- Works with MECHANIC 1 (authoritative guard budget clamp at trade creation):           -->
+          <!--   Mechanic 1 = clamp trade volume to fit budget  (trade creation)                    -->
+          <!--   Mechanic 2 = stop searching when budget is exhausted (search start)                -->
           <!-- ==================================================================================== -->
           <set_value name="$earlyMoneyCheck" exact="player.money"/>
           <set_value name="$minPlayerMoney" exact="1000"/>
@@ -2643,11 +2647,34 @@
               <set_value name="$minPlayerMoney" exact="$tmpMinMoney"/>
             </do_if>
           </do_if>
-          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix -->
-          <do_if value="$earlyMoneyCheck lt ($minPlayerMoney)Cr">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr below threshold=' + $minPlayerMoney + ' Cr - skipping trade search'" chance="100"/>
+          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix.
+               +1000 Cr safety buffer: prevents ships from searching when player money is close to
+               the threshold. Without the buffer, ships would search, get budget-clamped to tiny amounts,
+               execute micro-trades, and drain money toward MinPlayerMoney.
+               The buffer ensures a clean stop well before hitting the floor. -->
+          <set_value name="$moneyGateThreshold" exact="($minPlayerMoney + 1000)Cr"/>
+          <do_if value="$earlyMoneyCheck le $moneyGateThreshold">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr at or below threshold=' + ($minPlayerMoney + 1000) + ' Cr (MinPlayerMoney=' + $minPlayerMoney + ' + 1000 buffer) - skipping trade search'" chance="100"/>
             <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
             <resume label="no_trade_retry"/>
+          </do_if>
+          
+          <!-- GLOBAL MONEY CAP: When the authoritative guard blocked a trade (0 affordable units),
+               it set global.$GT_MoneyCapActive. This stops ALL ships from searching until money
+               increases. Clears automatically when player.money rises above the recorded level. -->
+          <do_if value="global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive">
+            <do_if value="$earlyMoneyCheck le global.$GT_MoneyCapMoney">
+              <!-- Money hasn't increased since fleet-wide block - skip search -->
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP: player money=' + ($earlyMoneyCheck / 100) + ' Cr has not increased since cap (' + (global.$GT_MoneyCapMoney / 100) + ' Cr) - skipping trade search'" chance="100"/>
+              <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+              <resume label="no_trade_retry"/>
+            </do_if>
+            <do_else>
+              <!-- Money increased! Clear global cap so all ships can search again -->
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP CLEARED: player money=' + ($earlyMoneyCheck / 100) + ' Cr increased above cap (' + (global.$GT_MoneyCapMoney / 100) + ' Cr) - resuming fleet trade searches'" chance="100"/>
+              <set_value name="global.$GT_MoneyCapActive" exact="false"/>
+              <remove_value name="global.$GT_MoneyCapMoney"/>
+            </do_else>
           </do_if>
           
           <!-- CRITICAL: Always wait briefly for any pending GT_Trade_Found signals before sending new request -->
@@ -2952,6 +2979,35 @@
       <label name="trade_found"/>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': REACHED trade_found label - starting blacklist validation at game time ' + player.age" chance="100"/>
+      </do_if>
+      
+      <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when player
+           money has dropped below the threshold since this ship's search started.
+           Checks both the static threshold (MinPlayerMoney + 100 buffer) and the global money cap.
+           Without this, ships deep in the pipeline would do full blacklist validation
+           on every trade only to be blocked at the authoritative guard anyway. -->
+      <set_value name="$fastMinPlayerMoney" exact="1000"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+        <set_value name="$tmpFastMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+        <do_if value="$tmpFastMin? and $tmpFastMin != null and $tmpFastMin gt 0">
+          <set_value name="$fastMinPlayerMoney" exact="$tmpFastMin"/>
+        </do_if>
+      </do_if>
+      <set_value name="$fastMoneyThreshold" exact="($fastMinPlayerMoney + 1000)Cr"/>
+      <do_if value="player.money le $fastMoneyThreshold">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr at or below threshold=' + ($fastMinPlayerMoney + 1000) + ' Cr - skipping validation, backing off'" chance="100"/>
+        </do_if>
+        <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+        <resume label="no_trade_retry"/>
+      </do_if>
+      <!-- Also check global money cap (set by authoritative guard when a ship couldn't afford even 1 unit) -->
+      <do_if value="global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK (global cap) at trade_found: player.money=' + (player.money / 100) + ' Cr, cap=' + (global.$GT_MoneyCapMoney / 100) + ' Cr - skipping validation, backing off'" chance="100"/>
+        </do_if>
+        <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+        <resume label="no_trade_retry"/>
       </do_if>
       
       <!-- Initialize validation variables BEFORE do_if block to ensure they always exist -->
@@ -4411,6 +4467,70 @@
           <!-- This appears to be a vanilla design decision - subordinates' finances are part of commander's finances -->
           <set_value name="$tradeOrderInternal" exact="false"/>
 
+          <!-- AUTHORITATIVE MinPlayerMoney guard — BUDGET CLAMP (race-free) -->
+          <!-- This runs in the AI script with NO yield between check and create_trade_order,
+               so player.money is guaranteed to reflect all prior create_trade_order deductions.
+               Mechanic 1: If the full trade would drain below MinPlayerMoney, reduce volume
+               to fit (player.money - MinPlayerMoney). If even 1 unit is unaffordable, block
+               and back off via no_trade_retry with insufficient_funds. -->
+          <set_value name="$aiBuyPrice" exact="0"/>
+          <do_if value="$pendingTrade.$BuyPrice?">
+            <set_value name="$aiBuyPrice" exact="$pendingTrade.$BuyPrice"/>
+          </do_if>
+          <do_elseif value="$pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice?">
+            <set_value name="$aiBuyPrice" exact="$pendingTrade.$BuyOffer.unitprice"/>
+          </do_elseif>
+          <set_value name="$aiPurchaseCost" exact="if $isSellOnlyTradeForPending then 0 else ($aiBuyPrice * $finalBuyAmount)"/>
+          <set_value name="$aiMinPlayerMoney" exact="1000"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+            <set_value name="$tmpAiMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+            <do_if value="$tmpAiMin? and $tmpAiMin != null and $tmpAiMin gt 0">
+              <set_value name="$aiMinPlayerMoney" exact="$tmpAiMin"/>
+            </do_if>
+          </do_if>
+          <do_if value="(player.money - $aiPurchaseCost) lt ($aiMinPlayerMoney)Cr">
+            <!-- Full clamped amount would drain below MinPlayerMoney.
+                 Try to reduce amount further to fit the available budget.
+                 availableBudget = player.money - MinPlayerMoney (in cents). -->
+            <do_if value="not $isSellOnlyTradeForPending and $aiBuyPrice gt 0">
+              <set_value name="$aiAvailableBudget" exact="player.money - ($aiMinPlayerMoney)Cr"/>
+              <set_value name="$aiAffordableUnits" exact="$aiAvailableBudget / $aiBuyPrice"/>
+              <do_if value="$aiAffordableUnits ge 1">
+                <!-- Player can afford a reduced amount - clamp and proceed -->
+                <set_value name="$finalBuyAmount" exact="$aiAffordableUnits"/>
+                <set_value name="$finalSellAmount" exact="$aiAffordableUnits"/>
+                <set_value name="$aiPurchaseCost" exact="$aiBuyPrice * $aiAffordableUnits"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BUDGET CLAMP (authoritative guard): reduced from original to ' + $aiAffordableUnits + ' units, cost=' + ($aiPurchaseCost / 100) + ' Cr, player.money=' + (player.money / 100) + ' Cr, remaining=' + ((player.money - $aiPurchaseCost) / 100) + ' Cr (threshold: ' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- Can't afford even 1 unit - truly insufficient funds -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (authoritative guard): player.money=' + (player.money / 100) + ' Cr, unitPrice=' + ($aiBuyPrice / 100) + ' Cr -- cannot afford even 1 unit above MinPlayerMoney threshold (' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
+                </do_if>
+                <!-- GLOBAL MONEY CAP: If even 1 unit is unaffordable, stop ALL ships from searching.
+                     Record player.money so the flag auto-clears when money increases from any source. -->
+                <set_value name="global.$GT_MoneyCapActive" exact="true"/>
+                <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
+                <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+                <resume label="no_trade_retry"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <!-- Sell-only trade should never fail this check (cost=0), but block as safety -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (authoritative guard, edge case): player.money=' + (player.money / 100) + ' Cr, purchaseCost=' + ($aiPurchaseCost / 100) + ' Cr -- below MinPlayerMoney threshold (' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
+              </do_if>
+              <set_value name="global.$GT_MoneyCapActive" exact="true"/>
+              <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
+              <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+              <resume label="no_trade_retry"/>
+            </do_else>
+          </do_if>
+
           <do_if value="$pendingTrade.$SellOffer?">
             <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="true" internal="$tradeOrderInternal"/>
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -4910,6 +5030,9 @@
       
       <label name="trade_completed"/>
       
+      <!-- NOTE: Global money cap (global.$GT_MoneyCapActive) auto-clears in the early money gate
+           when player.money rises above global.$GT_MoneyCapMoney. No per-ship clearing needed. -->
+      
       <!-- CRITICAL: Clear trades awaiting validation after trade execution completes -->
       <!-- This ensures ships always check cache first on next search, not stale pending trades -->
       <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
@@ -5142,18 +5265,24 @@
            Smooth gameplay > throughput: wait longer here to reduce request churn and let the scheduler/queues drain.
            TODO: keep hardcoded for now; consider exposing as tuning later. -->
       <set_value name="$noTradeReason" exact="if this.$lastNoTradeReason? then this.$lastNoTradeReason else ''"/>
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': no_trade_retry entered: reason=\'' + $noTradeReason + '\' player.money=' + (player.money / 100) + ' Cr'" chance="100"/>
+      </do_if>
       <do_if value="$noTradeReason == 'busy' or $noTradeReason == 'busy_batch' or $noTradeReason == 'home_refresh' or $noTradeReason == 'insufficient_funds'">
         <set_value name="this.$lastNoTradeReason" exact="''"/>
+        <!-- NOTE: Global money cap (global.$GT_MoneyCapActive) is set by the authoritative guard
+             when blocking. No per-ship state needed here — the global flag stops all ships. -->
         <!-- Fixed retry for special reasons (do NOT use escalating cooldown). -->
         <!-- For home_refresh: shorter wait (3s) to allow cache retry while home refresh populates cache -->
         <!-- For busy/busy_batch: longer wait (8-12s) to let queues drain -->
-        <!-- For insufficient_funds: longer wait (20-40s) - player is broke, no point retrying quickly.
-             Jitter prevents thundering herd: 250 ships spread across 20s window instead of all waking simultaneously. -->
-        <set_value name="this.$retryCooldown" exact="if $noTradeReason == 'home_refresh' then 3s else (if $noTradeReason == 'insufficient_funds' then 30s else 10s)"/>
+        <!-- For insufficient_funds: long wait (90-150s) - budget exhausted, no point retrying quickly.
+             Jitter prevents thundering herd: ships spread across 60s window instead of all waking simultaneously.
+             On wake-up, the early money gate and global money cap prevent futile searches. -->
+        <set_value name="this.$retryCooldown" exact="if $noTradeReason == 'home_refresh' then 3s else (if $noTradeReason == 'insufficient_funds' then 120s else 10s)"/>
         <!-- JITTER: Compute per-ship min/max wait for <wait> element.
-             insufficient_funds: 20s-40s (±33%), busy: 8s-12s (±20%), home_refresh: 3s (no jitter, needs responsiveness) -->
-        <set_value name="this.$retryWaitMin" exact="if $noTradeReason == 'insufficient_funds' then 20s else (if $noTradeReason == 'home_refresh' then 3s else 8s)"/>
-        <set_value name="this.$retryWaitMax" exact="if $noTradeReason == 'insufficient_funds' then 40s else (if $noTradeReason == 'home_refresh' then 3s else 12s)"/>
+             insufficient_funds: 90s-150s (±25%), busy: 8s-12s (±20%), home_refresh: 3s (no jitter, needs responsiveness) -->
+        <set_value name="this.$retryWaitMin" exact="if $noTradeReason == 'insufficient_funds' then 90s else (if $noTradeReason == 'home_refresh' then 3s else 8s)"/>
+        <set_value name="this.$retryWaitMax" exact="if $noTradeReason == 'insufficient_funds' then 150s else (if $noTradeReason == 'home_refresh' then 3s else 12s)"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': System busy/home refresh/insufficient funds - waiting ' + (this.$retryWaitMin/1s) + '-' + (this.$retryWaitMax/1s) + 's then retrying cache (reason: ' + $noTradeReason + ')'" chance="100"/>
         </do_if>
@@ -5211,7 +5340,7 @@
         <set_command command="command.wait"/>
         <set_command_action commandaction="commandaction.standingby"/>
         <!-- JITTER: Use per-ship min/max to spread retries across a time window (prevents thundering herd).
-             For insufficient_funds: 20s-40s window. For busy: 8s-12s. For home_refresh: fixed 3s. -->
+             For insufficient_funds: 90s-150s window. For busy: 8s-12s. For home_refresh: fixed 3s. -->
         <wait min="if @this.$retryWaitMin != null then @this.$retryWaitMin else 10s" max="if @this.$retryWaitMax != null then @this.$retryWaitMax else 10s"/>
         <resume label="main_loop"/>
       </do_if>
@@ -5899,7 +6028,8 @@
             $ScanDone = true
           ]
         ]"/>
-        <resume label="main_loop"/>
+        <!-- CRITICAL: Go to wait_for_response so AI catches MD's GT_Trade_Found/GT_No_Trade_Found -->
+        <resume label="wait_for_response"/>
       </do_if>
       
       <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
@@ -6497,7 +6627,10 @@
           $BestScore = $bestScore
         ]
       ]"/>
-      <resume label="main_loop"/>
+      <!-- CRITICAL: Go to wait_for_response (NOT main_loop) so the AI is in a wait state
+           when the MD sends GT_Trade_Found or GT_No_Trade_Found after processing the results.
+           Previously resumed to main_loop, which ran synchronously and missed the delayed signal. -->
+      <resume label="wait_for_response"/>
       
       <!-- Process live offers work unit -->
       <label name="process_live_offers_workunit"/>
@@ -6713,7 +6846,8 @@
               $WorkType = 'live_offers',
               $Result = if $filteredResult? then $filteredResult else table[$SellOffers = [], $BuyOffers = []]
             ]"/>
-            <resume label="main_loop"/>
+            <!-- CRITICAL: Go to wait_for_response so AI catches MD's GT_Trade_Found/GT_No_Trade_Found -->
+            <resume label="wait_for_response"/>
           </actions>
         </interrupt>
       </wait>
@@ -6729,7 +6863,8 @@
         $WorkType = 'live_offers',
         $Result = $filteredResult
       ]"/>
-      <resume label="main_loop"/>
+      <!-- CRITICAL: Go to wait_for_response so AI catches MD's GT_Trade_Found/GT_No_Trade_Found -->
+      <resume label="wait_for_response"/>
       
       <!-- Process trade matching work unit -->
       <label name="process_trade_matching_workunit"/>
@@ -7077,7 +7212,8 @@
           $BestScore = $bestScore
         ]
       ]"/>
-      <resume label="main_loop"/>
+      <!-- CRITICAL: Go to wait_for_response so AI catches MD's GT_Trade_Found/GT_No_Trade_Found -->
+      <resume label="wait_for_response"/>
       
     </actions>
   </attention>

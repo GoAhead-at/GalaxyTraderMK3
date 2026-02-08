@@ -18,7 +18,10 @@ import platform
 import re
 import sys
 import time as _time
-from collections import Counter, defaultdict
+import urllib.request
+import urllib.error
+import zipfile
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 
 
@@ -26,6 +29,10 @@ import gt_log_utils as u
 
 # ---------------------------------------------------------------------------
 # Version
+# ---------------------------------------------------------------------------
+UPLOAD_URL = "https://0x0.st"
+UPLOAD_RETENTION = "30 days (small files) to 365 days"
+
 # ---------------------------------------------------------------------------
 TOOL_VERSION = "1.0.0"
 
@@ -78,6 +85,20 @@ RE_SHIP_DESTROYED = re.compile(r"CRITICAL THREAT|Ship destruction")
 RE_HOME_SECTOR = re.compile(r"Operating with home base:\s+(?P<home>.+?)\s+\(maxbuy=")
 RE_HOME_SECTOR2 = re.compile(r"homeSector=(?P<home>.+?)(?:\s+[\w.]+\s*=|,|$)")
 
+# Insufficient funds / money cap events
+RE_BLOCKED_EARLY_REJECT = re.compile(
+    r"BLOCKED trade \(early reject\).*player\.money=(?P<money>[\d.]+)\s*Cr.*purchaseCost=(?P<cost>[\d.]+)\s*Cr.*MinPlayerMoney.*\((?P<threshold>[\d.]+)\s*Cr\)")
+RE_BLOCKED_AUTH_GUARD = re.compile(
+    r"BLOCKED trade \(authoritative guard\).*player\.money=(?P<money>[\d.]+)\s*Cr.*purchaseCost=(?P<cost>[\d.]+)\s*Cr.*MinPlayerMoney.*\((?P<threshold>[\d.]+)\s*Cr\)")
+RE_EARLY_MONEY_GATE = re.compile(
+    r"EARLY MONEY GATE.*player money=(?P<money>[\d.]+)\s*Cr.*threshold=(?P<threshold>[\d.]+)\s*Cr")
+RE_SHIP_MONEY_CAP_SKIP = re.compile(
+    r"SHIP MONEY CAP:.*player money=(?P<money>[\d.]+)\s*Cr.*last block \((?P<blocked_at>[\d.]+)\s*Cr\)")
+RE_SHIP_MONEY_CAP_CLEARED = re.compile(
+    r"SHIP MONEY CAP CLEARED")
+RE_INSUFFICIENT_FUNDS_WAIT = re.compile(
+    r"insufficient funds - waiting\s+(?P<min>[\d.]+)-(?P<max>[\d.]+)s")
+
 # Frame cost (timestamps)
 RE_TS_FLOAT = re.compile(r"\[Scripts\]\s+(\d+\.\d+)\s+\*\*\*")
 
@@ -115,10 +136,55 @@ class ReportWriter:
         self._lines.append(text)
         print(u.gray(text))
 
+    def file_only(self, text: str):
+        """Write to file only (no console output). Use for large data sections."""
+        self._lines.append(text)
+
     def save(self):
         with open(self._filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(self._lines))
             f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# 0x0.st upload (no auth, no account required)
+# ---------------------------------------------------------------------------
+def upload_file(filepath: str) -> str | None:
+    """Upload a file to 0x0.st and return the download URL, or None on failure."""
+    filename = os.path.basename(filepath)
+    boundary = f"----GTBugReport{int(_time.time())}"
+
+    with open(filepath, "rb") as f:
+        file_data = f.read()
+
+    # Build multipart/form-data body
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+    body += b"Content-Type: application/zip\r\n\r\n"
+    body += file_data
+    body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        UPLOAD_URL,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "GT-BugReport/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            url = resp.read().decode("utf-8").strip()
+            if url.startswith("http"):
+                return url
+            return None
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(u.red(f"  Upload error: {e}"))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +368,23 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
     threat_event_count = 0
     ship_destroyed_count = 0
 
+    # Insufficient funds tracking
+    block_early_reject_count = 0
+    block_auth_guard_count = 0
+    early_money_gate_count = 0
+    ship_money_cap_skip_count = 0
+    ship_money_cap_cleared_count = 0
+    insufficient_funds_wait_count = 0
+    # Per-ship: ship -> list of (timestamp, event_type, money, cost_or_threshold)
+    funds_events_per_ship: dict[str, list[tuple]] = defaultdict(list)
+    # Player money at block times (for trend display)
+    money_at_blocks: list[tuple[float, float]] = []  # (timestamp, player_money_cr)
+    # First/last insufficient funds timestamps
+    first_funds_block_ts: float | None = None
+    last_funds_block_ts: float = 0.0
+    # Recent (last 5 min) money-blocked ships
+    recent_money_blocked: Counter = Counter()
+
     # Errors
     error_lines: list[str] = []
     prop_lookup_fails: list[str] = []
@@ -312,8 +395,9 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
     recent_rejected: Counter = Counter()    # ship -> count
     recent_timeout: Counter = Counter()     # ship -> count
 
-    # Raw tail (last 100 GT lines)
-    gt_tail: list[str] = []
+    # Raw log tail (complete log or last N lines)
+    limit_tail = tail_size > 0  # True = keep only last N lines; False = keep all
+    log_tail: deque[str] | list[str] = deque(maxlen=tail_size) if limit_tail else []
 
     print(u.yellow("  Analyzing log (single-pass)..."))
     start_wall = _time.time()
@@ -347,16 +431,14 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
                 if len(critical_lines) < 50:
                     critical_lines.append(stripped)
 
+            # Log tail (all lines, not just GT)
+            log_tail.append(stripped)
+
             # GT-specific analysis
             if not RE_GT_TAG.search(stripped) and "GT_Find_" not in stripped and "GT_No_Trade" not in stripped and "GT_Trade" not in stripped:
                 continue
 
             gt_lines += 1
-
-            # GT tail
-            gt_tail.append(stripped)
-            if len(gt_tail) > tail_size:
-                gt_tail.pop(0)
 
             # Ship ID extraction
             sid = u.extract_ship_id(stripped)
@@ -421,6 +503,61 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
                 threat_event_count += 1
             if RE_SHIP_DESTROYED.search(stripped):
                 ship_destroyed_count += 1
+
+            # Insufficient funds / money cap events
+            m_er = RE_BLOCKED_EARLY_REJECT.search(stripped)
+            if m_er:
+                block_early_reject_count += 1
+                money_cr = float(m_er.group("money"))
+                cost_cr = float(m_er.group("cost"))
+                if ts is not None:
+                    money_at_blocks.append((ts, money_cr))
+                    if first_funds_block_ts is None:
+                        first_funds_block_ts = ts
+                    last_funds_block_ts = ts
+                if sid:
+                    funds_events_per_ship[sid].append((ts or 0.0, "block_md", money_cr, cost_cr))
+                    if ts and last_ts > 0 and ts >= last_ts - 300:
+                        recent_money_blocked[sid] += 1
+
+            m_ag = RE_BLOCKED_AUTH_GUARD.search(stripped)
+            if m_ag:
+                block_auth_guard_count += 1
+                money_cr = float(m_ag.group("money"))
+                cost_cr = float(m_ag.group("cost"))
+                if ts is not None:
+                    money_at_blocks.append((ts, money_cr))
+                    if first_funds_block_ts is None:
+                        first_funds_block_ts = ts
+                    last_funds_block_ts = ts
+                if sid:
+                    funds_events_per_ship[sid].append((ts or 0.0, "block_ai", money_cr, cost_cr))
+                    if ts and last_ts > 0 and ts >= last_ts - 300:
+                        recent_money_blocked[sid] += 1
+
+            m_emg = RE_EARLY_MONEY_GATE.search(stripped)
+            if m_emg:
+                early_money_gate_count += 1
+                if sid:
+                    money_cr = float(m_emg.group("money"))
+                    funds_events_per_ship[sid].append((ts or 0.0, "early_gate", money_cr, 0))
+                    if ts and last_ts > 0 and ts >= last_ts - 300:
+                        recent_money_blocked[sid] += 1
+
+            m_smc = RE_SHIP_MONEY_CAP_SKIP.search(stripped)
+            if m_smc:
+                ship_money_cap_skip_count += 1
+                if sid:
+                    money_cr = float(m_smc.group("money"))
+                    funds_events_per_ship[sid].append((ts or 0.0, "cap_skip", money_cr, 0))
+                    if ts and last_ts > 0 and ts >= last_ts - 300:
+                        recent_money_blocked[sid] += 1
+
+            if RE_SHIP_MONEY_CAP_CLEARED.search(stripped):
+                ship_money_cap_cleared_count += 1
+
+            if RE_INSUFFICIENT_FUNDS_WAIT.search(stripped):
+                insufficient_funds_wait_count += 1
 
     elapsed = _time.time() - start_wall
 
@@ -558,6 +695,85 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
     else:
         rpt.check("PASS", "No ship destruction events")
 
+    # --- Insufficient Funds ---
+    rpt.line("")
+    rpt.line("  --- Insufficient Funds ---")
+    total_funds_blocks = block_early_reject_count + block_auth_guard_count
+    total_funds_skips = early_money_gate_count + ship_money_cap_skip_count
+
+    if total_funds_blocks == 0 and total_funds_skips == 0:
+        rpt.check("PASS", "No insufficient funds events")
+    else:
+        rpt.line(f"    Trade blocks (MD FINAL GUARD)    : {block_early_reject_count}")
+        rpt.line(f"    Trade blocks (AI auth. guard)    : {block_auth_guard_count}")
+        rpt.line(f"    Search skips (early money gate)  : {early_money_gate_count}")
+        rpt.line(f"    Search skips (per-ship cap)      : {ship_money_cap_skip_count}")
+        rpt.line(f"    Cap clears (money increased)     : {ship_money_cap_cleared_count}")
+        rpt.line(f"    Backoff waits (insufficient)     : {insufficient_funds_wait_count}")
+
+        if total_funds_blocks > 0:
+            # Show severity
+            if total_funds_blocks > 100:
+                rpt.check("FAIL", f"Total trade blocks due to insufficient funds: {total_funds_blocks} (excessive - MinPlayerMoney may be too high or fleet too large)")
+            elif total_funds_blocks > 20:
+                rpt.check("WARN", f"Total trade blocks due to insufficient funds: {total_funds_blocks}")
+            else:
+                rpt.check("INFO", f"Total trade blocks due to insufficient funds: {total_funds_blocks}")
+
+        # Cap effectiveness: skips mean the cap is working (avoiding pointless searches)
+        if ship_money_cap_skip_count > 0:
+            rpt.check("PASS", f"Per-ship money cap saved {ship_money_cap_skip_count} pointless searches")
+
+        # Show player money trend at block times
+        if money_at_blocks:
+            first_block = money_at_blocks[0]
+            last_block = money_at_blocks[-1]
+            min_money = min(m for _, m in money_at_blocks)
+            rpt.line("")
+            rpt.line("    Player money at block events:")
+            rpt.line(f"      First block : t={first_block[0]:.2f}s  money={first_block[1]:,.0f} Cr")
+            rpt.line(f"      Last block  : t={last_block[0]:.2f}s  money={last_block[1]:,.0f} Cr")
+            rpt.line(f"      Lowest      : {min_money:,.0f} Cr")
+            if first_funds_block_ts is not None:
+                duration_blocked = last_funds_block_ts - first_funds_block_ts
+                rpt.line(f"      Block window: {duration_blocked:.0f}s ({duration_blocked/60:.1f} min)")
+
+        # Per-ship breakdown (top blocked ships)
+        ships_by_blocks = Counter()
+        for sid, events in funds_events_per_ship.items():
+            block_count = sum(1 for _, etype, _, _ in events if etype in ("block_md", "block_ai"))
+            if block_count > 0:
+                ships_by_blocks[sid] = block_count
+
+        if ships_by_blocks:
+            rpt.line("")
+            rpt.line(f"    Ships blocked by insufficient funds ({len(ships_by_blocks)} ships):")
+            for sid, cnt in ships_by_blocks.most_common(15):
+                # Show last known money and cost for this ship
+                last_event = None
+                for ev in reversed(funds_events_per_ship[sid]):
+                    if ev[1] in ("block_md", "block_ai"):
+                        last_event = ev
+                        break
+                if last_event:
+                    rpt.detail(f"      {sid}: {cnt}x blocked (last: money={last_event[2]:,.0f} Cr, trade cost={last_event[3]:,.0f} Cr)")
+                else:
+                    rpt.detail(f"      {sid}: {cnt}x blocked")
+
+        # Ships that only hit the cap skip (never actually blocked themselves, just skipped)
+        skip_only_ships = Counter()
+        for sid, events in funds_events_per_ship.items():
+            skip_count = sum(1 for _, etype, _, _ in events if etype in ("cap_skip", "early_gate"))
+            block_count = sum(1 for _, etype, _, _ in events if etype in ("block_md", "block_ai"))
+            if skip_count > 0 and block_count == 0:
+                skip_only_ships[sid] = skip_count
+
+        if skip_only_ships:
+            rpt.line("")
+            rpt.line(f"    Ships that only skipped searches (per-ship cap, {len(skip_only_ships)} ships):")
+            for sid, cnt in skip_only_ships.most_common(10):
+                rpt.detail(f"      {sid}: {cnt}x skipped")
+
     # =====================================================================
     # Section 6: Error Summary
     # =====================================================================
@@ -639,17 +855,27 @@ def analyze_log(rpt: ReportWriter, log_path: str, *, tail_size: int = 500):
         for sid, cnt in sorted(recent_timeout.items(), key=lambda x: x[1], reverse=True)[:10]:
             rpt.detail(f"    {sid}: {cnt}x")
 
+    if recent_money_blocked:
+        repeat_money = {s: c for s, c in recent_money_blocked.items() if c >= 2}
+        if repeat_money:
+            has_recent = True
+            rpt.check("WARN", f"Ships blocked by insufficient funds (>=2x in last 5 min): {len(repeat_money)}")
+            for sid, cnt in sorted(repeat_money.items(), key=lambda x: x[1], reverse=True)[:10]:
+                rpt.detail(f"    {sid}: {cnt}x blocked/skipped")
+
     if not has_recent:
         rpt.check("PASS", "No recurring ship issues in the last 5 minutes of game time")
 
     # =====================================================================
-    # Section 8: Raw Tail (last 100 GT log lines)
+    # Section 8: Attached Log (complete or last N lines)
     # =====================================================================
-    rpt.header("8. Last GT Log Lines (for context)")
-    rpt.line(f"  Showing last {len(gt_tail)} GT-related log lines:")
+    tail_label = f"last {tail_size:,}" if limit_tail else "complete"
+    rpt.header(f"8. Attached Log ({tail_label} — {len(log_tail):,} lines)")
+    rpt.line(f"  {'Last ' + str(tail_size) + ' lines' if limit_tail else 'Complete log'} ({len(log_tail):,} lines):")
     rpt.line("")
-    for line in gt_tail:
-        rpt.detail(f"  {u.truncate(line, 160)}")
+    print(u.gray(f"    (writing {len(log_tail):,} log lines to report file...)"))
+    for line in log_tail:
+        rpt.file_only(f"  {u.truncate(line, 300)}")
 
 
 # ---------------------------------------------------------------------------
@@ -660,8 +886,12 @@ def main():
         description="GalaxyTrader MK3 - Bug Report Diagnostic Tool")
     parser.add_argument("logfile", nargs="?", default="",
                         help="Path to log.log (auto-detected if omitted)")
-    parser.add_argument("--tail", type=int, default=500,
-                        help="Number of GT log lines to include at the end of the report (default: 500)")
+    parser.add_argument("--tail", type=int, default=0,
+                        help="Limit attached log lines to last N (default: 0 = complete log)")
+    parser.add_argument("--no-zip", action="store_true",
+                        help="Skip ZIP compression (output plain .txt only)")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Skip the upload prompt (local output only)")
     args = parser.parse_args()
 
     # Detect tty before fix_windows_encoding wraps stdout
@@ -697,19 +927,92 @@ def main():
     rpt.line("")
     rpt.line("--- END OF REPORT ---")
 
+    output_file = report_path  # tracks the final output file (txt or zip)
+
     try:
         rpt.save()
-        print()
-        print(u.green("  ============================================="))
-        print(u.green(f"   Report saved: {report_path}"))
-        print(u.green("  ============================================="))
-        print()
-        print(u.yellow("  Please attach this file to your bug report."))
-        print()
+
+        # ZIP compression (default: on)
+        if not args.no_zip:
+            zip_path = report_path.replace(".txt", ".zip")
+            report_basename = os.path.basename(report_path)
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                zf.write(report_path, report_basename)
+
+            txt_size = os.path.getsize(report_path)
+            zip_size = os.path.getsize(zip_path)
+            ratio = (1 - zip_size / txt_size) * 100 if txt_size > 0 else 0
+
+            # Remove the uncompressed .txt (ZIP contains it)
+            try:
+                os.remove(report_path)
+            except OSError:
+                pass  # ZIP was created; .txt cleanup is best-effort
+
+            output_file = zip_path
+
+            print()
+            print(u.green("  ============================================="))
+            print(u.green(f"   Report saved: {zip_path}"))
+            print(u.green(f"   Size: {zip_size / 1024:.0f} KB (compressed {ratio:.0f}% from {txt_size / 1024:.0f} KB)"))
+            print(u.green("  ============================================="))
+        else:
+            print()
+            print(u.green("  ============================================="))
+            print(u.green(f"   Report saved: {report_path}"))
+            print(u.green("  ============================================="))
     except OSError as e:
         print()
         print(u.red(f"  ERROR: Could not save report: {e}"))
         print(u.yellow("  The report was shown above in the console."))
+        print()
+        output_file = ""
+
+    # -------------------------------------------------------------------
+    # Upload prompt
+    # -------------------------------------------------------------------
+    if output_file and os.path.isfile(output_file) and not args.no_upload:
+        print()
+        print(u.cyan("  ----- Upload Bug Report -----"))
+        print()
+        print(f"  Would you like to upload the report to 0x0.st?")
+        print(f"  Retention: {UPLOAD_RETENTION} (based on file size).")
+        print(f"  No account required. The link can be shared freely.")
+        print()
+
+        try:
+            answer = input("  Upload? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+
+        if answer in ("y", "yes"):
+            print()
+            print(u.yellow("  Uploading..."), end=" ", flush=True)
+            link = upload_file(output_file)
+            if link:
+                print(u.green("Done!"))
+                print()
+                print(u.green("  ============================================="))
+                print(u.green(f"   Download link: {link}"))
+                print(u.green("  ============================================="))
+                print()
+                print(u.yellow("  Share this link in your bug report."))
+                print()
+            else:
+                print(u.red("Failed!"))
+                print()
+                print(u.red("  Upload failed. Please attach the file manually:"))
+                print(u.yellow(f"  {output_file}"))
+                print()
+        else:
+            print()
+            print(u.yellow(f"  Upload skipped. Please attach the file manually:"))
+            print(u.yellow(f"  {output_file}"))
+            print()
+    elif output_file:
+        print()
+        print(u.yellow(f"  Please attach this file to your bug report:"))
+        print(u.yellow(f"  {output_file}"))
         print()
 
     # Keep console open if double-clicked on Windows (not run from terminal)
