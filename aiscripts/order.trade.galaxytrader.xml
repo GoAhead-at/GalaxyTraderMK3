@@ -1345,15 +1345,7 @@
         </do_if>
       </do_if>
       
-      <!-- Always initialize effectiveMaxBuy/effectiveMaxSell from order parameters -->
-      <!-- This ensures variables exist even if ship is not a subordinate or commander lacks these properties -->
-      <do_if value="not $effectiveMaxBuy?">
-        <set_value name="$effectiveMaxBuy" exact="$maxbuy"/>
-      </do_if>
-      <do_if value="not $effectiveMaxSell?">
-        <set_value name="$effectiveMaxSell" exact="$maxsell"/>
-      </do_if>
-
+      <!-- effectiveMaxBuy/effectiveMaxSell always initialized in <init> block -->
       <!-- Persist effective distances for later labels (start_trading) -->
       <set_value name="this.$effectiveMaxBuy" exact="$effectiveMaxBuy"/>
       <set_value name="this.$effectiveMaxSell" exact="$effectiveMaxSell"/>
@@ -1451,6 +1443,16 @@
       <!-- Debug: Confirm we reached main loop -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': === MAIN LOOP STARTED === (Pilot: ' + (if this.ship.pilot then this.ship.pilot.name else 'NONE') + ')'" chance="100"/>
+      </do_if>
+      
+      <!-- Read MinPlayerMoney once per loop iteration — used by money gates, authoritative guard, and logbook.
+           Persisted on instance so it survives <wait> yields within this iteration. -->
+      <set_value name="this.$minPlayerMoney" exact="1000"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+        <set_value name="$tmpMinMoney" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+        <do_if value="$tmpMinMoney? and $tmpMinMoney != null and $tmpMinMoney gt 0">
+          <set_value name="this.$minPlayerMoney" exact="$tmpMinMoney"/>
+        </do_if>
       </do_if>
       
       <!-- Check if GT order was removed (main loop detection) -->
@@ -1551,12 +1553,12 @@
         <!-- First time check - initialize tracked commander -->
         <set_value name="this.$trackedCommander" exact="$currentCommander"/>
       </do_if>
-      <do_elseif value="((@this.$trackedCommander.exists == true) and not (@$currentCommander.exists == true)) or (not (@this.$trackedCommander.exists == true) and (@$currentCommander.exists == true))">
-        <!-- Commander state changed (was null, now exists OR was exists, now null) -->
+      <do_elseif value="this.$trackedCommander != $currentCommander">
+        <!-- Commander changed: null→exists, exists→null, or different commander -->
         <set_value name="$oldCommander" exact="if this.$trackedCommander? then this.$trackedCommander else null"/>
         <set_value name="$newCommander" exact="$currentCommander"/>
         
-        <!-- Check if old commander had GT order (for name restoration when subordinate removed) -->
+        <!-- Check if old commander had GT order (for name restoration) -->
         <set_value name="$oldCommanderHasGT" exact="false"/>
         <do_if value="@$oldCommander.exists">
           <do_if value="$oldCommander.defaultorder? and @$oldCommander.defaultorder.id == 'GalaxyTraderMK3'">
@@ -1583,79 +1585,17 @@
           <debug_text text="'[GT-AI] PHASE 6: Commander change detected for ' + this.ship.idcode + ' (old: ' + (if @$oldCommander.exists then @$oldCommander.idcode else 'NONE') + ', new: ' + (if @$newCommander.exists then @$newCommander.idcode else 'NONE') + ', has GT: ' + $newCommanderHasGT + ')'" chance="100"/>
         </do_if>
         
-        <!-- If ship was subordinate to GT commander and is no longer subordinate, restore name -->
-        <!-- This handles the case where a subordinate is removed from a GT commander -->
+        <!-- If ship was subordinate to GT commander and is no longer, restore name -->
         <do_if value="$oldCommanderHasGT and not $newCommanderHasGT and this.ship.pilot?">
-          <!-- Ship was subordinate to GT commander, now is not (either no commander or different commander without GT) -->
-          <!-- Check if ship has direct GT order -->
           <set_value name="$hasDirectGTOrder" exact="false"/>
           <do_if value="this.ship.defaultorder? and @this.ship.defaultorder.id == 'GalaxyTraderMK3'">
             <set_value name="$hasDirectGTOrder" exact="true"/>
           </do_if>
-          
-          <!-- Restore name if ship doesn't have direct GT order -->
-          <!-- If ship has direct GT order, it will keep GT name (independent GT ship) -->
           <do_if value="not $hasDirectGTOrder">
             <set_value name="$originalName" exact="null"/>
             <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName?">
               <set_value name="$originalName" exact="global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName"/>
             </do_if>
-            
-            <do_if value="$originalName">
-              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                $Ship = this.ship,
-                $Pilot = this.ship.pilot,
-                $Reason = 'Subordinate removed from GT commander - restoring original name',
-                $OriginalName = $originalName
-              ]"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] PHASE 6: Name restoration signal sent for ' + this.ship.idcode + ' (removed from GT commander, no direct GT order, original name: ' + $originalName + ')'" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_if>
-        </do_if>
-        
-        <!-- Update tracked commander -->
-        <set_value name="this.$trackedCommander" exact="$currentCommander"/>
-      </do_elseif>
-      <do_elseif value="(@this.$trackedCommander.exists == true) and (@$currentCommander.exists == true) and this.$trackedCommander != $currentCommander">
-        <!-- Commander changed to different commander -->
-        <set_value name="$oldCommander" exact="this.$trackedCommander"/>
-        <set_value name="$newCommander" exact="$currentCommander"/>
-        
-        <!-- Check if new commander has GT order -->
-        <set_value name="$newCommanderHasGT" exact="false"/>
-        <do_if value="$newCommander.defaultorder? and @$newCommander.defaultorder.id == 'GalaxyTraderMK3'">
-          <set_value name="$newCommanderHasGT" exact="true"/>
-        </do_if>
-        
-        <!-- Send state update signal -->
-        <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
-          $Ship = this.ship,
-          $UpdateType = 'Commander_Changed',
-          $Commander = $newCommander,
-          $CommanderHasGT = $newCommanderHasGT
-        ]"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] PHASE 6: Commander change detected for ' + this.ship.idcode + ' (old: ' + $oldCommander.idcode + ', new: ' + $newCommander.idcode + ', has GT: ' + $newCommanderHasGT + ')'" chance="100"/>
-        </do_if>
-        
-        <!-- If ship is no longer subordinate to GT commander, restore name -->
-        <do_if value="not $newCommanderHasGT and this.ship.pilot?">
-          <!-- Ship is no longer subordinate to GT commander -->
-          <!-- Check if ship has direct GT order -->
-          <set_value name="$hasDirectGTOrder" exact="false"/>
-          <do_if value="this.ship.defaultorder? and @this.ship.defaultorder.id == 'GalaxyTraderMK3'">
-            <set_value name="$hasDirectGTOrder" exact="true"/>
-          </do_if>
-          
-          <!-- Restore name if ship doesn't have direct GT order -->
-          <do_if value="not $hasDirectGTOrder">
-            <set_value name="$originalName" exact="null"/>
-            <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName?">
-              <set_value name="$originalName" exact="global.$GT_Pilots.{this.ship.pilot}.$OriginalShipName"/>
-            </do_if>
-            
             <do_if value="$originalName">
               <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
                 $Ship = this.ship,
@@ -1670,8 +1610,8 @@
           </do_if>
         </do_if>
         
-      <!-- Update tracked commander -->
-      <set_value name="this.$trackedCommander" exact="$currentCommander"/>
+        <!-- Update tracked commander -->
+        <set_value name="this.$trackedCommander" exact="$currentCommander"/>
       </do_elseif>
       
       <!-- ======================================= -->
@@ -1876,13 +1816,13 @@
           ]"/>
         </do_else>
       </do_if>
-      <do_elseif value="not $pilotXPBlocked">
+      <do_else>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pilot not XP blocked - proceeding to maintenance check'" chance="100"/>
         </do_if>
         <!-- Check maintenance needs before trading starts -->
         <resume label="check_maintenance"/>
-      </do_elseif>
+      </do_else>
       
       <!-- ======================================= -->
       <!-- INITIAL MAINTENANCE CHECK              -->
@@ -2291,42 +2231,25 @@
       <!-- If pilot.skill.management isn't available yet, do NOT request a trade search with bogus caps. -->
       <!-- Wait is only allowed at top-level; use a bounded loop here (not inside any do_if). -->
       <set_value name="$pilotSkillMissing" exact="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and (@this.ship.pilot == null or @this.ship.pilot.skill.management == null)"/>
-      <set_value name="$pilotSkillWaitTries" exact="0"/>
-      <set_value name="this.$pilotSkillWaitTries" exact="$pilotSkillWaitTries"/>
+      <set_value name="this.$pilotSkillWaitTries" exact="0"/>
       <do_while value="$pilotSkillMissing and this.$pilotSkillWaitTries lt 10">
         <wait exact="1s"/>
         <set_value name="$pilotSkillMissing" exact="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and (@this.ship.pilot == null or @this.ship.pilot.skill.management == null)"/>
         <set_value name="this.$pilotSkillWaitTries" exact="this.$pilotSkillWaitTries + 1"/>
-        <set_value name="$pilotSkillWaitTries" exact="this.$pilotSkillWaitTries"/>
       </do_while>
       <do_if value="$pilotSkillMissing">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ERROR: pilot.skill.management unavailable after ' + this.$pilotSkillWaitTries + 's - NOT sending trade search request. Will retry on next loop (this is a timing bug we want to SEE).'" chance="100"/>
         <resume label="main_loop"/>
       </do_if>
       
-      <!-- Ensure effectiveMaxBuy/effectiveMaxSell are initialized before use -->
-      <!-- These variables might not exist if start_trading is reached without going through init label -->
-      <do_if value="not $effectiveMaxBuy?">
-        <set_value name="$effectiveMaxBuy" exact="if this.$effectiveMaxBuy? then this.$effectiveMaxBuy else $maxbuy"/>
-      </do_if>
-      <do_if value="not $effectiveMaxSell?">
-        <set_value name="$effectiveMaxSell" exact="if this.$effectiveMaxSell? then this.$effectiveMaxSell else $maxsell"/>
-      </do_if>
+      <!-- effectiveMaxBuy/effectiveMaxSell initialized in <init> block -->
 
       <!-- ========================================= -->
       <!-- SUBORDINATE SETTINGS REFRESH (ON REQUEST) -->
       <!-- ========================================= -->
       <!-- Problem: Commander default-order param edits do not reliably trigger event_object_order_ready.
-           Solution: When a subordinate is ABOUT to request a new trade, refresh inherited commander settings if they changed. -->
-      <do_if value="not $effectiveAutoWares?">
-        <set_value name="$effectiveAutoWares" exact="$autowares"/>
-      </do_if>
-      <do_if value="not $effectiveWareBasket?">
-        <set_value name="$effectiveWareBasket" exact="[]"/>
-      </do_if>
-      <do_if value="not $effectiveDistancePenalty?">
-        <set_value name="$effectiveDistancePenalty" exact="$distancepenalty"/>
-      </do_if>
+           Solution: When a subordinate is ABOUT to request a new trade, refresh inherited commander settings if they changed.
+           effectiveAutoWares/effectiveWareBasket/effectiveDistancePenalty initialized in <init> block. -->
 
       <set_value name="$_isSubordinateNow" exact="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship"/>
       <do_if value="$_isSubordinateNow">
@@ -2574,22 +2497,7 @@
             ]"/>
           </do_if>
           
-          <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
-          <do_if value="not $effectiveIgnoreCarrierAux?">
-            <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveIgnoreBuildStorage?">
-            <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveIgnoreTradeRules?">
-            <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveDistancePenalty?">
-            <set_value name="$effectiveDistancePenalty" exact="if $distancepenalty? then $distancepenalty else 50"/>
-          </do_if>
-          <do_if value="not $effectiveFleetCoordination?">
-            <set_value name="$effectiveFleetCoordination" exact="if $fleetcoordination? then $fleetcoordination else false"/>
-          </do_if>
+          <!-- effectiveXxx variables initialized in <init> block -->
           
           <signal_objects object="player.galaxy" param="'GT_Find_Sell'" param2="table[
             $Ship = this.ship,
@@ -2632,7 +2540,7 @@
           
           <!-- ==================================================================================== -->
           <!-- MECHANIC 2: Early money gate - skip entire trade search pipeline when player is broke -->
-          <!-- Threshold: MinPlayerMoney + 100 Cr safety buffer.                                   -->
+          <!-- Threshold: MinPlayerMoney + 1000 Cr safety buffer.                                   -->
           <!-- This prevents the expensive cache search / work loop from running when there is      -->
           <!-- no meaningful budget left. Ships go directly to insufficient_funds cooldown.          -->
           <!-- Works with MECHANIC 1 (authoritative guard budget clamp at trade creation):           -->
@@ -2640,21 +2548,9 @@
           <!--   Mechanic 2 = stop searching when budget is exhausted (search start)                -->
           <!-- ==================================================================================== -->
           <set_value name="$earlyMoneyCheck" exact="player.money"/>
-          <set_value name="$minPlayerMoney" exact="1000"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-            <set_value name="$tmpMinMoney" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-            <do_if value="$tmpMinMoney? and $tmpMinMoney != null and $tmpMinMoney gt 0">
-              <set_value name="$minPlayerMoney" exact="$tmpMinMoney"/>
-            </do_if>
-          </do_if>
-          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix.
-               +1000 Cr safety buffer: prevents ships from searching when player money is close to
-               the threshold. Without the buffer, ships would search, get budget-clamped to tiny amounts,
-               execute micro-trades, and drain money toward MinPlayerMoney.
-               The buffer ensures a clean stop well before hitting the floor. -->
-          <set_value name="$moneyGateThreshold" exact="($minPlayerMoney + 1000)Cr"/>
+          <set_value name="$moneyGateThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
           <do_if value="$earlyMoneyCheck le $moneyGateThreshold">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr at or below threshold=' + ($minPlayerMoney + 1000) + ' Cr (MinPlayerMoney=' + $minPlayerMoney + ' + 1000 buffer) - skipping trade search'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr at or below threshold=' + (this.$minPlayerMoney + 1000) + ' Cr (MinPlayerMoney=' + this.$minPlayerMoney + ' + 1000 buffer) - skipping trade search'" chance="100"/>
             <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
             <resume label="no_trade_retry"/>
           </do_if>
@@ -2677,47 +2573,20 @@
             </do_else>
           </do_if>
           
-          <!-- CRITICAL: Always wait briefly for any pending GT_Trade_Found signals before sending new request -->
-          <!-- Wait (configured delay + 5ms buffer) to catch delayed signals and prevent race conditions -->
-          <!-- Even with 0ms delay, MD system needs processing time to queue and send signals -->
-          <!-- If signal arrives during wait, it will interrupt and process the trade immediately -->
-          <!-- Initialize tradeFoundSignalWaitTime with safe default FIRST to prevent property lookup errors -->
-          <!-- IMPORTANT (AI script lifetime): persist on instance; do NOT rely on local $vars across <wait/> yields. -->
-          <!-- Purpose A: Pre-request wait for GT_Trade_Found signal (milliseconds) -->
-          <set_value name="this.$tradeFoundSignalWaitTime" exact="5ms"/>
+          <!-- Wait briefly for any pending GT_Trade_Found signals before sending new request.
+               Configured delay + 5ms buffer. If signal arrives during wait, interrupt processes it. -->
           <set_value name="$signalDelayMs" exact="0"/>
           <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$TradeFoundSignalDelay?">
             <set_value name="$tmpDelay" exact="@global.$GT_GlobalSettings.$Performance.$TradeFoundSignalDelay"/>
-            <do_if value="$tmpDelay? and $tmpDelay ge 0 and $tmpDelay le 1000">
+            <do_if value="$tmpDelay ge 0 and $tmpDelay le 1000">
               <set_value name="$signalDelayMs" exact="$tmpDelay"/>
             </do_if>
           </do_if>
-          <!-- Always wait at least 5ms to give MD system time to process and send signals -->
-          <!-- Calculate waitTime: configured delay + 5ms buffer (minimum 5ms) -->
-          <!-- Ensure signalDelayMs is valid number before calculation to prevent expression errors -->
-          <do_if value="not $signalDelayMs? or $signalDelayMs == null">
-            <set_value name="$signalDelayMs" exact="0"/>
-          </do_if>
-          <!-- Calculate wait time in milliseconds first, then convert to time value -->
-          <!-- This avoids potential expression evaluation issues -->
-          <!-- CRITICAL: Ensure waitMs is initialized before calculation -->
-          <set_value name="$waitMs" exact="5"/>
-          <do_if value="$signalDelayMs? and $signalDelayMs ge 0">
-            <set_value name="$waitMs" exact="$signalDelayMs + 5"/>
-          </do_if>
-          <!-- CRITICAL: Calculate waitTime safely - if expression fails, tradeFoundSignalWaitTime keeps its default value of 5ms -->
-          <!-- Use proper null/existence check pattern from cursor rules: not $var? or $var == null checks if invalid -->
-          <!-- For positive check: variable exists AND is not null AND is valid -->
-          <set_value name="$calculatedWaitTime" exact="$waitMs * 1ms"/>
-          <!-- Only update tradeFoundSignalWaitTime if calculation succeeded (follows cursor rules pattern) -->
-          <do_if value="not (not $calculatedWaitTime? or $calculatedWaitTime == null) and $calculatedWaitTime gt 0ms">
-            <set_value name="this.$tradeFoundSignalWaitTime" exact="$calculatedWaitTime"/>
-          </do_if>
-          <!-- If calculation failed (variable doesn't exist or is null), tradeFoundSignalWaitTime remains at safe default of 5ms set above -->
+          <set_value name="this.$tradeFoundSignalWaitTime" exact="($signalDelayMs + 5) * 1ms"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Waiting ' + $waitMs + 'ms for GT_Trade_Found signal (configured delay=' + $signalDelayMs + 'ms + 5ms buffer) before sending new request'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Waiting ' + ($signalDelayMs + 5) + 'ms for GT_Trade_Found signal (delay=' + $signalDelayMs + 'ms + 5ms buffer)'" chance="100"/>
           </do_if>
-          <wait max="if @this.$tradeFoundSignalWaitTime != null then @this.$tradeFoundSignalWaitTime else 5ms" comment="Wait for GT_Trade_Found signal before sending new request">
+          <wait max="this.$tradeFoundSignalWaitTime" comment="Wait for pending GT_Trade_Found signals">
             <interrupt>
               <conditions>
                 <event_object_signalled object="this.ship" param="'GT_Trade_Found'"/>
@@ -2735,23 +2604,7 @@
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Pre-request wait completed - no signal received, sending new request'" chance="100"/>
           </do_if>
           
-          <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
-          <!-- These should be initialized in <init> block, but add safety checks here to prevent property lookup errors -->
-          <do_if value="not $effectiveIgnoreCarrierAux?">
-            <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveIgnoreBuildStorage?">
-            <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveIgnoreTradeRules?">
-            <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
-          </do_if>
-          <do_if value="not $effectiveDistancePenalty?">
-            <set_value name="$effectiveDistancePenalty" exact="if $distancepenalty? then $distancepenalty else 50"/>
-          </do_if>
-          <do_if value="not $effectiveFleetCoordination?">
-            <set_value name="$effectiveFleetCoordination" exact="if $fleetcoordination? then $fleetcoordination else false"/>
-          </do_if>
+          <!-- effectiveXxx variables initialized in <init> block -->
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': SENDING GT_Find_Trade signal to MD at game time ' + player.age" chance="100"/>
@@ -2983,28 +2836,11 @@
       
       <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when player
            money has dropped below the threshold since this ship's search started.
-           Checks both the static threshold (MinPlayerMoney + 100 buffer) and the global money cap.
-           Without this, ships deep in the pipeline would do full blacklist validation
-           on every trade only to be blocked at the authoritative guard anyway. -->
-      <set_value name="$fastMinPlayerMoney" exact="1000"/>
-      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-        <set_value name="$tmpFastMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-        <do_if value="$tmpFastMin? and $tmpFastMin != null and $tmpFastMin gt 0">
-          <set_value name="$fastMinPlayerMoney" exact="$tmpFastMin"/>
-        </do_if>
-      </do_if>
-      <set_value name="$fastMoneyThreshold" exact="($fastMinPlayerMoney + 1000)Cr"/>
-      <do_if value="player.money le $fastMoneyThreshold">
+           Checks static threshold (MinPlayerMoney + 1000 buffer) OR global money cap. -->
+      <set_value name="$fastMoneyThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
+      <do_if value="player.money le $fastMoneyThreshold or (global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney)">
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr at or below threshold=' + ($fastMinPlayerMoney + 1000) + ' Cr - skipping validation, backing off'" chance="100"/>
-        </do_if>
-        <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
-        <resume label="no_trade_retry"/>
-      </do_if>
-      <!-- Also check global money cap (set by authoritative guard when a ship couldn't afford even 1 unit) -->
-      <do_if value="global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK (global cap) at trade_found: player.money=' + (player.money / 100) + ' Cr, cap=' + (global.$GT_MoneyCapMoney / 100) + ' Cr - skipping validation, backing off'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr, globalCap=' + (if global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive then (global.$GT_MoneyCapMoney / 100) else 'off') + ' - skipping validation, backing off'" chance="100"/>
         </do_if>
         <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
         <resume label="no_trade_retry"/>
@@ -4481,13 +4317,7 @@
             <set_value name="$aiBuyPrice" exact="$pendingTrade.$BuyOffer.unitprice"/>
           </do_elseif>
           <set_value name="$aiPurchaseCost" exact="if $isSellOnlyTradeForPending then 0 else ($aiBuyPrice * $finalBuyAmount)"/>
-          <set_value name="$aiMinPlayerMoney" exact="1000"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-            <set_value name="$tmpAiMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-            <do_if value="$tmpAiMin? and $tmpAiMin != null and $tmpAiMin gt 0">
-              <set_value name="$aiMinPlayerMoney" exact="$tmpAiMin"/>
-            </do_if>
-          </do_if>
+          <set_value name="$aiMinPlayerMoney" exact="this.$minPlayerMoney"/>
           <do_if value="(player.money - $aiPurchaseCost) lt ($aiMinPlayerMoney)Cr">
             <!-- Full clamped amount would drain below MinPlayerMoney.
                  Try to reduce amount further to fit the available budget.
@@ -4893,16 +4723,7 @@
             <do_if value="this.$effectiveMaxSell?">
               <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
             </do_if>
-            <!-- CRITICAL: Ensure all effective variables exist before using them in signal -->
-            <do_if value="not $effectiveIgnoreCarrierAux?">
-              <set_value name="$effectiveIgnoreCarrierAux" exact="false"/>
-            </do_if>
-            <do_if value="not $effectiveIgnoreBuildStorage?">
-              <set_value name="$effectiveIgnoreBuildStorage" exact="false"/>
-            </do_if>
-            <do_if value="not $effectiveIgnoreTradeRules?">
-              <set_value name="$effectiveIgnoreTradeRules" exact="false"/>
-            </do_if>
+            <!-- effectiveIgnoreCarrierAux/BuildStorage/TradeRules initialized in <init> -->
             
             <signal_objects object="player.galaxy" param="'GT_Find_Trade'" param2="table[
               $Ship = this.ship,
@@ -5317,13 +5138,7 @@
           <set_value name="$timeSinceLastInsufficientFundsLogbook" exact="player.age - $lastInsufficientFundsLogbook"/>
           <do_if value="$timeSinceLastInsufficientFundsLogbook ge 300s or $lastInsufficientFundsLogbook == 0">
             <set_value name="$playerMoneyDisplay" exact="player.money / 100"/>
-            <set_value name="$thresholdDisplay" exact="1000"/>
-            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-              <set_value name="$tmpThreshold" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-              <do_if value="$tmpThreshold? and $tmpThreshold != null and $tmpThreshold gt 0">
-                <set_value name="$thresholdDisplay" exact="$tmpThreshold"/>
-              </do_if>
-            </do_if>
+            <set_value name="$thresholdDisplay" exact="this.$minPlayerMoney"/>
             <set_value name="$logbookMessage" exact="'Commander,\n\nTrading operations paused — insufficient funds.\n\nPlayer account: ' + $playerMoneyDisplay + ' Cr\nMinimum required: ' + $thresholdDisplay + ' Cr\n\nI will resume trading automatically once funds are above the threshold.\n\nYou can adjust the minimum in:\nGalaxyTrader Settings &gt; Fleet &gt; Min Player Money\n\nStanding by,\nAboard ' + this.ship.knownname"/>
             <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
               $Message = $logbookMessage,
@@ -6037,56 +5852,59 @@
       <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
       <!-- Ships in different sectors may still try (different path might exist) -->
       <set_value name="$currentSector" exact="this.ship.sector"/>
-      <set_value name="$failedTrades" exact="[]"/>
+      <set_value name="$failedTrades" exact="table[]"/>
       <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
         <set_value name="$failedTradesRaw" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
-        <set_value name="$failedTradesExpired" exact="[]"/>
+        <set_value name="$expiredCount" exact="0"/>
+        <set_value name="$keptCount" exact="0"/>
         <set_value name="$expirationTime" exact="1800s"/> <!-- 30 minutes -->
         
-        <!-- Filter out expired entries -->
-        <do_all exact="$failedTradesRaw.count" counter="$f">
-          <set_value name="$failedTrade" exact="$failedTradesRaw.{$f}"/>
-          <set_value name="$tradeAge" exact="player.age - $failedTrade.$Timestamp"/>
-          <do_if value="$tradeAge le $expirationTime">
-            <!-- Entry still valid - keep it -->
-            <append_to_list name="$failedTrades" exact="$failedTrade"/>
+        <!-- Filter expired entries from nested table: {buySector} -> {sellSector} -> record -->
+        <set_value name="$buyKeys" exact="$failedTradesRaw.keys"/>
+        <do_all exact="$buyKeys.count" counter="$bki">
+          <set_value name="$buyKey" exact="$buyKeys.{$bki}"/>
+          <do_if value="$failedTradesRaw.{$buyKey}?">
+            <set_value name="$innerTable" exact="$failedTradesRaw.{$buyKey}"/>
+            <set_value name="$sellKeys" exact="$innerTable.keys"/>
+            <do_all exact="$sellKeys.count" counter="$ski">
+              <set_value name="$sellKey" exact="$sellKeys.{$ski}"/>
+              <set_value name="$record" exact="@$innerTable.{$sellKey}"/>
+              <do_if value="$record? and $record.$Timestamp?">
+                <set_value name="$tradeAge" exact="player.age - $record.$Timestamp"/>
+                <do_if value="$tradeAge le $expirationTime">
+                  <!-- Entry still valid - copy to local table -->
+                  <do_if value="not $failedTrades.{$buyKey}?">
+                    <set_value name="$failedTrades.{$buyKey}" exact="table[]"/>
+                  </do_if>
+                  <set_value name="$failedTrades.{$buyKey}.{$sellKey}" exact="$record"/>
+                  <set_value name="$keptCount" exact="$keptCount + 1"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$expiredCount" exact="$expiredCount + 1"/>
+                </do_else>
+              </do_if>
+            </do_all>
           </do_if>
-          <do_else>
-            <!-- Entry expired - mark for removal -->
-            <append_to_list name="$failedTradesExpired" exact="$f"/>
-          </do_else>
         </do_all>
         
-        <!-- Update global storage with cleaned list -->
-        <do_if value="$failedTradesExpired.count gt 0">
+        <!-- Update global storage with cleaned table -->
+        <do_if value="$expiredCount gt 0 and $keptCount gt 0">
           <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="$failedTrades"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <set_value name="$sectorName" exact="@$currentSector.knownname"/>
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cleaned ' + $failedTradesExpired.count + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (older than 30 minutes)'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cleaned ' + $expiredCount + ' expired failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (kept ' + $keptCount + ')'" chance="100"/>
           </do_if>
         </do_if>
-        <do_elseif value="$failedTrades.count == 0">
-          <!-- All entries expired - remove empty list -->
+        <do_elseif value="$keptCount == 0">
+          <!-- All entries expired - clear the table entirely -->
           <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
         </do_elseif>
       </do_if>
       
-      <!-- ==================================================================================== -->
-      <!-- PERFORMANCE: Secondary money gate before expensive pre-filter loop -->
-      <!-- If player money is below threshold, skip the entire cache iteration (safety net) -->
-      <!-- ==================================================================================== -->
-      <set_value name="$moneyBeforePrefilter" exact="player.money"/>
-      <set_value name="$minMoneyPrefilter" exact="1000"/>
-      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-        <set_value name="$tmpMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-        <do_if value="$tmpMin? and $tmpMin != null and $tmpMin gt 0">
-          <set_value name="$minMoneyPrefilter" exact="$tmpMin"/>
-        </do_if>
-      </do_if>
-      <do_if value="$moneyBeforePrefilter lt $minMoneyPrefilter and $rawCacheList.count gt 0">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': CACHE PRE-FILTER SKIP: player money=' + $moneyBeforePrefilter + ' below threshold=' + $minMoneyPrefilter + ' - skipping ' + $rawCacheList.count + ' cache entries'" chance="100"/>
-        <set_value name="$rawCacheList" exact="[]"/>
-      </do_if>
+      <!-- NOTE: Removed redundant cache pre-filter money check.
+           The Early Money Gate and Fast Money Check already prevent reaching this point
+           when player money is below threshold. The old check also had a unit bug
+           (compared cents to credits). -->
       
       <!-- ==================================================================================== -->
       <!-- CRITICAL: Pre-filter cache entries by ALL cheap restrictions BEFORE processing -->
@@ -6357,27 +6175,12 @@
                 </do_if>
               </do_if>
               
-              <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - skip sector pairs that previously failed from this sector -->
-              <!-- This prevents revalidating entries that will fail due to blacklisted routes -->
+              <!-- CRITICAL: Prefilter by GT_FailedSectorPairs - O(1) nested table lookup -->
               <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
-              <!-- One failure in a sector pair blocks ALL station combinations in that route for ships in this sector -->
-              <do_if value="$isValid">
-                <set_value name="$skipFailedSectorPair" exact="false"/>
-                <do_if value="$failedTrades.count gt 0">
-                  <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
-                  <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
-                  <do_all exact="$failedTrades.count" counter="$failIdx">
-                    <set_value name="$failedTrade" exact="$failedTrades.{$failIdx}"/>
-                    <!-- CRITICAL: Validate failed trade has complete sector data before comparing -->
-                    <do_if value="$failedTrade.$BuySector? and $failedTrade.$SellSector?">
-                      <do_if value="$entryBuySector == $failedTrade.$BuySector and $entrySellSector == $failedTrade.$SellSector">
-                        <set_value name="$skipFailedSectorPair" exact="true"/>
-                        <break/>
-                      </do_if>
-                    </do_if>
-                  </do_all>
-                </do_if>
-                <do_if value="$skipFailedSectorPair">
+              <do_if value="$isValid and $failedTrades.keys.count gt 0">
+                <set_value name="$entryBuySector" exact="$buyOffer.owner.sector"/>
+                <set_value name="$entrySellSector" exact="$sellOffer.owner.sector"/>
+                <do_if value="$failedTrades.{$entryBuySector}? and $failedTrades.{$entryBuySector}.{$entrySellSector}?">
                   <set_value name="$isValid" exact="false"/>
                   <set_value name="$rejectReason" exact="'failed_sector_pair'"/>
                 </do_if>
