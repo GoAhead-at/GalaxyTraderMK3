@@ -2,415 +2,81 @@
 ==============================================================================
 GalaxyTrader MK3 - UI Element Library
 ==============================================================================
-Reusable UI components for consistent styling and behavior across all GT UI
+Reusable UI components for consistent styling and behavior across all GT UI.
+All patterns are validated against working GT UI code (info menu, context
+menus, diagnose report).
 
-Features:
-- Standard table creation with scrolling support
-- Consistent button styling
-- Text formatting helpers
-- Row creation helpers
-- Header creation helpers
+IMPORTANT: This file MUST be loaded BEFORE any UI file that uses GT_UI.
+           Ensure it appears first in ui.xml.
 
-Usage:
-    local GT_UI = require("extensions/GalaxyTraderMK3/ui/gt_ui_library")
-    local table = GT_UI.createStandardTable(frame, 10, { y = 0 })
+Usage (files loaded via ui.xml share _G):
+    GT_UI.createScrollTable(frame, 3, { ... })
+    GT_UI.addHeaderRow(tbl, {"Col1", "Col2", "Col3"})
+    GT_UI.formatMoney(150000)
 
 Author: GalaxyTrader Development Team
-Version: 1.0
+Version: 2.0  (rewrite based on audit of all working GT UIs)
 ==============================================================================
 ]]--
 
 local GT_UI = {}
 
 -- =============================================================================
--- CONFIGURATION
+-- CONSTANTS
 -- =============================================================================
 
-GT_UI.CONFIG = {
-    -- Standard dimensions
-    rowHeight = Helper.standardTextHeight,
-    fontSize = Helper.standardFontSize,
-    -- Calculate standard width: use playerInfoConfig.width minus sidebar and borders (like vanilla)
-    -- This gives us the actual available width for tables in the info menu
-    -- Add safety margin to ensure we don't exceed max width
-    standardWidth = (function()
-        local sidebarWidth = Helper.sidebarWidth or 40
-        local borderSize = Helper.borderSize or 3
-        local safetyMargin = 5  -- Safety margin to ensure we stay under max width
-        local baseWidth = (Helper.playerInfoConfig and Helper.playerInfoConfig.width) or (Helper.viewWidth * 0.8)
-        return baseWidth - sidebarWidth - borderSize - safetyMargin
-    end)(),
-    
-    -- Colors
-    colors = {
-        rowTitleBackground = Color["row_title_background"],
-        rowBackgroundSelected = Color["row_background_selected"],
-        buttonBackgroundDefault = Color["button_background_default"],
-        textWarning = Color["text_warning"],
-    },
+GT_UI.DEFAULTS = {
+    rowHeight       = Helper.standardTextHeight,
+    fontSize        = Helper.standardFontSize,
+    maxRowsPerPage  = 38,   -- max rows before pagination kicks in
+                            -- X4 computes full table min-height even with maxVisibleHeight;
+                            -- at ~26px/row + ~130px fixed rows, 38 rows ≈ 1118px which fits
+                            -- the ~1192px available in the diagnose frame at 1440p.
 }
 
 -- =============================================================================
--- TABLE CREATION
+-- COLORS  (validated against X4 7.x color table)
 -- =============================================================================
 
---[[
-    Creates a standard table with scrolling support and default cell properties
-    
-    Parameters:
-        frame: Parent frame to add table to
-        columnCount: Number of columns
-        options: Table with optional parameters:
-            - tabOrder: Tab order (default: 2)
-            - width: Table width (default: standardWidth)
-            - y: Y offset (default: 0)
-            - maxVisibleHeight: Max visible height (default: Helper.viewHeight)
-            - rowHeight: Row height (default: CONFIG.rowHeight)
-            - fontSize: Font size (default: CONFIG.fontSize)
-    
-    Returns:
-        table: Configured table object
-]]
-function GT_UI.createStandardTable(frame, columnCount, options)
-    options = options or {}
-    
-    -- Ensure width is valid (not 0 or negative)
-    local tableWidth = options.width or GT_UI.CONFIG.standardWidth
-    if tableWidth <= 0 then
-        DebugError(string.format("[GT UI] Warning: Invalid table width %d, using default", tableWidth))
-        tableWidth = GT_UI.CONFIG.standardWidth
-    end
-    
-    -- Don't set x position - it causes width=0 issues in X4
-    -- Let X4 handle table positioning within the frame
-    
-    -- Use reserveScrollBar = true when using fixed pixel widths
-    -- When using setColWidth (pixels), remaining columns become variable width automatically
-    local table = frame:addTable(columnCount, {
-        tabOrder = options.tabOrder or 2,
-        reserveScrollBar = true,  -- Enable scrollbar when using fixed pixel widths
-        width = tableWidth,
-        -- x = options.x,  -- REMOVED: Causes width=0 issues
-        y = options.y or 0,
-        maxVisibleHeight = options.maxVisibleHeight or Helper.viewHeight
-    })
-    
-    -- Set default cell properties
-    table:setDefaultCellProperties("text", {
-        minRowHeight = options.rowHeight or GT_UI.CONFIG.rowHeight,
-        fontsize = options.fontSize or GT_UI.CONFIG.fontSize
-    })
-    
-    return table
-end
+GT_UI.COLORS = {
+    headerBg        = Color["row_title_background"],
+    selectedBg      = Color["row_background_selected"],
+    buttonBg        = Color["button_background_default"],
+    tabActiveBg     = Color["row_background_selected"],
+    tabInactiveBg   = Color["row_background_blue"],
+    textPositive    = Color["text_positive"],
+    textNegative    = Color["text_negative"],
+    textWarning     = Color["text_warning"],
+    frameBg         = Color["frame_background_semitransparent"],
+}
 
---[[
-    Sets column widths using fixed pixel values
-    
-    Parameters:
-        table: Table object
-        widths: Array of width values in pixels (remaining columns become variable width)
-    
-    Example:
-        GT_UI.setColumnWidths(table, {30, 300, 200, 150})
-        -- Columns 1-4 get fixed pixel widths, remaining columns are variable
-    
-    Note: Uses setColWidth (pixels) instead of setColWidthPercent
-    This avoids scrollbar finalization errors!
-]]
-function GT_UI.setColumnWidths(table, widths)
-    if not widths or #widths == 0 then
-        return
+-- =============================================================================
+-- STATUS HELPERS
+-- =============================================================================
+
+--- Returns the appropriate color for a status string.
+--- @param status string  "PASS", "FAIL", "WARN", or anything else (nil = default)
+function GT_UI.getStatusColor(status)
+    if status == "PASS" then
+        return GT_UI.COLORS.textPositive
+    elseif status == "FAIL" then
+        return GT_UI.COLORS.textNegative
+    elseif status == "WARN" then
+        return GT_UI.COLORS.textWarning
     end
-    
-    -- Get total column count from table
-    local totalColumns = table.numcolumns
-    if not totalColumns or totalColumns == 0 then
-        -- Fallback: infer from widths (assumes remaining columns are variable)
-        totalColumns = #widths + 1
-    end
-    
-    -- Verify table has valid width before setting column widths
-    if table.properties and table.properties.width and table.properties.width <= 0 then
-        DebugError(string.format("[GT UI] Warning: Table width is %d, cannot set column widths", table.properties.width))
-        return
-    end
-    
-    -- Set widths for columns 1 through (#widths) using fixed pixel values
-    -- Remaining columns automatically become variable width for scrollbar
-    for i = 1, #widths do
-        if widths[i] and widths[i] > 0 then
-            table:setColWidth(i, widths[i])
-        end
-    end
-    
-    -- CRITICAL: Remaining columns (from #widths+1 to totalColumns) are left unset
-    -- This makes them variable width, which automatically accommodates the scrollbar
-    -- This approach avoids scrollbar finalization errors!
+    return nil  -- default text color
 end
 
 -- =============================================================================
--- HEADER CREATION
+-- FORMATTING
 -- =============================================================================
 
---[[
-    Creates a standard header row
-    
-    Parameters:
-        table: Table object
-        headers: Array of header configurations:
-            - Can be string (text) or table with:
-                - text: Header text
-                - textId: Text ID for ReadText (if text not provided)
-                - halign: Horizontal alignment (default: "center")
-                - sortable: Whether header is sortable (default: false)
-                - sortColumn: Column name for sorting (if sortable)
-                - currentSort: Current sort state {column, descending}
-                - onSort: Sort callback function (if sortable)
-        isFixed: Whether header is fixed (default: true)
-    
-    Returns:
-        row: Header row object
-]]
-function GT_UI.createHeaderRow(table, headers, isFixed)
-    isFixed = (isFixed ~= false)  -- Default to true
-    
-    local headerRow = table:addRow(true, {
-        bgColor = GT_UI.CONFIG.colors.rowTitleBackground,
-        fixed = isFixed
-    })
-    
-    -- Get total column count to ensure we don't exceed table columns
-    local totalColumns = table.numcolumns or #headers
-    
-    for i, headerConfig in ipairs(headers) do
-        -- Only create headers for columns that exist (don't exceed table column count)
-        if i > totalColumns then
-            break
-        end
-        
-        local cell = headerRow[i]
-        if not cell then
-            -- Safety check: if cell doesn't exist, skip
-            break
-        end
-        
-        local text = ""
-        local halign = "center"
-        local isSortable = false
-        local sortColumn = nil
-        local currentSort = nil
-        local onSort = nil
-        
-        -- Handle string or table configuration
-        if type(headerConfig) == "string" then
-            text = headerConfig
-        else
-            text = headerConfig.text or (headerConfig.textId and ReadText(77000, headerConfig.textId)) or ""
-            halign = headerConfig.halign or "center"
-            isSortable = headerConfig.sortable or false
-            sortColumn = headerConfig.sortColumn
-            currentSort = headerConfig.currentSort
-            onSort = headerConfig.onSort
-        end
-        
-        -- Ensure text is not empty (X4 requires content in cells)
-        if text == "" then
-            text = " "  -- Use space as placeholder
-        end
-        
-        -- Always create content - X4 requires content in every cell
-        if isSortable and onSort then
-            -- Create sortable header button
-            local displayText = text
-            
-            -- Add arrow indicator for currently sorted column
-            if currentSort and currentSort.column == sortColumn then
-                displayText = displayText .. (currentSort.descending and " ▼" or " ▲")
-            end
-            
-            local btn = cell:createButton({ height = GT_UI.CONFIG.rowHeight })
-            if btn then
-                btn:setText(displayText, { halign = halign })
-                cell.handlers.onClick = function()
-                    onSort(sortColumn)
-                    return true
-                end
-            else
-                -- Fallback: create text if button creation fails
-                cell:createText(text, { halign = halign })
-            end
-        else
-            -- Create simple text header
-            cell:createText(text, { halign = halign })
-        end
-    end
-    
-    return headerRow
-end
-
--- =============================================================================
--- ROW CREATION
--- =============================================================================
-
---[[
-    Creates a standard data row
-    
-    Parameters:
-        table: Table object
-        cells: Array of cell configurations:
-            - Can be string (text) or table with:
-                - text: Cell text
-                - halign: Horizontal alignment (default: "left")
-                - cellBGColor: Background color (for selection highlighting)
-                - onClick: Click handler (makes row selectable if provided)
-        isSelectable: Whether row is selectable (default: false)
-        bgColor: Row background color (optional)
-    
-    Returns:
-        row: Row object
-]]
-function GT_UI.createDataRow(table, cells, isSelectable, bgColor)
-    isSelectable = isSelectable or false
-    
-    local rowOptions = {}
-    if bgColor then
-        rowOptions.bgColor = bgColor
-    end
-    
-    local row = table:addRow(isSelectable, rowOptions)
-    
-    for i, cellConfig in ipairs(cells) do
-        local cell = row[i]
-        local text = ""
-        local halign = "left"
-        local cellBGColor = nil
-        local onClick = nil
-        
-        -- Handle string or table configuration
-        if type(cellConfig) == "string" then
-            text = cellConfig
-        else
-            text = cellConfig.text or ""
-            halign = cellConfig.halign or "left"
-            cellBGColor = cellConfig.cellBGColor
-            onClick = cellConfig.onClick
-        end
-        
-        cell:createText(text, { halign = halign, cellBGColor = cellBGColor })
-        
-        if onClick then
-            cell.handlers.onClick = onClick
-        end
-    end
-    
-    return row
-end
-
---[[
-    Creates an empty row with a message spanning all columns
-    
-    Parameters:
-        table: Table object
-        message: Message text
-        columnCount: Number of columns to span (default: table column count)
-        options: Optional table with:
-            - fontSize: Font size multiplier (default: 1.0)
-            - halign: Horizontal alignment (default: "center")
-    
-    Returns:
-        row: Empty row object
-]]
-function GT_UI.createEmptyRow(table, message, columnCount, options)
-    options = options or {}
-    columnCount = columnCount or table:getColumnCount()
-    
-    local row = table:addRow(nil, {})
-    local fontSize = options.fontSize or 1.0
-    local halign = options.halign or "center"
-    
-    row[1]:setColSpan(columnCount):createText(message, {
-        halign = halign,
-        fontsize = GT_UI.CONFIG.fontSize * fontSize
-    })
-    
-    return row
-end
-
--- =============================================================================
--- BUTTON CREATION
--- =============================================================================
-
---[[
-    Creates a standard button
-    
-    Parameters:
-        cell: Cell object to add button to
-        text: Button text (or textId for ReadText)
-        options: Table with optional parameters:
-            - textId: Text ID for ReadText (if text not provided)
-            - height: Button height (default: rowHeight)
-            - bgColor: Background color (default: buttonBackgroundDefault)
-            - fontSize: Font size multiplier (default: 0.8)
-            - halign: Horizontal alignment (default: "center")
-            - color: Text color (optional)
-            - onClick: Click handler function
-    
-    Returns:
-        button: Button object
-]]
-function GT_UI.createButton(cell, text, options)
-    options = options or {}
-    
-    -- Get text
-    local displayText = text
-    if options.textId then
-        displayText = ReadText(77000, options.textId)
-    end
-    
-    -- Create button
-    local button = cell:createButton({
-        height = options.height or GT_UI.CONFIG.rowHeight,
-        bgColor = options.bgColor or GT_UI.CONFIG.colors.buttonBackgroundDefault
-    })
-    
-    -- Set button text
-    local fontSize = (options.fontSize or 0.8) * GT_UI.CONFIG.fontSize
-    local textOptions = {
-        halign = options.halign or "center",
-        fontsize = fontSize
-    }
-    if options.color then
-        textOptions.color = options.color
-    end
-    button:setText(displayText, textOptions)
-    
-    -- Set click handler
-    if options.onClick then
-        cell.handlers.onClick = function()
-            options.onClick()
-            return true
-        end
-    end
-    
-    return button
-end
-
--- =============================================================================
--- TEXT FORMATTING
--- =============================================================================
-
---[[
-    Formats money with M/B suffixes
-    
-    Parameters:
-        amount: Amount in cents
-    
-    Returns:
-        string: Formatted money string (e.g., "1.5M Cr", "2.3B Cr")
-]]
+--- Format money amount (in cents/centimes) with M/B suffixes.
+--- Single source of truth -- do NOT duplicate this in other files.
+--- @param amount number  Amount in cents (X4 internal format)
+--- @return string  e.g. "1.5M Cr", "2.3B Cr", "42,000 Cr"
 function GT_UI.formatMoney(amount)
-    local credits = amount / 100  -- Convert from cents to credits
+    local credits = amount / 100
     if credits >= 1000000000 then
         return string.format("%.1fB Cr", credits / 1000000000)
     elseif credits >= 1000000 then
@@ -420,69 +86,540 @@ function GT_UI.formatMoney(amount)
     end
 end
 
---[[
-    Formats XP as "current / next" (e.g., "1500 / 2000")
-    
-    Parameters:
-        current: Current XP value
-        next: Next level XP threshold
-    
-    Returns:
-        string: Formatted XP string
-]]
-function GT_UI.formatXP(current, next)
-    return string.format("%d / %d", current or 0, next or 1000)
+-- =============================================================================
+-- STRING HELPERS
+-- =============================================================================
+
+--- Split a string by a delimiter (supports multi-char delimiters).
+--- @param str string       Input string
+--- @param delimiter string Delimiter (e.g. "||", ";;", ",")
+--- @return table           Array of substrings
+function GT_UI.split(str, delimiter)
+    local result = {}
+    if not str or str == "" then return result end
+
+    if #delimiter > 1 then
+        -- Multi-char delimiter: find-based
+        local start = 1
+        while true do
+            local pos = string.find(str, delimiter, start, true)
+            if pos then
+                table.insert(result, string.sub(str, start, pos - 1))
+                start = pos + #delimiter
+            else
+                table.insert(result, string.sub(str, start))
+                break
+            end
+        end
+    else
+        -- Single-char delimiter
+        local pattern = "([^" .. delimiter .. "]*)" .. delimiter .. "?"
+        for match in string.gmatch(str .. delimiter, pattern) do
+            table.insert(result, match)
+        end
+        -- Remove trailing empty entry
+        if #result > 0 and result[#result] == "" then
+            table.remove(result)
+        end
+    end
+    return result
 end
 
 -- =============================================================================
--- UTILITY FUNCTIONS
+-- TABLE CREATION
 -- =============================================================================
 
 --[[
-    Gets selection background color for a row
-    
-    Parameters:
-        isSelected: Whether row is selected
-    
-    Returns:
-        color: Background color or nil
-]]
-function GT_UI.getSelectionColor(isSelected)
-    return isSelected and GT_UI.CONFIG.colors.rowBackgroundSelected or nil
-end
+    Creates a scrollable table with sane defaults.
 
---[[
-    Creates a footer row with totals
-    
+    Uses reserveScrollBar = false and percentage-based column widths, which
+    is the pattern used by ALL working GT UIs.  If you need reserveScrollBar
+    = true, use fixed pixel widths via setColWidth() and leave at least one
+    column un-set so it becomes the variable-width column.
+
     Parameters:
-        table: Table object
-        message: Footer message (e.g., "Total Pilots: 80")
-        columnCount: Number of columns to span (default: table column count)
-    
-    Returns:
-        row: Footer row object
+        frame       : Parent frame
+        columnCount : Number of columns
+        options     : {
+            tabOrder          = number   (default 2)
+            x                 = number   (default Helper.borderSize)
+            y                 = number   (default 0)
+            width             = number   (default frame usable width)
+            maxVisibleHeight  = number   (default Helper.viewHeight)
+            reserveScrollBar  = bool     (default false)
+            highlightMode     = string   (default nil = normal)
+            fontSize          = number   (default GT_UI.DEFAULTS.fontSize)
+            rowHeight         = number   (default GT_UI.DEFAULTS.rowHeight)
+        }
+
+    Returns: table object
 ]]
-function GT_UI.createFooterRow(table, message, columnCount)
-    columnCount = columnCount or table:getColumnCount()
-    
-    local footerRow = table:addRow(nil, {
-        bgColor = GT_UI.CONFIG.colors.rowTitleBackground
+function GT_UI.createScrollTable(frame, columnCount, options)
+    options = options or {}
+
+    local tbl = frame:addTable(columnCount, {
+        tabOrder         = options.tabOrder or 2,
+        x                = options.x or Helper.borderSize,
+        y                = options.y or 0,
+        width            = options.width,
+        maxVisibleHeight = options.maxVisibleHeight or Helper.viewHeight,
+        reserveScrollBar = (options.reserveScrollBar == true),  -- default false
+        highlightMode    = options.highlightMode,
     })
-    
-    footerRow[1]:setColSpan(columnCount):createText(message, {})
-    
-    return footerRow
+
+    tbl:setDefaultCellProperties("text", {
+        minRowHeight = options.rowHeight or GT_UI.DEFAULTS.rowHeight,
+        fontsize     = options.fontSize or GT_UI.DEFAULTS.fontSize,
+    })
+
+    return tbl
+end
+
+--[[
+    Set column widths using percentages.
+    Leave one column UN-set to act as the flexible column (required when
+    reserveScrollBar = true, harmless when false).
+
+    Parameters:
+        tbl     : table object
+        widths  : array of {colIndex, percent} or just array of percents
+                  e.g. {22, 8} sets columns 1=22%, 2=8%, rest flexible
+
+    Example:
+        GT_UI.setColPercents(tbl, {22, 8})
+        -- Column 1 = 22%, Column 2 = 8%, Column 3+ = flexible
+]]
+function GT_UI.setColPercents(tbl, widths)
+    if not widths then return end
+    for i, pct in ipairs(widths) do
+        if pct and pct > 0 then
+            tbl:setColWidthPercent(i, pct)
+        end
+    end
+end
+
+-- =============================================================================
+-- HEADER / ROW / FOOTER CREATION
+-- =============================================================================
+
+--[[
+    Add a fixed header row with text labels.
+
+    Parameters:
+        tbl         : table object
+        headers     : array of strings or tables:
+                      string -> simple centered text
+                      table  -> { text=, halign=, sortColumn=, currentSort=, onSort= }
+        options     : { bgColor=, font= }
+
+    Returns: row object
+]]
+function GT_UI.addHeaderRow(tbl, headers, options)
+    options = options or {}
+
+    local row = tbl:addRow(true, {
+        fixed   = true,
+        bgColor = options.bgColor or GT_UI.COLORS.headerBg,
+    })
+
+    for i, hdr in ipairs(headers) do
+        local cell = row[i]
+        if not cell then break end
+
+        if type(hdr) == "string" then
+            cell:createText(hdr, {
+                halign = "center",
+                font   = options.font or Helper.headerRow1Font,
+            })
+        else
+            -- Table config: sortable header
+            local text    = hdr.text or ""
+            local halign  = hdr.halign or "center"
+
+            if hdr.sortColumn and hdr.onSort then
+                -- Sortable: use button
+                local displayText = text
+                if hdr.currentSort and hdr.currentSort.column == hdr.sortColumn then
+                    displayText = displayText .. (hdr.currentSort.descending and " \xe2\x96\xbc" or " \xe2\x96\xb2")
+                end
+                local btn = cell:createButton({ height = GT_UI.DEFAULTS.rowHeight })
+                btn:setText(displayText, { halign = halign })
+                local sortCol = hdr.sortColumn
+                local sortFn  = hdr.onSort
+                cell.handlers.onClick = function()
+                    sortFn(sortCol)
+                    return true
+                end
+            else
+                cell:createText(text, {
+                    halign = halign,
+                    font   = options.font or Helper.headerRow1Font,
+                })
+            end
+        end
+    end
+
+    return row
+end
+
+--[[
+    Add a data row.
+
+    Parameters:
+        tbl          : table object
+        cells        : array of strings or tables:
+                       string -> left-aligned text
+                       table  -> { text=, halign=, color=, cellBGColor=, wordwrap=,
+                                   fontsize=, colSpan=, onClick= }
+        options      : { selectable=bool (default true), bgColor=, interactive= }
+
+    Returns: row object
+]]
+function GT_UI.addDataRow(tbl, cells, options)
+    options = options or {}
+    local selectable = (options.selectable ~= false)  -- default true
+
+    local rowOpts = {}
+    if options.bgColor then rowOpts.bgColor = options.bgColor end
+    if options.interactive then rowOpts.interactive = true end
+
+    local row = tbl:addRow(selectable, rowOpts)
+
+    for i, cellCfg in ipairs(cells) do
+        local cell = row[i]
+        if not cell then break end
+
+        if type(cellCfg) == "string" then
+            cell:createText(cellCfg, { halign = "left" })
+        else
+            if cellCfg.colSpan then
+                cell:setColSpan(cellCfg.colSpan)
+            end
+
+            local textOpts = {
+                halign      = cellCfg.halign or "left",
+                fontsize    = cellCfg.fontsize,
+                color       = cellCfg.color,
+                cellBGColor = cellCfg.cellBGColor,
+                wordwrap    = cellCfg.wordwrap,
+            }
+            cell:createText(cellCfg.text or "", textOpts)
+
+            if cellCfg.onClick then
+                local fn = cellCfg.onClick
+                cell.handlers.onClick = function()
+                    fn()
+                    return true
+                end
+            end
+        end
+    end
+
+    return row
+end
+
+--[[
+    Add an empty-state row spanning all columns.
+
+    Parameters:
+        tbl         : table object
+        message     : string
+        columnCount : number of columns to span (REQUIRED - X4 has no getColumnCount)
+        options     : { halign=, fontsize= }
+
+    Returns: row object
+]]
+function GT_UI.addEmptyRow(tbl, message, columnCount, options)
+    options = options or {}
+
+    local row = tbl:addRow(nil, {})
+    row[1]:setColSpan(columnCount):createText(message, {
+        halign   = options.halign or "center",
+        fontsize = options.fontsize or GT_UI.DEFAULTS.fontSize,
+    })
+    return row
+end
+
+--[[
+    Add a footer row spanning all columns.
+
+    Parameters:
+        tbl         : table object
+        message     : string
+        columnCount : number of columns to span (REQUIRED - X4 has no getColumnCount)
+        options     : { halign=, fontsize=, bgColor= }
+
+    Returns: row object
+]]
+function GT_UI.addFooterRow(tbl, message, columnCount, options)
+    options = options or {}
+
+    local row = tbl:addRow(nil, {
+        fixed   = true,
+        bgColor = options.bgColor or GT_UI.COLORS.headerBg,
+    })
+    row[1]:setColSpan(columnCount):createText(message, {
+        halign   = options.halign or "center",
+        fontsize = options.fontsize or GT_UI.DEFAULTS.fontSize * 0.85,
+    })
+    return row
+end
+
+-- =============================================================================
+-- BUTTONS
+-- =============================================================================
+
+--[[
+    Create a button in a table cell.
+
+    Parameters:
+        cell    : cell object (row[n])
+        text    : button label
+        options : {
+            height   = number  (default GT_UI.DEFAULTS.rowHeight)
+            bgColor  = color   (default GT_UI.COLORS.buttonBg)
+            fontSize = number  (default GT_UI.DEFAULTS.fontSize * 0.85)
+            halign   = string  (default "center")
+            color    = color   (text color, optional)
+            onClick  = function
+        }
+
+    Returns: button object
+]]
+function GT_UI.createButton(cell, text, options)
+    options = options or {}
+
+    local btn = cell:createButton({
+        height  = options.height or GT_UI.DEFAULTS.rowHeight,
+        bgColor = options.bgColor or GT_UI.COLORS.buttonBg,
+    })
+
+    local textOpts = {
+        halign   = options.halign or "center",
+        fontsize = options.fontSize or (GT_UI.DEFAULTS.fontSize * 0.85),
+    }
+    if options.color then textOpts.color = options.color end
+    btn:setText(text, textOpts)
+
+    if options.onClick then
+        local fn = options.onClick
+        cell.handlers.onClick = function()
+            fn()
+            return true
+        end
+    end
+
+    return btn
+end
+
+-- =============================================================================
+-- TAB BAR
+-- =============================================================================
+
+--[[
+    Create a tab bar row.
+
+    Parameters:
+        frame       : parent frame
+        tabs        : array of { name=string, sectionIdx=number }
+        activeIdx   : currently active section index
+        options     : {
+            x        = number
+            y        = number
+            width    = number
+            maxTabs  = number  (default 14)
+            fontSize = number  (default GT_UI.DEFAULTS.fontSize * 0.75)
+            truncLen = number  (default 12, tab names longer than this get truncated)
+            onClick  = function(sectionIdx)  -- called when a tab is clicked
+        }
+
+    Returns: tabTable object, tabHeight (pixels)
+]]
+function GT_UI.createTabBar(frame, tabs, activeIdx, options)
+    options = options or {}
+
+    local maxTabs  = math.min(#tabs, options.maxTabs or 14)
+    local truncLen = options.truncLen or 12
+    local fontSize = options.fontSize or (GT_UI.DEFAULTS.fontSize * 0.75)
+
+    local tabTable = frame:addTable(maxTabs, {
+        tabOrder         = 1,
+        x                = options.x or Helper.borderSize,
+        y                = options.y or 0,
+        width            = options.width,
+        highlightMode    = "off",
+        reserveScrollBar = false,
+    })
+
+    -- Equal column widths
+    local colPct = math.floor(100 / maxTabs)
+    for i = 1, maxTabs do
+        tabTable:setColWidthPercent(i, colPct)
+    end
+
+    local tabRow = tabTable:addRow(true, { fixed = true })
+
+    for i = 1, maxTabs do
+        local tab = tabs[i]
+        if not tab then break end
+
+        local label = tab.name or ("Tab " .. i)
+        if #label > truncLen then
+            label = string.sub(label, 1, truncLen - 2) .. ".."
+        end
+
+        local isActive = (tab.sectionIdx == activeIdx)
+        local bgColor  = isActive and GT_UI.COLORS.tabActiveBg or GT_UI.COLORS.tabInactiveBg
+
+        local btn = tabRow[i]:createButton({
+            height  = GT_UI.DEFAULTS.rowHeight,
+            bgColor = bgColor,
+        })
+        btn:setText(label, { halign = "center", fontsize = fontSize })
+
+        if options.onClick then
+            local idx = tab.sectionIdx
+            local fn  = options.onClick
+            tabRow[i].handlers.onClick = function()
+                fn(idx)
+                return true
+            end
+        end
+    end
+
+    local tabHeight = GT_UI.DEFAULTS.rowHeight + 8
+    return tabTable, tabHeight
+end
+
+-- =============================================================================
+-- PAGINATION
+-- =============================================================================
+
+--[[
+    Paginate a row set: determine page bounds and whether pagination is needed.
+
+    Parameters:
+        totalRows   : number of total rows
+        currentPage : current page (1-based)
+        maxPerPage  : max rows per page (default GT_UI.DEFAULTS.maxRowsPerPage)
+
+    Returns: table {
+        startIdx    = first row index (1-based)
+        endIdx      = last row index (1-based)
+        totalRows   = total number of rows
+        totalPages  = total number of pages
+        currentPage = clamped current page
+        isPaginated = bool (totalRows > maxPerPage)
+    }
+]]
+function GT_UI.paginate(totalRows, currentPage, maxPerPage)
+    maxPerPage = maxPerPage or GT_UI.DEFAULTS.maxRowsPerPage
+
+    local totalPages = math.max(1, math.ceil(totalRows / maxPerPage))
+    currentPage = math.max(1, math.min(currentPage, totalPages))
+
+    local startIdx = (currentPage - 1) * maxPerPage + 1
+    local endIdx   = math.min(currentPage * maxPerPage, totalRows)
+
+    return {
+        startIdx    = startIdx,
+        endIdx      = endIdx,
+        totalRows   = totalRows,
+        totalPages  = totalPages,
+        currentPage = currentPage,
+        isPaginated = (totalRows > maxPerPage),
+    }
+end
+
+--[[
+    Add a pagination info header row (e.g. "Page 2/7 (rows 81-160 of 500)").
+    Only adds the row if pagination is active.
+
+    Parameters:
+        tbl         : table object
+        pageInfo    : result from GT_UI.paginate()
+        columnCount : number of columns to span
+
+    Returns: row object or nil
+]]
+function GT_UI.addPaginationHeader(tbl, pageInfo, columnCount)
+    if not pageInfo.isPaginated then return nil end
+
+    local row = tbl:addRow(nil, {
+        fixed   = true,
+        bgColor = GT_UI.COLORS.headerBg,
+    })
+    row[1]:setColSpan(columnCount):createText(
+        string.format("Page %d / %d  (rows %d - %d of %d total)",
+            pageInfo.currentPage, pageInfo.totalPages,
+            pageInfo.startIdx, pageInfo.endIdx,
+            pageInfo.totalRows),
+        { halign = "center", fontsize = GT_UI.DEFAULTS.fontSize * 0.8 }
+    )
+    return row
+end
+
+--[[
+    Add pagination navigation buttons (Prev / page indicator / Next).
+    Only adds the row if pagination is active and there are multiple pages.
+
+    Parameters:
+        tbl         : table object (must have at least 3 columns)
+        pageInfo    : result from GT_UI.paginate()
+        onPageChange: function(newPage) - called when prev/next is clicked
+
+    Returns: row object or nil
+]]
+function GT_UI.addPaginationNav(tbl, pageInfo, onPageChange)
+    if not pageInfo.isPaginated or pageInfo.totalPages <= 1 then
+        return nil
+    end
+
+    local row = tbl:addRow(true, {
+        fixed   = true,
+        bgColor = GT_UI.COLORS.headerBg,
+    })
+
+    -- Prev button (column 1)
+    if pageInfo.currentPage > 1 then
+        GT_UI.createButton(row[1], "<< Prev", {
+            bgColor  = GT_UI.COLORS.tabInactiveBg,
+            fontSize = GT_UI.DEFAULTS.fontSize * 0.85,
+            onClick  = function()
+                onPageChange(pageInfo.currentPage - 1)
+            end,
+        })
+    else
+        row[1]:createText("", {})
+    end
+
+    -- Page indicator (column 2)
+    row[2]:createText(
+        string.format("%d / %d", pageInfo.currentPage, pageInfo.totalPages),
+        { halign = "center", fontsize = GT_UI.DEFAULTS.fontSize * 0.8 }
+    )
+
+    -- Next button (column 3)
+    if pageInfo.currentPage < pageInfo.totalPages then
+        GT_UI.createButton(row[3], "Next >>", {
+            bgColor  = GT_UI.COLORS.tabInactiveBg,
+            fontSize = GT_UI.DEFAULTS.fontSize * 0.85,
+            onClick  = function()
+                onPageChange(pageInfo.currentPage + 1)
+            end,
+        })
+    else
+        row[3]:createText("", {})
+    end
+
+    return row
 end
 
 -- =============================================================================
 -- MODULE EXPORT
 -- =============================================================================
 
--- Export as global for X4 ui.xml loading (files loaded via ui.xml don't use require)
--- Also return for compatibility if require is used
-if not _G.GT_UI then
-    _G.GT_UI = GT_UI
-end
+-- Export as global for X4 ui.xml loading (files loaded via ui.xml share _G)
+_G.GT_UI = GT_UI
 
 return GT_UI
-

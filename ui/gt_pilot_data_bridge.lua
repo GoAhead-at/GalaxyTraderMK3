@@ -67,9 +67,13 @@ end
 -- HELPER FUNCTIONS
 -- =============================================================================
 
--- Format money with M/B suffixes
+-- Format money - delegate to GT_UI library (single source of truth)
 local function formatMoney(amount)
-    local credits = amount / 100  -- Convert from cents to credits
+    if GT_UI and GT_UI.formatMoney then
+        return GT_UI.formatMoney(amount)
+    end
+    -- Fallback if library not loaded (shouldn't happen)
+    local credits = amount / 100
     if credits >= 1000000000 then
         return string.format("%.1fB Cr", credits / 1000000000)
     elseif credits >= 1000000 then
