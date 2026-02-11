@@ -412,9 +412,11 @@
                 </do_if>
 
                 <set_value name="$supplyDistPenalty" exact="1.0 + ($supplyDist * 0.1)"/>
-                <set_value name="$supplyScore" exact="$supplyAmount / $supplyDistPenalty"/>
+                <!-- Price-aware scoring: prefer cheaper sellers (lower unitprice = higher score) -->
+                <set_value name="$supplyPriceFactor" exact="[1, $supSellOffer.unitprice].max"/>
+                <set_value name="$supplyScore" exact="$supplyAmount / ($supplyDistPenalty * $supplyPriceFactor)"/>
 
-                <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': amount=' + $supplyAmount + ', price=' + $supSellOffer.unitprice + ', dist=' + $supplyDist + ', score=' + $supplyScore" chance="this.$debugchance"/>
+                <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': amount=' + $supplyAmount + ', unitprice=' + $supSellOffer.unitprice + ', dist=' + $supplyDist + ', score=' + $supplyScore" chance="this.$debugchance"/>
 
                 <do_if value="$supplyScore gt $bestSupplyScore">
                   <set_value name="$bestSupplyScore" exact="$supplyScore"/>
@@ -438,65 +440,66 @@
         <do_if value="$bestSupplyTrade != null">
           <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade found: buy ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname + ' (dist: ' + $bestSupplyTrade.$Distance + ')'" chance="this.$debugchance"/>
 
-          <!-- Execute supply: fly to NPC seller, buy ware -->
+          <!-- Create BOTH trade orders upfront so reservations are visible immediately.
+               Pattern matches vanilla order.trade.routine: "create_trade_order adds the reservation automatically".
+               The engine executes queued orders in sequence (buy first, then deliver). -->
           <set_command_action commandaction="commandaction.flying"/>
-          <do_if value="$bestSupplyTrade.$SellOffer.available">
+          <set_value name="$supplyOrdersCreated" exact="false"/>
+
+          <do_if value="$bestSupplyTrade.$SellOffer.available and $bestSupplyTrade.$BuyOffer.available">
             <set_value name="$supBuyAmount" exact="[$bestSupplyTrade.$Amount, $bestSupplyTrade.$SellOffer.amount].min"/>
             <do_if value="$supBuyAmount gt 0">
+              <!-- Order 1: Buy from NPC seller -->
               <create_trade_order object="this.ship" tradeoffer="$bestSupplyTrade.$SellOffer" amount="$supBuyAmount" immediate="true" internal="false"/>
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Buying ' + $supBuyAmount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname" chance="this.$debugchance"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Created BUY order: ' + $supBuyAmount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname" chance="this.$debugchance"/>
+
+              <!-- Order 2: Deliver to home station (queued — executes after buy completes).
+                   This immediately reserves the amount at the home station's buy offer,
+                   so other ships see the reduced offer amount right away. -->
+              <create_trade_order object="this.ship" tradeoffer="$bestSupplyTrade.$BuyOffer" amount="$supBuyAmount" immediate="true" internal="false"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Created DELIVER order: ' + $supBuyAmount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' (reservation active)'" chance="this.$debugchance"/>
+
+              <set_value name="$supplyOrdersCreated" exact="true"/>
             </do_if>
           </do_if>
 
-          <!-- Wait for buy order -->
-          <do_while value="this.ship.orders.count gt 0">
-            <wait exact="5s">
-              <interrupt>
-                <conditions>
-                  <event_object_order_ready object="this.ship"/>
-                </conditions>
-              </interrupt>
-            </wait>
-          </do_while>
+          <do_if value="not $supplyOrdersCreated">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade offers no longer available — skipping'" chance="this.$debugchance"/>
+          </do_if>
 
-          <!-- Deliver to home station (sell to station's buy offer) -->
-          <do_if value="this.ship.cargo.{$bestSupplyTrade.$Ware}.count gt 0 and $bestSupplyTrade.$BuyOffer.available">
-            <set_value name="$supDeliverAmount" exact="[this.ship.cargo.{$bestSupplyTrade.$Ware}.count, $bestSupplyTrade.$BuyOffer.amount].min"/>
-            <do_if value="$supDeliverAmount gt 0">
-              <create_trade_order object="this.ship" tradeoffer="$bestSupplyTrade.$BuyOffer" amount="$supDeliverAmount" immediate="true" internal="false"/>
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Delivering ' + $supDeliverAmount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname" chance="this.$debugchance"/>
+          <!-- Wait for both orders to complete (buy + deliver) -->
+          <do_if value="$supplyOrdersCreated">
+            <do_while value="this.ship.orders.count gt 0">
+              <wait exact="5s">
+                <interrupt>
+                  <conditions>
+                    <event_object_order_ready object="this.ship"/>
+                  </conditions>
+                </interrupt>
+              </wait>
+            </do_while>
+          </do_if>
+
+          <!-- Logbook and XP only if supply orders were actually created and executed -->
+          <do_if value="$supplyOrdersCreated">
+            <do_if value="this.$logbookentries">
+              <set_value name="$supLogMsg" exact="'Supplied ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' from ' + $bestSupplyTrade.$SellerStation.knownname"/>
+              <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+                $Message = $supLogMsg,
+                $Category = 'upkeep',
+                $Title = 'MK1 Supply: ' + $bestSupplyTrade.$Ware.name,
+                $Object = this.ship,
+                $CheckGlobalSettings = false
+              ]"/>
             </do_if>
-          </do_if>
 
-          <!-- Wait for delivery -->
-          <do_while value="this.ship.orders.count gt 0">
-            <wait exact="5s">
-              <interrupt>
-                <conditions>
-                  <event_object_order_ready object="this.ship"/>
-                </conditions>
-              </interrupt>
-            </wait>
-          </do_while>
-
-          <!-- Logbook for supply -->
-          <do_if value="this.$logbookentries">
-            <set_value name="$supLogMsg" exact="'Supplied ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' from ' + $bestSupplyTrade.$SellerStation.knownname"/>
-            <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
-              $Message = $supLogMsg,
-              $Category = 'upkeep',
-              $Title = 'MK1 Supply: ' + $bestSupplyTrade.$Ware.name,
-              $Object = this.ship,
-              $CheckGlobalSettings = false
-            ]"/>
-          </do_if>
-
-          <!-- XP for supply run -->
-          <do_if value="this.ship.pilot">
-            <signal_objects object="player.galaxy" param="'GT_Update_Pilot_XP'" param2="table[
-              $Ship = this.ship,
-              $Pilot = this.ship.pilot
-            ]"/>
+            <!-- XP for supply run -->
+            <do_if value="this.ship.pilot">
+              <signal_objects object="player.galaxy" param="'GT_Update_Pilot_XP'" param2="table[
+                $Ship = this.ship,
+                $Pilot = this.ship.pilot
+              ]"/>
+            </do_if>
           </do_if>
 
           <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SUPPLY PHASE COMPLETE === Re-evaluating...'" chance="this.$debugchance"/>
