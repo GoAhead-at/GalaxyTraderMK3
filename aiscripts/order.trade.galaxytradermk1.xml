@@ -69,6 +69,17 @@
         <input_param name="max" value="2"/>
         <input_param name="step" value="1"/>
       </param>
+
+      <!-- Supply Station (buy resources for home station) -->
+      <param name="supply" default="false" type="bool" text="{77000, 30021}" comment="{77000, 30121}"/>
+
+      <!-- Min Station Storage % (supply priority threshold) -->
+      <param name="minstorage" default="50" type="number" text="{77000, 30022}" comment="{77000, 30122}">
+        <input_param name="startvalue" value="50"/>
+        <input_param name="min" value="10"/>
+        <input_param name="max" value="90"/>
+        <input_param name="step" value="5"/>
+      </param>
     </params>
     <requires>
       <match shiptype="shiptype.lasertower" negate="true"/>
@@ -133,6 +144,8 @@
     <set_value name="this.$fleetcoordination" exact="$fleetcoordination"/>
     <set_value name="this.$debuglevel" exact="$debuglevel"/>
     <set_value name="this.$debugchance" exact="$debugchance"/>
+    <set_value name="this.$supply" exact="$supply"/>
+    <set_value name="this.$minstorage" exact="$minstorage"/>
 
     <!-- Wait time when no trades found (from global settings or default 60s) -->
     <set_value name="this.$waitTimeNoTrades" exact="if global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades? then global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades else 60s"/>
@@ -149,7 +162,16 @@
       ]
     ]"/>
 
-    <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === MK1 INIT COMPLETE === Home: ' + $homeStation.knownname + ', MaxSell: ' + $maxsell + ', IgnoreRules: ' + $ignoretraderules" chance="$debugchance"/>
+    <!-- Register station as MK1-supplied (if supply is enabled) -->
+    <do_if value="this.$supply">
+      <do_if value="not global.$GT_MK1SuppliedStations?">
+        <set_value name="global.$GT_MK1SuppliedStations" exact="table[]"/>
+      </do_if>
+      <set_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}" exact="this.ship"/>
+      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Registered station ' + this.$homeStation.knownname + ' as MK1-supplied'" chance="$debugchance"/>
+    </do_if>
+
+    <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === MK1 INIT COMPLETE === Home: ' + $homeStation.knownname + ', MaxSell: ' + $maxsell + ', IgnoreRules: ' + $ignoretraderules + ', Supply: ' + $supply" chance="$debugchance"/>
   </init>
 
   <attention min="unknown">
@@ -170,6 +192,10 @@
           <show_notification text="'GalaxyTrader MK1: ' + {77000, 30202}.['(destroyed)']" timeout="10s"/>
         </do_if>
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': ABORT — home station destroyed'" chance="100"/>
+        <!-- Unregister from supply registry (station may still be in table if it was just destroyed) -->
+        <do_if value="global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
+          <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>
+        </do_if>
         <set_command_action commandaction="commandaction.standingby"/>
         <return/>
       </do_if>
@@ -179,6 +205,10 @@
           <show_notification text="'GalaxyTrader MK1: ' + {77000, 30203}.[this.$homeStation.knownname]" timeout="10s"/>
         </do_if>
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': ABORT — station no longer player-owned'" chance="100"/>
+        <!-- Unregister from supply registry -->
+        <do_if value="global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
+          <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>
+        </do_if>
         <set_command_action commandaction="commandaction.standingby"/>
         <return/>
       </do_if>
@@ -196,6 +226,20 @@
         <set_value name="this.$fleetcoordination" exact="this.ship.defaultorder.$fleetcoordination"/>
         <set_value name="this.$debuglevel" exact="this.ship.defaultorder.$debuglevel"/>
         <set_value name="this.$debugchance" exact="if this.$debuglevel ge 1 then 100 else 0"/>
+        <set_value name="this.$supply" exact="this.ship.defaultorder.$supply"/>
+        <set_value name="this.$minstorage" exact="this.ship.defaultorder.$minstorage"/>
+
+        <!-- Update supply station registry if supply toggled -->
+        <do_if value="not global.$GT_MK1SuppliedStations?">
+          <set_value name="global.$GT_MK1SuppliedStations" exact="table[]"/>
+        </do_if>
+        <do_if value="this.$supply">
+          <set_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}" exact="this.ship"/>
+        </do_if>
+        <do_elseif value="global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
+          <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Unregistered station ' + this.$homeStation.knownname + ' (supply toggled off)'" chance="this.$debugchance"/>
+        </do_elseif>
       </do_if>
 
       <!-- ============================================================== -->
@@ -203,6 +247,268 @@
       <!-- ============================================================== -->
       <signal_objects object="player.galaxy" param="'GT_Check_Maintenance'" param2="table[$Ship = this.ship]"/>
       <wait exact="1ms" comment="Cooperative yield"/>
+
+      <!-- ============================================================== -->
+      <!-- STEP 2b: Supply mode — affordability + threshold check         -->
+      <!-- ============================================================== -->
+      <set_value name="this.$supplyPriority" exact="false"/>
+      <set_value name="this.$supplySkipped" exact="false"/>
+
+      <do_if value="this.$supply">
+        <!-- Check if station can afford at least 1 unit of any resource -->
+        <set_value name="$stationResources" exact="this.$homeStation.resources.list"/>
+        <set_value name="$canAffordAny" exact="false"/>
+
+        <do_if value="$stationResources.count gt 0">
+          <do_all exact="$stationResources.count" counter="$ri">
+            <set_value name="$res" exact="$stationResources.{$ri}"/>
+            <do_if value="$res.averageprice? and this.$homeStation.money ge $res.averageprice">
+              <set_value name="$canAffordAny" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="not $canAffordAny">
+          <!-- Station can't afford any resources — skip supply entirely -->
+          <set_value name="this.$supplySkipped" exact="true"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply SKIPPED — station cannot afford any resources (balance: ' + this.$homeStation.money + ')'" chance="this.$debugchance"/>
+        </do_if>
+        <do_else>
+          <!-- Check per-ware: is ANY resource below minstorage threshold? -->
+          <do_all exact="$stationResources.count" counter="$ri">
+            <set_value name="$res" exact="$stationResources.{$ri}"/>
+            <set_value name="$resCurrent" exact="this.$homeStation.cargo.{$res}.count"/>
+            <set_value name="$resTarget" exact="this.$homeStation.cargo.{$res}.target"/>
+            <do_if value="$resTarget gt 0">
+              <set_value name="$resPercent" exact="($resCurrent * 100) / $resTarget"/>
+              <do_if value="$resPercent lt this.$minstorage">
+                <set_value name="this.$supplyPriority" exact="true"/>
+                <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply PRIORITY — ' + $res.name + ' at ' + $resPercent + '% (threshold: ' + this.$minstorage + '%)'" chance="this.$debugchance"/>
+                <break/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_else>
+      </do_if>
+
+      <!-- ============================================================== -->
+      <!-- STEP 2c: Priority supply phase (runs before sell when urgent)  -->
+      <!-- ============================================================== -->
+      <do_if value="this.$supplyPriority">
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SUPPLY PHASE START (priority) ==='" chance="this.$debugchance"/>
+        <set_command_action commandaction="commandaction.searchingtrades"/>
+
+        <!-- Build list of under-threshold resources -->
+        <create_list name="$supplyWares"/>
+        <set_value name="$stationResources" exact="this.$homeStation.resources.list"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Station resources count: ' + $stationResources.count + ', station money: ' + this.$homeStation.money" chance="this.$debugchance"/>
+        <do_all exact="$stationResources.count" counter="$ri">
+          <set_value name="$res" exact="$stationResources.{$ri}"/>
+          <set_value name="$resTarget" exact="this.$homeStation.cargo.{$res}.target"/>
+          <do_if value="$resTarget gt 0">
+            <set_value name="$resCurrent" exact="this.$homeStation.cargo.{$res}.count"/>
+            <set_value name="$resPercent" exact="($resCurrent * 100) / $resTarget"/>
+            <do_if value="$resPercent lt this.$minstorage">
+              <append_to_list name="$supplyWares" exact="$res"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':   Need ' + $res.name + ': ' + $resCurrent + '/' + $resTarget + ' (' + $resPercent + '%)'" chance="this.$debugchance"/>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply wares to find: ' + $supplyWares.count" chance="this.$debugchance"/>
+
+        <!-- Build search sectors (same range as sell) -->
+        <create_list name="$supplySectors"/>
+        <append_to_list name="$supplySectors" exact="this.$homeStation.sector"/>
+        <do_if value="this.$maxsell gt 0">
+          <find_sector name="$supplyNearbySectors" space="player.galaxy" multiple="true">
+            <match_gate_distance object="this.$homeStation.sector" min="0" max="this.$maxsell"/>
+          </find_sector>
+          <do_if value="$supplyNearbySectors? and $supplyNearbySectors.count gt 0">
+            <do_all exact="$supplyNearbySectors.count" counter="$sni">
+              <do_if value="$supplyNearbySectors.{$sni} != this.$homeStation.sector">
+                <append_to_list name="$supplySectors" exact="$supplyNearbySectors.{$sni}"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Searching ' + $supplySectors.count + ' sectors (maxsell=' + this.$maxsell + ')'" chance="this.$debugchance"/>
+
+        <!-- Find best NPC seller for under-threshold resources -->
+        <set_value name="$bestSupplyTrade" exact="null"/>
+        <set_value name="$bestSupplyScore" exact="0"/>
+
+        <do_all exact="$supplyWares.count" counter="$swi">
+          <set_value name="$supplyWare" exact="$supplyWares.{$swi}"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':   Searching for seller of ' + $supplyWare.name + '...'" chance="this.$debugchance"/>
+
+          <!-- How much does the station need? -->
+          <set_value name="$supplyNeeded" exact="this.$homeStation.cargo.{$supplyWare}.target - this.$homeStation.cargo.{$supplyWare}.count"/>
+          <do_if value="$supplyNeeded le 0">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':     SKIP — station already full (needed=' + $supplyNeeded + ')'" chance="this.$debugchance"/>
+            <continue/>
+          </do_if>
+
+          <!-- Can the ship carry this ware? -->
+          <do_if value="this.ship.cargo.{$supplyWare}.max le 0">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':     SKIP — ship cannot carry ' + $supplyWare.name" chance="this.$debugchance"/>
+            <continue/>
+          </do_if>
+
+          <!-- Get the station's buy offer (station wants to buy this resource) -->
+          <find_buy_offer buyer="this.$homeStation" wares="$supplyWare" result="$stationBuyOffer"/>
+          <do_if value="not $stationBuyOffer.available or $stationBuyOffer.amount le 0">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':     SKIP — station has no buy offer for ' + $supplyWare.name + ' (available=' + $stationBuyOffer.available + ', amount=' + @$stationBuyOffer.amount + ')'" chance="this.$debugchance"/>
+            <continue/>
+          </do_if>
+
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':     Station buy offer: amount=' + $stationBuyOffer.amount + ', unitprice=' + $stationBuyOffer.unitprice + ', needed=' + $supplyNeeded" chance="this.$debugchance"/>
+
+          <!-- Find NPC sellers in range -->
+          <set_value name="$supplyOffersFound" exact="0"/>
+          <do_all exact="$supplySectors.count" counter="$ssi">
+            <set_value name="$supplySec" exact="$supplySectors.{$ssi}"/>
+            <find_sell_offer wares="$supplyWare" space="$supplySec" result="$secSupplySellOffers" multiple="true">
+              <match_seller tradesknownto="this.ship.owner" owner="faction.player" negateownerfilter="true">
+                <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <offeramount min="1"/>
+            </find_sell_offer>
+
+            <set_value name="$secOfferCount" exact="if $secSupplySellOffers? then $secSupplySellOffers.count else 0"/>
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':     Sector ' + $supplySec.knownname + ': ' + $secOfferCount + ' sell offers'" chance="this.$debugchance"/>
+
+            <do_if value="$secSupplySellOffers? and $secSupplySellOffers.count gt 0">
+              <do_all exact="$secSupplySellOffers.count" counter="$soi">
+                <set_value name="$supSellOffer" exact="$secSupplySellOffers.{$soi}"/>
+                <set_value name="$supplyOffersFound" operation="add"/>
+
+                <!-- Can the station afford it? -->
+                <set_value name="$supplyAmount" exact="[$supplyNeeded, $supSellOffer.amount, this.ship.cargo.{$supplyWare}.free].min"/>
+                <do_if value="$supplyAmount le 0">
+                  <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': SKIP — zero amount (needed=' + $supplyNeeded + ', offerAmt=' + $supSellOffer.amount + ', cargoFree=' + this.ship.cargo.{$supplyWare}.free + ')'" chance="this.$debugchance"/>
+                  <continue/>
+                </do_if>
+
+                <set_value name="$supplyCost" exact="$supSellOffer.unitprice * $supplyAmount"/>
+                <do_if value="$supplyCost gt this.$homeStation.money">
+                  <!-- Reduce amount to what station can afford -->
+                  <set_value name="$supplyAmount" exact="(this.$homeStation.money / $supSellOffer.unitprice)i"/>
+                  <do_if value="$supplyAmount le 0">
+                    <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': SKIP — station cannot afford (cost=' + $supplyCost + ', money=' + this.$homeStation.money + ')'" chance="this.$debugchance"/>
+                    <continue/>
+                  </do_if>
+                  <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': Reduced amount to ' + $supplyAmount + ' (station budget: ' + this.$homeStation.money + ')'" chance="this.$debugchance"/>
+                </do_if>
+
+                <!-- Distance and score -->
+                <set_value name="$supplyDist" exact="this.$homeStation.gatedistance.{$supSellOffer.owner}"/>
+                <do_if value="$supplyDist lt 0">
+                  <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': SKIP — unreachable (gatedistance=-1)'" chance="this.$debugchance"/>
+                  <continue/>
+                </do_if>
+
+                <set_value name="$supplyDistPenalty" exact="1.0 + ($supplyDist * 0.1)"/>
+                <set_value name="$supplyScore" exact="$supplyAmount / $supplyDistPenalty"/>
+
+                <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':       ' + @$supSellOffer.owner.knownname + ': amount=' + $supplyAmount + ', price=' + $supSellOffer.unitprice + ', dist=' + $supplyDist + ', score=' + $supplyScore" chance="this.$debugchance"/>
+
+                <do_if value="$supplyScore gt $bestSupplyScore">
+                  <set_value name="$bestSupplyScore" exact="$supplyScore"/>
+                  <set_value name="$bestSupplyTrade" exact="table[
+                    $Ware = $supplyWare,
+                    $SellOffer = $supSellOffer,
+                    $BuyOffer = $stationBuyOffer,
+                    $Amount = $supplyAmount,
+                    $SellerStation = $supSellOffer.owner,
+                    $Distance = $supplyDist
+                  ]"/>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_all>
+
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ':   ' + $supplyWare.name + ': ' + $supplyOffersFound + ' total NPC sell offers found'" chance="this.$debugchance"/>
+          <wait exact="1ms" comment="Cooperative yield between supply wares"/>
+        </do_all>
+
+        <do_if value="$bestSupplyTrade != null">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade found: buy ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname + ' (dist: ' + $bestSupplyTrade.$Distance + ')'" chance="this.$debugchance"/>
+
+          <!-- Execute supply: fly to NPC seller, buy ware -->
+          <set_command_action commandaction="commandaction.flying"/>
+          <do_if value="$bestSupplyTrade.$SellOffer.available">
+            <set_value name="$supBuyAmount" exact="[$bestSupplyTrade.$Amount, $bestSupplyTrade.$SellOffer.amount].min"/>
+            <do_if value="$supBuyAmount gt 0">
+              <create_trade_order object="this.ship" tradeoffer="$bestSupplyTrade.$SellOffer" amount="$supBuyAmount" immediate="true" internal="false"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Buying ' + $supBuyAmount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname" chance="this.$debugchance"/>
+            </do_if>
+          </do_if>
+
+          <!-- Wait for buy order -->
+          <do_while value="this.ship.orders.count gt 0">
+            <wait exact="5s">
+              <interrupt>
+                <conditions>
+                  <event_object_order_ready object="this.ship"/>
+                </conditions>
+              </interrupt>
+            </wait>
+          </do_while>
+
+          <!-- Deliver to home station (sell to station's buy offer) -->
+          <do_if value="this.ship.cargo.{$bestSupplyTrade.$Ware}.count gt 0 and $bestSupplyTrade.$BuyOffer.available">
+            <set_value name="$supDeliverAmount" exact="[this.ship.cargo.{$bestSupplyTrade.$Ware}.count, $bestSupplyTrade.$BuyOffer.amount].min"/>
+            <do_if value="$supDeliverAmount gt 0">
+              <create_trade_order object="this.ship" tradeoffer="$bestSupplyTrade.$BuyOffer" amount="$supDeliverAmount" immediate="true" internal="false"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Delivering ' + $supDeliverAmount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname" chance="this.$debugchance"/>
+            </do_if>
+          </do_if>
+
+          <!-- Wait for delivery -->
+          <do_while value="this.ship.orders.count gt 0">
+            <wait exact="5s">
+              <interrupt>
+                <conditions>
+                  <event_object_order_ready object="this.ship"/>
+                </conditions>
+              </interrupt>
+            </wait>
+          </do_while>
+
+          <!-- Logbook for supply -->
+          <do_if value="this.$logbookentries">
+            <set_value name="$supLogMsg" exact="'Supplied ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' from ' + $bestSupplyTrade.$SellerStation.knownname"/>
+            <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+              $Message = $supLogMsg,
+              $Category = 'upkeep',
+              $Title = 'MK1 Supply: ' + $bestSupplyTrade.$Ware.name,
+              $Object = this.ship,
+              $CheckGlobalSettings = false
+            ]"/>
+          </do_if>
+
+          <!-- XP for supply run -->
+          <do_if value="this.ship.pilot">
+            <signal_objects object="player.galaxy" param="'GT_Update_Pilot_XP'" param2="table[
+              $Ship = this.ship,
+              $Pilot = this.ship.pilot
+            ]"/>
+          </do_if>
+
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SUPPLY PHASE COMPLETE === Re-evaluating...'" chance="this.$debugchance"/>
+          <wait exact="1ms" comment="Cooperative yield"/>
+          <resume label="main_loop"/>
+        </do_if>
+        <do_else>
+          <!-- Reset priority flag so the no-sell fallback can attempt supply again with a short retry -->
+          <set_value name="this.$supplyPriority" exact="false"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No supply trades found — falling through to sell phase'" chance="this.$debugchance"/>
+        </do_else>
+      </do_if>
 
       <!-- ============================================================== -->
       <!-- STEP 3: Handle leftover cargo from interrupted trades          -->
@@ -495,11 +801,22 @@
       </do_all>
 
       <do_if value="$bestTrade == null">
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No trades found — waiting ' + this.$waitTimeNoTrades" chance="this.$debugchance"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No sell trades found'" chance="this.$debugchance"/>
+
+        <!-- If supply is enabled and not skipped, try opportunistic supply before waiting -->
+        <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No sells — attempting opportunistic supply'" chance="this.$debugchance"/>
+          <set_value name="this.$supplyPriority" exact="true"/>
+          <resume label="main_loop"/>
+        </do_if>
+
         <do_if value="this.$notifications ge 2">
           <show_notification text="'MK1 ' + this.ship.knownname + ': ' + {77000, 30201}.[this.$maxsell]" timeout="5s"/>
         </do_if>
-        <wait exact="this.$waitTimeNoTrades"/>
+        <!-- Short retry when supply is active (trade offers may not be populated yet), full wait otherwise -->
+        <set_value name="$retryWait" exact="if this.$supply then 10s else this.$waitTimeNoTrades"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Waiting ' + $retryWait + ' before retry (supply=' + this.$supply + ')'" chance="this.$debugchance"/>
+        <wait exact="$retryWait"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -685,7 +1002,33 @@
         <show_notification text="'MK1 ' + this.ship.knownname + ': ' + {77000, 30206}.[$firstTrade.$Amount, $firstTrade.$Ware.name, $firstTrade.$BuyStation.knownname, ($firstTrade.$UnitProfit * $firstTrade.$Amount), ($firstTrade.$UnitProfit * $firstTrade.$Amount)]" timeout="5s"/>
       </do_if>
 
-      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === CYCLE COMPLETE === Delivered ' + $deliveryRoute.count + ' trades'" chance="this.$debugchance"/>
+      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SELL CYCLE COMPLETE === Delivered ' + $deliveryRoute.count + ' trades'" chance="this.$debugchance"/>
+
+      <!-- ============================================================== -->
+      <!-- STEP 11: Opportunistic supply (after sell, if enabled)         -->
+      <!-- ============================================================== -->
+      <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority">
+        <!-- Check if any resource is below target (not threshold — just below target) -->
+        <set_value name="$needsSupply" exact="false"/>
+        <set_value name="$stationResources" exact="this.$homeStation.resources.list"/>
+        <do_if value="$stationResources.count gt 0 and this.$homeStation.money gt 0">
+          <do_all exact="$stationResources.count" counter="$ri">
+            <set_value name="$res" exact="$stationResources.{$ri}"/>
+            <do_if value="this.$homeStation.cargo.{$res}.count lt this.$homeStation.cargo.{$res}.target">
+              <set_value name="$needsSupply" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="$needsSupply">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Attempting opportunistic supply after sell cycle'" chance="this.$debugchance"/>
+          <!-- Trigger supply phase on next iteration by setting the flag -->
+          <set_value name="this.$supplyPriority" exact="true"/>
+          <wait exact="1ms" comment="Cooperative yield"/>
+          <resume label="main_loop"/>
+        </do_if>
+      </do_if>
 
       <!-- Short yield before next cycle -->
       <wait exact="1ms" comment="Cooperative yield before next cycle"/>
@@ -695,4 +1038,11 @@
 
     </actions>
   </attention>
+  <on_abort>
+    <!-- Cleanup: unregister station from MK1 supply registry -->
+    <do_if value="this.$homeStation? and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
+      <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>
+      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': on_abort — unregistered station from supply registry'" chance="100"/>
+    </do_if>
+  </on_abort>
 </aiscript>
