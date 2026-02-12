@@ -1,5 +1,5 @@
--- GalaxyTrader MK3 Context Menu Rename
--- Adds "MK3 Rename" context menu entry to ship overview in map menu
+-- GalaxyTrader Context Menu Rename
+-- Adds "GT Rename" context menu entry to ship overview in map menu
 
 -- FFI setup
 local ffi = require("ffi")
@@ -33,7 +33,7 @@ local gtRenameContext = {}
 -- Create rename context menu with edit box (following vanilla pattern)
 function menu.createGTRenameContext(frame)
     -- Use fallback string directly to avoid ReadText lookup errors
-    local title = "MK3 Rename"
+    local title = "GT Rename"
     local component = menu.contextMenuData.component
     
     -- Get original name to display (only use GT original name from blackboard, no fallback)
@@ -309,7 +309,7 @@ if originalOnInteractMenuCallback then
     end
 end
 
--- Hook into createRenameContext to add our "MK3 Rename" button to the vanilla rename context
+-- Hook into createRenameContext to add our "GT Rename" button to the vanilla rename context
 -- This adds a button that opens our floating window instead of the vanilla rename dialog
 
 DebugError("[GT Context Rename] Context menu rename integration loaded")

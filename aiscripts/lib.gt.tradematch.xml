@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.tradematch" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="sellOffers" default="[]"/>
+    <param name="buyOffers" default="[]"/>
+    <param name="homeSector" default="this.ship.sector"/>
+    <param name="maxDistance" default="0"/>
+    <param name="minROI" default="0"/>
+    <param name="minAbsoluteProfit" default="0"/>
+    <param name="distancePenalty" default="0.1"/>
+    <param name="factionPriority" default="0"/>
+    <param name="ignoreBuildStorage" default="false"/>
+    <param name="ignoreCarrierAux" default="false"/>
+    <param name="scoreMode" default="'sell'"/>
+    <param name="maxTradesPerWare" default="20"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <create_list name="$tradeList"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+      <set_value name="$tradesEvaluated" exact="0"/>
+      <set_value name="$tradesRejected" exact="0"/>
+
+      <!-- Read AI yield interval from global settings (persisted to instance var to survive waits) -->
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
+        <set_value name="this.$gt_yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+
+      <do_if value="not $sellOffers? or not $buyOffers? or $sellOffers.count == 0 or $buyOffers.count == 0">
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $TradeList = $tradeList,
+          $TradesEvaluated = 0,
+          $TradesRejected = 0
+        ]"/>
+      </do_if>
+
+      <!-- Per-ware trade limiting: prevents a single high-volume ware (e.g. Energy Cells)
+           from dominating the entire trade list. Each ware gets up to $maxTradesPerWare
+           trades, ensuring diversity across all tradeable wares in the galaxy.
+           Old version: MaxTradesPerWare=20 per ware. -->
+      <set_value name="$tradesPerWare" exact="table[]"/>
+
+      <do_all exact="$sellOffers.count" counter="$si">
+        <set_value name="$sellOffer" exact="$sellOffers.{$si}"/>
+        <set_value name="$ware" exact="@$sellOffer.ware"/>
+        <set_value name="$buyStation" exact="if $sellOffer? and $sellOffer.owner? then @$sellOffer.owner else null"/>
+
+        <!-- Per-ware early skip: if this ware already has max trades, skip entire inner loop -->
+        <do_if value="$ware? and $tradesPerWare.{$ware}? and $tradesPerWare.{$ware} ge $maxTradesPerWare">
+          <continue/>
+        </do_if>
+
+        <do_all exact="$buyOffers.count" counter="$bi">
+          <set_value name="$buyOffer" exact="$buyOffers.{$bi}"/>
+          <set_value name="$sellStation" exact="if $buyOffer? and $buyOffer.owner? then @$buyOffer.owner else null"/>
+
+          <do_if value="@$buyOffer.ware != $ware">
+            <continue/>
+          </do_if>
+          <!-- Per-ware trade cap (inner loop): stop producing more trades for this ware
+               once the limit is reached. The outer-loop early skip handles the next sell offer,
+               but a single sell offer can pair with hundreds of buy offers for the same ware. -->
+          <do_if value="$ware? and $tradesPerWare.{$ware}? and $tradesPerWare.{$ware} ge $maxTradesPerWare">
+            <break/>
+          </do_if>
+          <do_if value="$buyStation == null or $sellStation == null">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+
+          <!-- Build storage exclusion -->
+          <do_if value="$ignoreBuildStorage">
+            <do_if value="$buyStation.isbuildstorage or $sellStation.isbuildstorage">
+              <set_value name="$tradesRejected" operation="add"/>
+              <continue/>
+            </do_if>
+          </do_if>
+
+          <!-- Carrier / auxiliary exclusion -->
+          <do_if value="$ignoreCarrierAux">
+            <do_if value="$buyStation.isauxiliary or $buyStation.iscarrier or $sellStation.isauxiliary or $sellStation.iscarrier">
+              <set_value name="$tradesRejected" operation="add"/>
+              <continue/>
+            </do_if>
+          </do_if>
+
+          <set_value name="$tradeAmount" exact="[$sellOffer.amount, $buyOffer.amount, $ship.cargo.{$ware}.free].min"/>
+          <do_if value="$tradeAmount le 0">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+
+          <set_value name="$unitProfit" exact="$buyOffer.unitprice - $sellOffer.unitprice"/>
+          <do_if value="$scoreMode == 'sell' and $unitProfit le 0">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+
+          <!-- Distance check: validate BOTH buy station and sell station -->
+          <set_value name="$distBuy" exact="$homeSector.gatedistance.{$buyStation}"/>
+          <do_if value="$distBuy lt 0 or $distBuy gt $maxDistance">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+          <set_value name="$distSell" exact="$homeSector.gatedistance.{$sellStation}"/>
+          <do_if value="$distSell lt 0 or $distSell gt $maxDistance">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+          <!-- Use the greater distance for scoring (worst-case leg) -->
+          <set_value name="$distance" exact="[$distBuy, $distSell].max"/>
+
+          <set_value name="$distanceFactor" exact="1.0 + ($distance * $distancePenalty)"/>
+          <set_value name="$score" exact="0"/>
+
+          <do_if value="$scoreMode == 'supply'">
+            <set_value name="$priceFactor" exact="[1, $sellOffer.unitprice].max"/>
+            <set_value name="$score" exact="$tradeAmount / ($distanceFactor * $priceFactor)"/>
+          </do_if>
+          <do_else>
+            <set_value name="$grossProfit" exact="$unitProfit * $tradeAmount"/>
+            <set_value name="$roi" exact="if $sellOffer.unitprice gt 0 then ($unitProfit * 100) / $sellOffer.unitprice else 0"/>
+            <do_if value="$grossProfit lt $minAbsoluteProfit or $roi lt $minROI">
+              <set_value name="$tradesRejected" operation="add"/>
+              <continue/>
+            </do_if>
+            <set_value name="$score" exact="$grossProfit / $distanceFactor"/>
+
+            <!-- Faction priority bonus: boost score for trades involving player-owned stations -->
+            <do_if value="$factionPriority gt 0">
+              <set_value name="$factionBonus" exact="1.0"/>
+              <do_if value="$buyStation.isplayerowned or $sellStation.isplayerowned">
+                <set_value name="$factionBonus" exact="1.0 + ($factionPriority * 0.1)"/>
+              </do_if>
+              <set_value name="$score" exact="$score * $factionBonus"/>
+            </do_if>
+          </do_else>
+
+          <set_value name="$trade" exact="table[
+            $Ware = $ware,
+            $BuyOffer = $sellOffer,
+            $SellOffer = $buyOffer,
+            $Amount = $tradeAmount,
+            $Score = $score,
+            $BuyStation = $buyStation,
+            $SellStation = $sellStation,
+            $BuySector = $buyStation.sector,
+            $SellSector = $sellStation.sector,
+            $Distance = $distance,
+            $UnitProfit = $unitProfit,
+            $BuyPrice = $sellOffer.unitprice,
+            $SellPrice = $buyOffer.unitprice,
+            $ProfitPerUnit = $unitProfit,
+            $Profit = ($unitProfit * $tradeAmount)
+          ]"/>
+          <append_to_list name="$tradeList" exact="$trade"/>
+          <set_value name="$tradesEvaluated" operation="add"/>
+
+          <!-- Track per-ware trade count -->
+          <do_if value="$ware?">
+            <do_if value="not $tradesPerWare.{$ware}?">
+              <set_value name="$tradesPerWare.{$ware}" exact="0"/>
+            </do_if>
+            <set_value name="$tradesPerWare.{$ware}" operation="add"/>
+          </do_if>
+
+          <do_if value="$score gt $bestScore">
+            <set_value name="$bestScore" exact="$score"/>
+            <set_value name="$bestTrade" exact="$trade"/>
+          </do_if>
+        </do_all>
+
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after each sell-offer loop"/>
+      </do_all>
+
+      <return value="table[
+        $Found = ($bestTrade != null),
+        $BestTrade = $bestTrade,
+        $BestScore = $bestScore,
+        $TradeList = $tradeList,
+        $TradesEvaluated = $tradesEvaluated,
+        $TradesRejected = $tradesRejected
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

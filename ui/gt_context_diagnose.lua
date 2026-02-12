@@ -125,8 +125,8 @@ function gtDiagnose.openReport(component)
         return
     end
 
-    -- Show VERDICT tab first (last section)
-    gtDiagnose.currentTab  = #gtDiagnose.sections
+    -- Show Ship State tab first (contains VERDICT at top)
+    gtDiagnose.currentTab  = 1
     gtDiagnose.currentPage = 1
 
     -- Frame dimensions
@@ -204,12 +204,11 @@ function gtDiagnose.populateFrame(frame)
     local titleHeight = Helper.headerRow1FontSize + 10
 
     -- ===== TAB BAR =====
-    -- Build tab order: VERDICT first, then sections 1..N-1
+    -- Sections in natural order (Ship State first, contains VERDICT at top)
     local numSections = #sections
     local tabDefs = {}
-    tabDefs[1] = { name = sections[numSections].name, sectionIdx = numSections }
-    for i = 1, numSections - 1 do
-        tabDefs[i + 1] = { name = sections[i].name, sectionIdx = i }
+    for i = 1, numSections do
+        tabDefs[i] = { name = sections[i].name, sectionIdx = i }
     end
 
     local _, tabHeight = GT_UI.createTabBar(frame, tabDefs, gtDiagnose.currentTab, {
@@ -252,9 +251,10 @@ function gtDiagnose.populateFrame(frame)
 
     -- Determine section name for layout selection
     local sectionName = currentSection.name or ""
-    local isPairDetails = (sectionName == "Pair Details")
-    local isClearance   = (sectionName == "Clearance")
-    local isMultiCol    = (numCols >= 6) or isPairDetails or isClearance
+    local isPairDetails    = (sectionName == "Pair Details")
+    local isClearance      = (sectionName == "Clearance")
+    local isSearchSummary  = (sectionName == "Search Summary")
+    local isMultiCol       = (numCols >= 6) or isPairDetails or isClearance or isSearchSummary
 
     if isMultiCol then
         -- ===== 6-COLUMN STRUCTURED LAYOUT =====
@@ -267,17 +267,27 @@ function gtDiagnose.populateFrame(frame)
             width            = width,
             maxVisibleHeight = gtDiagnose.frameHeight - contentY - Helper.borderSize - 10,
         })
-        -- Col widths: Status=6%, Ware=10%, col3=22%, col4=22%, col5=12%, col6=flexible
-        GT_UI.setColPercents(contentTable, { 6, 10, 22, 22, 12 })
-
         -- Column headers depend on section type
-        if isPairDetails then
+        if isSearchSummary then
+            -- Search Summary: Status=6%, Check=25%, Sell=10%, Buy=10%, Total=10%, rest=flexible
+            GT_UI.setColPercents(contentTable, { 6, 25, 10, 10, 10 })
+            GT_UI.addHeaderRow(contentTable, {
+                { text = "Status", halign = "center" },
+                "Sector / Check",
+                { text = "Sell", halign = "right" },
+                { text = "Buy", halign = "right" },
+                { text = "Total", halign = "right" },
+                "",
+            })
+        elseif isPairDetails then
+            -- Pair Details: Status=6%, Ware=10%, Route=30%, Profit=12%, ROI=8%, Reason=flexible
+            GT_UI.setColPercents(contentTable, { 6, 10, 30, 12, 8 })
             GT_UI.addHeaderRow(contentTable, {
                 { text = "Status", halign = "center" },
                 "Ware",
-                "Buy From",
-                "Sell To",
-                { text = "Profit/ROI", halign = "right" },
+                "Route",
+                { text = "Profit", halign = "right" },
+                { text = "ROI", halign = "right" },
                 "Reason",
             })
         elseif isClearance then
@@ -330,11 +340,21 @@ function gtDiagnose.populateFrame(frame)
                           color = (status == "FAIL") and GT_UI.COLORS.textNegative or nil },
                     }, { bgColor = rowBg })
                 else
+                    -- Right-align numeric columns per section type
+                    local detailAlign = "left"
+                    local col4Align   = "left"
+                    if isSearchSummary then
+                        detailAlign = "right"
+                        col4Align   = "right"
+                    elseif isPairDetails then
+                        col4Align = "right"
+                    end
+
                     GT_UI.addDataRow(contentTable, {
                         { text = status, halign = "center", fontsize = detailFontSize, color = statusColor },
                         { text = check, fontsize = detailFontSize },
-                        { text = detail, fontsize = detailFontSize },
-                        { text = col4, fontsize = detailFontSize },
+                        { text = detail, halign = detailAlign, fontsize = detailFontSize },
+                        { text = col4, halign = col4Align, fontsize = detailFontSize },
                         { text = col5, halign = "right", fontsize = detailFontSize },
                         { text = col6, fontsize = detailFontSize,
                           color = (status == "FAIL") and GT_UI.COLORS.textNegative or nil },

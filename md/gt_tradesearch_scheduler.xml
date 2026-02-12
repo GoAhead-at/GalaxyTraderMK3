@@ -1,24 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <mdscript name="GT_TradeSearch_Scheduler" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/md.xsd">
   <cues>
-    <!-- =====================================================================
-         Trade-search Scheduler (Hard Frame Budget)
+    <!-- Clean post-migration scheduler:
+         GT_Search_Request -> GT_Search_Go -> GT_Search_Done -->
 
-         Purpose:
-         - Single entrypoint for starting new trade searches.
-         - Enforces a hard minimum interval between starting expensive searches.
-         - Avoids same-frame stampedes: only one search start per tick.
-
-         External contract:
-         - Accepts canonical request tables from GT_TradingAI (Ship + parameters).
-         - Starts the existing search engine by signalling md.GT_Trading_Search.SearchTradeRoutes.
-         - AI still receives GT_Trade_Found / GT_No_Trade_Found via existing execution/signals.
-
-         NOTE: This is step 1 of the full rewrite. It strictly limits *starts*.
-               Later steps will convert cache/live/match into true work-unit steppers.
-         ===================================================================== -->
-
-    <cue name="Init" instantiate="true">
+    <cue name="Init" instantiate="true" version="1">
       <conditions>
         <check_any>
           <event_game_loaded/>
@@ -26,1704 +12,333 @@
         </check_any>
       </conditions>
       <actions>
-        <do_if value="not global.$GT_TS?">
-          <set_value name="global.$GT_TS" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Queue? or global.$GT_TS.$Queue == null">
-          <set_value name="global.$GT_TS.$Queue" exact="[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Queued? or global.$GT_TS.$Queued == null">
-          <set_value name="global.$GT_TS.$Queued" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Requests? or global.$GT_TS.$Requests == null">
-          <set_value name="global.$GT_TS.$Requests" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Processing?">
-          <set_value name="global.$GT_TS.$Processing" exact="false"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$NextStartTime?">
-          <set_value name="global.$GT_TS.$NextStartTime" exact="0s"/>
-        </do_if>
-        <!-- Throttle expensive queue-wide maintenance in Tick -->
-        <do_if value="not global.$GT_TS.$LastStaleScan?">
-          <set_value name="global.$GT_TS.$LastStaleScan" exact="0s"/>
-        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+      </actions>
+    </cue>
 
-        <!-- Reset transient coalescing / output queues on load (not safe to resume across save/load) -->
-        <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
-        <do_if value="global.$GT_TS_OutputQueue?">
-          <set_value name="global.$GT_TS_OutputQueue" exact="table[
-            $TradeFoundQueue = [],
-            $TradeFoundQueued = table[],
-            $TradeFoundProcessing = false
-          ]"/>
+    <cue name="InitSearchSemaphore" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <set_value name="global.$GT_SearchSemaphore" exact="table[]"/>
         </do_if>
-
-        <!-- Legacy queue cleanup (safe): SearchQueue is no longer used for scheduling starts -->
-        <do_if value="global.$GT_SearchQueue?">
-          <remove_value name="global.$GT_SearchQueue.$Ships"/>
-          <remove_value name="global.$GT_SearchQueue.$QueuedShips"/>
-          <remove_value name="global.$GT_SearchQueue.$Processing"/>
-          <remove_value name="global.$GT_SearchQueue.$NextSearchStartTime"/>
+        <do_if value="not global.$GT_SearchSemaphore.$Queue?">
+          <set_value name="global.$GT_SearchSemaphore.$Queue" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_SearchSemaphore.$Queued?">
+          <set_value name="global.$GT_SearchSemaphore.$Queued" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_SearchSemaphore.$ActiveShips?">
+          <set_value name="global.$GT_SearchSemaphore.$ActiveShips" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_SearchSemaphore.$Active?">
+          <set_value name="global.$GT_SearchSemaphore.$Active" exact="0"/>
+        </do_if>
+        <set_value name="$maxConcurrentLive" exact="1"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
+          <set_value name="$maxConcurrentLive" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
+        </do_if>
+        <do_if value="$maxConcurrentLive lt 1">
+          <set_value name="$maxConcurrentLive" exact="1"/>
+        </do_if>
+        <set_value name="global.$GT_SearchSemaphore.$MaxConcurrent" exact="$maxConcurrentLive"/>
+        <do_if value="not global.$GT_SearchSemaphore.$DispatchScheduled?">
+          <set_value name="global.$GT_SearchSemaphore.$DispatchScheduled" exact="false"/>
         </do_if>
       </actions>
     </cue>
 
-    <!-- Enqueue a trade-search request (canonical request table) -->
+    <!-- Legacy compatibility: older call sites can still enqueue here -->
     <cue name="Enqueue" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
       <actions>
         <set_value name="$req" exact="event.param"/>
-        <set_value name="$ship" exact="$req.$Ship"/>
-
-        <do_if value="not $ship? or not $ship.exists">
-          <cancel_cue cue="this"/>
+        <do_if value="$req? and $req.$Ship? and $req.$Ship.exists">
+          <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="$req"/>
         </do_if>
-        <do_else>
-
-        <!-- Ensure global structures exist -->
-        <do_if value="not global.$GT_TS?">
-          <set_value name="global.$GT_TS" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Queue? or global.$GT_TS.$Queue == null">
-          <set_value name="global.$GT_TS.$Queue" exact="[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Queued? or global.$GT_TS.$Queued == null">
-          <set_value name="global.$GT_TS.$Queued" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_TS.$Requests? or global.$GT_TS.$Requests == null">
-          <set_value name="global.$GT_TS.$Requests" exact="table[]"/>
-        </do_if>
-
-        <!-- Overwrite latest request for ship (idempotent) -->
-        <set_value name="global.$GT_TS.$Requests.{$ship}" exact="$req"/>
-
-        <!-- Initialize EnqueuedAt table if needed -->
-        <do_if value="not global.$GT_TS.$EnqueuedAt? or global.$GT_TS.$EnqueuedAt == null">
-          <set_value name="global.$GT_TS.$EnqueuedAt" exact="table[]"/>
-        </do_if>
-
-        <!-- O(1) de-dupe -->
-        <do_if value="not global.$GT_TS.$Queued.{$ship}?">
-          <set_value name="global.$GT_TS.$Queued.{$ship}" exact="true"/>
-          <!-- Track when ship was enqueued (for stale entry detection) -->
-          <set_value name="global.$GT_TS.$EnqueuedAt.{$ship}" exact="player.age"/>
-          <append_to_list name="global.$GT_TS.$Queue" exact="$ship"/>
-        </do_if>
-        <do_else>
-          <!-- Ship already queued - update enqueue time (prevents timeout if ship re-requests) -->
-          <set_value name="global.$GT_TS.$EnqueuedAt.{$ship}" exact="player.age"/>
-        </do_else>
-
-        <!-- Hub status: request queued -->
-        <set_value name="$traceId" exact="if @$req.$TraceId != null then @$req.$TraceId else ''"/>
-        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-          <param name="ship" value="$ship"/>
-          <param name="stage" value="'queued'"/>
-          <param name="state" value="'waiting'"/>
-          <param name="reason" value="''"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="extra" value="table[$QueueSize = global.$GT_TS.$Queue.count]"/>
-        </run_actions>
-
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-TS] Enqueue: ' + $ship.idcode + ' (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
-        </do_if>
-
-        <!-- Kick scheduler -->
-        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
-        </do_else>
       </actions>
     </cue>
 
-    <!-- Single-threaded scheduler tick -->
+    <!-- Legacy compatibility: old delayed entrypoint now forwards to request -->
+    <cue name="SearchTradeRoutes_Delayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="1ms"/>
+      <actions>
+        <set_value name="$req" exact="event.param"/>
+        <do_if value="$req? and $req.$Ship? and $req.$Ship.exists">
+          <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="$req"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Compatibility kick points from removed queue/work-item flow -->
     <cue name="Tick" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
       <actions>
-        <!-- IMPORTANT: In X4 MD, cancel_cue does NOT reliably stop the current actions block or a later action block after <delay>.
-             Use a persistent instance flag to gate BOTH action blocks. -->
-        <set_value name="this.$DelayTime" exact="0ms"/>
-        <set_value name="this.$TickProceed" exact="false"/>
-
-        <do_if value="not global.$GT_TS? or not global.$GT_TS.$Queue?">
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_elseif value="global.$GT_TS.$Processing">
-          <!-- Prevent stampede -->
-          <cancel_cue cue="this"/>
-        </do_elseif>
-        <do_else>
-        <set_value name="this.$TickProceed" exact="true"/>
-        <set_value name="global.$GT_TS.$Processing" exact="true"/>
-
-        <!-- Initialize EnqueuedAt table if needed -->
-        <do_if value="not global.$GT_TS.$EnqueuedAt? or global.$GT_TS.$EnqueuedAt == null">
-          <set_value name="global.$GT_TS.$EnqueuedAt" exact="table[]"/>
-        </do_if>
-
-        <!-- SAFEGUARD: Remove stale queue entries (older than 60 seconds), but DO NOT scan the entire queue every Tick.
-             Under large fleets, queue scanning becomes O(N) and can cause continuous stutter by itself. -->
-        <set_value name="$doStaleScan" exact="false"/>
-        <set_value name="$staleScanInterval" exact="2s"/>
-        <set_value name="$lastStaleScan" exact="@global.$GT_TS.$LastStaleScan"/>
-        <do_if value="not $lastStaleScan? or $lastStaleScan == null or (player.age - $lastStaleScan) ge $staleScanInterval">
-          <set_value name="$doStaleScan" exact="true"/>
-          <set_value name="global.$GT_TS.$LastStaleScan" exact="player.age"/>
-        </do_if>
-
-        <do_if value="$doStaleScan">
-          <set_value name="$staleThreshold" exact="60s"/> <!-- Default fallback -->
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$QueueStaleThresholdSeconds?">
-            <set_value name="$staleThreshold" exact="global.$GT_GlobalSettings.$Performance.$QueueStaleThresholdSeconds * 1s"/>
-          </do_if>
-          <set_value name="$staleShips" exact="[]"/>
-          <do_all exact="global.$GT_TS.$Queue.count" counter="$i">
-            <set_value name="$queuedShip" exact="global.$GT_TS.$Queue.{$i}"/>
-            <set_value name="$enqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$queuedShip}"/>
-            <do_if value="$enqueuedAt? and $enqueuedAt != null">
-              <set_value name="$queueAge" exact="player.age - $enqueuedAt"/>
-              <do_if value="$queueAge gt $staleThreshold">
-                <append_to_list name="$staleShips" exact="$queuedShip"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <append_to_list name="$staleShips" exact="$queuedShip"/>
-            </do_else>
-          </do_all>
-
-          <do_all exact="$staleShips.count" counter="$j">
-            <set_value name="$staleShip" exact="$staleShips.{$j}"/>
-            <set_value name="$staleAge" exact="0s"/>
-            <set_value name="$staleEnqueuedAt" exact="@global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
-            <do_if value="$staleEnqueuedAt? and $staleEnqueuedAt != null">
-              <set_value name="$staleAge" exact="player.age - $staleEnqueuedAt"/>
-            </do_if>
-            <remove_from_list name="global.$GT_TS.$Queue" exact="$staleShip"/>
-            <remove_value name="global.$GT_TS.$Queued.{$staleShip}"/>
-            <remove_value name="global.$GT_TS.$EnqueuedAt.{$staleShip}"/>
-            <do_if value="$staleShip? and $staleShip.exists">
-              <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-                <param name="ship" value="$staleShip"/>
-                <param name="reason" value="'busy'"/>
-              </run_actions>
-              <signal_objects object="$staleShip" param="'GT_No_Trade_Found'" param2="'busy'" delay="1ms"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-TS] SAFEGUARD: Removed stale queue entry for ' + $staleShip.idcode + ' (queued for ' + ($staleAge / 1s) + 's, threshold=60s) - signaling busy retry'" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_all>
-        </do_if>
-
-        <!-- If no pending ships after cleanup, stop -->
-        <do_if value="global.$GT_TS.$Queue.count le 0">
-          <set_value name="global.$GT_TS.$Processing" exact="false"/>
-          <set_value name="this.$TickProceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <!-- Hard budget: enforce min interval between starting searches -->
-        <set_value name="$nextStart" exact="@global.$GT_TS.$NextStartTime"/>
-        <do_if value="$nextStart? and $nextStart != null and player.age lt $nextStart">
-          <set_value name="this.$DelayTime" exact="$nextStart - player.age"/>
-        </do_if>
-
-        <do_if value="this.$DelayTime gt 0ms and global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-TS] Budget: delaying next start by ' + (this.$DelayTime / 1ms) + 'ms (queue=' + global.$GT_TS.$Queue.count + ')'" chance="100"/>
-        </do_if>
-        </do_else>
-      </actions>
-      <delay exact="this.$DelayTime"/>
-      <actions>
-        <do_if value="this.$TickProceed">
-        <!-- ROOT CAUSE FIX: Create multiple work items per tick to fill queue faster -->
-        <!-- Tick was creating 1 work item per 25ms, causing bottleneck with large queues -->
-        <!-- ProcessWorkQueue can process 10 items per tick, so Tick should create multiple items per call -->
-        <!-- Creating work items is cheap (just data structures), so we can create 5-10 per call without stutter -->
-        <!-- Start pacing: make sure we don't flood the work queue under big fleets -->
-        <set_value name="$startIntervalMs" exact="100"/>
-        <!-- Use global setting if available -->
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$SchedulerTickInterval?">
-          <set_value name="$tmpInterval" exact="@global.$GT_GlobalSettings.$Performance.$SchedulerTickInterval"/>
-          <do_if value="$tmpInterval? and $tmpInterval != null and $tmpInterval ge 50 and $tmpInterval le 500">
-            <set_value name="$startIntervalMs" exact="$tmpInterval"/>
-          </do_if>
-        </do_if>
-        <set_value name="global.$GT_TS.$NextStartTime" exact="player.age + ($startIntervalMs * 1ms)"/>
-        
-        <!-- Under big fleets, creating many CacheQuery work items quickly can keep the scheduler busy continuously.
-             Keep this small so work is distributed across frames. -->
-        <set_value name="$maxShipsPerTick" exact="1"/> <!-- Default fallback -->
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxShipsPerTick?">
-          <set_value name="$maxShipsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxShipsPerTick"/>
-        </do_if>
-        <do_if value="not $maxShipsPerTick? or $maxShipsPerTick == null or $maxShipsPerTick lt 1">
-          <set_value name="$maxShipsPerTick" exact="1"/>
-        </do_if>
-        <do_if value="$maxShipsPerTick gt 5">
-          <set_value name="$maxShipsPerTick" exact="5"/>
-        </do_if>
-        <set_value name="$shipsProcessed" exact="0"/>
-        
-        <do_while value="global.$GT_TS.$Queue.count gt 0 and $shipsProcessed lt $maxShipsPerTick">
-          <!-- Dequeue one ship -->
-          <set_value name="$ship" exact="global.$GT_TS.$Queue.{1}"/>
-          
-          <!-- CRITICAL FIX: Validate ship exists BEFORE clearing timestamp (preserves diagnostic info) -->
-          <do_if value="not $ship? or not $ship.exists">
-            <!-- Ship destroyed - remove from queue but preserve timestamp for diagnostics -->
-            <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
-            <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
-            <!-- Note: Keep $EnqueuedAt for diagnostics (shows how long destroyed ship was queued) -->
-            <set_value name="$shipsProcessed" operation="add"/>
-            <continue/>
-          </do_if>
-          
-          <!-- Ship is valid - proceed with dequeue and timestamp cleanup -->
-          <remove_from_list name="global.$GT_TS.$Queue" exact="$ship"/>
-          <remove_value name="global.$GT_TS.$Queued.{$ship}"/>
-          <!-- Clear enqueue timestamp (ship is being processed) -->
-          <remove_value name="global.$GT_TS.$EnqueuedAt.{$ship}"/>
-
-          <!-- Load latest request -->
-          <set_value name="$req" exact="@global.$GT_TS.$Requests.{$ship}"/>
-          <do_if value="$req == null">
-            <!-- Request cleared - skip this ship -->
-            <set_value name="$shipsProcessed" operation="add"/>
-            <continue/>
-          </do_if>
-
-          <!-- Start the search engine -->
-          <!-- CRITICAL FIX: Create CacheQuery work item directly instead of signaling SearchTradeRoutes -->
-          <!-- This prevents concurrent SearchTradeRoutes instances (up to 22 per frame) causing stutter -->
-          <!-- SearchTradeRoutes will be signaled by scheduler when cache query completes -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-TS] Start: ' + $ship.idcode + ' (queue_remaining=' + global.$GT_TS.$Queue.count + ') - creating CacheQuery work item'" chance="100"/>
-          </do_if>
-          
-          <!-- Extract parameters from request (same as SearchTradeRoutes does) -->
-          <set_value name="$traceId" exact="if $req.$TraceId? then $req.$TraceId else '0'"/>
-          
-          <!-- CRITICAL FIX: Determine home sector using GT_GetHomeSector (same as SearchTradeRoutes) -->
-          <!-- $req.$HomeSector may not exist - SearchTradeRoutes determines it dynamically -->
-          <set_value name="$homeSector" exact="null"/>
-          <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-            <param name="ship" value="$ship"/>
-          </run_actions>
-          
-          <set_value name="$maxDistance" exact="@$req.$MaxDistance"/>
-          <set_value name="$minROI" exact="@$req.$MinROI"/>
-          <set_value name="$minAbsoluteProfit" exact="@$req.$MinAbsoluteProfit"/>
-          <!-- Ship-specific cache filters (prefer AIParameters; req may not carry these fields) -->
-          <set_value name="$ignoreBuildStorage" exact="false"/>
-          <do_if value="$req.$IgnoreBuildStorage?">
-            <set_value name="$ignoreBuildStorage" exact="$req.$IgnoreBuildStorage"/>
-          </do_if>
-          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreBuildStorage?">
-            <set_value name="$ignoreBuildStorage" exact="global.$GT_AIParameters.{$ship}.$IgnoreBuildStorage"/>
-          </do_elseif>
-
-          <set_value name="$ignoreCarrierAux" exact="false"/>
-          <do_if value="$req.$IgnoreCarrierAux?">
-            <set_value name="$ignoreCarrierAux" exact="$req.$IgnoreCarrierAux"/>
-          </do_if>
-          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreCarrierAux?">
-            <set_value name="$ignoreCarrierAux" exact="global.$GT_AIParameters.{$ship}.$IgnoreCarrierAux"/>
-          </do_elseif>
-
-          <set_value name="$ignoreTradeRules" exact="false"/>
-          <do_if value="$req.$IgnoreTradeRules?">
-            <set_value name="$ignoreTradeRules" exact="$req.$IgnoreTradeRules"/>
-          </do_if>
-          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$IgnoreTradeRules?">
-            <set_value name="$ignoreTradeRules" exact="global.$GT_AIParameters.{$ship}.$IgnoreTradeRules"/>
-          </do_elseif>
-          
-          <!-- CRITICAL FIX: Validate home sector before creating work item (prevents invalid_params errors) -->
-          <do_if value="not $homeSector? or not $homeSector.exists">
-            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-              <param name="traceId" value="$traceId"/>
-              <param name="stage" value="'Scheduler'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=cannot_determine_home_sector ship=' + $ship.idcode + ' - skipping cache query'"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-            <!-- CRITICAL FIX: Release lock and signal AI (terminal failure routine) -->
-            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-              <param name="ship" value="$ship"/>
-              <param name="reason" value="'cannot_determine_home_sector'"/>
-            </run_actions>
-            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'" delay="1ms"/>
-            <set_value name="$shipsProcessed" operation="add"/>
-            <continue/>
-          </do_if>
-          
-          <!-- Create CacheQuery work item directly (bypasses SearchTradeRoutes initial entry) -->
-          <run_actions ref="md.GT_Libraries_General.GT_CreateWorkItem" result="$cacheWorkItem">
-            <param name="type" value="'CacheQuery'"/>
-            <param name="key" value="$ship.idcode + '_CacheQuery'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="payload" value="table[
-              $Ship = $ship,
-              $HomeSector = $homeSector,
-              $MaxDistance = $maxDistance,
-              $MinROI = $minROI,
-              $MinAbsoluteProfit = $minAbsoluteProfit,
-              $IgnoreBuildStorage = $ignoreBuildStorage,
-              $IgnoreCarrierAux = $ignoreCarrierAux,
-              $IgnoreTradeRules = $ignoreTradeRules,
-              $ResumeParams = $req
-            ]"/>
-          </run_actions>
-          
-          <!-- Enqueue work item to scheduler -->
-          <run_actions ref="md.GT_Libraries_General.GT_EnqueueWorkItem">
-            <param name="workItem" value="$cacheWorkItem"/>
-          </run_actions>
-          
-          <set_value name="$shipsProcessed" operation="add"/>
-        </do_while>
-
-        <!-- Continue if more work exists -->
-        <set_value name="global.$GT_TS.$Processing" exact="false"/>
-        <do_if value="global.$GT_TS.$Queue.count gt 0">
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.Tick"/>
-        </do_if>
-        </do_if>
-      </actions>
-    </cue>
-    
-    <!-- =====================================================================
-         Central Work Queue Processor (Phase 2)
-         
-         Purpose:
-         - Processes work items from global.$GT_Scheduler.$WorkQueue
-         - Respects budgets for different work types
-         - Updates work item states
-         - Logs scheduler operations
-         
-         Work Item Types:
-         - 'Request': Initial trade search request
-         - 'CacheQuery': Cache lookup work (can be expensive due to reachability/path checks)
-         - 'SearchContinuation': Resume SearchTradeRoutes with prior stage results (paced; avoids same-frame bursts)
-         - 'HomeSearch': Home sector pathfinding work
-         - 'OfferCollect': Offer collection work
-         - 'Finalize': Finalization work
-         Note: 'Match' work items removed - trade matching now handled by AI work units
-         ===================================================================== -->
-    
-    <!-- Process Work Queue -->
-    <cue name="ProcessWorkQueue" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <actions>
-        <!-- IMPORTANT: In X4 MD, cancel_cue does NOT reliably stop the current actions block.
-             Use an explicit gate to prevent fallthrough into scheduler mutation. -->
-        <set_value name="this.$ProcessProceed" exact="true"/>
-
-        <!-- Validate scheduler exists - ERROR if missing -->
-        <do_if value="not global.$GT_Scheduler?">
-          <debug_text text="'[GT-ERROR] ProcessWorkQueue: Scheduler not initialized'" chance="100"/>
-          <set_value name="this.$ProcessProceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-        
-        <!-- Prevent concurrent processing -->
-        <do_if value="this.$ProcessProceed and global.$GT_Scheduler.$Processing">
-          <set_value name="this.$ProcessProceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-        
-        <!-- If no work, stop -->
-        <do_if value="this.$ProcessProceed and (not global.$GT_Scheduler.$WorkQueue? or global.$GT_Scheduler.$WorkQueue.count le 0)">
-          <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
-          <set_value name="this.$ProcessProceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <do_if value="this.$ProcessProceed">
-          <set_value name="global.$GT_Scheduler.$Processing" exact="true"/>
-        
-        <!-- CRITICAL: Ensure ActiveWork is a table (not a list) - MUST be checked BEFORE counting active work -->
-        <!-- ROOT CAUSE: Accessing .keys.count on an empty table might corrupt it in X4 MD -->
-        <!-- SOLUTION: Store the count in a variable BEFORE the do_all loop to prevent corruption -->
-        <do_if value="not global.$GT_Scheduler.$ActiveWork?">
-          <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
-        </do_if>
-        <!-- Ensure ActiveWork is a table - if it's not, reinitialize it (should never happen, but defensive) -->
-        <do_else>
-          <do_if value="typeof global.$GT_Scheduler.$ActiveWork != datatype.table">
-            <!-- ActiveWork is not a table - reinitialize (this should never happen, indicates a bug) -->
-            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-              <param name="traceId" value="0"/>
-              <param name="stage" value="'Scheduler'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=ActiveWork_not_table_reinitializing'"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-            <set_value name="global.$GT_Scheduler.$ActiveWork" exact="table[]"/>
-          </do_if>
-        </do_else>
-        
-        <!-- Initialize budgets if missing, using global settings if available, otherwise defaults -->
-        <do_if value="not global.$GT_Scheduler.$Budgets?">
-          <!-- Try to read from global settings first -->
-          <set_value name="$defaultCacheSearches" exact="2"/>
-          <set_value name="$defaultLiveSearches" exact="1"/>
-          <!-- Load from global settings if available -->
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
-            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
-              <set_value name="$defaultCacheSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
-            </do_if>
-            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
-              <set_value name="$defaultLiveSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
-            </do_if>
-          </do_if>
-          
-          <set_value name="$defaultFallbackSearches" exact="1"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches?">
-            <set_value name="$defaultFallbackSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches"/>
-          </do_if>
-          <set_value name="global.$GT_Scheduler.$Budgets" exact="table[
-            $CheapOpsPerTick = $defaultCacheSearches,
-            $OfferOpsPerTick = 5,
-            $MaxActiveHomeSearches = $defaultLiveSearches,
-            $MaxActiveFallbackSearches = $defaultFallbackSearches
-          ]"/>
-        </do_if>
-        <do_else>
-          <!-- Budgets exist - reload from global settings every tick to pick up changes -->
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
-            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches?">
-              <set_value name="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentCacheSearches"/>
-            </do_if>
-            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches?">
-              <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentLiveSearches"/>
-            </do_if>
-            <do_if value="global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches?">
-              <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches"/>
-            </do_if>
-          </do_if>
-        </do_else>
-        
-        <!-- Count active work by type -->
-        <set_value name="$activeCacheQueries" exact="0"/>
-        <set_value name="$activeHomeSearches" exact="0"/>
-        <set_value name="$activeFallbackSearches" exact="0"/>
-        
-        <!-- CRITICAL: Only count active work if ActiveWork is a table (has .keys property) -->
-        <!-- ROOT CAUSE FIX: Store .keys.count in a variable BEFORE do_all to prevent corruption -->
-        <!-- Accessing .keys.count directly in do_all might corrupt the table in X4 MD -->
-        <set_value name="$activeWorkKeysCount" exact="0"/>
-        <do_if value="global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.keys?">
-          <set_value name="$activeWorkKeysCount" exact="global.$GT_Scheduler.$ActiveWork.keys.count"/>
-          <do_all exact="$activeWorkKeysCount" counter="$i">
-            <set_value name="$key" exact="global.$GT_Scheduler.$ActiveWork.keys.{$i}"/>
-            <set_value name="$workItem" exact="global.$GT_Scheduler.$ActiveWork.{$key}"/>
-            <do_if value="$workItem? and $workItem.$Type? and $workItem.$State == 'active'">
-              <do_if value="$workItem.$Type == 'CacheQuery'">
-                <set_value name="$activeCacheQueries" operation="add"/>
-              </do_if>
-              <do_elseif value="$workItem.$Type == 'HomeSearch'">
-                <!-- Check if this is a fallback search -->
-                <set_value name="$isFallbackWorkItem" exact="false"/>
-                <do_if value="$workItem.$Payload? and $workItem.$Payload.$ResumeParams? and $workItem.$Payload.$ResumeParams.$IsFallback? and $workItem.$Payload.$ResumeParams.$IsFallback == true">
-                  <set_value name="$isFallbackWorkItem" exact="true"/>
-                </do_if>
-                <do_if value="$isFallbackWorkItem">
-                  <set_value name="$activeFallbackSearches" operation="add"/>
-                </do_if>
-                <do_else>
-                  <set_value name="$activeHomeSearches" operation="add"/>
-                </do_else>
-              </do_elseif>
-            </do_if>
-          </do_all>
-        </do_if>
-        
-        <!-- Process work items respecting budgets -->
-        <set_value name="$processed" exact="0"/>
-        <!-- IMPORTANT:
-             CacheQuery is synchronous, but NOT necessarily cheap (CachePickBest can do gatedistance/path checks).
-             Under big-fleet backlog, we must hard-budget CacheQuery per tick + add real frame spacing. -->
-        <set_value name="$cacheQueriesStartedThisTick" exact="0"/>
-        <set_value name="$continuationsStartedThisTick" exact="0"/>
-        <!-- Defensive checks: ensure all budget properties exist before accessing -->
-        <do_if value="not global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches?">
-          <set_value name="$defaultFallbackSearches" exact="1"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches?">
-            <set_value name="$defaultFallbackSearches" exact="@global.$GT_GlobalSettings.$Performance.$MaxConcurrentFallbackSearches"/>
-          </do_if>
-          <set_value name="global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches" exact="$defaultFallbackSearches"/>
-        </do_if>
-        
-        <set_value name="$budgetCheapOps" exact="global.$GT_Scheduler.$Budgets.$CheapOpsPerTick"/>
-        <set_value name="$budgetHomeSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveHomeSearches - $activeHomeSearches"/>
-        <set_value name="$budgetFallbackSearches" exact="global.$GT_Scheduler.$Budgets.$MaxActiveFallbackSearches - $activeFallbackSearches"/>
-
-        <!-- Hard per-tick budgets (separate from "concurrent" budgets).
-             Goal: prevent continuous stutter when many ships enqueue at once. -->
-        <set_value name="$maxCacheQueriesPerTick" exact="1"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxCacheQueriesPerTick?">
-          <set_value name="$maxCacheQueriesPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxCacheQueriesPerTick"/>
-        </do_if>
-        <do_if value="$maxCacheQueriesPerTick lt 1">
-          <set_value name="$maxCacheQueriesPerTick" exact="1"/>
-        </do_if>
-        <do_if value="$maxCacheQueriesPerTick gt 5">
-          <set_value name="$maxCacheQueriesPerTick" exact="5"/>
-        </do_if>
-
-        <set_value name="$maxContinuationsPerTick" exact="1"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxSearchContinuationsPerTick?">
-          <set_value name="$maxContinuationsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxSearchContinuationsPerTick"/>
-        </do_if>
-        <do_if value="$maxContinuationsPerTick lt 1">
-          <set_value name="$maxContinuationsPerTick" exact="1"/>
-        </do_if>
-        <do_if value="$maxContinuationsPerTick gt 5">
-          <set_value name="$maxContinuationsPerTick" exact="5"/>
-        </do_if>
-        
-        <!-- Log scheduler tick -->
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="0"/>
-          <param name="stage" value="'Scheduler'"/>
-          <param name="action" value="'Tick'"/>
-          <param name="details" value="'queue=' + global.$GT_Scheduler.$WorkQueue.count + ' active=' + (if global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.keys? then global.$GT_Scheduler.$ActiveWork.keys.count else 0) + ' cacheStarted=' + $cacheQueriesStartedThisTick + '/' + global.$GT_Scheduler.$Budgets.$CheapOpsPerTick + ' budgetHome=' + $budgetHomeSearches"/>
-          <param name="logLevel" value="3"/>
-        </run_actions>
-        
-        <!-- Process work items from queue - hard-budget per tick to prevent frame blocking.
-             IMPORTANT: Do NOT scan/rotate huge queues within the same tick (can become O(N) and cause stutter itself). -->
-        <set_value name="$maxItemsPerTick" exact="1"/> <!-- Default fallback -->
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxItemsPerTick?">
-          <set_value name="$maxItemsPerTick" exact="@global.$GT_GlobalSettings.$Performance.$MaxItemsPerTick"/>
-        </do_if>
-        <do_if value="not $maxItemsPerTick? or $maxItemsPerTick == null or $maxItemsPerTick lt 1">
-          <set_value name="$maxItemsPerTick" exact="1"/>
-        </do_if>
-        <do_if value="$maxItemsPerTick gt 5">
-          <set_value name="$maxItemsPerTick" exact="5"/>
-        </do_if>
-        <!-- CRITICAL FIX: Track rotations to prevent infinite rotation when all items are unprocessable -->
-        <set_value name="$rotationsThisTick" exact="0"/>
-        <set_value name="$queueCountAtStart" exact="global.$GT_Scheduler.$WorkQueue.count"/>
-        <set_value name="$maxRotationsPerTick" exact="[$queueCountAtStart, 5].min"/>
-        <do_while value="global.$GT_Scheduler.$WorkQueue.count gt 0 and $processed lt $maxItemsPerTick and $rotationsThisTick lt $maxRotationsPerTick">
-          <set_value name="$workItem" exact="global.$GT_Scheduler.$WorkQueue.{1}"/>
-          
-          <!-- Validate work item - ERROR if invalid -->
-          <do_if value="not $workItem? or not $workItem.$Type? or not $workItem.$Key?">
-            <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
-            <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-              <param name="traceId" value="0"/>
-              <param name="stage" value="'Scheduler'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=invalid_workItem'"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-            <continue/>
-          </do_if>
-          
-          <!-- Check budget for this work type -->
-          <set_value name="$canProcess" exact="false"/>
-          <do_if value="$workItem.$Type == 'CacheQuery'">
-            <!-- CRITICAL FIX: Check BOTH per-tick limit AND concurrent active limit -->
-            <!-- Per-tick cap prevents frame spikes, concurrent limit prevents too many simultaneous searches -->
-            <do_if value="$cacheQueriesStartedThisTick lt $maxCacheQueriesPerTick and $activeCacheQueries lt $budgetCheapOps">
-              <set_value name="$canProcess" exact="true"/>
-              <set_value name="$cacheQueriesStartedThisTick" operation="add"/>
-            </do_if>
-          </do_if>
-          <do_elseif value="$workItem.$Type == 'SearchContinuation'">
-            <do_if value="$continuationsStartedThisTick lt $maxContinuationsPerTick">
-              <set_value name="$canProcess" exact="true"/>
-              <set_value name="$continuationsStartedThisTick" operation="add"/>
-            </do_if>
-          </do_elseif>
-          <do_elseif value="$workItem.$Type == 'HomeSearch'">
-            <!-- Check if this is a fallback search -->
-            <set_value name="$isFallbackWorkItem" exact="false"/>
-            <do_if value="$workItem.$Payload? and $workItem.$Payload.$ResumeParams? and $workItem.$Payload.$ResumeParams.$IsFallback? and $workItem.$Payload.$ResumeParams.$IsFallback == true">
-              <set_value name="$isFallbackWorkItem" exact="true"/>
-            </do_if>
-            <do_if value="$isFallbackWorkItem and $budgetFallbackSearches gt 0">
-              <set_value name="$canProcess" exact="true"/>
-              <set_value name="$budgetFallbackSearches" operation="subtract"/>
-            </do_if>
-            <do_elseif value="not $isFallbackWorkItem and $budgetHomeSearches gt 0">
-              <set_value name="$canProcess" exact="true"/>
-              <set_value name="$budgetHomeSearches" operation="subtract"/>
-            </do_elseif>
-          </do_elseif>
-          <do_elseif value="$workItem.$Type == 'Request' or $workItem.$Type == 'OfferCollect' or $workItem.$Type == 'Finalize'">
-            <!-- These types don't have strict budgets yet -->
-            <set_value name="$canProcess" exact="true"/>
-          </do_elseif>
-          
-          <!-- Process if budget allows -->
-          <do_if value="$canProcess">
-            <!-- Remove from queue -->
-            <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
-            
-            <!-- Extract ship from payload to use as ActiveWork key (ship object, not string key) -->
-            <!-- NOTE: ActiveWork type check moved to start of ProcessWorkQueue to avoid clearing active work during processing -->
-            <set_value name="$payload" exact="$workItem.$Payload"/>
-            <set_value name="$ship" exact="@$payload.$Ship"/>
-            
-            <!-- CRITICAL FIX: Validate ship exists and is valid before processing work item -->
-            <do_if value="not $ship? or not $ship.exists">
-              <!-- Invalid ship - mark work item as failed and skip processing -->
-              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="stage" value="'Scheduler'"/>
-                <param name="action" value="'Error'"/>
-                <param name="details" value="'reason=invalid_ship_in_payload type=' + $workItem.$Type + ' key=' + (if $workItem.$Key? then $workItem.$Key else 'unknown')"/>
-                <param name="logLevel" value="0"/>
-              </run_actions>
-              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-                <param name="key" value="$workItem.$Key"/>
-                <param name="newState" value="'failed'"/>
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="reason" value="'invalid_ship'"/>
-                <param name="workItem" value="$workItem"/>
-              </run_actions>
-              <continue/>
-            </do_if>
-            
-            <!-- Ship is valid - proceed with processing -->
-            <!-- Add to ActiveWork BEFORE updating state (keyed by ship object, not string key) -->
-            <set_value name="global.$GT_Scheduler.$ActiveWork.{$ship}" exact="$workItem"/>
-            
-            <!-- Update state to active (pass work item to avoid lookup issues) -->
-            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-              <param name="key" value="$workItem.$Key"/>
-              <param name="newState" value="'active'"/>
-              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-              <param name="workItem" value="$workItem"/>
-            </run_actions>
-            
-            <!-- Dispatch to appropriate handler -->
-            <do_if value="$workItem.$Type == 'CacheQuery'">
-              <!-- Process CacheQuery work item -->
-              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork" param="$workItem"/>
-            </do_if>
-            <do_elseif value="$workItem.$Type == 'SearchContinuation'">
-              <!-- Process SearchTradeRoutes continuation (paced) -->
-              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessSearchContinuationWork" param="$workItem"/>
-            </do_elseif>
-            <do_elseif value="$workItem.$Type == 'HomeSearch'">
-              <!-- Process HomeSearch work item -->
-              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessHomeSearchWork" param="$workItem"/>
-            </do_elseif>
-            <do_elseif value="$workItem.$Type == 'Request'">
-              <!-- Process Request work item (start search) -->
-              <!-- For now, keep using existing flow - will migrate later -->
-              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="stage" value="'Scheduler'"/>
-                <param name="action" value="'WorkItemActivated'"/>
-                <param name="details" value="'type=' + $workItem.$Type + ' key=' + $workItem.$Key + ' note=handler_not_implemented_yet'"/>
-                <param name="logLevel" value="2"/>
-              </run_actions>
-              <!-- Mark as completed for now (will implement handler later) -->
-              <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-                <param name="key" value="$workItem.$Key"/>
-                <param name="newState" value="'completed'"/>
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="workItem" value="$workItem"/>
-              </run_actions>
-              <!-- Remove from ActiveWork using ship key -->
-              <do_if value="$ship?">
-                <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-              </do_if>
-            </do_elseif>
-            <do_else>
-              <!-- Other work types (OfferCollect, Finalize) - log and mark as completed (handlers will be implemented in later phases) -->
-              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="stage" value="'Scheduler'"/>
-                <param name="action" value="'WorkItemActivated'"/>
-                <param name="details" value="'type=' + $workItem.$Type + ' key=' + $workItem.$Key + ' note=handler_not_implemented_yet'"/>
-                <param name="logLevel" value="2"/>
-              </run_actions>
-              <!-- Mark as completed for now (will implement handlers later) -->
-              <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-                <param name="key" value="$workItem.$Key"/>
-                <param name="newState" value="'completed'"/>
-                <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-                <param name="workItem" value="$workItem"/>
-              </run_actions>
-              <!-- Remove from ActiveWork using ship key -->
-              <do_if value="$ship?">
-                <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-              </do_if>
-            </do_else>
-            
-            <set_value name="$processed" operation="add"/>
-          </do_if>
-          <do_else>
-            <!-- CRITICAL FIX: Budget exhausted for this type - rotate item to end of queue to prevent infinite loop -->
-            <!-- This allows us to scan for processable items while preserving queue order -->
-            <!-- Only break if ALL budgets are exhausted (no more work can be processed this tick) -->
-            <set_value name="$cacheBudgetExhausted" exact="$cacheQueriesStartedThisTick ge $maxCacheQueriesPerTick"/>
-            <set_value name="$continuationBudgetExhausted" exact="$continuationsStartedThisTick ge $maxContinuationsPerTick"/>
-
-            <!-- If we hit our per-tick cap for CacheQuery/Continuation, DO NOT rotate-scan a large queue. Yield to next tick. -->
-            <do_if value="($workItem.$Type == 'CacheQuery' and $cacheBudgetExhausted) or ($workItem.$Type == 'SearchContinuation' and $continuationBudgetExhausted)">
-              <break/>
-            </do_if>
-
-            <do_if value="$cacheBudgetExhausted and $continuationBudgetExhausted and $budgetHomeSearches le 0 and $budgetFallbackSearches le 0">
-              <!-- All budgets exhausted - break to prevent infinite loop -->
-              <break/>
-            </do_if>
-            <do_else>
-              <!-- Some budgets still available - rotate unprocessable item to end of queue -->
-              <!-- This prevents infinite loop when head item can't be processed but other items can -->
-              <!-- CRITICAL FIX: Track rotations to prevent rotating entire queue multiple times -->
-              <set_value name="$rotationsThisTick" operation="add"/>
-              <remove_from_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
-              <append_to_list name="global.$GT_Scheduler.$WorkQueue" exact="$workItem"/>
-              <!-- Continue to next item (might be different type with available budget) -->
-              <!-- If we've rotated as many times as queue size, all items are likely unprocessable - break to prevent infinite rotation -->
-              <do_if value="$rotationsThisTick ge $maxRotationsPerTick">
-                <break/>
-              </do_if>
-            </do_else>
-          </do_else>
-        </do_while>
-        
-        <!-- Periodic statistics logging and cleanup (every 10 seconds) -->
-        <set_value name="$timeSinceLastStats" exact="player.age - global.$GT_Scheduler.$LastStatsLog"/>
-        <do_if value="$timeSinceLastStats ge 10s">
-          <set_value name="global.$GT_Scheduler.$LastStatsLog" exact="player.age"/>
-          
-          <!-- Cleanup expired reservations -->
-          <run_actions ref="md.GT_Libraries_General.GT_CleanupExpiredReservations" result="$cleanupResult">
-            <param name="traceId" value="0"/>
-          </run_actions>
-          
-          <!-- Collect statistics -->
-          <set_value name="$counters" exact="global.$GT_Scheduler.$Counters"/>
-          <set_value name="$cacheHitRate" exact="0.0"/>
-          <do_if value="$counters.$Completed gt 0">
-            <!-- TODO: Calculate actual cache hit rate from completed work items -->
-            <set_value name="$cacheHitRate" exact="0.0"/>
-          </do_if>
-          
-          <!-- Reservation statistics -->
-          <set_value name="$reservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0]"/>
-          <do_if value="global.$GT_ReservationStats?">
-            <set_value name="$reservationStats" exact="global.$GT_ReservationStats"/>
-          </do_if>
-          
-          <!-- Log combined statistics -->
-          <set_value name="$statsDetails" exact="'queue=' + global.$GT_Scheduler.$WorkQueue.count + ' active=' + (if global.$GT_Scheduler.$ActiveWork? and global.$GT_Scheduler.$ActiveWork.keys? then global.$GT_Scheduler.$ActiveWork.keys.count else 0) + ' completed=' + (if $counters.$Completed? then $counters.$Completed else 0) + ' failed=' + (if $counters.$Failed? then $counters.$Failed else 0) + ' cacheHitRate=' + ($cacheHitRate * 100) + '% reservations=' + (if $reservationStats.$Active? then $reservationStats.$Active else 0) + ' expired=' + (if $reservationStats.$Expired? then $reservationStats.$Expired else 0) + ' conflicts=' + (if $reservationStats.$Conflicts? then $reservationStats.$Conflicts else 0)"/>
-          
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="0"/>
-            <param name="stage" value="'Scheduler'"/>
-            <param name="action" value="'Stats'"/>
-            <param name="details" value="$statsDetails"/>
-            <param name="logLevel" value="1"/>
-          </run_actions>
-        </do_if>
-        
-        <!-- Continue processing if more work exists -->
-        <!-- CRITICAL FIX: Use delayed cue instead of instant self-signal to ensure frame distribution -->
-        <!-- signal_cue_instantly can run in same frame, defeating "5 items per tick" limit -->
-        <!-- Using a separate delayed cue ensures proper frame distribution -->
-        <set_value name="global.$GT_Scheduler.$Processing" exact="false"/>
-        <do_if value="global.$GT_Scheduler.$WorkQueue.count gt 0">
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueueDelayed"/>
-        </do_if>
-        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
       </actions>
     </cue>
 
-    <!-- Process SearchContinuation Work Item -->
-    <!-- Purpose: resume SearchTradeRoutes with prior stage results, but under scheduler pacing (avoid same-frame bursts). -->
-    <cue name="ProcessSearchContinuationWork" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <actions>
-        <set_value name="$workItem" exact="event.param"/>
-
-        <do_if value="not $workItem? or not $workItem.$Payload?">
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-
-        <set_value name="$payload" exact="$workItem.$Payload"/>
-        <set_value name="$params" exact="@$payload.$Params"/>
-        <set_value name="$ship" exact="@$payload.$Ship"/>
-        <do_if value="not $ship? and $params? and $params.$Ship?">
-          <set_value name="$ship" exact="@$params.$Ship"/>
-        </do_if>
-
-        <!-- Validate -->
-        <do_if value="not $ship? or not $ship.exists or not $params?">
-          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-            <param name="key" value="if $workItem.$Key? then $workItem.$Key else ''"/>
-            <param name="newState" value="'failed'"/>
-            <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-            <param name="reason" value="'invalid_params'"/>
-            <param name="workItem" value="$workItem"/>
-          </run_actions>
-          <do_if value="$ship?">
-            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-
-        <!-- Resume SearchTradeRoutes, but do NOT run it in the same frame (frame pacing). -->
-        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SearchTradeRoutes_Delayed" param="$params"/>
-
-        <!-- Mark as completed and remove from ActiveWork -->
-        <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-          <param name="key" value="$workItem.$Key"/>
-          <param name="newState" value="'completed'"/>
-          <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-          <param name="workItem" value="$workItem"/>
-        </run_actions>
-        <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-        </do_else>
-        </do_else>
-      </actions>
-    </cue>
-
-    <!-- Frame-paced SearchTradeRoutes entry -->
-    <cue name="SearchTradeRoutes_Delayed" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <!-- Smoothness > speed: force cross-frame execution (bigger jitter to avoid herding). -->
-      <delay min="80ms" max="300ms"/>
-      <actions>
-        <signal_cue_instantly cue="md.GT_Trading_Search.SearchTradeRoutes" param="event.param"/>
-      </actions>
-    </cue>
-    
-    <!-- Process CacheQuery Work Item -->
-    <!-- Handles cache query work items by calling GT_TS_CachePickBest -->
-    <cue name="ProcessCacheQueryWork" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <actions>
-        <set_value name="$workItem" exact="event.param"/>
-        
-        <!-- Validate work item - ERROR if missing -->
-        <do_if value="not $workItem? or not $workItem.$Payload?">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-            <param name="stage" value="'Scheduler'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=invalid_cachequery_workitem key=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'unknown')"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <!-- Extract ship from payload for ActiveWork key -->
-          <set_value name="$payload" exact="$workItem.$Payload"/>
-          <set_value name="$workShip" exact="@$payload.$Ship"/>
-          <do_if value="$workItem? and $workItem.$Key?">
-            <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-              <param name="key" value="$workItem.$Key"/>
-              <param name="newState" value="'failed'"/>
-              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-              <param name="reason" value="'invalid_payload'"/>
-              <param name="workItem" value="$workItem"/>
-            </run_actions>
-            <!-- Remove from ActiveWork using ship key -->
-            <do_if value="$workShip?">
-              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}"/>
-            </do_if>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-        
-        <set_value name="$payload" exact="$workItem.$Payload"/>
-        <set_value name="$ship" exact="@$payload.$Ship"/>
-        <set_value name="$homeSector" exact="@$payload.$HomeSector"/>
-        <set_value name="$maxDistance" exact="@$payload.$MaxDistance"/>
-        <set_value name="$minROI" exact="@$payload.$MinROI"/>
-        <set_value name="$minAbsoluteProfit" exact="@$payload.$MinAbsoluteProfit"/>
-        <set_value name="$ignoreBuildStorage" exact="@$payload.$IgnoreBuildStorage"/>
-        <set_value name="$ignoreCarrierAux" exact="@$payload.$IgnoreCarrierAux"/>
-        <set_value name="$ignoreTradeRules" exact="@$payload.$IgnoreTradeRules"/>
-        <do_if value="$ignoreTradeRules == null">
-          <set_value name="$ignoreTradeRules" exact="false"/>
-        </do_if>
-        <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-
-        <!-- Hub status: cache query running -->
-        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-          <param name="ship" value="$ship"/>
-          <param name="stage" value="'cache_query'"/>
-          <param name="state" value="'running'"/>
-          <param name="reason" value="''"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="homeSector" value="$homeSector"/>
-        </run_actions>
-        
-        <!-- Validate required parameters - ERROR if missing -->
-        <do_if value="not $ship? or not $ship.exists or not $homeSector? or not $homeSector.exists">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'CacheQuery'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=invalid_params ship=' + (if $ship? then $ship.idcode else 'null') + ' homeSector=' + (if $homeSector? then 'valid' else 'null')"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-          <!-- Work item is already in ActiveWork, not in WorkQueue, so lookup by key would fail -->
-          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-            <param name="key" value="$workItem.$Key"/>
-            <param name="newState" value="'failed'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="reason" value="'invalid_params'"/>
-            <param name="workItem" value="$workItem"/>
-          </run_actions>
-          <!-- CRITICAL FIX: Release lock and signal AI (terminal failure routine) -->
-          <do_if value="$ship? and $ship.exists">
-            <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-              <param name="ship" value="$ship"/>
-              <param name="reason" value="'invalid_params'"/>
-            </run_actions>
-            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'" delay="1ms"/>
-          </do_if>
-          <!-- Remove from ActiveWork using ship key -->
-          <do_if value="$ship?">
-            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-        
-        <!-- MIGRATION: Queue AI work unit for cache search processing -->
-        <!-- AI script handles frame budgeting and chunking automatically -->
-        <!-- Get MaxEntries from global settings (default: 5) -->
-        <set_value name="$maxEntries" exact="5"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
-          <set_value name="$tmpMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
-          <do_if value="$tmpMaxEntries? and $tmpMaxEntries != null and $tmpMaxEntries gt 0">
-            <set_value name="$maxEntries" exact="$tmpMaxEntries"/>
-          </do_if>
-        </do_if>
-        <!-- Clamp to reasonable bounds -->
-        <do_if value="$maxEntries lt 1">
-          <set_value name="$maxEntries" exact="1"/>
-        </do_if>
-        <do_if value="$maxEntries gt 100">
-          <set_value name="$maxEntries" exact="100"/>
-        </do_if>
-        
-        <set_value name="$workUnit" exact="table[
-          $WorkType = 'cache_search',
-          $Ship = $ship,
-          $HomeSector = $homeSector,
-          $MaxDistance = $maxDistance,
-          $MinROI = $minROI,
-          $MinAbsoluteProfit = $minAbsoluteProfit,
-          $IgnoreBuildStorage = $ignoreBuildStorage,
-          $IgnoreCarrierAux = $ignoreCarrierAux,
-          $MaxEntries = $maxEntries,
-          $WorkItemKey = $workItem.$Key,
-          $TraceId = $traceId
-        ]"/>
-        
-        <!-- Store work item reference for completion callback -->
-        <set_value name="global.$GT_WorkUnitWorkItems.{$ship}" exact="$workItem"/>
-        
-        <!-- Log work unit creation -->
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="$traceId"/>
-          <param name="stage" value="'Scheduler'"/>
-          <param name="action" value="'QueueWorkUnit'"/>
-          <param name="details" value="'ship=' + $ship.idcode + ' type=cache_search homeSector=' + (if $homeSector? then $homeSector.knownname else 'null')"/>
-          <param name="logLevel" value="1"/>
-        </run_actions>
-        
-        <!-- Queue work unit for AI processing -->
-        <signal_cue_instantly cue="md.GT_WorkUnit_Coordinator.QueueWorkUnit" param="$workUnit"/>
-        
-        <!-- Exit - will resume when AI work unit completes -->
-        <cancel_cue cue="this"/>
-        </do_else>
-        </do_else>
-      </actions>
-    </cue>
-
-    <!-- CacheQuery continuation (Frame Distribution) -->
-    <!-- Purpose: Ensure chunked cache scanning yields cross-frame and cannot peg a core in a tight loop. -->
-    <cue name="ProcessCacheQueryWork_Delayed" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <!-- Smoothness > speed: longer delay between cache chunks to spread load -->
-      <delay min="20ms" max="80ms"/>
-      <actions>
-        <set_value name="$workItem" exact="event.param"/>
-        <do_if value="$workItem? and $workItem.$Payload?">
-          <set_value name="$workItem.$Payload.$CacheScanScheduled" exact="false"/>
-        </do_if>
-        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessCacheQueryWork" param="$workItem"/>
-      </actions>
-    </cue>
-    
-    <!-- Process HomeSearch Work Item -->
-    <!-- Handles home sector pathfinding and sector collection for live searches -->
-    <cue name="ProcessHomeSearchWork" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <actions>
-        <set_value name="$workItem" exact="event.param"/>
-        
-        <!-- UNCONDITIONAL logging to track ALL entries - use GT_LogTradeSearch which always logs -->
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-          <param name="stage" value="'ProcessHomeSearchWork'"/>
-          <param name="action" value="'ENTERED'"/>
-          <param name="details" value="'workItem=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'null')"/>
-          <param name="logLevel" value="1"/>
-        </run_actions>
-        
-        <!-- Validate work item - ERROR if missing -->
-        <do_if value="not $workItem? or not $workItem.$Payload?">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="if $workItem? and $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-            <param name="stage" value="'Scheduler'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=invalid_homesearch_workitem key=' + (if $workItem? and $workItem.$Key? then $workItem.$Key else 'unknown')"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <!-- Extract ship from payload for ActiveWork key -->
-          <set_value name="$payload" exact="$workItem.$Payload"/>
-          <set_value name="$workShip" exact="@$payload.$Ship"/>
-          <do_if value="$workItem? and $workItem.$Key?">
-            <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-            <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-              <param name="key" value="$workItem.$Key"/>
-              <param name="newState" value="'failed'"/>
-              <param name="traceId" value="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-              <param name="reason" value="'invalid_payload'"/>
-              <param name="workItem" value="$workItem"/>
-            </run_actions>
-            <!-- Remove from ActiveWork using ship key -->
-            <do_if value="$workShip?">
-              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$workShip}"/>
-            </do_if>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-        
-        <set_value name="$payload" exact="$workItem.$Payload"/>
-        <set_value name="$ship" exact="@$payload.$Ship"/>
-        <set_value name="$traceId" exact="if $workItem.$TraceId? then $workItem.$TraceId else '0'"/>
-        
-        <!-- Check if this is a fallback search - fallback searches bypass home-sector lock -->
-        <set_value name="$isFallback" exact="false"/>
-        <do_if value="$payload.$ResumeParams?">
-          <do_if value="$payload.$ResumeParams.$IsFallback? and $payload.$ResumeParams.$IsFallback == true">
-            <set_value name="$isFallback" exact="true"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Validate required parameters - ERROR if missing -->
-        <do_if value="not $ship? or not $ship.exists">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'HomeSearch'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=invalid_ship'"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <!-- CRITICAL FIX: Pass workItem parameter so GT_UpdateWorkItemState doesn't need to look it up -->
-          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-            <param name="key" value="$workItem.$Key"/>
-            <param name="newState" value="'failed'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="reason" value="'invalid_ship'"/>
-            <param name="workItem" value="$workItem"/>
-          </run_actions>
-          <!-- Remove from ActiveWork using ship key -->
-          <do_if value="$ship?">
-            <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-          </do_if>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-
-        <!-- Get home sector for logging -->
-        <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
-          <param name="ship" value="$ship"/>
-        </run_actions>
-        
-        <!-- FALLBACK SEARCHES: Skip home-sector lock - each ship gets its own search -->
-        <do_if value="$isFallback">
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: FALLBACK search - bypassing home-sector lock (home=' + (if $homeSector? then @$homeSector.knownname else 'unknown') + ')'" chance="100"/>
-          </do_if>
-          
-          <!-- Hub status: fallback search starting (no lock) -->
-          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-            <param name="ship" value="$ship"/>
-            <param name="stage" value="'home_search'"/>
-            <param name="state" value="'running'"/>
-            <param name="reason" value="'fallback_no_lock'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="homeSector" value="$homeSector"/>
-          </run_actions>
-          
-          <!-- Build params table for SearchLiveTrades (same as normal search) -->
-          <set_value name="$startTime" exact="player.age"/>
-          <run_actions ref="md.GT_Libraries_General.GT_BuildSearchParams" result="$searchParams">
-            <param name="payload" value="$payload"/>
-          </run_actions>
-          <!-- Pass IsFallback flag through to SearchLiveTrades -->
-          <do_if value="$payload.$ResumeParams? and $payload.$ResumeParams.$IsFallback?">
-            <set_value name="$searchParams.$IsFallback" exact="$payload.$ResumeParams.$IsFallback"/>
-          </do_if>
-          
-          <!-- Store work item reference in state for continuation -->
-          <do_if value="not global.$GT_SearchLiveTrades_State?">
-            <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
-            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
-          </do_if>
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$HomeSector" exact="$homeSector"/>
-          
-          <!-- Signal SearchLiveTrades (async operation) -->
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'HomeSearch'"/>
-            <param name="action" value="'Start'"/>
-            <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown') + ' fallback=true'"/>
-            <param name="logLevel" value="1"/>
-          </run_actions>
-          
-          <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
-          
-          <!-- Note: Work item remains active until SearchLiveTrades completes -->
-          <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
-        </do_if>
-        <do_else>
-          <!-- NORMAL LIVE SEARCHES: Enforce per-home-sector live-search exclusivity.
-               Only one ship may run HomeSearch/SearchLiveTrades per home sector at a time. Others wait silently and are resumed when the refresh completes. -->
-
-        <!-- Hub status: home search evaluating / reserving per-home-sector slot -->
-        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: STARTED (home=' + (if $homeSector? then @$homeSector.knownname else 'unknown') + ')'" chance="100"/>
-        </do_if>
-        
-        <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-          <param name="ship" value="$ship"/>
-          <param name="stage" value="'home_search'"/>
-          <param name="state" value="'evaluating'"/>
-          <param name="reason" value="''"/>
-          <param name="traceId" value="$traceId"/>
-          <param name="homeSector" value="$homeSector"/>
-        </run_actions>
-        <set_value name="$proceed" exact="true"/>
-        <do_if value="not $homeSector? or not $homeSector.exists">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'HomeSearch'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=no_home_sector ship=' + $ship.idcode"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-            <param name="key" value="$workItem.$Key"/>
-            <param name="newState" value="'failed'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="reason" value="'no_home_sector'"/>
-            <param name="workItem" value="$workItem"/>
-          </run_actions>
-          <run_actions ref="md.GT_Libraries_General.GT_RequestRegistry_Release">
-            <param name="ship" value="$ship"/>
-            <param name="reason" value="'no_home_sector'"/>
-          </run_actions>
-          <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'busy'" delay="1ms"/>
-          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-          <set_value name="$proceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-
-        <do_if value="$proceed">
-          <do_if value="not global.$GT_TS_LiveRefreshBySector?">
-            <set_value name="global.$GT_TS_LiveRefreshBySector" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}?">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[]"/>
-          </do_if>
-          <!-- CRITICAL FIX: Atomic reservation with delay-based state propagation -->
-          <!-- Based on forum insight: MD script state changes need time to propagate to concurrent instances -->
-          <!-- Read entry once and check atomically - no duplicate checks that create race windows -->
-          <!-- Multiple ships might read simultaneously, but only one can successfully reserve -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Entering coalescing check (home=' + @$homeSector.knownname + ')'" chance="100"/>
-          </do_if>
-          
-          <set_value name="$refreshEntryDoubleCheck" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
-          <set_value name="$alreadyReserved" exact="false"/>
-          <do_if value="$refreshEntryDoubleCheck? and $refreshEntryDoubleCheck != null and $refreshEntryDoubleCheck.$Active? and $refreshEntryDoubleCheck.$Active">
-            <set_value name="$initiatorCheck" exact="@$refreshEntryDoubleCheck.$Initiator"/>
-            <do_if value="$initiatorCheck? and $initiatorCheck.exists and $initiatorCheck != $ship">
-              <!-- Another ship reserved it - queue as waiter -->
-              <set_value name="$alreadyReserved" exact="true"/>
-              <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Refresh already reserved by ' + @$initiatorCheck.idcode + ' (home=' + @$homeSector.knownname + ') - queueing as waiter'" chance="100"/>
-              </do_if>
-              
-              <!-- Queue as waiter -->
-              <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
-                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
-              </do_if>
-              <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
-                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
-                <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
-                <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
-                  $Ship = $ship,
-                  $Params = @$payload.$ResumeParams,
-                  $EnqueuedAt = player.age
-                ]"/>
-              </do_if>
-              
-              <!-- Mark work item as completed (waiting) -->
-              <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-                <param name="key" value="$workItem.$Key"/>
-                <param name="newState" value="'completed'"/>
-                <param name="traceId" value="$traceId"/>
-                <param name="reason" value="'home_refresh_wait'"/>
-                <param name="workItem" value="$workItem"/>
-              </run_actions>
-              <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-              <cancel_cue cue="this"/>
-            </do_if>
-          </do_if>
-          
-          <!-- Only proceed if we successfully reserved the slot -->
-          <do_if value="not $alreadyReserved">
-          <!-- Atomic check-and-set with delayed verification via VerifyHomeRefreshReservation -->
-          <!-- Multiple ships can all pass the "not active" check simultaneously -->
-          <!-- Solution: Set Active flag, then delegate verification to async cue with 1ms delay -->
-          <!-- If another ship overwrote us, the verification cue queues us as a waiter -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Attempting to reserve slot (home=' + @$homeSector.knownname + ')'" chance="100"/>
-          </do_if>
-          
-          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}" exact="table[
-            $Active = true,
-            $Initiator = $ship,
-            $LastStarted = player.age
-          ]"/>
-          
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') ProcessHomeSearchWork: Set Active flag, delegating verification to VerifyHomeRefreshReservation with 1ms delay (home=' + @$homeSector.knownname + ')'" chance="100"/>
-          </do_if>
-          
-          <!-- BUG FIX C8: Delegate verification to existing VerifyHomeRefreshReservation cue -->
-          <!-- MD state changes need time to propagate to concurrent instances (master rule: atomic operations / race conditions) -->
-          <!-- The immediate inline verification was unreliable: another ship could overwrite in the same frame -->
-          <!-- VerifyHomeRefreshReservation has a proper 1ms delay between conditions and actions, -->
-          <!-- ensuring the write is committed before verification. It handles both race-lost (waiter queueing) -->
-          <!-- and race-won (live search dispatch) paths with full continuation logic. -->
-          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.VerifyHomeRefreshReservation" param="table[
-            $Ship = $ship,
-            $HomeSector = $homeSector,
-            $WorkItem = $workItem,
-            $Payload = $payload,
-            $TraceId = $traceId
-          ]"/>
-          </do_if>
-        </do_if>
-        </do_else>
-        </do_else>
-        </do_else>
-      </actions>
-    </cue>
-
-    <!-- Verify Home Refresh Reservation (Delayed) -->
-    <!-- Purpose: Verify atomic reservation after delay to ensure state propagation across concurrent instances -->
-    <!-- Forum insight: MD script state changes need time to be visible to concurrent instances -->
-    <cue name="VerifyHomeRefreshReservation" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <!-- CRITICAL: Delay ensures state change propagates before verification -->
-      <!-- Even 1ms delay ensures the write is committed and visible to concurrent instances -->
-      <delay exact="1ms"/>
-      <actions>
-        <set_value name="$params" exact="event.param"/>
-        <set_value name="$ship" exact="@$params.$Ship"/>
-        <set_value name="$homeSector" exact="@$params.$HomeSector"/>
-        <set_value name="$workItem" exact="@$params.$WorkItem"/>
-        <set_value name="$payload" exact="@$params.$Payload"/>
-        <set_value name="$traceId" exact="if $params.$TraceId? then $params.$TraceId else (if $workItem.$TraceId? then $workItem.$TraceId else '0')"/>
-        
-        <!-- Validate parameters -->
-        <set_value name="$proceed" exact="true"/>
-        <do_if value="not $ship? or not $ship.exists or not $homeSector? or not $homeSector.exists">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'HomeSearch'"/>
-            <param name="action" value="'Error'"/>
-            <param name="details" value="'reason=invalid_verification_params'"/>
-            <param name="logLevel" value="0"/>
-          </run_actions>
-          <set_value name="$proceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-        
-        <do_if value="$proceed">
-          <!-- CRITICAL FIX: Verify we still own the reservation after delay -->
-          <!-- Multiple ships may have tried to set Active simultaneously -->
-          <!-- After delay, check if we're still the Initiator - if not, another ship won the race -->
-          <set_value name="$weReservedIt" exact="false"/>
-        
-        <!-- Check if reservation is still ours -->
-        <set_value name="$finalCheck" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
-        <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator? and $finalCheck.$Initiator == $ship">
-          <set_value name="$weReservedIt" exact="true"/>
-        </do_if>
-        
-        <do_if value="not $weReservedIt">
-          <!-- Another ship reserved it - clear our failed attempt and queue as waiter -->
-          <set_value name="$otherInitiator" exact="null"/>
-          <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator?">
-            <set_value name="$otherInitiator" exact="@$finalCheck.$Initiator"/>
-          </do_if>
-          
-          <!-- Clear our failed reservation attempt (if we set it but lost the race) -->
-          <do_if value="$finalCheck? and $finalCheck != null and $finalCheck.$Active? and $finalCheck.$Active and $finalCheck.$Initiator? and $finalCheck.$Initiator != $ship">
-            <!-- Another ship owns it - leave it as is -->
-          </do_if>
-          <do_else>
-            <!-- No active reservation - clear any stale state we might have created -->
-            <remove_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}"/>
-          </do_else>
-          
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') VerifyHomeRefresh: lost race - refresh reserved by ' + (if $otherInitiator? then @$otherInitiator.idcode else 'unknown') + ' (home=' + @$homeSector.knownname + ') - queueing as waiter'" chance="100"/>
-          </do_if>
-          
-          <!-- Queue as waiter -->
-          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="[]"/>
-          </do_if>
-          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued == null">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}" exact="true"/>
-            <append_to_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="table[
-              $Ship = $ship,
-              $Params = @$payload.$ResumeParams,
-              $EnqueuedAt = player.age
-            ]"/>
-          </do_if>
-          
-          <!-- Mark work item as completed (waiting) -->
-          <run_actions ref="md.GT_Libraries_General.GT_UpdateWorkItemState">
-            <param name="key" value="$workItem.$Key"/>
-            <param name="newState" value="'completed'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="reason" value="'home_refresh_wait'"/>
-            <param name="workItem" value="$workItem"/>
-          </run_actions>
-          <remove_value name="global.$GT_Scheduler.$ActiveWork.{$ship}"/>
-          <cancel_cue cue="this"/>
-        </do_if>
-        <do_else>
-          <!-- We successfully reserved it - proceed with live search -->
-          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Scheduler] (' + $ship.idcode + ') VerifyHomeRefresh: RESERVED home-sector refresh slot atomically (home=' + @$homeSector.knownname + ') - starting live search'" chance="100"/>
-          </do_if>
-          
-          <!-- Hub status: initiator started home refresh -->
-          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-            <param name="ship" value="$ship"/>
-            <param name="stage" value="'home_search'"/>
-            <param name="state" value="'running'"/>
-            <param name="reason" value="'initiator'"/>
-            <param name="traceId" value="$traceId"/>
-            <param name="homeSector" value="$homeSector"/>
-          </run_actions>
-          
-          <!-- Execute home search by signaling SearchLiveTrades -->
-          <!-- This is async - SearchLiveTrades will handle pathfinding and sector collection -->
-          <set_value name="$startTime" exact="player.age"/>
-          
-          <!-- Build params table for SearchLiveTrades -->
-          <run_actions ref="md.GT_Libraries_General.GT_BuildSearchParams" result="$searchParams">
-            <param name="payload" value="$payload"/>
-          </run_actions>
-          <do_if value="$payload.$TraceId?">
-            <set_value name="$searchParams.$TraceId" exact="$payload.$TraceId"/>
-          </do_if>
-          <do_else>
-            <set_value name="$searchParams.$TraceId" exact="$traceId"/>
-          </do_else>
-          
-          <!-- Store work item reference in state for continuation -->
-          <do_if value="not global.$GT_SearchLiveTrades_State?">
-            <set_value name="global.$GT_SearchLiveTrades_State" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_SearchLiveTrades_State.{$ship}?">
-            <set_value name="global.$GT_SearchLiveTrades_State.{$ship}" exact="table[]"/>
-          </do_if>
-          <!-- Store WorkItemKey (for logging) and WorkItemShip (for ActiveWork lookup) -->
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemKey" exact="$workItem.$Key"/>
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$WorkItemShip" exact="$ship"/>
-          <!-- Store home sector for later cleanup -->
-          <set_value name="global.$GT_SearchLiveTrades_State.{$ship}.$HomeSector" exact="$homeSector"/>
-          
-          <!-- Signal SearchLiveTrades (async operation) -->
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="$traceId"/>
-            <param name="stage" value="'HomeSearch'"/>
-            <param name="action" value="'Start'"/>
-            <param name="details" value="'ship=' + $ship.idcode + ' maxDistance=' + (if $searchParams.$MaxDistance? then $searchParams.$MaxDistance else 'unknown')"/>
-            <param name="logLevel" value="1"/>
-          </run_actions>
-          
-          <signal_cue_instantly cue="md.GT_Search_Methods.SearchLiveTrades" param="$searchParams"/>
-          
-          <!-- Note: Work item remains active until SearchLiveTrades completes -->
-          <!-- Completion will be handled by SearchLiveTrades_Resume or error handler -->
-        </do_else>
-        </do_if>
-      </actions>
-    </cue>
-
-    <!-- Home-sector live-refresh finished: wake ships that were waiting silently (FIFO per home sector) -->
-    <cue name="HomeRefreshFinished" instantiate="true">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <!-- Ensure cross-frame execution; avoid same-frame avalanches after big live searches -->
-      <!-- CRITICAL FIX: Increased delay to throttle wake-ups and prevent CPU spikes -->
-      <!-- When many waiters wake simultaneously, this spreads them across multiple frames -->
-      <!-- Combined with reduced batch size (2 instead of 5), this prevents stuttering -->
-      <delay min="50ms" max="150ms"/>
-      <actions>
-        <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-          <param name="traceId" value="'0'"/>
-          <param name="stage" value="'HomeRefreshFinished'"/>
-          <param name="action" value="'ENTERED'"/>
-          <param name="details" value="'homeSector=' + (if event.param? and event.param.exists then @event.param.knownname else 'null')"/>
-          <param name="logLevel" value="1"/>
-        </run_actions>
-        <set_value name="$homeSector" exact="event.param"/>
-        <!-- IMPORTANT: cancel_cue does NOT stop the current actions block.
-             Use an explicit flag to prevent fallthrough into $Waiters access. -->
-        <set_value name="this.$Proceed" exact="true"/>
-
-        <do_if value="not $homeSector? or not $homeSector.exists">
-          <set_value name="this.$Proceed" exact="false"/>
-        </do_if>
-
-        <do_if value="this.$Proceed and (not global.$GT_TS_LiveRefreshBySector? or not global.$GT_TS_LiveRefreshBySector.{$homeSector}?)">
-          <set_value name="this.$Proceed" exact="false"/>
-        </do_if>
-
-        <!-- De-dupe / single-thread per home sector -->
-        <do_if value="this.$Proceed">
-          <do_if value="not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing?">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
-          </do_if>
-          <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing">
-            <set_value name="this.$Proceed" exact="false"/>
-          </do_if>
-          <do_if value="this.$Proceed">
-            <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="true"/>
-          </do_if>
-        </do_if>
-
-        <!-- Nothing to do -->
-        <do_if value="this.$Proceed and (not global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters == null or global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count le 0)">
-          <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-            <param name="traceId" value="'0'"/>
-            <param name="stage" value="'HomeRefreshFinished'"/>
-            <param name="action" value="'NoWaiters'"/>
-            <param name="details" value="'homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null') + ' waiters.count=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0)"/>
-            <param name="logLevel" value="1"/>
-          </run_actions>
-          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
-          <set_value name="this.$Proceed" exact="false"/>
-        </do_if>
-
-        <do_if value="this.$Proceed">
-          <!-- Process a small batch per call to avoid spikes -->
-          <!-- CRITICAL: Reduce batch size to prevent CPU spikes when many waiters wake simultaneously -->
-          <set_value name="$maxWake" exact="2"/> <!-- Default fallback -->
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxWakePerTick?">
-            <set_value name="$maxWake" exact="@global.$GT_GlobalSettings.$Performance.$MaxWakePerTick"/>
-          </do_if>
-          <do_if value="not $maxWake? or $maxWake == null or $maxWake lt 1">
-            <set_value name="$maxWake" exact="2"/>
-          </do_if>
-          <do_if value="$maxWake gt 10">
-            <set_value name="$maxWake" exact="10"/>
-          </do_if>
-          <set_value name="$woke" exact="0"/>
-
-          <!-- PERFORMANCE FIX: Check player money ONCE before waking waiters.
-               When player is broke, re-enqueueing triggers expensive O(n) cache scans per ship that ALL
-               return 0 trades. Instead, apply ZeroTradeCooldown and signal GT_No_Trade_Found directly.
-               This prevents the cache-scan storm that causes game stutter with large fleets. -->
-          <set_value name="$playerMoneyForWake" exact="player.money"/>
-          <!-- Use the configurable MinPlayerMoney threshold (default: 1000 Cr) -->
-          <set_value name="$wakeMinPlayerMoney" exact="1000"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
-            <set_value name="$tmpWakeMin" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
-            <do_if value="$tmpWakeMin? and $tmpWakeMin != null and $tmpWakeMin gt 0">
-              <set_value name="$wakeMinPlayerMoney" exact="$tmpWakeMin"/>
-            </do_if>
-          </do_if>
-          <!-- Convert MinPlayerMoney from display credits to internal units (cents) using Cr suffix -->
-          <set_value name="$playerIsBroke" exact="$playerMoneyForWake lt ($wakeMinPlayerMoney)Cr"/>
-
-          <!-- Get ZeroTradeCooldown base duration (used when player is broke) -->
-          <set_value name="$wakeZeroTradeCooldownBase" exact="30s"/>
-          <do_if value="$playerIsBroke and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown?">
-            <set_value name="$wakeZeroTradeCooldownBase" exact="global.$GT_GlobalSettings.$Fleet.$ZeroTradeCooldown"/>
-          </do_if>
-          <!-- JITTER: Compute min/max range for per-ship cooldown (±33% of base).
-               Each ship gets a different cooldown duration, so they don't all retry at the same time.
-               This is the MD-side complement to the AI-side jitter (20s-40s wait). -->
-          <set_value name="$wakeJitterMin" exact="$wakeZeroTradeCooldownBase * 0.67"/>
-          <set_value name="$wakeJitterMax" exact="$wakeZeroTradeCooldownBase * 1.33"/>
-
-          <do_while value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0 and $woke lt $maxWake">
-            <set_value name="$entry" exact="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.{1}"/>
-            <remove_from_list name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters" exact="$entry"/>
-
-            <set_value name="$ship" exact="@$entry.$Ship"/>
-            <set_value name="$params" exact="@$entry.$Params"/>
-            <set_value name="$traceId" exact="if $params? and $params.$TraceId? then $params.$TraceId else (if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else '')"/>
-            <!-- Clear de-dupe marker -->
-            <do_if value="$ship? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}?">
-              <remove_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WaiterQueued.{$ship}"/>
-            </do_if>
-
-            <do_if value="$ship? and $ship.exists and $params?">
-              <!-- PERFORMANCE FIX: When player is broke, don't re-enqueue (avoids expensive cache scan).
-                   Apply ZeroTradeCooldown and signal GT_No_Trade_Found to let AI script handle the backoff. -->
-              <do_if value="$playerIsBroke">
-                <!-- Apply ZeroTradeCooldown to this ship with per-ship jitter -->
-                <do_if value="not global.$GT_CacheMissCooldowns?">
-                  <set_value name="global.$GT_CacheMissCooldowns" exact="table[]"/>
-                </do_if>
-                <!-- JITTER: Each ship gets a different cooldown (±33% of base) to stagger retries -->
-                <set_value name="$shipCooldown" exact="[$wakeJitterMin, $wakeJitterMax].randominrange"/>
-                <set_value name="global.$GT_CacheMissCooldowns.{$ship}" exact="table[
-                  $LastLiveSearch = player.age,
-                  $CooldownDuration = $shipCooldown
-                ]"/>
-
-                <!-- Log that we're applying cooldown instead of re-enqueueing -->
-                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                  <param name="traceId" value="$traceId"/>
-                  <param name="stage" value="'HomeRefreshFinished'"/>
-                  <param name="action" value="'BrokeCooldown'"/>
-                  <param name="details" value="'ship=' + $ship.idcode + ' playerMoney=' + $playerMoneyForWake + ' cooldown=' + ($shipCooldown / 1) + 's homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null')"/>
-                  <param name="logLevel" value="1"/>
-                </run_actions>
-
-                <!-- Release any search lock this ship holds -->
-                <do_if value="global.$GT_TS? and global.$GT_TS.$Requests? and global.$GT_TS.$Requests.{$ship}?">
-                  <remove_value name="global.$GT_TS.$Requests.{$ship}"/>
-                </do_if>
-
-                <!-- Signal AI script: no trade found (triggers escalating wait on AI side) -->
-                <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'insufficient_funds'" delay="1ms"/>
-              </do_if>
-              <do_else>
-                <!-- Player has money - normal wake: re-enqueue for cache search -->
-                <!-- Log which ship is being woken -->
-                <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                  <param name="traceId" value="$traceId"/>
-                  <param name="stage" value="'HomeRefreshFinished'"/>
-                  <param name="action" value="'WakingShip'"/>
-                  <param name="details" value="'ship=' + $ship.idcode + ' homeSector=' + (if $homeSector? and $homeSector.exists then @$homeSector.knownname else 'null') + ' waitersRemaining=' + (if global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? then global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count else 0)"/>
-                  <param name="logLevel" value="1"/>
-                </run_actions>
-                <!-- Hub status: woke after home refresh, re-queueing -->
-                <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-                  <param name="ship" value="$ship"/>
-                  <param name="stage" value="'home_search'"/>
-                  <param name="state" value="'woken'"/>
-                  <param name="reason" value="'home_refresh_finished'"/>
-                  <param name="traceId" value="$traceId"/>
-                  <param name="homeSector" value="$homeSector"/>
-                </run_actions>
-                <!-- Resume search by re-enqueueing SearchTradeRoutes through the central scheduler (silent to player) -->
-                <signal_cue_instantly cue="md.GT_Trading_Queue.EnqueueSearchTradeRoutes" param="$params"/>
-              </do_else>
-            </do_if>
-            <do_else>
-              <!-- Log if ship/params are invalid -->
-              <run_actions ref="md.GT_Libraries_General.GT_LogTradeSearch">
-                <param name="traceId" value="'0'"/>
-                <param name="stage" value="'HomeRefreshFinished'"/>
-                <param name="action" value="'InvalidWaiter'"/>
-                <param name="details" value="'ship?=' + ($ship? and $ship.exists) + ' params?=' + ($params? != null)"/>
-                <param name="logLevel" value="1"/>
-              </run_actions>
-            </do_else>
-
-            <set_value name="$woke" operation="add"/>
-          </do_while>
-
-          <!-- Done with this wake batch -->
-          <set_value name="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$WakeProcessing" exact="false"/>
-
-          <!-- If more waiters remain, schedule another pass -->
-          <!-- CRITICAL FIX: The cue already has delay at top (10-60ms), and reduced batch size (2 instead of 5) -->
-          <!-- This spreads out the cache search load over multiple frames instead of all at once -->
-          <do_if value="global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Waiters.count gt 0">
-            <!-- Re-signal with delay (cue has delay at top: 10-60ms) -->
-            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.HomeRefreshFinished" param="$homeSector"/>
-          </do_if>
-        </do_if>
-      </actions>
-    </cue>
-    
-    <!-- Process Match Work Item -->
-    <!-- Handles batch trade matching work -->
-    <!-- ProcessMatchWork REMOVED: Match work items are no longer created after migration to AI work units -->
-    
-    <!-- Delayed Work Queue Processor (Frame Distribution) -->
-    <!-- Purpose: Ensures ProcessWorkQueue is called with frame delay to prevent tight loops -->
     <cue name="ProcessWorkQueueDelayed" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
-      <!-- Frame pacing: Smoothness > speed. Use a longer cross-frame delay (with jitter) so backlog can't create micro-stutter. -->
-      <delay min="60ms" max="140ms"/>
+      <delay exact="1ms"/>
       <actions>
-        <!-- Signal ProcessWorkQueue with frame delay -->
-        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.ProcessWorkQueue"/>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+      </actions>
+    </cue>
+
+    <cue name="HandleSearchRequest" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Search_Request'"/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param2"/>
+        <set_value name="$ship" exact="@$params.$Ship"/>
+        <set_value name="$enqueueAllowed" exact="true"/>
+
+        <do_if value="not $ship? or not $ship.exists">
+          <set_value name="$enqueueAllowed" exact="false"/>
+        </do_if>
+
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+
+        <do_if value="$enqueueAllowed and global.$GT_SearchSemaphore.$ActiveShips? and global.$GT_SearchSemaphore.$ActiveShips.{$ship}?">
+          <set_value name="$enqueueAllowed" exact="false"/>
+        </do_if>
+        <do_if value="$enqueueAllowed and global.$GT_SearchSemaphore.$Queued? and global.$GT_SearchSemaphore.$Queued.{$ship}?">
+          <set_value name="$enqueueAllowed" exact="false"/>
+        </do_if>
+
+        <do_if value="$enqueueAllowed">
+          <append_to_list name="global.$GT_SearchSemaphore.$Queue" exact="table[
+            $Ship = $ship,
+            $Params = $params,
+            $EnqueuedAt = player.age
+          ]"/>
+          <set_value name="global.$GT_SearchSemaphore.$Queued.{$ship}" exact="true"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <cue name="DispatchSearchGoDelayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="200ms"/>
+      <actions>
+        <do_if value="global.$GT_SearchSemaphore?">
+          <set_value name="global.$GT_SearchSemaphore.$DispatchScheduled" exact="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+      </actions>
+    </cue>
+
+    <cue name="DispatchSearchGo" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+
+        <do_if value="global.$GT_SearchSemaphore.$Queue.count gt 0 and global.$GT_SearchSemaphore.$Active ge global.$GT_SearchSemaphore.$MaxConcurrent">
+          <do_if value="not global.$GT_SearchSemaphore.$DispatchScheduled">
+            <set_value name="global.$GT_SearchSemaphore.$DispatchScheduled" exact="true"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGoDelayed"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_while value="global.$GT_SearchSemaphore.$Queue.count gt 0 and global.$GT_SearchSemaphore.$Active lt global.$GT_SearchSemaphore.$MaxConcurrent">
+            <set_value name="$entry" exact="global.$GT_SearchSemaphore.$Queue.{1}"/>
+            <remove_from_list name="global.$GT_SearchSemaphore.$Queue" exact="$entry"/>
+
+            <set_value name="$ship" exact="@$entry.$Ship"/>
+            <set_value name="$params" exact="@$entry.$Params"/>
+
+            <do_if value="$ship? and $ship.exists">
+              <set_value name="global.$GT_SearchSemaphore.$Active" operation="add"/>
+              <set_value name="global.$GT_SearchSemaphore.$ActiveShips.{$ship}" exact="table[
+                $StartedAt = player.age,
+                $Params = $params
+              ]"/>
+              <remove_value name="global.$GT_SearchSemaphore.$Queued.{$ship}"/>
+
+              <signal_objects object="$ship" param="'GT_Search_Go'" param2="$params" delay="1ms"/>
+            </do_if>
+            <do_else>
+              <!-- Ship no longer exists: clean up Queued table entry (prevent memory leak) -->
+              <do_if value="$ship? and global.$GT_SearchSemaphore.$Queued? and global.$GT_SearchSemaphore.$Queued.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$Queued.{$ship}"/>
+              </do_if>
+            </do_else>
+          </do_while>
+        </do_else>
+      </actions>
+    </cue>
+
+    <cue name="HandleSearchDone" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Search_Done'"/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param2"/>
+        <set_value name="$ship" exact="@$data.$Ship"/>
+        <set_value name="$found" exact="if $data? and $data.$Found? then @$data.$Found else false"/>
+        <set_value name="$tradeList" exact="if $data? and $data.$TradeList? then @$data.$TradeList else []"/>
+        <set_value name="$searchMethod" exact="if $data? and $data.$SearchMethod? then @$data.$SearchMethod else 'live'"/>
+        <set_value name="$activeEntry" exact="if $ship? and global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$ActiveShips? and global.$GT_SearchSemaphore.$ActiveShips.{$ship}? then @global.$GT_SearchSemaphore.$ActiveShips.{$ship} else null"/>
+
+        <do_if value="$ship? and global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$ActiveShips? and global.$GT_SearchSemaphore.$ActiveShips.{$ship}?">
+          <remove_value name="global.$GT_SearchSemaphore.$ActiveShips.{$ship}"/>
+          <do_if value="global.$GT_SearchSemaphore.$Active gt 0">
+            <set_value name="global.$GT_SearchSemaphore.$Active" operation="subtract"/>
+          </do_if>
+        </do_if>
+
+        <!-- Cache write is now handled by the AI script (lib.gt.cache.write) BEFORE
+             signaling GT_Search_Done. This allows sorted insertion with <wait> yields
+             between entries, preventing frame drops on large caches.
+             The scheduler only manages the semaphore and forwards trade results. -->
+
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="$found and $tradeList.count gt 0">
+            <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
+              $TradeList = $tradeList,
+              $SearchMethod = $searchMethod
+            ]" delay="1ms"/>
+          </do_if>
+          <do_else>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'no_trade'" delay="1ms"/>
+          </do_else>
+        </do_if>
+
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+      </actions>
+    </cue>
+
+    <cue name="HandleSearchAbort" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Search_Abort'"/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param2"/>
+        <set_value name="$ship" exact="@$data.$Ship"/>
+
+        <do_if value="global.$GT_SearchSemaphore? and $ship?">
+          <!-- Remove from Queued lookup table -->
+          <do_if value="global.$GT_SearchSemaphore.$Queued? and global.$GT_SearchSemaphore.$Queued.{$ship}?">
+            <remove_value name="global.$GT_SearchSemaphore.$Queued.{$ship}"/>
+          </do_if>
+          <!-- Remove from Queue list (iterate reverse to safely remove by index) -->
+          <do_if value="global.$GT_SearchSemaphore.$Queue? and global.$GT_SearchSemaphore.$Queue.count gt 0">
+            <do_all exact="global.$GT_SearchSemaphore.$Queue.count" counter="$qi" reverse="true">
+              <do_if value="@global.$GT_SearchSemaphore.$Queue.{$qi}.$Ship == $ship">
+                <remove_value name="global.$GT_SearchSemaphore.$Queue.{$qi}"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <!-- Remove from ActiveShips and release semaphore slot -->
+          <do_if value="global.$GT_SearchSemaphore.$ActiveShips? and global.$GT_SearchSemaphore.$ActiveShips.{$ship}?">
+            <remove_value name="global.$GT_SearchSemaphore.$ActiveShips.{$ship}"/>
+            <do_if value="global.$GT_SearchSemaphore.$Active gt 0">
+              <set_value name="global.$GT_SearchSemaphore.$Active" operation="subtract"/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+      </actions>
+    </cue>
+
+    <!-- Periodic stale-check: kick-start on game load, then self-cycles via SemaphoreStaleCheckLoop -->
+    <cue name="SemaphoreStaleCheckInit" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+        </check_any>
+      </conditions>
+      <actions>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SemaphoreStaleCheckLoop"/>
+      </actions>
+    </cue>
+
+    <cue name="SemaphoreStaleCheckLoop" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="30s"/>
+      <actions>
+        <!-- Cleanup expired fleet reservations (restored from pre-migration scheduler).
+             Original release called GT_CleanupExpiredReservations every 10s;
+             piggybacking on the 30s stale check is sufficient since TTL is 10s. -->
+        <run_actions ref="md.GT_Libraries_General.GT_CleanupExpiredReservations" result="$cleanupResult">
+          <param name="traceId" value="0"/>
+        </run_actions>
+        
+        <!-- Safely get ActiveShips into a local; deep global.$X.$Y.keys chains can fail in MD -->
+        <set_value name="$activeShipsTable" exact="@global.$GT_SearchSemaphore.$ActiveShips"/>
+        <do_if value="$activeShipsTable? and typeof $activeShipsTable == datatype.table and $activeShipsTable.keys.count gt 0">
+          <!-- Snapshot keys list so mutations during iteration are safe -->
+          <set_value name="$activeKeys" exact="$activeShipsTable.keys.list"/>
+          <set_value name="$purged" exact="0"/>
+          <do_all exact="$activeKeys.count" counter="$ki">
+            <set_value name="$activeShip" exact="$activeKeys.{$ki}"/>
+            <set_value name="$shouldPurge" exact="false"/>
+            <!-- Ship destroyed -->
+            <do_if value="not $activeShip.exists">
+              <set_value name="$shouldPurge" exact="true"/>
+            </do_if>
+            <!-- Ship no longer has GT order and not subordinate to GT commander -->
+            <do_if value="not $shouldPurge and $activeShip.exists">
+              <set_value name="$hasGT" exact="false"/>
+              <do_if value="$activeShip.defaultorder? and @$activeShip.defaultorder.id == 'GalaxyTraderMK3'">
+                <set_value name="$hasGT" exact="true"/>
+              </do_if>
+              <do_if value="not $hasGT and $activeShip.commander? and $activeShip.commander.exists and $activeShip.commander.defaultorder? and @$activeShip.commander.defaultorder.id == 'GalaxyTraderMK3'">
+                <set_value name="$hasGT" exact="true"/>
+              </do_if>
+              <!-- Only purge non-GT ships that have been active longer than StaleThresholdSeconds -->
+              <do_if value="not $hasGT">
+                <set_value name="$staleAge" exact="120"/>
+                <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+                  <set_value name="$staleAge" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+                </do_if>
+                <set_value name="$entryAge" exact="player.age - @global.$GT_SearchSemaphore.$ActiveShips.{$activeShip}.$StartedAt"/>
+                <do_if value="$entryAge gt ($staleAge * 1s)">
+                  <set_value name="$shouldPurge" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_if value="$shouldPurge">
+              <remove_value name="global.$GT_SearchSemaphore.$ActiveShips.{$activeShip}"/>
+              <do_if value="global.$GT_SearchSemaphore.$Active gt 0">
+                <set_value name="global.$GT_SearchSemaphore.$Active" operation="subtract"/>
+              </do_if>
+              <set_value name="$purged" operation="add"/>
+            </do_if>
+          </do_all>
+          <do_if value="$purged gt 0">
+            <debug_text text="'[GT-Scheduler] StaleCheck: purged ' + $purged + ' stale semaphore entries'" chance="100"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchSearchGo"/>
+          </do_if>
+        </do_if>
+        <!-- Re-schedule next check -->
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SemaphoreStaleCheckLoop"/>
       </actions>
     </cue>
   </cues>
