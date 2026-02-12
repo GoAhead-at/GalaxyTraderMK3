@@ -73,6 +73,11 @@
         <!-- 1. CHECK REPAIR (Level 12+)                                              -->
         <!-- ========================================================================= -->
         
+        <!-- DIAGNOSTIC: Log repair prerequisites -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] Repair gate: pilotLevel=' + $pilotLevel + ' (need 12+), AutoRepair.Enabled=' + @global.$GT_GlobalSettings.$AutoRepair.$Enabled + ', HullThreshold=' + @global.$GT_GlobalSettings.$AutoRepair.$HullThreshold + '%'" chance="100"/>
+        </do_if>
+        
         <do_if value="$pilotLevel ge 12 and @global.$GT_GlobalSettings.$AutoRepair.$Enabled">
           <set_value name="$hullPercentage" exact="$ship.hullpercentage"/>
           <set_value name="$repairThreshold" exact="@global.$GT_GlobalSettings.$AutoRepair.$HullThreshold"/>
@@ -257,6 +262,9 @@
         <set_value name="$maxJumpDistance" exact="15"/>
         <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxDistance?">
           <set_value name="$maxJumpDistance" exact="global.$GT_AIParameters.{$ship}.$MaxDistance"/>
+        </do_if>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] ExecuteMaintenance for ' + $ship.idcode + ': maxJumpDistance=' + $maxJumpDistance + ', needsRepair=' + $needsRepair + ', needsEquipment=' + $needsEquipment + ', hullPercentage=' + $hullPercentage + ', repairThreshold=' + $repairThreshold" chance="100"/>
         </do_if>
         
         <!-- Track orders created -->
@@ -1888,6 +1896,8 @@
         <!-- Validate each station has repair capability AND docking capability -->
         <!-- Vanilla check: station must be able to build OR supply this ship class (interrupt.restock.xml:778) -->
         <set_value name="$validatedStations" exact="[]"/>
+        <set_value name="$preFilterRejectCapability" exact="0"/>
+        <set_value name="$preFilterRejectDocking" exact="0"/>
         <do_all exact="$potentialStations.count" counter="$i">
           <set_value name="$station" exact="$potentialStations.{$i}"/>
           <set_value name="$isValid" exact="true"/>
@@ -1897,6 +1907,10 @@
           <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
           <do_if value="not $canBuild and not $canSupply">
             <set_value name="$isValid" exact="false"/>
+            <set_value name="$preFilterRejectCapability" operation="add"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter REJECT: ' + $station.knownname + ' - cannot build/supply class ' + $ship.class + ' (canBuild=' + $canBuild + ', canSupply=' + $canSupply + ')'" chance="100"/>
+            </do_if>
           </do_if>
           
           <!-- Verify docking capability: station must have docking bay for this ship size -->
@@ -1906,6 +1920,10 @@
             </find_dockingbay>
             <do_if value="not $testDock">
               <set_value name="$isValid" exact="false"/>
+              <set_value name="$preFilterRejectDocking" operation="add"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter REJECT: ' + $station.knownname + ' - no docking bay for size ' + $ship.docksize" chance="100"/>
+              </do_if>
             </do_if>
           </do_if>
           
@@ -1916,7 +1934,7 @@
         
         <set_value name="$potentialStations" exact="$validatedStations"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Validated ' + $potentialStations.count + ' stations with repair capability (can build OR supply class ' + $ship.class + ') and docking capability (size ' + $ship.docksize + ')'" chance="100"/>
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter: ' + $potentialStations.count + ' passed, ' + $preFilterRejectCapability + ' rejected (capability), ' + $preFilterRejectDocking + ' rejected (docking) — ship class=' + $ship.class + ', docksize=' + $ship.docksize" chance="100"/>
         </do_if>
         
         <!-- Early exit: Find first valid station (stations already sorted by distance, so first valid = nearest) -->
@@ -1924,12 +1942,21 @@
         
         <do_all exact="$potentialStations.count" counter="$i">
           <!-- PERFORMANCE OPTIMIZATION: Early exit - stop if we already found a valid station -->
-          <do_if value="$nearestStation?">
+          <!-- CRITICAL: Use != null, NOT $nearestStation? — the ? operator checks if the variable EXISTS (is defined),
+               not if its value is non-null. Since we set_value to null above, ? returns true and breaks immediately. -->
+          <do_if value="$nearestStation != null">
             <break/>
           </do_if>
           
           <set_value name="$station" exact="$potentialStations.{$i}"/>
           <set_value name="$isValid" exact="true"/>
+          <set_value name="$rejectReason" exact="''"/>
+          <set_value name="$gateDistance" exact="-1"/>
+          
+          <!-- DIAGNOSTIC: Log each station being evaluated -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Evaluating: ' + $station.knownname + ' (sector: ' + @$station.sector.knownname + ', owner: ' + @$station.owner.knownname + ')'" chance="100"/>
+          </do_if>
           
           <!-- SAFETY CHECK 1: Blacklist checks (station + sector) -->
           <do_if value="$isValid">
@@ -1952,16 +1979,12 @@
             
             <do_if value="$stationBlacklisted or $sectorTravelBlacklisted or $sectorActivityBlacklisted">
               <set_value name="$isValid" exact="false"/>
-              <set_value name="$blacklistReason" exact="if $stationBlacklisted then 'station unsafe' else if $sectorTravelBlacklisted then 'sector travel blocked (threat system)' else 'sector activity restricted'"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - blacklisted (' + $blacklistReason + ')'" chance="100"/>
-              </do_if>
+              <set_value name="$rejectReason" exact="if $stationBlacklisted then 'BLACKLIST(station)' else if $sectorTravelBlacklisted then 'BLACKLIST(sector-travel)' else 'BLACKLIST(sector-activity)'"/>
             </do_if>
           </do_if>
           
           <!-- SAFETY CHECK 2: Full reachability check (station known + basic path + blacklist-aware path) -->
           <do_if value="$isValid">
-            <!-- Check ALL reachability requirements BEFORE selecting station -->
             <run_actions ref="md.GT_Libraries_Pathfinding.GT_IsStationReachable" result="$reachabilityCheck">
               <param name="ship" value="$ship"/>
               <param name="station" value="$station"/>
@@ -1970,15 +1993,12 @@
             </run_actions>
             <do_if value="not $reachabilityCheck">
               <set_value name="$isValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - not reachable (station unknown or no path)'" chance="100"/>
-              </do_if>
+              <set_value name="$rejectReason" exact="'UNREACHABLE'"/>
             </do_if>
           </do_if>
           
           <!-- SAFETY CHECK 3: Get distance and check if station is within max jump distance -->
           <do_if value="$isValid">
-            <!-- Get blacklist-aware distance for distance check -->
             <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$gateDistance">
               <param name="ship" value="$ship"/>
               <param name="fromSector" value="$ship.sector"/>
@@ -1988,63 +2008,42 @@
             </run_actions>
             <do_if value="$gateDistance gt $maxJumpDistance">
               <set_value name="$isValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - beyond max jump distance (' + $gateDistance + ' jumps, max: ' + $maxJumpDistance + ')'" chance="100"/>
-              </do_if>
+              <set_value name="$rejectReason" exact="'DISTANCE(' + $gateDistance + '/' + $maxJumpDistance + ')'"/>
             </do_if>
           </do_if>
           
           <!-- SAFETY CHECK 4: Verify repair capability (double-check using vanilla pattern) -->
-          <!-- Note: find_station already filtered by canbuildclass/cansupplyclass, but verify shiptrader exists -->
           <do_if value="$isValid">
-            <!-- Vanilla check: station must have shiptrader control entity (order.repair.xml:71-73) -->
             <do_if value="not $station.shiptrader?">
               <set_value name="$isValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - no shiptrader control entity'" chance="100"/>
-              </do_if>
+              <set_value name="$rejectReason" exact="'NO_SHIPTRADER'"/>
             </do_if>
             <do_else>
-              <!-- Additional verification: station must be able to build OR supply this ship class -->
-              <!-- Vanilla pattern: canbuildclass.{ship.class} OR cansupplyclass.{ship.class} (interrupt.restock.xml:778) -->
               <set_value name="$canBuild" exact="@$station.canbuildclass.{$ship.class}"/>
               <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
               <do_if value="not $canBuild and not $canSupply">
                 <set_value name="$isValid" exact="false"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - cannot build or supply ship class ' + $ship.class" chance="100"/>
-                </do_if>
+                <set_value name="$rejectReason" exact="'NO_BUILD_OR_SUPPLY(class=' + $ship.class + ')'"/>
               </do_if>
             </do_else>
           </do_if>
           
           <!-- SAFETY CHECK 5: Check docking permission (same pattern as resupply) -->
           <do_if value="$isValid">
-            <!-- For non-capital ships OR when station is a regular station, check docking permission -->
             <set_value name="$checkDocking" exact="not $ship.iscapitalship or ($station.isclass.station)"/>
             
             <do_if value="$checkDocking">
               <set_value name="$canDock" exact="$station.dockingallowed.{$ship}"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Docking allowed check: ' + $canDock" chance="100"/>
-              </do_if>
-              
               <do_if value="not $canDock">
                 <set_value name="$isValid" exact="false"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - docking not allowed (trade restrictions, relation issues, or docking policy)'" chance="100"/>
-                </do_if>
+                <set_value name="$rejectReason" exact="'DOCKING_DENIED'"/>
               </do_if>
             </do_if>
-            <do_else>
-              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Capital ship - skipping docking permission check'" chance="100"/>
-            </do_else>
           </do_if>
           
-          <!-- Check if sector is excluded (from ship configuration) -->
+          <!-- SAFETY CHECK 6: Check if sector is excluded (from ship configuration) -->
           <do_if value="$isValid and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$Config?">
             <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors?">
-              <!-- Check if sector is in exclusion list using explicit loop (indexof unreliable for lists) -->
               <set_value name="$isSectorExcluded" exact="false"/>
               <do_all exact="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors.count" counter="$j">
                 <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors.{$j} == $station.sector">
@@ -2055,20 +2054,25 @@
               
               <do_if value="$isSectorExcluded">
                 <set_value name="$isValid" exact="false"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Filtered out ' + $station.knownname + ' (sector: ' + $station.sector.knownname + ') - sector excluded in config'" chance="100"/>
-                </do_if>
+                <set_value name="$rejectReason" exact="'SECTOR_EXCLUDED'"/>
               </do_if>
             </do_if>
+          </do_if>
+          
+          <!-- DIAGNOSTIC: Always log the result for every station -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="$isValid">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] -> ACCEPTED: ' + $station.knownname + ' (distance: ' + $gateDistance + ' jumps)'" chance="100"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] -> REJECTED: ' + $station.knownname + ' | Reason: ' + $rejectReason" chance="100"/>
+            </do_else>
           </do_if>
           
           <!-- EARLY EXIT: First valid station found (already sorted by distance) -->
           <do_if value="$isValid">
             <set_value name="$nearestStation" exact="$station"/>
             <set_value name="$nearestDistance" exact="$gateDistance"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') ✓ Found nearest repair station: ' + $nearestStation.knownname + ' (' + $nearestDistance + ' jumps away) - stopping search after checking ' + $i + '/' + $potentialStations.count + ' stations'" chance="100"/>
-            </do_if>
             <break/>
           </do_if>
         </do_all>
