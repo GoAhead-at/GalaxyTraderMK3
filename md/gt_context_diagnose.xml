@@ -293,6 +293,44 @@
           <append_to_list name="$sec1.$Rows" exact="table[$Check = 'GT Registry Status', $Status = 'INFO', $Detail = '' + $shipData.$Status]"/>
         </do_if>
 
+        <!-- Search Pipeline State (Fallback / Isolated flags) -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Search Pipeline ---', $Status = 'INFO', $Detail = '']"/>
+        <set_value name="$pipelineState" exact="'Normal'"/>
+        <set_value name="$pipelineResult" exact="'PASS'"/>
+        <set_value name="$pipelineDesc" exact="'Ship is using the normal search pipeline with standard price ranges and full search radius.'"/>
+        <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+          <set_value name="$pipelineState" exact="'ISOLATED'"/>
+          <set_value name="$pipelineResult" exact="'WARN'"/>
+          <set_value name="$pipelineDesc" exact="'Ship is isolated (all connected sectors blacklisted or unreachable). Using isolated price ranges (no filter) and searching only within current sector.'"/>
+        </do_if>
+        <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{$ship}?">
+          <set_value name="$pipelineState" exact="'FALLBACK'"/>
+          <set_value name="$pipelineResult" exact="'WARN'"/>
+          <set_value name="$pipelineDesc" exact="'Normal search found no trades. Fallback active: searching near ship position with reduced radius (1/3 of normal), relaxed profit thresholds (ROI halved, min 100 Cr), and fallback price ranges. Trades still limited to home sector max distance.'"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Search Pipeline', $Status = $pipelineResult, $Detail = $pipelineState]"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Pipeline Detail', $Status = 'INFO', $Detail = $pipelineDesc]"/>
+
+        <!-- Show configured price ranges for the active pipeline -->
+        <!-- Defaults: no filter (1.0 = max price, -1.0 = min price) — must be numeric for relativeprice filter -->
+        <set_value name="$activeSellPriceMax" exact="1.0"/>
+        <set_value name="$activeBuyPriceMin" exact="-1.0"/>
+        <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
+          <do_if value="$pipelineState == 'ISOLATED'">
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$IsolatedSellPriceMax? then @global.$GT_Config.$Trading.$IsolatedSellPriceMax else 1.0"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$IsolatedBuyPriceMin? then @global.$GT_Config.$Trading.$IsolatedBuyPriceMin else -1.0"/>
+          </do_if>
+          <do_elseif value="$pipelineState == 'FALLBACK'">
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 0.2"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -0.2"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$SellPriceMax? then @global.$GT_Config.$Trading.$SellPriceMax else 1.0"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$BuyPriceMin? then @global.$GT_Config.$Trading.$BuyPriceMin else -1.0"/>
+          </do_else>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Active Price Range', $Status = 'INFO', $Detail = 'Sell max: ' + ($activeSellPriceMax * 100) + '%, Buy min: ' + ($activeBuyPriceMin * 100) + '%']"/>
+
         <!-- ================================================ -->
         <!-- Blacklist Status                                  -->
         <!-- ================================================ -->
@@ -455,17 +493,48 @@
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Order Source', $Status = 'INFO', $Detail = $orderSourceLabel]"/>
 
         <!-- Max distance (maxbuy / maxsell from order params) -->
-        <set_value name="$maxBuy" exact="0"/>
-        <set_value name="$maxSell" exact="0"/>
+        <!-- IMPORTANT: order param default expressions use this.ship which doesn't resolve in MD context.
+             Reading defaultorder.$maxbuy in MD can return 25 (the fallback maximum) instead of the
+             skill-based default. We must compute the pilot skill cap independently and apply it. -->
+        <set_value name="$rawMaxBuy" exact="0"/>
+        <set_value name="$rawMaxSell" exact="0"/>
         <do_if value="$gtOrder? and $gtOrder.$maxbuy?">
-          <set_value name="$maxBuy" exact="$gtOrder.$maxbuy"/>
+          <set_value name="$rawMaxBuy" exact="$gtOrder.$maxbuy"/>
         </do_if>
         <do_if value="$gtOrder? and $gtOrder.$maxsell?">
-          <set_value name="$maxSell" exact="$gtOrder.$maxsell"/>
+          <set_value name="$rawMaxSell" exact="$gtOrder.$maxsell"/>
         </do_if>
+
+        <!-- Compute pilot skill cap (mirrors AI script logic in order.trade.galaxytrader.xml lines 765-787) -->
+        <set_value name="$pilotMaxJumps" exact="25"/>
+        <do_if value="$ship.pilot? and $ship.pilot.skill.management?">
+          <set_value name="$diagPilotSkill" exact="$ship.pilot.skill.management"/>
+          <do_if value="$diagPilotSkill le 2">
+            <set_value name="$pilotMaxJumps" exact="1"/>
+          </do_if>
+          <do_elseif value="$diagPilotSkill le 5">
+            <set_value name="$pilotMaxJumps" exact="3"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 8">
+            <set_value name="$pilotMaxJumps" exact="5"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 11">
+            <set_value name="$pilotMaxJumps" exact="10"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 13">
+            <set_value name="$pilotMaxJumps" exact="15"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$pilotMaxJumps" exact="25"/>
+          </do_else>
+        </do_if>
+
+        <!-- Apply pilot skill cap: effective = min(order value, pilot capability) -->
+        <set_value name="$maxBuy" exact="[$rawMaxBuy, $pilotMaxJumps].min"/>
+        <set_value name="$maxSell" exact="[$rawMaxSell, $pilotMaxJumps].min"/>
         <set_value name="$maxDistance" exact="[$maxBuy, $maxSell].max"/>
-        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Buy Distance', $Status = 'INFO', $Detail = '' + $maxBuy + ' jumps']"/>
-        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Sell Distance', $Status = 'INFO', $Detail = '' + $maxSell + ' jumps']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Buy Distance', $Status = 'INFO', $Detail = '' + $maxBuy + ' jumps (order: ' + $rawMaxBuy + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Sell Distance', $Status = 'INFO', $Detail = '' + $maxSell + ' jumps (order: ' + $rawMaxSell + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Effective Max Distance', $Status = if $maxDistance gt 0 then 'PASS' else 'FAIL', $Detail = '' + $maxDistance + ' jumps (max of buy/sell)']"/>
 
         <!-- Allow illegal (from order params, with explicit true/false) -->
@@ -798,6 +867,7 @@
         <set_value name="$sec8.$Name" exact="'Search Summary'"/>
         <set_value name="$sec8.$Rows" exact="[]"/>
 
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Search Pipeline', $Status = 'INFO', $Detail = $pipelineState + ' (Sell max: ' + ($activeSellPriceMax * 100) + '%, Buy min: ' + ($activeBuyPriceMin * 100) + '%)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Sectors In Range', $Status = 'INFO', $Detail = '' + $searchSectors.count + ' sectors']"/>
 
         <!-- Collect sell offers and buy offers from all sectors -->
@@ -808,7 +878,7 @@
         <do_all exact="$searchSectors.count" counter="$si">
           <set_value name="$searchSec" exact="$searchSectors.{$si}"/>
 
-          <!-- Find sell offers -->
+          <!-- Find sell offers (with price range filter matching actual search pipeline) -->
           <do_if value="$ignoreTradeRules">
             <find_sell_offer space="$searchSec" result="$secSellOffers" multiple="true">
               <match_seller tradesknownto="$ship.owner">
@@ -816,7 +886,7 @@
                 <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               </match_seller>
               <amount min="1"/>
-              <totalvolume min="1"/>
+              <relativeprice max="$activeSellPriceMax"/>
             </find_sell_offer>
           </do_if>
           <do_else>
@@ -826,7 +896,7 @@
                 <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               </match_seller>
               <amount min="1"/>
-              <totalvolume min="1"/>
+              <relativeprice max="$activeSellPriceMax" tradepartner="$ship"/>
             </find_sell_offer>
           </do_else>
           <set_value name="$secSellCount" exact="0"/>
@@ -837,7 +907,7 @@
             </do_all>
           </do_if>
 
-          <!-- Find buy offers -->
+          <!-- Find buy offers (with price range filter matching actual search pipeline) -->
           <do_if value="$ignoreTradeRules">
             <find_buy_offer space="$searchSec" result="$secBuyOffers" multiple="true">
               <match_buyer tradesknownto="$ship.owner">
@@ -845,7 +915,7 @@
                 <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               </match_buyer>
               <amount min="1"/>
-              <totalvolume min="1"/>
+              <relativeprice min="$activeBuyPriceMin"/>
             </find_buy_offer>
           </do_if>
           <do_else>
@@ -855,7 +925,7 @@
                 <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
               </match_buyer>
               <amount min="1"/>
-              <totalvolume min="1"/>
+              <relativeprice min="$activeBuyPriceMin" tradepartner="$ship"/>
             </find_buy_offer>
           </do_else>
           <set_value name="$secBuyCount" exact="0"/>
@@ -1184,7 +1254,7 @@
               <do_all exact="$searchSectors.count" counter="$clsi">
                 <set_value name="$clSector" exact="$searchSectors.{$clsi}"/>
 
-                <!-- Find buy offers for this specific ware -->
+                <!-- Find buy offers for this specific ware (with price range filter) -->
                 <do_if value="$ignoreTradeRules">
                   <find_buy_offer wares="[$clWare]" space="$clSector" result="$clBuyOffers" multiple="true">
                     <match_buyer tradesknownto="$ship.owner">
@@ -1192,6 +1262,7 @@
                       <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
                     </match_buyer>
                     <amount min="1"/>
+                    <relativeprice min="$activeBuyPriceMin"/>
                   </find_buy_offer>
                 </do_if>
                 <do_else>
@@ -1201,6 +1272,7 @@
                       <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
                     </match_buyer>
                     <amount min="1"/>
+                    <relativeprice min="$activeBuyPriceMin" tradepartner="$ship"/>
                   </find_buy_offer>
                 </do_else>
 

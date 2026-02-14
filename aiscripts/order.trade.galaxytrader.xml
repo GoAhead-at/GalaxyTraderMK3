@@ -125,16 +125,23 @@
           </do_if>
         </do_if>
         
-        <!-- Store in instance variables for main_loop to use -->
-        <set_value name="this.$tradeFoundViaInterrupt" exact="true"/>
-        <set_value name="this.$tradeListFromSignal" exact="if $signalTradeList != null then $signalTradeList else []"/>
-        <set_value name="this.$searchMethodFromSignal" exact="if $signalSearchMethod != null and $signalSearchMethod != '' then $signalSearchMethod else ''"/>
-        
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <set_value name="$tradeCountForDebug" exact="if $signalTradeList != null then $signalTradeList.count else 0"/>
-          <set_value name="$dataSource" exact="if ($signalTradeList != null and $signalTradeList.count gt 0 and event.param2? and event.param2 != null) then 'param2' else 'global storage'"/>
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received via interrupt handler - stored ' + $tradeCountForDebug + ' trades from ' + $dataSource" chance="100"/>
+        <!-- Only set the interrupt flag if we actually have trades to process.
+             Empty signals cause pointless trade_found processing with 0 trades. -->
+        <do_if value="$signalTradeList != null and $signalTradeList.count gt 0">
+          <set_value name="this.$tradeFoundViaInterrupt" exact="true"/>
+          <set_value name="this.$tradeListFromSignal" exact="$signalTradeList"/>
+          <set_value name="this.$searchMethodFromSignal" exact="if $signalSearchMethod != null and $signalSearchMethod != '' then $signalSearchMethod else ''"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <set_value name="$dataSource" exact="if (event.param2? and event.param2 != null) then 'param2' else 'global storage'"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received via interrupt handler - stored ' + $signalTradeList.count + ' trades from ' + $dataSource" chance="100"/>
+          </do_if>
         </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received but trade list is empty - ignoring (no interrupt flag set)'" chance="100"/>
+          </do_if>
+        </do_else>
       </actions>
     </handler>
     
@@ -2723,8 +2730,6 @@
                    MD responds with a non-backoff "still working" or "reset" signal to prevent AI cooldown escalation under fleet load. -->
               <event_object_signalled object="this.ship" param="'GT_TradeSearch_InProgress'"/>
               <event_object_signalled object="this.ship" param="'GT_TradeSearch_Reset'"/>
-              <!-- Destination threatened → abort and restart main loop -->
-              <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
               <!-- New AI pipeline semaphore grant -->
               <event_object_signalled object="this.ship" param="'GT_Search_Go'"/>
             </check_any>
@@ -2838,52 +2843,6 @@
                 <debug_text text="'[GT-AI] ' + this.ship.idcode + ': RECEIVED GT_No_Trade_Found signal - starting retry logic (cargo disposal: ' + $isCargoDisposal + ')'" chance="100"/>
               </do_if>
               <resume label="no_trade_retry"/>
-            </do_elseif>
-            <do_elseif value="event.param == 'GT_Destination_Threatened'">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: Destination threatened - aborting current trade'" chance="100"/>
-              
-              <!-- Set reroute flag for ship name -->
-              <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
-                <set_value name="global.$GT_Ships.{this.ship}.$Rerouting" exact="true"/>
-              </do_if>
-              
-              <!-- Trigger ship rename to show [REROUTE] state -->
-              <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
-                <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-                  $ship=this.ship, 
-                  $pilot=this.ship.pilot, 
-                  $xp=global.$GT_Pilots.{this.ship.pilot}.$XP, 
-                  $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
-                  $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
-                  $nameType='trader'
-                ]"/>
-              </do_if>
-              
-              <!-- Player logbook notification about route threat -->
-              <do_if value="$gt_logbookentries">
-                <set_value name="$threatData" exact="event.param2"/>
-                <set_value name="$threatenedSector" exact="@$threatData.$Sector"/>
-                <set_value name="$threatLevel" exact="@$threatData.$ThreatLevel"/>
-                <set_value name="$hasCargo" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>
-                
-                <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                <set_value name="$logbookMessage" exact="{77000,3209}.[@$threatenedSector.knownname, $threatLevel, this.ship.knownname]"/>
-                
-                <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
-                  $Message = $logbookMessage,
-                  $Category = 'alerts',
-                  $Title = 'Route Threat Detected: ' + this.ship.knownname,
-                  $Object = this.ship,
-                  $Interaction = 'showonmap',
-                  $Highlighted = true,
-                  $CheckGlobalSettings = false
-                ]"/>
-              </do_if>
-              
-              <!-- Abort current trade, go back to main loop -->
-              <!-- Cargo check will detect cargo and send GT_Find_Sell automatically -->
-              <cancel_all_orders object="this.ship"/>
-              <resume label="main_loop"/>
             </do_elseif>
           </actions>
         </interrupt>
@@ -3159,6 +3118,104 @@
           <resume label="no_trade_retry"/>
         </do_if>
 
+        <!-- ═══════════════════════════════════════════════════════════════════════════
+             FALLBACK SEARCH: When normal pipeline yields no trades, attempt a fallback
+             search with relaxed parameters before giving up.
+             See lib.gt.fallback.search.xml for the full pipeline (pathfinding / live /
+             tradematch / scoring with relaxed params, centered on ship position).
+             ═══════════════════════════════════════════════════════════════════════════ -->
+        <do_if value="not $pipelineFound and $searchMode == 'buy_and_sell'">
+          <!-- Check conditions: not isolated, not already in fallback -->
+          <set_value name="$isIsolated" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?"/>
+          <set_value name="$isFallbackAlready" exact="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{this.ship}?"/>
+
+          <do_if value="not $isIsolated and not $isFallbackAlready">
+            <run_script name="'lib.gt.fallback.search'" result="$fallbackResult">
+              <param name="ship" value="this.ship"/>
+              <param name="homeSector" value="$searchHomeSector"/>
+              <param name="maxDistance" value="$searchMaxDistance"/>
+              <param name="minROI" value="$searchMinROI"/>
+              <param name="distancePenalty" value="$gt_distancepenalty"/>
+              <param name="factionPriority" value="$searchFactionPriority"/>
+              <param name="wareBasket" value="$searchWareBasket"/>
+              <param name="allowIllegal" value="$searchAllowIllegal"/>
+              <param name="ignoreMK1Supply" value="$searchIgnoreMK1Supply"/>
+              <param name="ignoreTradeRules" value="$searchIgnoreTradeRules"/>
+              <param name="ignoreBuildStorage" value="$searchIgnoreBuildStorage"/>
+              <param name="ignoreCarrierAux" value="$searchIgnoreCarrierAux"/>
+              <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
+              <param name="debugchance" value="@this.$debugchance"/>
+            </run_script>
+            <!-- SAVEGAME GUARD -->
+            <do_if value="not $searchMode?">
+              <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
+              <resume label="no_trade_retry"/>
+            </do_if>
+
+            <do_if value="$fallbackResult? and $fallbackResult.$Found">
+              <!-- FALLBACK SUCCESS: Set flag, update pipeline, rename ship -->
+              <set_value name="$pipelineFound" exact="true"/>
+              <set_value name="$pipelineTradeList" exact="if $fallbackResult.$TradeList? then @$fallbackResult.$TradeList else []"/>
+              <set_value name="$pipelineSearchMethod" exact="'live_fallback'"/>
+
+              <!-- Set the fallback flag -->
+              <do_if value="not global.$GT_FallbackTradeActive?">
+                <set_value name="global.$GT_FallbackTradeActive" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_FallbackTradeActive.{this.ship}" exact="true"/>
+
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FALLBACK SUCCESS: Found ' + $pipelineTradeList.count + ' trades with relaxed parameters. Set [FALLBACK] flag.'" chance="100"/>
+              </do_if>
+
+              <!-- Trigger ship rename to show [FALLBACK] state -->
+              <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+                <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                  $ship=this.ship,
+                  $pilot=this.ship.pilot,
+                  $xp=global.$GT_Pilots.{this.ship.pilot}.$XP,
+                  $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
+                  $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+                  $nameType='fallback'
+                ]"/>
+              </do_if>
+
+              <!-- Logbook entry for fallback activation -->
+              <do_if value="$gt_logbookentries">
+                <set_value name="$sectorName" exact="@this.ship.sector.knownname"/>
+                <do_if value="not $sectorName?">
+                  <set_value name="$sectorName" exact="'Unknown Sector'"/>
+                </do_if>
+                <set_value name="$fallbackMaxDistance" exact="if $fallbackResult.$FallbackMaxDistance? then $fallbackResult.$FallbackMaxDistance else 1"/>
+                <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+                  $Message = 'Commander,\n\nNormal search found no trades. Falling back to nearby search.\n\nShip: ' + this.ship.knownname + '\nSector: ' + $sectorName + '\nNormal range: ' + $searchMaxDistance + ' jump(s)\nFallback range: ' + $fallbackMaxDistance + ' jump(s) from current position\nPrice filter relaxed to fallback settings.\n\nStanding by,\nAboard ' + this.ship.knownname,
+                  $Category = 'alerts',
+                  $Title = 'Fallback Search: ' + this.ship.knownname,
+                  $Object = this.ship,
+                  $Interaction = 'showonmap',
+                  $CheckGlobalSettings = true
+                ]"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FALLBACK SEARCH: No trades found even with relaxed parameters. Proceeding to no_trade_retry.'" chance="100"/>
+              </do_if>
+            </do_else>
+          </do_if>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FALLBACK SEARCH skipped: isIsolated=' + $isIsolated + ' isFallbackAlready=' + $isFallbackAlready" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+
+        <!-- Final pipeline result check -->
+        <do_if value="not $pipelineFound">
+          <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
+          <resume label="no_trade_retry"/>
+        </do_if>
+
         <!-- Notify scheduler that this ship finished its search slot (semaphore release + dispatch) -->
         <signal_objects object="player.galaxy" param="'GT_Search_Done'" param2="table[
           $Ship = this.ship,
@@ -3211,6 +3268,7 @@
       <set_value name="$tradesRejectedDistance" exact="0"/>
       <set_value name="$tradesRejectedCargo" exact="0"/>
       <set_value name="$tradesRejectedProfit" exact="0"/>
+      <set_value name="$tradesRejectedRestriction" exact="0"/>
       
       <!-- Iterate through trade list and validate each one -->
       <!-- Priority order: Signal param2 (from cache search work unit or live search) > Global storage (for threat intelligence compatibility) -->
@@ -3259,6 +3317,16 @@
            Valid for the duration of this validation loop (ship doesn't move). -->
       <set_value name="$gdCache" exact="table[]"/>
       <set_value name="$gdCacheBL" exact="table[]"/>
+      
+      <!-- Resolve enforcement flags once before loop (MD-stored AI parameters override order params) -->
+      <set_value name="$enfIgnoreBuildStorage" exact="$effectiveIgnoreBuildStorage"/>
+      <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{this.ship}? and global.$GT_AIParameters.{this.ship}.$IgnoreBuildStorage?">
+        <set_value name="$enfIgnoreBuildStorage" exact="global.$GT_AIParameters.{this.ship}.$IgnoreBuildStorage"/>
+      </do_if>
+      <set_value name="$enfIgnoreCarrierAux" exact="$effectiveIgnoreCarrierAux"/>
+      <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{this.ship}? and global.$GT_AIParameters.{this.ship}.$IgnoreCarrierAux?">
+        <set_value name="$enfIgnoreCarrierAux" exact="global.$GT_AIParameters.{this.ship}.$IgnoreCarrierAux"/>
+      </do_if>
       
       <!-- Iterate through trade list -->
       <!-- Check if tradeList exists and has items before looping -->
@@ -3802,28 +3870,31 @@
                 </do_else>
               </do_else>
               
+              <!-- Resolve max distances safely — instance vars may be missing after hot-reload -->
+              <set_value name="$_maxBuy" exact="if this.$effectiveMaxBuy? then this.$effectiveMaxBuy else $searchMaxDistance"/>
+              <set_value name="$_maxSell" exact="if this.$effectiveMaxSell? then this.$effectiveMaxSell else $searchMaxDistance"/>
+
               <!-- Show calculated distances for diagnosis -->
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$buyStationNameForDebug" exact="if $isSellOnlyTrade then 'N/A (sell-only)' else (if $buyStation? then @$buyStation.knownname else 'Unknown')"/>
                 <set_value name="$buySectorNameForDebug" exact="if $isSellOnlyTrade then 'N/A (sell-only)' else (if $buyStation? then @$buyStation.sector.knownname else 'Unknown')"/>
                 <debug_text text="'[GT-AI] ' + this.ship.idcode + ': HOME SECTOR distance check (trade ' + $tradeIdx + '):' +
                   '\n  Home sector: ' + @$homeSector.knownname +
-                  '\n  BUY station: ' + $buyStationNameForDebug + ' (Sector: ' + $buySectorNameForDebug + ', Distance from home: ' + $buyDistanceFromHome + '/' + this.$effectiveMaxBuy + ' jumps)' +
-                  '\n  SELL station: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance from home: ' + $sellDistanceFromHome + '/' + this.$effectiveMaxSell + ' jumps)' +
+                  '\n  BUY station: ' + $buyStationNameForDebug + ' (Sector: ' + $buySectorNameForDebug + ', Distance from home: ' + $buyDistanceFromHome + '/' + $_maxBuy + ' jumps)' +
+                  '\n  SELL station: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance from home: ' + $sellDistanceFromHome + '/' + $_maxSell + ' jumps)' +
                   '\n  Ship position: ' + @this.ship.sector.knownname +
-                  '\n  Validation: ' + (if ($buyDistanceFromHome lt 0 or $sellDistanceFromHome lt 0 or ($buyDistanceFromHome gt this.$effectiveMaxBuy and not $isSellOnlyTrade) or $sellDistanceFromHome gt this.$effectiveMaxSell) then 'REJECTED' else 'PASSED')"
+                  '\n  Validation: ' + (if ($buyDistanceFromHome lt 0 or $sellDistanceFromHome lt 0 or ($buyDistanceFromHome gt $_maxBuy and not $isSellOnlyTrade) or $sellDistanceFromHome gt $_maxSell) then 'REJECTED' else 'PASSED')"
                   chance="100"/>
               </do_if>
               
               <!-- Reject if stations exceed maxDistance from home -->
-              <!-- For sell-only trades, only check sell distance -->
               <set_value name="$distanceCheckFailed" exact="false"/>
               <do_if value="not $isSellOnlyTrade">
-                <do_if value="$buyDistanceFromHome lt 0 or $buyDistanceFromHome gt this.$effectiveMaxBuy">
+                <do_if value="$buyDistanceFromHome lt 0 or $buyDistanceFromHome gt $_maxBuy">
                   <set_value name="$distanceCheckFailed" exact="true"/>
                 </do_if>
               </do_if>
-              <do_if value="$sellDistanceFromHome lt 0 or $sellDistanceFromHome gt this.$effectiveMaxSell">
+              <do_if value="$sellDistanceFromHome lt 0 or $sellDistanceFromHome gt $_maxSell">
                 <set_value name="$distanceCheckFailed" exact="true"/>
               </do_if>
               
@@ -3834,8 +3905,8 @@
                 <set_value name="$buySectorNameForDebug" exact="if $isSellOnlyTrade then 'N/A (sell-only)' else (if $buyStation? then @$buyStation.sector.knownname else 'Unknown')"/>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdx + '/' + (if $tradeList != null then $tradeList.count else 0) + ' DISTANCE EXCEEDED:' +
-                    '\n  BUY: ' + $buyStationNameForDebug + ' (Sector: ' + $buySectorNameForDebug + ', Distance from home: ' + $buyDistanceFromHome + '/' + this.$effectiveMaxBuy + ' jumps)' +
-                    '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance from home: ' + $sellDistanceFromHome + '/' + this.$effectiveMaxSell + ' jumps)' +
+                    '\n  BUY: ' + $buyStationNameForDebug + ' (Sector: ' + $buySectorNameForDebug + ', Distance from home: ' + $buyDistanceFromHome + '/' + $_maxBuy + ' jumps)' +
+                    '\n  SELL: ' + @$sellStation.knownname + ' (Sector: ' + @$sellStation.sector.knownname + ', Distance from home: ' + $sellDistanceFromHome + '/' + $_maxSell + ' jumps)' +
                     '\n  Home sector: ' + @$homeSector.knownname +
                     '\n  Ship position: ' + @this.ship.sector.knownname +
                     '\n  Reason: Station(s) exceed maximum distance from home sector' +
@@ -4626,6 +4697,55 @@
                   <continue/>
                 </do_if>
                 
+                <!-- Buildstorage enforcement (inside loop so rejected trades try next) -->
+                <do_if value="$enfIgnoreBuildStorage">
+                  <set_value name="$_buyIsBuildStorage" exact="false"/>
+                  <do_if value="$buyStation?">
+                    <set_value name="$_buyIsBuildStorage" exact="$buyStation.isclass.buildstorage"/>
+                  </do_if>
+                  <set_value name="$_sellIsBuildStorage" exact="false"/>
+                  <do_if value="$sellStation?">
+                    <set_value name="$_sellIsBuildStorage" exact="$sellStation.isclass.buildstorage"/>
+                  </do_if>
+                  <do_if value="$_buyIsBuildStorage or $_sellIsBuildStorage">
+                    <set_value name="$tradesRejectedRestriction" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' rejected by buildstorage restriction (buy=' + $_buyIsBuildStorage + ', sell=' + $_sellIsBuildStorage + ') → Trying next trade...'" chance="100"/>
+                    </do_if>
+                    <do_if value="$searchMethod == 'cache'">
+                      <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'buildstorage_blocked']"/>
+                    </do_if>
+                    <continue/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Carrier/Aux enforcement (inside loop so rejected trades try next) -->
+                <!-- Vanilla pattern: carriers = type==shiptype.carrier, aux = primarypurpose==purpose.auxiliary -->
+                <!-- Do NOT use purpose.fight — that catches wharfs/shipyards (they build combat ships) -->
+                <do_if value="$enfIgnoreCarrierAux">
+                  <set_value name="$_rejectCarrierAux" exact="false"/>
+                  <do_if value="$buyStation?">
+                    <do_if value="@$buyStation.type == shiptype.carrier or @$buyStation.primarypurpose == purpose.auxiliary">
+                      <set_value name="$_rejectCarrierAux" exact="true"/>
+                    </do_if>
+                  </do_if>
+                  <do_if value="not $_rejectCarrierAux and $sellStation?">
+                    <do_if value="@$sellStation.type == shiptype.carrier or @$sellStation.primarypurpose == purpose.auxiliary">
+                      <set_value name="$_rejectCarrierAux" exact="true"/>
+                    </do_if>
+                  </do_if>
+                  <do_if value="$_rejectCarrierAux">
+                    <set_value name="$tradesRejectedRestriction" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' rejected by carrier/aux restriction → Trying next trade...'" chance="100"/>
+                    </do_if>
+                    <do_if value="$searchMethod == 'cache'">
+                      <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'carrier_aux_blocked']"/>
+                    </do_if>
+                    <continue/>
+                  </do_if>
+                </do_if>
+                
                 <!-- All checks passed including clamping and final docking verification - this trade is valid -->
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' is VALID - using this trade!'" chance="100"/>
@@ -4690,7 +4810,7 @@
         <!-- Use safe access and check existence before accessing -->
         <do_if value="$validTradeFound? and $validTradeFound">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesRejectedPath + ' unreachable, ' + $tradesRejectedDocking + ' docking denied, ' + $tradesRejectedDistance + ' distance exceeded, ' + $tradesRejectedCargo + ' insufficient cargo, ' + $tradesBlacklisted + ' blacklisted)'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Validation PASSED - creating trade orders (checked ' + $tradesChecked + ' trades, ' + $tradesRejectedPath + ' unreachable, ' + $tradesRejectedDocking + ' docking denied, ' + $tradesRejectedDistance + ' distance exceeded, ' + $tradesRejectedCargo + ' insufficient cargo, ' + $tradesBlacklisted + ' blacklisted, ' + $tradesRejectedRestriction + ' restriction blocked)'" chance="100"/>
           </do_if>
           
           <!-- Update pending trade entry with ACTUAL trade being executed -->
@@ -4767,79 +4887,6 @@
           <!-- For sell-only trades, skip buy order (ship already has cargo) -->
           <set_value name="$finalBuyAmount" exact="if $pendingTrade.$FinalBuyAmount? then $pendingTrade.$FinalBuyAmount else $pendingTrade.$Amount"/>
           <set_value name="$finalSellAmount" exact="if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount"/>
-          
-          <!-- Enforce buildstorage/carrier-aux restrictions before creating orders -->
-          <!-- Resolve effective flags (prefer MD-stored AI parameters, fallback to local effective flags) -->
-          <set_value name="$enfIgnoreBuildStorage" exact="false"/>
-          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{this.ship}? and global.$GT_AIParameters.{this.ship}.$IgnoreBuildStorage?">
-            <set_value name="$enfIgnoreBuildStorage" exact="global.$GT_AIParameters.{this.ship}.$IgnoreBuildStorage"/>
-          </do_if>
-          <do_if value="not $enfIgnoreBuildStorage">
-            <set_value name="$enfIgnoreBuildStorage" exact="$effectiveIgnoreBuildStorage"/>
-          </do_if>
-          
-          <set_value name="$enfIgnoreCarrierAux" exact="false"/>
-          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{this.ship}? and global.$GT_AIParameters.{this.ship}.$IgnoreCarrierAux?">
-            <set_value name="$enfIgnoreCarrierAux" exact="global.$GT_AIParameters.{this.ship}.$IgnoreCarrierAux"/>
-          </do_if>
-          <do_if value="not $enfIgnoreCarrierAux">
-            <set_value name="$enfIgnoreCarrierAux" exact="$effectiveIgnoreCarrierAux"/>
-          </do_if>
-          
-          <!-- Extract stations if needed (debug section later also uses these vars) -->
-          <set_value name="$buyStationForPending" exact="if $pendingTrade.$BuyStation? then $pendingTrade.$BuyStation else (if $pendingTrade.$BuyOffer? then @$pendingTrade.$BuyOffer.owner else null)"/>
-          <set_value name="$sellStationForPending" exact="if $pendingTrade.$SellStation? then $pendingTrade.$SellStation else (if $pendingTrade.$SellOffer? then @$pendingTrade.$SellOffer.owner else null)"/>
-          
-          <!-- Buildstorage enforcement -->
-          <do_if value="$enfIgnoreBuildStorage">
-            <set_value name="$buyIsBuildStorage" exact="false"/>
-            <do_if value="$buyStationForPending?">
-              <set_value name="$buyIsBuildStorage" exact="$buyStationForPending.isclass.buildstorage"/>
-            </do_if>
-            <set_value name="$sellIsBuildStorage" exact="false"/>
-            <do_if value="$sellStationForPending?">
-              <set_value name="$sellIsBuildStorage" exact="$sellStationForPending.isclass.buildstorage"/>
-            </do_if>
-            <do_if value="$buyIsBuildStorage or $sellIsBuildStorage">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade rejected by buildstorage restriction (buy=' + $buyIsBuildStorage + ', sell=' + $sellIsBuildStorage + ')'" chance="100"/>
-              </do_if>
-              <!-- Scenario 3: Flag ship-specific buildstorage restriction on cache entry -->
-              <do_if value="$searchMethod == 'cache'">
-                <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$pendingTrade.$BuyOffer, $SellOffer = @$pendingTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'buildstorage_blocked']"/>
-              </do_if>
-              <signal_objects object="this.ship" param="'GT_No_Trade_Found'" param2="'trade_rules_violation'"/>
-              <return/>
-            </do_if>
-          </do_if>
-          
-          <!-- Carrier/Aux enforcement (stations only) -->
-          <do_if value="$enfIgnoreCarrierAux">
-            <set_value name="$rejectCarrierAux" exact="false"/>
-            <do_if value="$buyStationForPending? and $buyStationForPending.isclass.station">
-              <set_value name="$buyPrimaryPurpose" exact="@$buyStationForPending.primarypurpose"/>
-              <do_if value="$buyPrimaryPurpose == purpose.auxiliary or $buyPrimaryPurpose == purpose.fight">
-                <set_value name="$rejectCarrierAux" exact="true"/>
-              </do_if>
-            </do_if>
-            <do_if value="not $rejectCarrierAux and $sellStationForPending? and $sellStationForPending.isclass.station">
-              <set_value name="$sellPrimaryPurpose" exact="@$sellStationForPending.primarypurpose"/>
-              <do_if value="$sellPrimaryPurpose == purpose.auxiliary or $sellPrimaryPurpose == purpose.fight">
-                <set_value name="$rejectCarrierAux" exact="true"/>
-              </do_if>
-            </do_if>
-            <do_if value="$rejectCarrierAux">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade rejected by carrier/aux restriction'" chance="100"/>
-              </do_if>
-              <!-- Scenario 3: Flag ship-specific carrier/aux restriction on cache entry -->
-              <do_if value="$searchMethod == 'cache'">
-                <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$pendingTrade.$BuyOffer, $SellOffer = @$pendingTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'carrier_aux_blocked']"/>
-              </do_if>
-              <signal_objects object="this.ship" param="'GT_No_Trade_Found'" param2="'trade_rules_violation'"/>
-              <return/>
-            </do_if>
-          </do_if>
           
           <!-- CRITICAL FIX: Final validation immediately before order creation -->
           <!-- This catches cases where trade rules changed between earlier validation and order creation -->
@@ -5216,18 +5263,27 @@
             <set_value name="$buyPriceForSignal" exact="if $pendingTrade.$BuyPrice? then ($pendingTrade.$BuyPrice / 100) else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then ($pendingTrade.$BuyOffer.unitprice / 100) else 0)"/>
             <set_value name="$sellPriceForSignal" exact="if $pendingTrade.$SellPrice? then ($pendingTrade.$SellPrice / 100) else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then ($pendingTrade.$SellOffer.unitprice / 100) else 0)"/>
             
+            <!-- Determine search pipeline type for logbook display -->
+            <set_value name="$logSearchPipeline" exact="'normal'"/>
+            <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?">
+              <set_value name="$logSearchPipeline" exact="'isolated'"/>
+            </do_if>
+            <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{this.ship}?">
+              <set_value name="$logSearchPipeline" exact="'fallback'"/>
+            </do_elseif>
             <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
               $Ship = this.ship,
-              $BuyOffer = $pendingTrade.$BuyOffer,
-              $SellOffer = $pendingTrade.$SellOffer,
+              $BuyOffer = if $pendingTrade.$BuyOffer? then $pendingTrade.$BuyOffer else null,
+              $SellOffer = if $pendingTrade.$SellOffer? then $pendingTrade.$SellOffer else null,
               $Amount = $logAmount,
               $Profit = if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0,
               $BuyPrice = $buyPriceForSignal,
               $SellPrice = $sellPriceForSignal,
-              $IsSellOnly = $isSellOnlyTradeForPending
+              $IsSellOnly = $isSellOnlyTradeForPending,
+              $SearchPipeline = $logSearchPipeline
             ]"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Logbook entry queued (sell-only: ' + $isSellOnlyTradeForPending + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Logbook entry queued (sell-only: ' + $isSellOnlyTradeForPending + ', pipeline: ' + $logSearchPipeline + ')'" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
@@ -5239,6 +5295,7 @@
           <set_value name="$tradesRejectedOfferInvalidSafe" exact="if $tradesRejectedOfferInvalid? then $tradesRejectedOfferInvalid else 0"/>
           <set_value name="$tradesRejectedDistanceSafe" exact="if $tradesRejectedDistance? then $tradesRejectedDistance else 0"/>
           <set_value name="$tradesRejectedCargoSafe" exact="if $tradesRejectedCargo? then $tradesRejectedCargo else 0"/>
+          <set_value name="$tradesRejectedRestrictionSafe" exact="if $tradesRejectedRestriction? then $tradesRejectedRestriction else 0"/>
           <set_value name="$tradesBlacklistedSafe" exact="if $tradesBlacklisted? then $tradesBlacklisted else 0"/>
           <!-- Use safe access for $tradeList.count -->
           <set_value name="$tradeListCountSafe" exact="if $tradeList != null then $tradeList.count else 0"/>
@@ -5255,6 +5312,7 @@
               '\n  Offer invalid: ' + $tradesRejectedOfferInvalidSafe +
               '\n  Distance unreachable: ' + $tradesRejectedDistanceSafe +
               '\n  Cargo insufficient: ' + $tradesRejectedCargoSafe +
+              '\n  Restriction blocked: ' + $tradesRejectedRestrictionSafe +
               '\n  Blacklisted: ' + $tradesBlacklistedSafe +
               '\n  Total rejected: ' + $tradeListCountSafe +
               (if $searchMethod == 'cache' then '\n  ⚠ CACHE STALE: All cached trades invalid - likely offers changed or stations became unreachable' else '') +
@@ -5337,7 +5395,7 @@
           <do_if value="$searchMethod == 'cache'">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': All cached trades rejected - triggering LIVE market search instead of retrying cache' +
-                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Blacklist=' + $tradesBlacklistedSafe +
+                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', Blacklist=' + $tradesBlacklistedSafe +
                 '\n  ⚠ CACHE STALE: All ' + $tradeListCountSafe + ' cached trades invalid - likely offers changed, stations became unreachable, or docking permissions revoked'" chance="100"/>
             </do_if>
             <!-- Send signal to force live search (bypass cache) -->
@@ -5426,6 +5484,17 @@
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-AI] (' + this.ship.idcode + ') Cleared [FALLBACK] flag - trade failed'" chance="100"/>
                 </do_if>
+                <!-- Trigger ship rename to remove [FALLBACK] state -->
+                <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+                  <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                    $ship=this.ship,
+                    $pilot=this.ship.pilot,
+                    $xp=global.$GT_Pilots.{this.ship.pilot}.$XP,
+                    $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
+                    $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+                    $nameType='trader'
+                  ]"/>
+                </do_if>
               </do_if>
               
               <!-- Note: Isolated flag state will be verified by batch processor on next state check -->
@@ -5481,6 +5550,25 @@
       
       <!-- NOTE: Global money cap (global.$GT_MoneyCapActive) auto-clears in the early money gate
            when player.money rises above global.$GT_MoneyCapMoney. No per-ship clearing needed. -->
+      
+      <!-- Clear fallback flag after trade completes (fallback is single-use per search cycle) -->
+      <do_if value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{this.ship}?">
+        <remove_value name="global.$GT_FallbackTradeActive.{this.ship}"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] (' + this.ship.idcode + ') Cleared [FALLBACK] flag - trade completed'" chance="100"/>
+        </do_if>
+        <!-- Trigger ship rename to remove [FALLBACK] state -->
+        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $ship=this.ship,
+            $pilot=this.ship.pilot,
+            $xp=global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
+            $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+            $nameType='trader'
+          ]"/>
+        </do_if>
+      </do_if>
       
       <!-- CRITICAL: Clear trades awaiting validation after trade execution completes -->
       <!-- This ensures ships always check cache first on next search, not stale pending trades -->
