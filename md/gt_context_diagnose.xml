@@ -342,6 +342,62 @@
         </run_actions>
         <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Blacklist Group', $Status = 'INFO', $Detail = '' + $diagBlacklistGroup]"/>
 
+        <!-- Route cache (stored jump path sectors for reroute diagnostics) -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Route Cache ---', $Status = 'INFO', $Detail = '']"/>
+        <set_value name="$globalBlacklistEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Global Blacklist Epoch', $Status = 'INFO', $Detail = '' + $globalBlacklistEpoch]"/>
+        <set_value name="$routeCacheExists" exact="false"/>
+        <set_value name="$routeCache" exact="null"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$RoutePathCache?">
+          <set_value name="$routeCacheExists" exact="true"/>
+          <set_value name="$routeCache" exact="global.$GT_Ships.{$ship}.$RoutePathCache"/>
+        </do_if>
+        <do_if value="$routeCacheExists and $routeCache?">
+          <set_value name="$cacheEpoch" exact="if $routeCache.$BlacklistEpoch? then $routeCache.$BlacklistEpoch else 0"/>
+          <set_value name="$cacheGroup" exact="if $routeCache.$BlacklistGroup? then '' + $routeCache.$BlacklistGroup else 'N/A'"/>
+          <set_value name="$cacheDestName" exact="'Unknown'"/>
+          <do_if value="$routeCache.$DestinationSector? and @$routeCache.$DestinationSector.knownname != null">
+            <set_value name="$cacheDestName" exact="@$routeCache.$DestinationSector.knownname"/>
+          </do_if>
+          <set_value name="$remainingCount" exact="0"/>
+          <do_if value="$routeCache.$RemainingSectors?">
+            <set_value name="$remainingCount" exact="$routeCache.$RemainingSectors.count"/>
+          </do_if>
+
+          <set_value name="$routeSectorChain" exact="''"/>
+          <do_if value="$remainingCount gt 0">
+            <set_value name="$routeLimit" exact="[$remainingCount, 20].min"/>
+            <do_all exact="$routeLimit" counter="$rci">
+              <set_value name="$rcSector" exact="$routeCache.$RemainingSectors.{$rci}"/>
+              <set_value name="$rcSectorName" exact="'Unknown'"/>
+              <do_if value="$rcSector? and @$rcSector.knownname != null">
+                <set_value name="$rcSectorName" exact="@$rcSector.knownname"/>
+              </do_if>
+              <do_if value="$routeSectorChain == ''">
+                <set_value name="$routeSectorChain" exact="$rcSectorName"/>
+              </do_if>
+              <do_else>
+                <set_value name="$routeSectorChain" exact="$routeSectorChain + ' -> ' + $rcSectorName"/>
+              </do_else>
+            </do_all>
+            <do_if value="$remainingCount gt 20">
+              <set_value name="$routeSectorChain" exact="$routeSectorChain + ' -> ... (+' + ($remainingCount - 20) + ')'"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$routeSectorChain" exact="'(empty)'"/>
+          </do_else>
+
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Epoch (Ship)', $Status = if $cacheEpoch == $globalBlacklistEpoch then 'PASS' else 'WARN', $Detail = '' + $cacheEpoch + ' (global: ' + $globalBlacklistEpoch + ')']"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Blacklist Group', $Status = 'INFO', $Detail = $cacheGroup]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Destination', $Status = 'INFO', $Detail = $cacheDestName]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Remaining Sectors', $Status = if $remainingCount gt 0 then 'INFO' else 'WARN', $Detail = '' + $remainingCount]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cached Jump Path', $Status = 'INFO', $Detail = $routeSectorChain]"/>
+        </do_if>
+        <do_else>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Route Cache', $Status = 'WARN', $Detail = 'No stored jump path cache for this ship']"/>
+        </do_else>
+
         <!-- Check current sector blacklist status -->
         <do_if value="$ship.sector? and $diagBlacklistGroup?">
           <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$currentSectorBL">
@@ -536,6 +592,21 @@
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Buy Distance', $Status = 'INFO', $Detail = '' + $maxBuy + ' jumps (order: ' + $rawMaxBuy + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Sell Distance', $Status = 'INFO', $Detail = '' + $maxSell + ' jumps (order: ' + $rawMaxSell + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Effective Max Distance', $Status = if $maxDistance gt 0 then 'PASS' else 'FAIL', $Detail = '' + $maxDistance + ' jumps (max of buy/sell)']"/>
+
+        <!-- Minimum cargo utilization (hard filter) -->
+        <set_value name="$rawCargoTarget" exact="90"/>
+        <do_if value="$gtOrder? and $gtOrder.$cargotarget?">
+          <set_value name="$rawCargoTarget" exact="$gtOrder.$cargotarget"/>
+        </do_if>
+        <set_value name="$effectiveCargoTarget" exact="[10,[$rawCargoTarget,100].min].max"/>
+        <set_value name="$cargoFilterMode" exact="'ACTIVE (live/cache/fallback)'"/>
+        <set_value name="$cargoFilterStatus" exact="'PASS'"/>
+        <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+          <set_value name="$cargoFilterMode" exact="'DISABLED (isolated mode)'"/>
+          <set_value name="$cargoFilterStatus" exact="'WARN'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Min Cargo Utilization', $Status = 'INFO', $Detail = '' + $effectiveCargoTarget + '% (order: ' + $rawCargoTarget + ')']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Cargo Util Filter Mode', $Status = $cargoFilterStatus, $Detail = $cargoFilterMode]"/>
 
         <!-- Allow illegal (from order params, with explicit true/false) -->
         <set_value name="$allowIllegal" exact="false"/>
@@ -1625,7 +1696,16 @@
           <append_to_list name="$suggestions" exact="'Increase max distance to expand search radius'"/>
           <append_to_list name="$suggestions" exact="'Check if sectors have operational stations'"/>
         </do_elseif>
-        <!-- Priority 5: All pairs fail -->
+        <!-- Priority 5: Offers exist, but no valid pair candidates were formed -->
+        <do_elseif value="$pairCount == 0 and ($allSellOffers.count gt 0 and $allBuyOffers.count gt 0)">
+          <set_value name="$verdict" exact="'NO MATCHING PAIRS: Offers exist on both sides, but no tradable sell-buy pairs could be formed'"/>
+          <do_if value="$rejectSameStation gt 0">
+            <append_to_list name="$suggestions" exact="'Most matches were same-station loops (' + $rejectSameStation + ' skipped) — this is intentionally ignored.'"/>
+          </do_if>
+          <append_to_list name="$suggestions" exact="'Check ware overlap between sell and buy offers in Pair Details.'"/>
+          <append_to_list name="$suggestions" exact="'Increase max distance or review blacklist constraints to expose more counterpart stations.'"/>
+        </do_elseif>
+        <!-- Priority 6: All evaluated pairs fail -->
         <do_elseif value="$passCount == 0 and $pairCount gt 0">
           <!-- Find dominant rejection reason -->
           <set_value name="$maxReject" exact="0"/>
@@ -1642,9 +1722,25 @@
             <set_value name="$maxReject" exact="$rejectBelowROI"/>
             <set_value name="$maxRejectName" exact="'below_roi_threshold (threshold: ' + $effectiveROI + '%)'"/>
           </do_if>
+          <do_if value="$rejectNotOperational gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectNotOperational"/>
+            <set_value name="$maxRejectName" exact="'station_not_operational'"/>
+          </do_if>
           <do_if value="$rejectDocking gt $maxReject">
             <set_value name="$maxReject" exact="$rejectDocking"/>
             <set_value name="$maxRejectName" exact="'docking_denied'"/>
+          </do_if>
+          <do_if value="$rejectIllegal gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectIllegal"/>
+            <set_value name="$maxRejectName" exact="'ware_illegal (AllowIllegal=false)'"/>
+          </do_if>
+          <do_if value="$rejectCargoType gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectCargoType"/>
+            <set_value name="$maxRejectName" exact="'cargo_incompatible'"/>
+          </do_if>
+          <do_if value="$rejectZeroAmount gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectZeroAmount"/>
+            <set_value name="$maxRejectName" exact="'zero_amount (cargo/money/offer limits)'"/>
           </do_if>
           <do_if value="$rejectPathBlocked gt $maxReject">
             <set_value name="$maxReject" exact="$rejectPathBlocked"/>
@@ -1658,6 +1754,9 @@
             <set_value name="$maxReject" exact="$rejectDistance"/>
             <set_value name="$maxRejectName" exact="'distance_exceeded (maxDistance=' + $maxDistance + ')'"/>
           </do_if>
+          <do_if value="$maxReject == 0">
+            <set_value name="$maxRejectName" exact="'mixed_or_unclassified_rejections (see Pair Details)'"/>
+          </do_if>
 
           <set_value name="$verdict" exact="'ALL REJECTED: 0/' + $pairCount + ' pairs passed. Dominant reason: ' + $maxRejectName + ' (' + $maxReject + ' pairs)'"/>
 
@@ -1670,11 +1769,23 @@
           <do_if value="$rejectDocking gt 0">
             <append_to_list name="$suggestions" exact="'Check dock size compatibility — ship is ' + $dockSize + '-class'"/>
           </do_if>
+          <do_if value="$rejectNotOperational gt 0">
+            <append_to_list name="$suggestions" exact="'Some stations are not operational. Wait for production/storage recovery or pick other sectors.'"/>
+          </do_if>
+          <do_if value="$rejectIllegal gt 0">
+            <append_to_list name="$suggestions" exact="'Enable AllowIllegal if you want to include illegal wares.'"/>
+          </do_if>
+          <do_if value="$rejectCargoType gt 0">
+            <append_to_list name="$suggestions" exact="'Ship cargo type cannot carry some wares. Limit ware basket or use suitable ship class.'"/>
+          </do_if>
+          <do_if value="$rejectZeroAmount gt 0">
+            <append_to_list name="$suggestions" exact="'Offer amount/cargo free/money limits reduce tradable amount to zero for many pairs.'"/>
+          </do_if>
           <do_if value="$rejectPathBlocked gt 0">
             <append_to_list name="$suggestions" exact="'Review blacklist settings — some routes may be blocked'"/>
           </do_if>
         </do_elseif>
-        <!-- Priority 6: Trades found -->
+        <!-- Priority 7: Trades found -->
         <do_elseif value="$passCount gt 0">
           <set_value name="$verdict" exact="'TRADES AVAILABLE: ' + $passCount + ' viable pairs found. Best: ' + $bestDiagPairDesc"/>
           <append_to_list name="$suggestions" exact="'Ship should be able to find trades. If it is not trading, check scheduler state and queue.'"/>

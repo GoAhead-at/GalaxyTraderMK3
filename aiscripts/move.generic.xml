@@ -69,53 +69,225 @@
                   <set_value name="$threatAvoidanceEnabled" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled"/>
                   <set_value name="$useDynamicBlacklist" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
                 </do_if>
-                
+
+                <!-- Determine ship blacklist group -->
+                <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+                <do_if value="this.ship.isclass.[class.ship_m, class.ship_l, class.ship_xl]">
+                  <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+                </do_if>
+
                 <!-- Calculate normal distance (shortest path) -->
                 <set_value name="$normalDistance" exact="this.ship.gatedistance.{$destinationSector}"/>
-                
+
                 <!-- Calculate blacklist-aware distance (avoiding threats) - only if threat avoidance is enabled -->
                 <set_value name="$blacklistDistance" exact="-1"/>
                 <do_if value="$threatAvoidanceEnabled and $useDynamicBlacklist">
-                  <!-- Determine ship's blacklistgroup -->
-                  <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
-                  <do_if value="this.ship.isclass.[class.ship_m, class.ship_l, class.ship_xl]">
-                    <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
-                  </do_if>
                   <set_value name="$blacklistDistance" exact="this.ship.gatedistance.{$destinationSector}.{$blacklistgroup}.{this.ship}"/>
                 </do_if>
 
-                <!-- Debug: log EVERY validation check that is actually performed (distance calculations done) -->
-                <!-- This helps measure how often these checks fire and correlate with CPU spikes -->
+                <!-- Epoch-based route cache + topology compare (catches equal-jump reroutes) -->
+                <set_value name="$currentBlacklistEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+                <set_value name="$epochChanged" exact="false"/>
+                <set_value name="$haveCachedPath" exact="false"/>
+                <set_value name="$routeChangedByEpoch" exact="false"/>
+                <set_value name="$cachedRemainingSectors" exact="[]"/>
+                <set_value name="$needsPathRebuild" exact="false"/>
+
+                <do_if value="global.$GT_Ships.{this.ship}.$RoutePathCache?">
+                  <set_value name="$routeCache" exact="global.$GT_Ships.{this.ship}.$RoutePathCache"/>
+                  <do_if value="$routeCache.$DestinationSector? and $routeCache.$DestinationSector == $destinationSector and $routeCache.$BlacklistGroup? and $routeCache.$BlacklistGroup == $blacklistgroup and $routeCache.$RemainingSectors?">
+                    <set_value name="$haveCachedPath" exact="true"/>
+                    <set_value name="$cachedRemainingSectors" exact="$routeCache.$RemainingSectors"/>
+                    <set_value name="$cachedEpoch" exact="if $routeCache.$BlacklistEpoch? then $routeCache.$BlacklistEpoch else 0"/>
+                    <set_value name="$epochChanged" exact="$cachedEpoch != $currentBlacklistEpoch"/>
+
+                    <!-- Exclude already passed sectors from cached path by trimming to current sector -->
+                    <set_value name="$foundCurrentIndex" exact="0"/>
+                    <do_all exact="$cachedRemainingSectors.count" counter="$idx">
+                      <do_if value="$foundCurrentIndex == 0 and $cachedRemainingSectors.{$idx} == $newSector">
+                        <set_value name="$foundCurrentIndex" exact="$idx"/>
+                      </do_if>
+                    </do_all>
+                    <do_if value="$foundCurrentIndex gt 1">
+                      <set_value name="$trimmedCachedSectors" exact="[]"/>
+                      <do_all exact="$cachedRemainingSectors.count - $foundCurrentIndex + 1" counter="$trimIdx">
+                        <set_value name="$sourceIdx" exact="$foundCurrentIndex + $trimIdx - 1"/>
+                        <append_to_list name="$trimmedCachedSectors" exact="$cachedRemainingSectors.{$sourceIdx}"/>
+                      </do_all>
+                      <set_value name="$cachedRemainingSectors" exact="$trimmedCachedSectors"/>
+                    </do_if>
+                    <do_elseif value="$foundCurrentIndex == 0 and $cachedRemainingSectors.count gt 0">
+                      <!-- Cached route no longer anchored at current sector -->
+                      <set_value name="$haveCachedPath" exact="false"/>
+                    </do_elseif>
+                  </do_if>
+                </do_if>
+
+                <do_if value="not $haveCachedPath or $epochChanged">
+                  <set_value name="$needsPathRebuild" exact="true"/>
+                </do_if>
+
+                <set_value name="$recalculatedRemainingSectors" exact="[]"/>
+                <do_if value="$needsPathRebuild and $threatAvoidanceEnabled and $useDynamicBlacklist">
+                  <set_value name="$jumppath" exact="[]"/>
+                  <get_jump_path component="$jumppath" multiple="true" uselocalhighways="true" useblacklist="$blacklistgroup" refobject="this.assignedcontrolled" useknownpath="this.isplayerowned">
+                    <start object="this.ship"/>
+                    <end object="$destinationSector"/>
+                  </get_jump_path>
+                  <do_if value="$jumppath.count lt 2">
+                    <get_jump_path component="$jumppath" multiple="true" uselocalhighways="false" useblacklist="$blacklistgroup" refobject="this.assignedcontrolled" useknownpath="this.isplayerowned">
+                      <start object="this.ship"/>
+                      <end object="$destinationSector"/>
+                    </get_jump_path>
+                  </do_if>
+
+                  <set_value name="$lastRouteSector" exact="null"/>
+                  <append_to_list name="$recalculatedRemainingSectors" exact="$newSector"/>
+                  <set_value name="$lastRouteSector" exact="$newSector"/>
+                  <do_all exact="$jumppath.count" counter="$jpidx">
+                    <set_value name="$pathComponent" exact="$jumppath.{$jpidx}"/>
+                    <do_if value="$pathComponent? and @$pathComponent.sector != null">
+                      <set_value name="$pathSector" exact="@$pathComponent.sector"/>
+                      <do_if value="$lastRouteSector == null or $pathSector != $lastRouteSector">
+                        <append_to_list name="$recalculatedRemainingSectors" exact="$pathSector"/>
+                        <set_value name="$lastRouteSector" exact="$pathSector"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                  <do_if value="$lastRouteSector != $destinationSector">
+                    <append_to_list name="$recalculatedRemainingSectors" exact="$destinationSector"/>
+                  </do_if>
+
+                  <do_if value="$epochChanged and $haveCachedPath">
+                    <set_value name="$pathsMatch" exact="true"/>
+                    <do_if value="$cachedRemainingSectors.count != $recalculatedRemainingSectors.count">
+                      <set_value name="$pathsMatch" exact="false"/>
+                    </do_if>
+                    <do_else>
+                      <do_all exact="$cachedRemainingSectors.count" counter="$cmpidx">
+                        <do_if value="$cachedRemainingSectors.{$cmpidx} != $recalculatedRemainingSectors.{$cmpidx}">
+                          <set_value name="$pathsMatch" exact="false"/>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                    </do_else>
+                    <do_if value="not $pathsMatch">
+                      <set_value name="$routeChangedByEpoch" exact="true"/>
+                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <set_value name="$cachedPathText" exact="''"/>
+                        <set_value name="$newPathText" exact="''"/>
+                        <set_value name="$cachedLimit" exact="[$cachedRemainingSectors.count, 20].min"/>
+                        <set_value name="$newLimit" exact="[$recalculatedRemainingSectors.count, 20].min"/>
+
+                        <do_all exact="$cachedLimit" counter="$cti">
+                          <set_value name="$csec" exact="$cachedRemainingSectors.{$cti}"/>
+                          <set_value name="$cname" exact="'Unknown'"/>
+                          <do_if value="$csec? and @$csec.knownname != null">
+                            <set_value name="$cname" exact="@$csec.knownname"/>
+                          </do_if>
+                          <do_if value="$cachedPathText == ''">
+                            <set_value name="$cachedPathText" exact="$cname"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$cachedPathText" exact="$cachedPathText + ' -> ' + $cname"/>
+                          </do_else>
+                        </do_all>
+                        <do_if value="$cachedRemainingSectors.count gt 20">
+                          <set_value name="$cachedPathText" exact="$cachedPathText + ' -> ... (+' + ($cachedRemainingSectors.count - 20) + ')'"/>
+                        </do_if>
+                        <do_if value="$cachedPathText == ''">
+                          <set_value name="$cachedPathText" exact="'(empty)'"/>
+                        </do_if>
+
+                        <do_all exact="$newLimit" counter="$nti">
+                          <set_value name="$nsec" exact="$recalculatedRemainingSectors.{$nti}"/>
+                          <set_value name="$nname" exact="'Unknown'"/>
+                          <do_if value="$nsec? and @$nsec.knownname != null">
+                            <set_value name="$nname" exact="@$nsec.knownname"/>
+                          </do_if>
+                          <do_if value="$newPathText == ''">
+                            <set_value name="$newPathText" exact="$nname"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$newPathText" exact="$newPathText + ' -> ' + $nname"/>
+                          </do_else>
+                        </do_all>
+                        <do_if value="$recalculatedRemainingSectors.count gt 20">
+                          <set_value name="$newPathText" exact="$newPathText + ' -> ... (+' + ($recalculatedRemainingSectors.count - 20) + ')'"/>
+                        </do_if>
+                        <do_if value="$newPathText == ''">
+                          <set_value name="$newPathText" exact="'(empty)'"/>
+                        </do_if>
+
+                        <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': EPOCH ROUTE MISMATCH:' +
+                          '\n  Epoch old/new: ' + $cachedEpoch + ' -> ' + $currentBlacklistEpoch +
+                          '\n  Cached sectors (' + $cachedRemainingSectors.count + '): ' + $cachedPathText +
+                          '\n  New sectors (' + $recalculatedRemainingSectors.count + '): ' + $newPathText" chance="100"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+
+                  <set_value name="global.$GT_Ships.{this.ship}.$RoutePathCache" exact="table[
+                    $DestinationSector = $destinationSector,
+                    $BlacklistGroup = $blacklistgroup,
+                    $BlacklistEpoch = $currentBlacklistEpoch,
+                    $RemainingSectors = $recalculatedRemainingSectors
+                  ]"/>
+                </do_if>
+                <do_elseif value="$haveCachedPath">
+                  <set_value name="global.$GT_Ships.{this.ship}.$RoutePathCache.$RemainingSectors" exact="$cachedRemainingSectors"/>
+                </do_elseif>
+
+                <!-- Debug: log performed validation checks -->
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <set_value name="$blacklistGroupDisplay" exact="if $threatAvoidanceEnabled and $useDynamicBlacklist then $blacklistgroup else 'N/A (threat avoidance disabled)'"/>
-                  <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE CHECK: dest=' + $destinationDisplayName + ' (sector ' + @$destinationSector.knownname + '), normal=' + $normalDistance + ', blacklist=' + $blacklistDistance + ', group=' + $blacklistGroupDisplay + ', threatAvoidance=' + $threatAvoidanceEnabled + ', useBlacklist=' + $useDynamicBlacklist" chance="100"/>
+                  <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE CHECK: dest=' + $destinationDisplayName + ' (sector ' + @$destinationSector.knownname + '), normal=' + $normalDistance + ', blacklist=' + $blacklistDistance + ', group=' + $blacklistGroupDisplay + ', threatAvoidance=' + $threatAvoidanceEnabled + ', useBlacklist=' + $useDynamicBlacklist + ', epoch=' + $currentBlacklistEpoch + ', epochChanged=' + $epochChanged + ', routeChangedByEpoch=' + $routeChangedByEpoch" chance="100"/>
                 </do_if>
-                
-                <!-- Check if reroute needed: unreachable OR path changed (longer due to blacklist) -->
-                <!-- Case 1: Normal path doesn't exist (disconnected sectors, destroyed gates) -->
+
+                <!-- Unified reroute decision -->
+                <set_value name="$shouldReroute" exact="false"/>
+                <set_value name="$normalDistanceForLog" exact="$normalDistance"/>
+                <set_value name="$blacklistDistanceText" exact="if $blacklistDistance lt 0 then 'UNREACHABLE' else $blacklistDistance + ' jumps'"/>
+                <set_value name="$statusText" exact="'Path unchanged'"/>
+
+                <!-- Case 1: Normal path doesn't exist -->
                 <do_if value="$normalDistance lt 0">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$normalDistanceForLog" exact="-1"/>
+                  <set_value name="$blacklistDistanceText" exact="'UNREACHABLE'"/>
+                  <set_value name="$statusText" exact="'No path available'"/>
+                </do_if>
+                <!-- Case 2: blacklist-aware path blocked/longer -->
+                <do_elseif value="$threatAvoidanceEnabled and $useDynamicBlacklist and ($blacklistDistance lt 0 or $blacklistDistance gt $normalDistance)">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$statusText" exact="if $blacklistDistance lt 0 then 'No safe path available' else 'Path requires detour'"/>
+                </do_elseif>
+                <!-- Case 3: epoch changed and route topology changed -->
+                <do_elseif value="$routeChangedByEpoch">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$statusText" exact="'Route topology changed after blacklist update'"/>
+                </do_elseif>
+
+                <do_if value="$shouldReroute">
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE REROUTE: Destination ' + @$currentDestination.knownname + ' unreachable (normal path: -1) - aborting movement'" chance="100"/>
+                    <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE REROUTE: Destination ' + @$currentDestination.knownname + ' changed (normal: ' + $normalDistance + ' jumps, blacklist-aware: ' + $blacklistDistance + ' jumps, epochRouteChanged: ' + $routeChangedByEpoch + ') - aborting movement'" chance="100"/>
                   </do_if>
-                  
+
                   <!-- Set reroute flag for ship name -->
                   <set_value name="global.$GT_Ships.{this.ship}.$Rerouting" exact="true"/>
-                  
+
                   <!-- Trigger ship rename to show [REROUTE] state -->
                   <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-                    $ship=this.ship, 
-                    $pilot=this.ship.pilot, 
-                    $xp=global.$GT_Pilots.{this.ship.pilot}.$XP, 
+                    $ship=this.ship,
+                    $pilot=this.ship.pilot,
+                    $xp=global.$GT_Pilots.{this.ship.pilot}.$XP,
                     $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
                     $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
                     $nameType='trader'
                   ]"/>
-                  
+
                   <!-- Player logbook notification about route change -->
-                  <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                  <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, -1, 'UNREACHABLE', 'No path available', this.ship.knownname]"/>
-                  
-                  <!-- Send logbook message via signal (handled by MD cue) -->
+                  <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, $normalDistanceForLog, $blacklistDistanceText, $statusText, this.ship.knownname]"/>
                   <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
                     $Message = $logbookMessage,
                     $Category = 'alerts',
@@ -124,7 +296,7 @@
                     $Interaction = 'showonmap',
                     $Highlighted = false
                   ]"/>
-                  
+
                   <!-- Signal dock failure to parent order (TradePerform, Repair, Supply, etc.) -->
                   <do_if value="not global.$GT_DockFailures?">
                     <set_value name="global.$GT_DockFailures" exact="table[]"/>
@@ -135,67 +307,11 @@
                     $Destination = $destination,
                     $Timestamp = player.age
                   ]"/>
-                  
+
                   <!-- Abort move.generic - this will return control to parent order -->
                   <set_value name="$returnvalue" exact="false"/>
                   <abort_called_scripts resume="finish"/>
                 </do_if>
-                <!-- Case 2: Normal path exists, but blacklist-aware path is blocked or longer (only if threat avoidance enabled) -->
-                <do_elseif value="$normalDistance ge 0">
-                  <do_if value="$threatAvoidanceEnabled and $useDynamicBlacklist and ($blacklistDistance lt 0 or $blacklistDistance gt $normalDistance)">
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE REROUTE: Destination ' + @$currentDestination.knownname + ' path changed (normal: ' + $normalDistance + ' jumps, blacklist-aware: ' + $blacklistDistance + ' jumps) - aborting movement'" chance="100"/>
-                    </do_if>
-                    
-                    <!-- Set reroute flag for ship name -->
-                    <set_value name="global.$GT_Ships.{this.ship}.$Rerouting" exact="true"/>
-                    
-                    <!-- Trigger ship rename to show [REROUTE] state -->
-                    <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-                      $ship=this.ship, 
-                      $pilot=this.ship.pilot, 
-                      $xp=global.$GT_Pilots.{this.ship.pilot}.$XP, 
-                      $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
-                      $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
-                      $nameType='trader'
-                    ]"/>
-                    
-                    <!-- Player logbook notification about route change -->
-                    <!-- Format blacklist distance for display -->
-                    <set_value name="$blacklistDistanceText" exact="if $blacklistDistance lt 0 then 'UNREACHABLE' else $blacklistDistance + ' jumps'"/>
-                    
-                    <!-- Format status text -->
-                    <set_value name="$statusText" exact="if $blacklistDistance lt 0 then 'No safe path available' else 'Path requires detour'"/>
-                    
-                    <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-                    <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, $normalDistance, $blacklistDistanceText, $statusText, this.ship.knownname]"/>
-                    
-                    <!-- Send logbook message via signal (handled by MD cue) -->
-                    <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
-                      $Message = $logbookMessage,
-                      $Category = 'alerts',
-                      $Title = 'Route Path Changed: ' + this.ship.knownname,
-                      $Object = this.ship,
-                      $Interaction = 'showonmap',
-                      $Highlighted = false
-                    ]"/>
-                    
-                    <!-- Signal dock failure to parent order (TradePerform, Repair, Supply, etc.) -->
-                    <do_if value="not global.$GT_DockFailures?">
-                      <set_value name="global.$GT_DockFailures" exact="table[]"/>
-                    </do_if>
-                    <set_value name="global.$GT_DockFailures.{this.ship}" exact="table[
-                      $Reason = 'ROUTE_PATH_CHANGED',
-                      $FailureText = {1045, 124},
-                      $Destination = $destination,
-                      $Timestamp = player.age
-                    ]"/>
-                    
-                    <!-- Abort move.generic - this will return control to parent order -->
-                    <set_value name="$returnvalue" exact="false"/>
-                    <abort_called_scripts resume="finish"/>
-                  </do_if>
-                </do_elseif>
               </do_if>
             </do_if>
           </do_if>
