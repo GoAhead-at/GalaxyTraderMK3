@@ -4113,10 +4113,15 @@
           <param name="skill_level" value="$skillInfo.$Level"/>
         </run_actions>
         
-        <!-- Check if pilot is XP blocked -->
+        <!-- Check if pilot is training-gated -->
         <set_value name="$pilotXPBlocked" exact="false"/>
-        <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$XPBlocked?">
-          <set_value name="$pilotXPBlocked" exact="true"/>
+        <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}?">
+          <run_actions ref="md.GT_Libraries_General.GT_GetTrainingGate" result="$trainingGate">
+            <param name="pilot" value="$ship.pilot"/>
+            <param name="ship" value="$ship"/>
+            <param name="respect_hard_force" value="true"/>
+          </run_actions>
+          <set_value name="$pilotXPBlocked" exact="$trainingGate.$MustTrainNow"/>
         </do_if>
         
         <!-- Validate and correct MaxBuy distance -->
@@ -4511,6 +4516,117 @@
         
         <!-- Return formatted string -->
         <return value="$formatted"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
+    <!-- TRAINING GATE UTILITIES -->
+    <!-- ========================================= -->
+    
+    <!-- Unified training/XP gate decision -->
+    <library name="GT_GetTrainingGate" purpose="run_actions">
+      <params>
+        <param name="pilot" comment="Pilot to evaluate"/>
+        <param name="ship" default="null" comment="Optional ship (for diagnostics only)"/>
+        <param name="respect_hard_force" default="true" comment="Whether BlockedLevel enforces mandatory training"/>
+      </params>
+      <actions>
+        <set_value name="$gate" exact="table[
+          $MustTrainNow = false,
+          $CanTrade = true,
+          $XPGainBlocked = false,
+          $XPBlocked = false,
+          $BlockedLevel = 0,
+          $HardForce = true,
+          $Reason = 'none'
+        ]"/>
+        
+        <!-- Default hard-force behavior is enabled unless explicitly disabled -->
+        <set_value name="$hardForceTraining" exact="true"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$HardForceTraining?">
+          <set_value name="$hardForceTraining" exact="global.$GT_GlobalSettings.$XP.$HardForceTraining"/>
+        </do_if>
+        <do_if value="not $respect_hard_force">
+          <set_value name="$hardForceTraining" exact="false"/>
+        </do_if>
+        <set_value name="$gate.$HardForce" exact="$hardForceTraining"/>
+        
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <set_value name="$xpBlockedFlag" exact="global.$GT_Pilots.{$pilot}.$XPBlocked?"/>
+          <set_value name="$pausedWithTrainingNeeded" exact="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded?"/>
+          <set_value name="$blockedLevel" exact="0"/>
+          <do_if value="global.$GT_Pilots.{$pilot}.$BlockedLevel?">
+            <set_value name="$blockedLevel" exact="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
+          </do_if>
+          
+          <set_value name="$xpGainBlocked" exact="$xpBlockedFlag or $blockedLevel gt 1"/>
+          <set_value name="$mustTrainNow" exact="$pausedWithTrainingNeeded or $xpBlockedFlag or ($hardForceTraining and $blockedLevel gt 1)"/>
+          
+          <set_value name="$gate.$XPBlocked" exact="$xpBlockedFlag"/>
+          <set_value name="$gate.$BlockedLevel" exact="$blockedLevel"/>
+          <set_value name="$gate.$XPGainBlocked" exact="$xpGainBlocked"/>
+          <set_value name="$gate.$MustTrainNow" exact="$mustTrainNow"/>
+          <set_value name="$gate.$CanTrade" exact="not $mustTrainNow"/>
+          
+          <set_value name="$reason" exact="'none'"/>
+          <do_if value="$pausedWithTrainingNeeded">
+            <set_value name="$reason" exact="'paused_training_needed'"/>
+          </do_if>
+          <do_elseif value="$xpBlockedFlag">
+            <set_value name="$reason" exact="'xp_blocked'"/>
+          </do_elseif>
+          <do_elseif value="$hardForceTraining and $blockedLevel gt 1">
+            <set_value name="$reason" exact="'hard_force_blocked_level'"/>
+          </do_elseif>
+          <do_elseif value="$blockedLevel gt 1">
+            <set_value name="$reason" exact="'xp_blocked_only_blocked_level'"/>
+          </do_elseif>
+          <set_value name="$gate.$Reason" exact="$reason"/>
+        </do_if>
+        <do_else>
+          <set_value name="$gate.$Reason" exact="'pilot_missing_or_unregistered'"/>
+        </do_else>
+        
+        <return value="$gate"/>
+      </actions>
+    </library>
+    
+    <!-- Centralized transition to training-blocked state -->
+    <library name="GT_SetTrainingBlocked" purpose="run_actions">
+      <params>
+        <param name="pilot" comment="Pilot to block"/>
+        <param name="level" default="1" comment="Required training level"/>
+        <param name="set_xpblocked" default="true" comment="Set XPBlocked flag"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <set_value name="global.$GT_Pilots.{$pilot}.$BlockedLevel" exact="$level"/>
+          <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'needs_training'"/>
+          <do_if value="$set_xpblocked">
+            <set_value name="global.$GT_Pilots.{$pilot}.$XPBlocked" exact="true"/>
+          </do_if>
+          <return value="true"/>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+    
+    <!-- Centralized transition to unblocked state -->
+    <library name="GT_ClearTrainingBlocked" purpose="run_actions">
+      <params>
+        <param name="pilot" comment="Pilot to unblock"/>
+        <param name="clear_blocked_level" default="true" comment="Clear BlockedLevel too"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <remove_value name="global.$GT_Pilots.{$pilot}.$XPBlocked"/>
+          <do_if value="$clear_blocked_level">
+            <remove_value name="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
+          </do_if>
+          <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'active'"/>
+          <return value="true"/>
+        </do_if>
+        <return value="false"/>
       </actions>
     </library>
     

@@ -174,7 +174,9 @@ local function onReceivePilotData(_, param)
                 shipProfit = tonumber(fields[11]) or 0,   -- Ship's profit (current ship)
                 location = fields[12] or "Unknown",
                 tradeCount = tonumber(fields[13]) or 0,
+                blockedLevel = tonumber(fields[14]) or 0,
             }
+            pilotInfo.trainingBlocked = pilotInfo.blockedLevel > 1
             
             -- Format XP for display
             pilotInfo.xpFormatted = string.format("%s / %s",

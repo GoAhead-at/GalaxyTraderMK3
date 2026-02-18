@@ -821,19 +821,23 @@ function gtMenu.displayPilotControl(frame, instance, yOffset)
         
         -- Training button (only if automatic training is disabled)
         if not settings.autoTraining then
-            local trainingBtn = row[currentCol]:createButton({ 
-                height = gtMenu.rowHeight, 
-                bgColor = Color["button_background_default"] 
-            })
-            trainingBtn:setText(ReadText(77000, 8450), { halign = "center", fontsize = gtMenu.fontSize * 0.8 })
-            row[currentCol].handlers.onClick = function()
-                -- DebugError("[GT Control] Training button clicked for pilot: " .. pilot.pilotName .. " (Ship: " .. pilot.shipId .. ")")
-                if Mods and Mods.GalaxyTrader and Mods.GalaxyTrader.PilotControl and Mods.GalaxyTrader.PilotControl.sendToTraining then
-                    Mods.GalaxyTrader.PilotControl.sendToTraining(pilot.shipId)
-                else
-                    DebugError("[GT Control] ERROR: PilotControl bridge not available!")
+            if pilot.trainingBlocked then
+                local trainingBtn = row[currentCol]:createButton({ 
+                    height = gtMenu.rowHeight, 
+                    bgColor = Color["button_background_default"] 
+                })
+                trainingBtn:setText(ReadText(77000, 8450), { halign = "center", fontsize = gtMenu.fontSize * 0.8 })
+                row[currentCol].handlers.onClick = function()
+                    -- DebugError("[GT Control] Training button clicked for pilot: " .. pilot.pilotName .. " (Ship: " .. pilot.shipId .. ")")
+                    if Mods and Mods.GalaxyTrader and Mods.GalaxyTrader.PilotControl and Mods.GalaxyTrader.PilotControl.sendToTraining then
+                        Mods.GalaxyTrader.PilotControl.sendToTraining(pilot.shipId)
+                    else
+                        DebugError("[GT Control] ERROR: PilotControl bridge not available!")
+                    end
+                    return true
                 end
-                return true
+            else
+                row[currentCol]:createText("-", { halign = "center", cellBGColor = cellBgColor, color = Color["text_inactive"] })
             end
             currentCol = currentCol + 1
         end

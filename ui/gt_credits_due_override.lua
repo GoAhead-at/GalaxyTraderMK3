@@ -114,10 +114,10 @@ local function formatCreditsCompact(creditsAmount)
             intPart = intPart + 1
             fracPart = 0
         end
-        return prefix .. tostring(intPart) .. decimalSep .. tostring(fracPart) .. "M"
+        return prefix .. tostring(intPart) .. decimalSep .. tostring(fracPart) .. "M Cr"
     end
 
-    return prefix .. addThousandsSeparators(absCredits, thousandSep)
+    return prefix .. addThousandsSeparators(absCredits, thousandSep) .. " Cr"
 end
 
 local function splitLines(text)

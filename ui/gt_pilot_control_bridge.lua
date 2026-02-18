@@ -22,10 +22,8 @@ end
 function Mods.GalaxyTrader.PilotControl.sendToTraining(shipId)
     debugLog("Sending ship to training: " .. tostring(shipId))
     
-    -- Send signal to MD
-    -- Format: "action|shipId"
-    local param = "training|" .. tostring(shipId)
-    AddUITriggeredEvent("GT_PilotControl", "Action", param)
+    -- Send training request to MD (shipId in param3)
+    AddUITriggeredEvent("GT_PilotControl", "Training", tostring(shipId))
     
     debugLog("Training signal sent for ship: " .. tostring(shipId))
 end
