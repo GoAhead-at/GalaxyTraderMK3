@@ -176,6 +176,66 @@ function GT_UI.createScrollTable(frame, columnCount, options)
 end
 
 --[[
+    Add a lightweight floating text label to a frame.
+    Designed for non-interactive overlays that must not participate in tab flow.
+
+    Parameters:
+        frame   : parent frame
+        options : {
+            x          = number (required)
+            y          = number (required)
+            width      = number (required)
+            height     = number (required)
+            text       = string OR function() -> string
+            halign     = string (default "left")
+            fontsize   = number (default GT_UI.DEFAULTS.fontSize)
+            color      = color (optional)
+            tabOrder   = number (default 0)
+        }
+
+    Returns: table object
+]]
+function GT_UI.addFloatingLabel(frame, options)
+    options = options or {}
+
+    local rowHeight = options.height or GT_UI.DEFAULTS.rowHeight
+
+    local tbl = frame:addTable(1, {
+        tabOrder         = options.tabOrder or 0,
+        x                = options.x or 0,
+        y                = options.y or 0,
+        width            = options.width or 300,
+        height           = rowHeight,
+        scaling          = false,
+        highlightMode    = "off",
+        reserveScrollBar = false,
+        skipTabChange    = true,
+    })
+
+    tbl:setDefaultCellProperties("text", {
+        minRowHeight = rowHeight,
+        fontsize     = options.fontsize or GT_UI.DEFAULTS.fontSize,
+    })
+
+    local labelText = options.text or ""
+    if type(labelText) == "function" then
+        labelText = labelText() or ""
+    end
+
+    local row = tbl:addRow(nil, { fixed = true })
+    row[1]:createText(labelText, {
+        halign   = options.halign or "left",
+        fontsize = options.fontsize or GT_UI.DEFAULTS.fontSize,
+        color    = options.color,
+        wordwrap = false,
+        x        = 0,
+        y        = 0,
+    })
+
+    return tbl
+end
+
+--[[
     Set column widths using percentages.
     Leave one column UN-set to act as the flexible column (required when
     reserveScrollBar = true, harmless when false).
