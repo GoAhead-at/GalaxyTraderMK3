@@ -675,6 +675,11 @@
           </do_if>
           
           <set_value name="$equipmentStation" exact="null"/>
+          <set_value name="$playerStationJumpPreference" exact="2"/>
+          <set_value name="$nearestPlayerEquipmentStation" exact="null"/>
+          <set_value name="$nearestPlayerEquipmentDistance" exact="999999"/>
+          <set_value name="$nearestForeignEquipmentStation" exact="null"/>
+          <set_value name="$nearestForeignEquipmentDistance" exact="999999"/>
           <set_value name="$stationsChecked" exact="0"/>
           <set_value name="$stationsWithNoStock" exact="0"/>
           <set_value name="$stationsSkippedDistance" exact="0"/>
@@ -705,15 +710,6 @@
             <!-- CRITICAL DEBUG: Log loop iteration start -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Maintenance] DEBUG: Loop iteration ' + $i + ', equipmentStation is null: ' + ($equipmentStation == null)" chance="100"/>
-            </do_if>
-            
-            <!-- PERFORMANCE OPTIMIZATION: Early exit - stop if we already found a valid station -->
-            <!-- CRITICAL: Check != null, not ? (because ? returns true even for null values) -->
-            <do_if value="$equipmentStation != null">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance] DEBUG: Early exit triggered at iteration ' + $i + ' (equipmentStation found)'" chance="100"/>
-              </do_if>
-              <break/>
             </do_if>
             
             <!-- CRITICAL: Extract station BEFORE any checks to ensure loop processes items -->
@@ -908,17 +904,20 @@
                 </do_if>
               </do_else>
               
-              <!-- If this station can supply, use it! -->
+              <!-- If this station can supply, track nearest valid player/foreign candidate -->
               <do_if value="$canSupply">
-              <set_value name="$equipmentStation" exact="$station"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance]    SELECTED THIS STATION  '" chance="100"/>
-                <debug_text text="'[GT-Maintenance]    Station: ' + $equipmentStation.knownname" chance="100"/>
-                <debug_text text="'[GT-Maintenance]    Distance: ' + $distance + ' jumps'" chance="100"/>
-                <debug_text text="'[GT-Maintenance]    Owner: ' + @$equipmentStation.owner.knownname" chance="100"/>
-                <debug_text text="'[GT-Maintenance]    Sector: ' + @$equipmentStation.sector.knownname" chance="100"/>
-              </do_if>
-                <break/> <!-- Found a good station, stop searching -->
+                <do_if value="$station.owner == faction.player">
+                  <do_if value="$distance lt $nearestPlayerEquipmentDistance">
+                    <set_value name="$nearestPlayerEquipmentStation" exact="$station"/>
+                    <set_value name="$nearestPlayerEquipmentDistance" exact="$distance"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <do_if value="$distance lt $nearestForeignEquipmentDistance">
+                    <set_value name="$nearestForeignEquipmentStation" exact="$station"/>
+                    <set_value name="$nearestForeignEquipmentDistance" exact="$distance"/>
+                  </do_if>
+                </do_else>
               </do_if>
               <do_else>
                 <!-- Station cannot supply, try next one -->
@@ -929,6 +928,26 @@
               </do_else>
             </do_if>
           </do_all>
+          </do_if>
+          
+          <!-- Final equipment station selection with player-station preference -->
+          <do_if value="$nearestPlayerEquipmentStation and $nearestForeignEquipmentStation">
+            <do_if value="$nearestPlayerEquipmentDistance le ($nearestForeignEquipmentDistance + $playerStationJumpPreference)">
+              <set_value name="$equipmentStation" exact="$nearestPlayerEquipmentStation"/>
+            </do_if>
+            <do_else>
+              <set_value name="$equipmentStation" exact="$nearestForeignEquipmentStation"/>
+            </do_else>
+          </do_if>
+          <do_elseif value="$nearestPlayerEquipmentStation">
+            <set_value name="$equipmentStation" exact="$nearestPlayerEquipmentStation"/>
+          </do_elseif>
+          <do_elseif value="$nearestForeignEquipmentStation">
+            <set_value name="$equipmentStation" exact="$nearestForeignEquipmentStation"/>
+          </do_elseif>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $equipmentStation">
+            <debug_text text="'[GT-Maintenance] Equipment station preference: selected ' + $equipmentStation.knownname + ' (player dist=' + $nearestPlayerEquipmentDistance + ', foreign dist=' + $nearestForeignEquipmentDistance + ', threshold=' + $playerStationJumpPreference + ')'" chance="100"/>
           </do_if>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1937,17 +1956,15 @@
           <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter: ' + $potentialStations.count + ' passed, ' + $preFilterRejectCapability + ' rejected (capability), ' + $preFilterRejectDocking + ' rejected (docking) — ship class=' + $ship.class + ', docksize=' + $ship.docksize" chance="100"/>
         </do_if>
         
-        <!-- Early exit: Find first valid station (stations already sorted by distance, so first valid = nearest) -->
+        <!-- Prefer player-owned stations if they are within +2 jumps of nearest foreign station -->
+        <set_value name="$playerStationJumpPreference" exact="2"/>
         <set_value name="$nearestStation" exact="null"/>
+        <set_value name="$nearestPlayerStation" exact="null"/>
+        <set_value name="$nearestPlayerDistance" exact="999999"/>
+        <set_value name="$nearestForeignStation" exact="null"/>
+        <set_value name="$nearestForeignDistance" exact="999999"/>
         
         <do_all exact="$potentialStations.count" counter="$i">
-          <!-- PERFORMANCE OPTIMIZATION: Early exit - stop if we already found a valid station -->
-          <!-- CRITICAL: Use != null, NOT $nearestStation? — the ? operator checks if the variable EXISTS (is defined),
-               not if its value is non-null. Since we set_value to null above, ? returns true and breaks immediately. -->
-          <do_if value="$nearestStation != null">
-            <break/>
-          </do_if>
-          
           <set_value name="$station" exact="$potentialStations.{$i}"/>
           <set_value name="$isValid" exact="true"/>
           <set_value name="$rejectReason" exact="''"/>
@@ -2069,13 +2086,42 @@
             </do_else>
           </do_if>
           
-          <!-- EARLY EXIT: First valid station found (already sorted by distance) -->
+          <!-- Track nearest valid player and foreign stations -->
           <do_if value="$isValid">
-            <set_value name="$nearestStation" exact="$station"/>
-            <set_value name="$nearestDistance" exact="$gateDistance"/>
-            <break/>
+            <do_if value="$station.owner == faction.player">
+              <do_if value="$gateDistance lt $nearestPlayerDistance">
+                <set_value name="$nearestPlayerStation" exact="$station"/>
+                <set_value name="$nearestPlayerDistance" exact="$gateDistance"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="$gateDistance lt $nearestForeignDistance">
+                <set_value name="$nearestForeignStation" exact="$station"/>
+                <set_value name="$nearestForeignDistance" exact="$gateDistance"/>
+              </do_if>
+            </do_else>
           </do_if>
         </do_all>
+        
+        <!-- Final station selection with player-station preference -->
+        <do_if value="$nearestPlayerStation and $nearestForeignStation">
+          <do_if value="$nearestPlayerDistance le ($nearestForeignDistance + $playerStationJumpPreference)">
+            <set_value name="$nearestStation" exact="$nearestPlayerStation"/>
+          </do_if>
+          <do_else>
+            <set_value name="$nearestStation" exact="$nearestForeignStation"/>
+          </do_else>
+        </do_if>
+        <do_elseif value="$nearestPlayerStation">
+          <set_value name="$nearestStation" exact="$nearestPlayerStation"/>
+        </do_elseif>
+        <do_elseif value="$nearestForeignStation">
+          <set_value name="$nearestStation" exact="$nearestForeignStation"/>
+        </do_elseif>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $nearestStation">
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Repair station preference: selected ' + $nearestStation.knownname + ' (player dist=' + $nearestPlayerDistance + ', foreign dist=' + $nearestForeignDistance + ', threshold=' + $playerStationJumpPreference + ')'" chance="100"/>
+        </do_if>
         
         <do_if value="not $nearestStation">
           <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') No suitable repair station found after checking all ' + $potentialStations.count + ' discovered stations'" chance="100"/>
