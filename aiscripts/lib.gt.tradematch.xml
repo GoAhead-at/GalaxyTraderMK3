@@ -15,9 +15,64 @@
     <param name="scoreMode" default="'sell'"/>
     <param name="maxTradesPerWare" default="20"/>
     <param name="debugchance" default="0"/>
+    <param name="mode" default="'match'"/>
+    <param name="lineType" default="'source'"/>
+    <param name="sourceStation" default="null"/>
+    <param name="station" default="null"/>
+    <param name="wareText" default="null"/>
+    <param name="isPlayerOwned" default="false"/>
+    <param name="diagMode" default="'unknown'"/>
+    <param name="unavailableFlag" default="'0'"/>
+    <param name="amountText" default="'n/a'"/>
+    <param name="altUnavailableFlag" default="'n/a'"/>
+    <param name="altAmountText" default="'n/a'"/>
+    <param name="cargoCount" default="0"/>
+    <param name="cargoTarget" default="0"/>
+    <param name="cargoRatio" default="0"/>
+    <param name="ignoreTradeRules" default="false"/>
   </params>
   <attention min="unknown">
     <actions>
+      <do_if value="$mode == 'offerdiag_probe'">
+        <set_value name="$diagModeResult" exact="'partner-filtered'"/>
+        <set_value name="$altUnavailableFlagResult" exact="'n/a'"/>
+        <set_value name="$altAmountTextResult" exact="'n/a'"/>
+        <do_if value="$ignoreTradeRules and $station.isplayerowned">
+          <set_value name="$diagModeResult" exact="'ignore-rules(player-owned)'"/>
+          <set_value name="$altUnavailableFlagResult" exact="'1'"/>
+          <set_value name="$altAmountTextResult" exact="'n/a'"/>
+          <do_if value="$lineType == 'dest'">
+            <find_buy_offer tradepartner="$ship" buyer="$station" wares="$wareText" result="$altOfferWithRules"/>
+          </do_if>
+          <do_else>
+            <find_sell_offer tradepartner="$ship" seller="$station" wares="$wareText" result="$altOfferWithRules"/>
+          </do_else>
+          <do_if value="$altOfferWithRules == null or not $altOfferWithRules.available">
+            <set_value name="$altUnavailableFlagResult" exact="'0'"/>
+          </do_if>
+          <do_if value="$altOfferWithRules != null">
+            <set_value name="$altAmountTextResult" exact="$altOfferWithRules.offeramount.{$ship}"/>
+          </do_if>
+        </do_if>
+        <return value="table[
+          $Mode = $diagModeResult,
+          $AltUnavailableFlag = $altUnavailableFlagResult,
+          $AltAmountText = $altAmountTextResult
+        ]"/>
+      </do_if>
+
+      <do_if value="$mode == 'offerdiag'">
+        <set_value name="$ownerText" exact="if $isPlayerOwned then 'player' else 'foreign'"/>
+        <set_value name="$detail" exact="''"/>
+        <do_if value="$lineType == 'dest'">
+          <set_value name="$detail" exact="$sourceStation.idcode + '->' + $station.idcode + ':' + $wareText + ' owner=' + $ownerText + ' mode=' + $diagMode + ' buy(unavailable=' + $unavailableFlag + ',amount=' + $amountText + ') altWithRules(unavailable=' + $altUnavailableFlag + ',amount=' + $altAmountText + ') cargo=' + $cargoCount + '/' + $cargoTarget + ' (' + $cargoRatio + '%)'"/>
+        </do_if>
+        <do_else>
+          <set_value name="$detail" exact="$station.knownname + ' [' + $station.idcode + ']:' + $wareText + ' owner=' + $ownerText + ' mode=' + $diagMode + ' offer(unavailable=' + $unavailableFlag + ',amount=' + $amountText + ') altWithRules(unavailable=' + $altUnavailableFlag + ',amount=' + $altAmountText + ')'"/>
+        </do_else>
+        <return value="$detail"/>
+      </do_if>
+
       <create_list name="$tradeList"/>
       <set_value name="$bestTrade" exact="null"/>
       <set_value name="$bestScore" exact="0"/>
@@ -91,11 +146,31 @@
             </do_if>
           </do_if>
 
+          <!-- Shared amount semantics:
+               Prefer per-ship effective offer amounts (offeramount.{ship}) to match vanilla
+               trade resolution, especially for internal/no-money flows. Fallback to raw amount
+               when offeramount is unavailable. -->
+          <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
+          <do_if value="$sellOfferAmount == null">
+            <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
+          </do_if>
+          <do_if value="$sellOfferAmount == null">
+            <set_value name="$sellOfferAmount" exact="0"/>
+          </do_if>
+
+          <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
+          <do_if value="$buyOfferAmount == null">
+            <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
+          </do_if>
+          <do_if value="$buyOfferAmount == null">
+            <set_value name="$buyOfferAmount" exact="0"/>
+          </do_if>
+
           <!-- UNIVERSAL CACHE BASIS:
                Do not bind cached trade amount/score to the writer ship's free cargo.
                Cache entries should represent station-side opportunity; per-ship execution
                amount is resolved later via clamp_trade_amount in order.trade.galaxytrader. -->
-          <set_value name="$tradeAmount" exact="[$sellOffer.amount, $buyOffer.amount].min"/>
+          <set_value name="$tradeAmount" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
           <do_if value="$tradeAmount le 0">
             <set_value name="$tradesRejected" operation="add"/>
             <continue/>
@@ -126,7 +201,8 @@
           <set_value name="$volumePerUnit" exact="if $ware? and $ware.volume? then $ware.volume else 1"/>
 
           <do_if value="$scoreMode == 'supply'">
-            <set_value name="$priceFactor" exact="[1, $sellOffer.unitprice].max"/>
+            <!-- Use numeric credits (not money type) to avoid float->money conversion warnings in score math. -->
+            <set_value name="$priceFactor" exact="[1, ($sellOffer.unitprice / 1Cr)].max"/>
             <set_value name="$score" exact="$tradeAmount / ($distanceFactor * $priceFactor)"/>
           </do_if>
           <do_else>
@@ -154,6 +230,8 @@
             $SellOffer = $buyOffer,
             $Amount = $tradeAmount,
             $OfferMaxAmount = $tradeAmount,
+            $BuyOfferAmount = $sellOfferAmount,
+            $SellOfferAmount = $buyOfferAmount,
             $Score = $score,
             $BuyStation = $buyStation,
             $SellStation = $sellStation,
