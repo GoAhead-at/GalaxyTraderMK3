@@ -104,6 +104,37 @@
     <handler ref="ResupplyHandler"/>
     <handler ref="TargetInvalidHandler"/>
     <handler ref="TideHandler"/>
+
+    <!-- MK1 threat broadcast hook: level 6+ pilots can warn fleet when attacked -->
+    <handler>
+      <conditions>
+        <event_object_attacked object="this.ship"/>
+      </conditions>
+      <actions>
+        <set_value name="$pilotLevel" exact="1"/>
+        <set_value name="$primaryFaction" exact="null"/>
+        <do_if value="event.param? and event.param.owner?">
+          <set_value name="$primaryFaction" exact="event.param.owner"/>
+        </do_if>
+        <do_if value="this.ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$Level?">
+          <set_value name="$pilotLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+        </do_if>
+        <do_if value="$pilotLevel ge 6">
+          <signal_objects object="player.galaxy" param="'GT_Threat_Warning'" param2="table[
+            $Sector = this.ship.sector,
+            $DetectedBy = this.ship,
+            $HostileCount = 1,
+            $PrimaryFaction = $primaryFaction,
+            $ShipClass_XL = 0,
+            $ShipClass_L = 0,
+            $ShipClass_M = 1,
+            $ShipClass_S = 0,
+            $ThreatScore = 2,
+            $Timestamp = player.age
+          ]"/>
+        </do_if>
+      </actions>
+    </handler>
   </interrupts>
 
   <init>
@@ -156,6 +187,18 @@
     <set_value name="this.$debugchance" exact="$debugchance"/>
     <set_value name="this.$supply" exact="$supply"/>
     <set_value name="this.$minstorage" exact="$minstorage"/>
+    <set_value name="this.$activeSupplyReservationWare" exact="null"/>
+
+    <!-- Shared supply reservation table (hierarchical):
+         global.$GT_SupplyReservations.{homeStation}.{ware} = list of reserving ships -->
+    <do_if value="not global.$GT_SupplyReservations?">
+      <set_value name="global.$GT_SupplyReservations" exact="table[]"/>
+    </do_if>
+    <!-- Reserved incoming amounts per station/ware/ship:
+         global.$GT_SupplyReservationAmounts.{homeStation}.{ware}.{ship} = reservedAmount -->
+    <do_if value="not global.$GT_SupplyReservationAmounts?">
+      <set_value name="global.$GT_SupplyReservationAmounts" exact="table[]"/>
+    </do_if>
 
     <!-- Wait time when no trades found (from global settings or default 60s) -->
     <set_value name="this.$waitTimeNoTrades" exact="if global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades? then global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades else 60s"/>
@@ -334,6 +377,8 @@
         </do_all>
 
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply wares to find: ' + $supplyWares.count" chance="this.$debugchance"/>
+        <!-- Small stagger to reduce same-tick herd selection across many subordinates. -->
+        <wait min="200ms" max="900ms"/>
 
         <!-- Shared pipeline: pathfinding + live search + trade match -->
         <run_script name="'lib.gt.pathfinding'" result="$supplySpaces">
@@ -401,31 +446,182 @@
           <param name="scoreMode" value="'supply'"/>
           <param name="distancePenalty" value="0.1"/>
         </run_script>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after shared tradematch call"/>
 
         <set_value name="$bestSupplyTrade" exact="null"/>
-        <do_if value="$supplyMatchResult.$Found and $supplyMatchResult.$BestTrade?">
-          <set_value name="$bestSupplyCoreTrade" exact="$supplyMatchResult.$BestTrade"/>
-          <set_value name="$bestSupplyAmount" exact="$bestSupplyCoreTrade.$Amount"/>
+        <set_value name="$bestSupplyReservationWare" exact="null"/>
+        <set_value name="$bestSupplyScore" exact="-1"/>
+        <set_value name="$availableSupplyTradeWaresCount" exact="0"/>
+        <do_if value="$supplyMatchResult.$Found and $supplyMatchResult.$TradeList? and $supplyMatchResult.$TradeList.count gt 0">
+          <run_script name="'lib.gt.tradematch'" result="$mk1DistinctWaresResult">
+            <param name="mode" value="'count_distinct_wares'"/>
+            <param name="tradeListInput" value="$supplyMatchResult.$TradeList"/>
+          </run_script>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after distinct-ware helper call"/>
+          <set_value name="$availableSupplyTradeWaresCount" exact="if $mk1DistinctWaresResult.$DistinctCount? then $mk1DistinctWaresResult.$DistinctCount else 0"/>
 
-          <!-- Soft buytarget cap: don't force full cargo in supply mode -->
-          <set_value name="$buyTargetAmount" exact="$bestSupplyAmount"/>
-          <do_if value="$bestSupplyCoreTrade.$Ware.volume gt 0 and this.$buytarget lt 100">
-            <set_value name="$buyTargetAmount" exact="[1, ((this.ship.cargo.capacity.all * this.$buytarget / 100) / $bestSupplyCoreTrade.$Ware.volume)i].max"/>
+          <do_if value="this.$debuglevel ge 1">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': supply candidate wares available now=' + $availableSupplyTradeWaresCount" chance="this.$debugchance"/>
           </do_if>
-          <set_value name="$bestSupplyAmount" exact="[$bestSupplyAmount, $buyTargetAmount].min"/>
 
-          <set_value name="$bestSupplyTrade" exact="table[
-            $Ware = $bestSupplyCoreTrade.$Ware,
-            $SellOffer = $bestSupplyCoreTrade.$BuyOffer,
-            $BuyOffer = $bestSupplyCoreTrade.$SellOffer,
-            $Amount = $bestSupplyAmount,
-            $SellerStation = $bestSupplyCoreTrade.$BuyOffer.owner,
-            $Distance = $bestSupplyCoreTrade.$Distance
-          ]"/>
+          <do_all exact="$supplyMatchResult.$TradeList.count" counter="$smti">
+            <set_value name="$candidateCoreTrade" exact="$supplyMatchResult.$TradeList.{$smti}"/>
+            <set_value name="$candidateAmount" exact="$candidateCoreTrade.$Amount"/>
+
+            <!-- Soft buytarget cap: don't force full cargo in supply mode -->
+            <set_value name="$candidateTargetAmount" exact="$candidateAmount"/>
+            <do_if value="$candidateCoreTrade.$Ware.volume gt 0 and this.$buytarget lt 100">
+              <set_value name="$candidateTargetAmount" exact="[1, ((this.ship.cargo.capacity.all * this.$buytarget / 100) / $candidateCoreTrade.$Ware.volume)i].max"/>
+            </do_if>
+            <set_value name="$candidateAmount" exact="[$candidateAmount, $candidateTargetAmount].min"/>
+
+            <do_if value="$candidateAmount gt 0">
+              <!-- Per-ware concurrency reservation:
+                   allows multiple ships per ware based on current deficit size. -->
+              <do_if value="not global.$GT_SupplyReservations?">
+                <set_value name="global.$GT_SupplyReservations" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_SupplyReservations.{this.$homeStation}?">
+                <set_value name="$emptyHomeSupplyReservationTable" exact="table[]"/>
+                <set_value name="global.$GT_SupplyReservations.{this.$homeStation}" exact="$emptyHomeSupplyReservationTable"/>
+              </do_if>
+              <do_if value="not global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}?">
+                <create_list name="$emptySupplyReservationList"/>
+                <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}" exact="$emptySupplyReservationList"/>
+              </do_if>
+              <do_if value="not global.$GT_SupplyReservationAmounts?">
+                <set_value name="global.$GT_SupplyReservationAmounts" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}?">
+                <set_value name="$emptyHomeSupplyReservationAmountTable" exact="table[]"/>
+                <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}" exact="$emptyHomeSupplyReservationAmountTable"/>
+              </do_if>
+              <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$candidateCoreTrade.$Ware}?">
+                <set_value name="$emptySupplyReservationAmountTable" exact="table[]"/>
+                <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$candidateCoreTrade.$Ware}" exact="$emptySupplyReservationAmountTable"/>
+              </do_if>
+
+              <!-- Prune stale reservations (destroyed ships) and count active slots. -->
+              <create_list name="$prunedSupplyReservations"/>
+              <set_value name="$reservedCount" exact="0"/>
+              <set_value name="$alreadyReservedByThisShip" exact="false"/>
+              <set_value name="$incomingReservedAmount" exact="0"/>
+              <do_if value="global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}.count gt 0">
+                <do_all exact="global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}.count" counter="$rsvi">
+                  <set_value name="$rsvShip" exact="global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}.{$rsvi}"/>
+                  <do_if value="$rsvShip? and $rsvShip.exists">
+                    <append_to_list name="$prunedSupplyReservations" exact="$rsvShip"/>
+                    <set_value name="$reservedCount" operation="add"/>
+                    <do_if value="$rsvShip == this.ship">
+                      <set_value name="$alreadyReservedByThisShip" exact="true"/>
+                    </do_if>
+                    <do_else>
+                      <do_if value="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$candidateCoreTrade.$Ware}.{$rsvShip}?">
+                        <set_value name="$incomingReservedAmount" exact="$incomingReservedAmount + global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$candidateCoreTrade.$Ware}.{$rsvShip}"/>
+                      </do_if>
+                    </do_else>
+                  </do_if>
+                </do_all>
+                <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{$candidateCoreTrade.$Ware}" exact="$prunedSupplyReservations"/>
+              </do_if>
+
+              <!-- Dynamic slot count per ware:
+                   max ships ~= ceil(remaining need / ship chunk). -->
+              <set_value name="$needAmount" exact="0"/>
+              <set_value name="$effectiveNeedAmount" exact="0"/>
+              <set_value name="$targetAmount" exact="this.$homeStation.cargo.{$candidateCoreTrade.$Ware}.target"/>
+              <set_value name="$currentAmount" exact="this.$homeStation.cargo.{$candidateCoreTrade.$Ware}.count"/>
+              <do_if value="$targetAmount gt $currentAmount">
+                <set_value name="$needAmount" exact="$targetAmount - $currentAmount"/>
+              </do_if>
+              <set_value name="$effectiveNeedAmount" exact="[$needAmount - $incomingReservedAmount, 0].max"/>
+              <set_value name="$shipChunkAmount" exact="this.ship.cargo.{$candidateCoreTrade.$Ware}.max"/>
+              <do_if value="this.$buytarget lt 100">
+                <set_value name="$shipChunkAmount" exact="[1, ($shipChunkAmount * this.$buytarget / 100)i].max"/>
+              </do_if>
+              <do_if value="$shipChunkAmount lt 1">
+                <set_value name="$shipChunkAmount" exact="1"/>
+              </do_if>
+
+              <run_script name="'lib.gt.tradematch'" result="$mk1FairnessResult">
+                <param name="mode" value="'ware_fairness'"/>
+                <param name="rawNeedAmount" value="$needAmount"/>
+                <param name="incomingReservedAmount" value="$incomingReservedAmount"/>
+                <param name="shipChunkAmount" value="$shipChunkAmount"/>
+                <param name="availableTradeWaresCount" value="$availableSupplyTradeWaresCount"/>
+                <param name="reservedCount" value="$reservedCount"/>
+                <param name="alreadyReservedByThisShip" value="$alreadyReservedByThisShip"/>
+                <param name="fairnessCap" value="2"/>
+              </run_script>
+              <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after fairness helper call"/>
+              <set_value name="$effectiveNeedAmount" exact="$mk1FairnessResult.$EffectiveNeedAmount"/>
+              <set_value name="$maxShipsForWare" exact="$mk1FairnessResult.$MaxShipsForWare"/>
+              <set_value name="$reservationAllowsTrade" exact="$mk1FairnessResult.$ReservationAllowsTrade"/>
+
+              <do_if value="$reservationAllowsTrade and $candidateCoreTrade.$Score gt $bestSupplyScore">
+                <set_value name="$bestSupplyScore" exact="$candidateCoreTrade.$Score"/>
+                <set_value name="$bestSupplyReservationWare" exact="$candidateCoreTrade.$Ware"/>
+                <set_value name="$bestSupplyTrade" exact="table[
+                  $Ware = $candidateCoreTrade.$Ware,
+                  $SellOffer = $candidateCoreTrade.$BuyOffer,
+                  $BuyOffer = $candidateCoreTrade.$SellOffer,
+                  $Amount = $candidateAmount,
+                  $SellerStation = $candidateCoreTrade.$BuyOffer.owner,
+                  $Distance = $candidateCoreTrade.$Distance,
+                  $ReservedCount = $reservedCount,
+                  $MaxShipsForWare = $maxShipsForWare,
+                  $IncomingReservedAmount = $incomingReservedAmount,
+                  $NeedAmount = $needAmount,
+                  $EffectiveNeedAmount = $effectiveNeedAmount
+                ]"/>
+              </do_if>
+            </do_if>
+          </do_all>
         </do_if>
 
         <do_if value="$bestSupplyTrade != null">
-          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade found: buy ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname + ' (dist: ' + $bestSupplyTrade.$Distance + ')'" chance="this.$debugchance"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade found: buy ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname + ' (dist: ' + $bestSupplyTrade.$Distance + ', slots: ' + $bestSupplyTrade.$ReservedCount + '/' + $bestSupplyTrade.$MaxShipsForWare + ', incoming=' + $bestSupplyTrade.$IncomingReservedAmount + ', need=' + $bestSupplyTrade.$NeedAmount + ', effectiveNeed=' + $bestSupplyTrade.$EffectiveNeedAmount + ')'" chance="this.$debugchance"/>
+
+          <!-- Acquire/refresh reservation for selected ware before queuing orders. -->
+          <do_if value="$bestSupplyReservationWare? and $bestSupplyReservationWare != null">
+            <do_if value="not global.$GT_SupplyReservations?">
+              <set_value name="global.$GT_SupplyReservations" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_SupplyReservationAmounts?">
+              <set_value name="global.$GT_SupplyReservationAmounts" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_SupplyReservations.{this.$homeStation}?">
+              <set_value name="$emptyBestHomeSupplyReservationTable" exact="table[]"/>
+              <set_value name="global.$GT_SupplyReservations.{this.$homeStation}" exact="$emptyBestHomeSupplyReservationTable"/>
+            </do_if>
+            <do_if value="not global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}?">
+              <create_list name="$emptyBestSupplyReservationList"/>
+              <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}" exact="$emptyBestSupplyReservationList"/>
+            </do_if>
+            <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}?">
+              <set_value name="$emptyBestHomeSupplyReservationAmountTable" exact="table[]"/>
+              <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}" exact="$emptyBestHomeSupplyReservationAmountTable"/>
+            </do_if>
+            <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$bestSupplyReservationWare}?">
+              <set_value name="$emptyBestSupplyReservationAmountTable" exact="table[]"/>
+              <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$bestSupplyReservationWare}" exact="$emptyBestSupplyReservationAmountTable"/>
+            </do_if>
+            <set_value name="$reservationAlreadyPresent" exact="false"/>
+            <do_if value="global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}.count gt 0">
+              <do_all exact="global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}.count" counter="$arvi">
+                <do_if value="global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}.{$arvi} == this.ship">
+                  <set_value name="$reservationAlreadyPresent" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="not $reservationAlreadyPresent">
+              <append_to_list name="global.$GT_SupplyReservations.{this.$homeStation}.{$bestSupplyReservationWare}" exact="this.ship"/>
+            </do_if>
+            <!-- Provisional incoming amount; adjusted to actual queued amount below. -->
+            <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{$bestSupplyReservationWare}.{this.ship}" exact="$bestSupplyTrade.$Amount"/>
+            <set_value name="this.$activeSupplyReservationWare" exact="$bestSupplyReservationWare"/>
+          </do_if>
 
           <!-- Create BOTH trade orders upfront so reservations are visible immediately.
                Pattern matches vanilla order.trade.routine: "create_trade_order adds the reservation automatically".
@@ -447,6 +643,18 @@
               <set_value name="$supBuyAmount" exact="[$supBuyAmount, $supAffordableAmount].min"/>
             </do_if>
             <do_if value="$supBuyAmount gt 0">
+              <do_if value="this.$activeSupplyReservationWare? and this.$activeSupplyReservationWare != null and global.$GT_SupplyReservationAmounts?">
+                <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}?">
+                <set_value name="$emptyActiveHomeSupplyReservationAmountTable" exact="table[]"/>
+                <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}" exact="$emptyActiveHomeSupplyReservationAmountTable"/>
+                </do_if>
+                <do_if value="not global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+                <set_value name="$emptyActiveSupplyReservationAmountTable" exact="table[]"/>
+                <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}" exact="$emptyActiveSupplyReservationAmountTable"/>
+                </do_if>
+                <!-- Update to the actual in-flight incoming amount for effective-need accounting. -->
+                <set_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}.{this.ship}" exact="$supBuyAmount"/>
+              </do_if>
               <!-- Queue delivery first, then buy.
                    With immediate="true", later created orders execute first (vanilla TradeRoutine pattern),
                    so this guarantees BUY executes before DELIVER. -->
@@ -461,6 +669,27 @@
           </do_if>
 
           <do_if value="not $supplyOrdersCreated">
+            <!-- Release reservation immediately if no orders were created. -->
+            <do_if value="this.$activeSupplyReservationWare? and this.$activeSupplyReservationWare != null and this.$homeStation? and global.$GT_SupplyReservations? and global.$GT_SupplyReservations.{this.$homeStation}? and global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+              <create_list name="$supplyReservationAfterRelease"/>
+              <do_all exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.count" counter="$rrvi">
+                <set_value name="$rrShip" exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.{$rrvi}"/>
+                <do_if value="$rrShip? and $rrShip.exists and $rrShip != this.ship">
+                  <append_to_list name="$supplyReservationAfterRelease" exact="$rrShip"/>
+                </do_if>
+              </do_all>
+              <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}" exact="$supplyReservationAfterRelease"/>
+              <do_if value="$supplyReservationAfterRelease.count == 0">
+                <remove_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+              </do_if>
+              <do_if value="global.$GT_SupplyReservationAmounts? and global.$GT_SupplyReservationAmounts.{this.$homeStation}? and global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+                <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}.{this.ship}"/>
+                <do_if value="$supplyReservationAfterRelease.count == 0">
+                  <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <set_value name="this.$activeSupplyReservationWare" exact="null"/>
             <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade offers no longer available — skipping'" chance="this.$debugchance"/>
           </do_if>
 
@@ -475,6 +704,27 @@
                 </interrupt>
               </wait>
             </do_while>
+            <!-- Release reservation after supply run completes. -->
+            <do_if value="this.$activeSupplyReservationWare? and this.$activeSupplyReservationWare != null and this.$homeStation? and global.$GT_SupplyReservations? and global.$GT_SupplyReservations.{this.$homeStation}? and global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+              <create_list name="$supplyReservationAfterDone"/>
+              <do_all exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.count" counter="$drvi">
+                <set_value name="$drShip" exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.{$drvi}"/>
+                <do_if value="$drShip? and $drShip.exists and $drShip != this.ship">
+                  <append_to_list name="$supplyReservationAfterDone" exact="$drShip"/>
+                </do_if>
+              </do_all>
+              <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}" exact="$supplyReservationAfterDone"/>
+              <do_if value="$supplyReservationAfterDone.count == 0">
+                <remove_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+              </do_if>
+              <do_if value="global.$GT_SupplyReservationAmounts? and global.$GT_SupplyReservationAmounts.{this.$homeStation}? and global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+                <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}.{this.ship}"/>
+                <do_if value="$supplyReservationAfterDone.count == 0">
+                  <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <set_value name="this.$activeSupplyReservationWare" exact="null"/>
           </do_if>
 
           <!-- Logbook and XP only if supply orders were actually created and executed -->
@@ -700,6 +950,7 @@
         <param name="distancePenalty" value="0.1"/>
         <param name="scoreMode" value="'sell'"/>
       </run_script>
+      <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after shared tradematch call"/>
 
       <create_list name="$allTrades"/>
       <set_value name="$matchedTrades" exact="[]"/>
@@ -981,6 +1232,29 @@
     </actions>
   </attention>
   <on_abort>
+    <!-- Cleanup: release active supply reservation slot -->
+    <do_if value="this.$activeSupplyReservationWare? and this.$activeSupplyReservationWare != null and this.$homeStation? and global.$GT_SupplyReservations? and global.$GT_SupplyReservations.{this.$homeStation}? and global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+      <create_list name="$abortSupplyReservationAfterRelease"/>
+      <do_all exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.count" counter="$arvi">
+        <set_value name="$arShip" exact="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}.{$arvi}"/>
+        <do_if value="$arShip? and $arShip.exists and $arShip != this.ship">
+          <append_to_list name="$abortSupplyReservationAfterRelease" exact="$arShip"/>
+        </do_if>
+      </do_all>
+      <set_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}" exact="$abortSupplyReservationAfterRelease"/>
+      <do_if value="$abortSupplyReservationAfterRelease.count == 0">
+        <remove_value name="global.$GT_SupplyReservations.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+      </do_if>
+      <do_if value="global.$GT_SupplyReservationAmounts? and global.$GT_SupplyReservationAmounts.{this.$homeStation}? and global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}?">
+        <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}.{this.ship}"/>
+        <do_if value="$abortSupplyReservationAfterRelease.count == 0">
+          <remove_value name="global.$GT_SupplyReservationAmounts.{this.$homeStation}.{this.$activeSupplyReservationWare}"/>
+        </do_if>
+      </do_if>
+      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': on_abort — released supply reservation for ware ' + this.$activeSupplyReservationWare" chance="100"/>
+    </do_if>
+    <set_value name="this.$activeSupplyReservationWare" exact="null"/>
+
     <!-- Cleanup: unregister station from MK1 supply registry -->
     <do_if value="this.$homeStation? and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
       <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>
