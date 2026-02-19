@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="order.trade.galaxytraderMK2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/aiscripts.xsd" version="1">
+<aiscript name="order.trade.galaxytraderMK2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4Original/libraries/aiscripts.xsd" version="2">
   <order id="GalaxyTraderMK2" name="{77000, 20002}" description="{77000, 20102}" category="trade" infinite="true" allowinloop="false" canplayercancel="true">
     <params>
       <param name="homeStation" type="object" default="null" text="{77000, 20017}" comment="{77000, 20117}">
@@ -54,6 +54,12 @@
               <param name="debuglevel" default="if global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Debug? and global.$GT_MK2_GlobalSettings.$Debug.$DebugLevel? then global.$GT_MK2_GlobalSettings.$Debug.$DebugLevel else 1" type="number" text="{77000, 30020}" comment="{77000, 30120}" advanced="true">
         <input_param name="min" value="0"/>
         <input_param name="max" value="2"/>
+        <input_param name="step" value="1"/>
+      </param>
+      <param name="allowlowvolume" default="false" type="bool" text="{77000, 20030}" comment="{77000, 20130}" advanced="true"/>
+      <param name="lowvolumefloorpercent" default="10" type="number" text="{77000, 20031}" comment="{77000, 20131}" advanced="true">
+        <input_param name="min" value="1"/>
+        <input_param name="max" value="50"/>
         <input_param name="step" value="1"/>
       </param>
     </params>
@@ -158,6 +164,8 @@
     <set_value name="this.$notifications" exact="$notifications"/>
     <set_value name="this.$debuglevel" exact="$debuglevel"/>
     <set_value name="this.$debugchance" exact="$debugchance"/>
+    <set_value name="this.$allowlowvolume" exact="$allowlowvolume"/>
+    <set_value name="this.$lowvolumefloorpercent" exact="[1, [50, $lowvolumefloorpercent].min].max"/>
                 <set_value name="this.$minCargoFillPercent" exact="25"/>
                 <do_if value="global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Distribution? and global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent?">
                   <set_value name="this.$minCargoFillPercent" exact="[10, [100, global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent].min].max"/>
@@ -169,15 +177,10 @@
     <set_value name="this.$noTradeRetryCount" exact="0"/>
     <set_value name="this.$lastTradeDestination" exact="null"/>
     <set_value name="this.$lastTradeWare" exact="null"/>
-    <set_value name="this.$lastTradeReservedAmount" exact="0"/>
-
-    <!-- MK2 multi-ship reservation state (separate from shared scalar GT_TradeReservations table). -->
-    <do_if value="not global.$GT_MK2_TradeReservations?">
-      <set_value name="global.$GT_MK2_TradeReservations" exact="table[]"/>
-    </do_if>
-    <do_if value="not global.$GT_MK2_TradeReservationAmounts?">
-      <set_value name="global.$GT_MK2_TradeReservationAmounts" exact="table[]"/>
-    </do_if>
+    <set_value name="this.$stickySource" exact="null"/>
+    <set_value name="this.$stickyDestination" exact="null"/>
+    <set_value name="this.$stickyWare" exact="null"/>
+    <set_value name="this.$stickyCyclesLeft" exact="0"/>
 
     <!-- Payment-source control:
          - with player homeStation: assign to station (station account pays non-internal trades)
@@ -207,8 +210,17 @@
   <attention min="unknown">
     <actions>
       <set_value name="this.$gt_yieldMs" exact="1"/>
+      <set_value name="this.$gt_criticalYieldMs" exact="10"/>
+      <set_value name="this.$searchCadenceMinSec" exact="8"/>
+      <set_value name="this.$searchCadenceMaxSec" exact="12"/>
       <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
         <set_value name="this.$gt_yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+      <do_if value="global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Distribution? and global.$GT_MK2_GlobalSettings.$Distribution.$SearchCadenceMinSec?">
+        <set_value name="this.$searchCadenceMinSec" exact="[1, [300, @global.$GT_MK2_GlobalSettings.$Distribution.$SearchCadenceMinSec].min].max"/>
+      </do_if>
+      <do_if value="global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Distribution? and global.$GT_MK2_GlobalSettings.$Distribution.$SearchCadenceMaxSec?">
+        <set_value name="this.$searchCadenceMaxSec" exact="[this.$searchCadenceMinSec, [600, @global.$GT_MK2_GlobalSettings.$Distribution.$SearchCadenceMaxSec].min].max"/>
       </do_if>
 
       <label name="main_loop"/>
@@ -223,16 +235,18 @@
         <resume label="no_trade_retry"/>
       </do_if>
 
+      <!-- Keep runtime values in sync only when this ship has a direct MK2 default order.
+           Assist subordinates receive inherited params from order.assist -> run_script. -->
       <do_if value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyTraderMK2'">
         <set_value name="this.$sourceList" exact="[]"/>
         <do_if value="this.ship.defaultorder.$sourceList? and this.ship.defaultorder.$sourceList.count gt 0">
           <set_value name="this.$sourceList" exact="this.ship.defaultorder.$sourceList"/>
         </do_if>
-        <do_else>
+        <do_if value="not this.$sourceList? or this.$sourceList.count == 0">
           <do_if value="this.ship.defaultorder.$sourceStation? and this.ship.defaultorder.$sourceStation.exists and this.ship.defaultorder.$sourceStation.isclass.station">
             <append_to_list name="this.$sourceList" exact="this.ship.defaultorder.$sourceStation"/>
           </do_if>
-        </do_else>
+        </do_if>
         <set_value name="this.$destList" exact="this.ship.defaultorder.$destList"/>
         <set_value name="this.$minStorage" exact="this.ship.defaultorder.$minStorage"/>
         <set_value name="this.$staticStorage" exact="this.ship.defaultorder.$staticStorage"/>
@@ -248,7 +262,45 @@
         <set_value name="this.$notifications" exact="this.ship.defaultorder.$notifications"/>
         <set_value name="this.$debuglevel" exact="this.ship.defaultorder.$debuglevel"/>
         <set_value name="this.$debugchance" exact="if this.$debuglevel ge 1 then 100 else 0"/>
+        <set_value name="this.$allowlowvolume" exact="if this.ship.defaultorder.$allowlowvolume? then this.ship.defaultorder.$allowlowvolume else false"/>
+        <set_value name="this.$lowvolumefloorpercent" exact="if this.ship.defaultorder.$lowvolumefloorpercent? then [1, [50, this.ship.defaultorder.$lowvolumefloorpercent].min].max else 10"/>
       </do_if>
+      <do_elseif value="this.ship.commander.exists and this.ship.commander != this.ship and this.ship.defaultorder? and this.ship.defaultorder.id == 'Assist' and this.ship.commander.defaultorder?">
+        <!-- Vanilla-aligned subordinate inheritance:
+             Assist references commander's defaultorder; if that default is Assist, use its baseorder. -->
+        <set_value name="$mk2InheritedOrder" exact="this.ship.commander.defaultorder"/>
+        <do_if value="$mk2InheritedOrder.id == 'Assist' and $mk2InheritedOrder.$baseorder?">
+          <set_value name="$mk2InheritedOrder" exact="$mk2InheritedOrder.$baseorder"/>
+        </do_if>
+        <do_if value="$mk2InheritedOrder? and $mk2InheritedOrder.id == 'GalaxyTraderMK2'">
+          <set_value name="this.$sourceList" exact="[]"/>
+          <do_if value="$mk2InheritedOrder.$sourceList? and $mk2InheritedOrder.$sourceList.count gt 0">
+            <set_value name="this.$sourceList" exact="$mk2InheritedOrder.$sourceList"/>
+          </do_if>
+          <do_if value="not this.$sourceList? or this.$sourceList.count == 0">
+            <do_if value="$mk2InheritedOrder.$sourceStation? and $mk2InheritedOrder.$sourceStation.exists and $mk2InheritedOrder.$sourceStation.isclass.station">
+              <append_to_list name="this.$sourceList" exact="$mk2InheritedOrder.$sourceStation"/>
+            </do_if>
+          </do_if>
+          <set_value name="this.$destList" exact="$mk2InheritedOrder.$destList"/>
+          <set_value name="this.$minStorage" exact="$mk2InheritedOrder.$minStorage"/>
+          <set_value name="this.$staticStorage" exact="$mk2InheritedOrder.$staticStorage"/>
+          <set_value name="this.$maxStorage" exact="$mk2InheritedOrder.$maxStorage"/>
+          <set_value name="this.$autowares" exact="if $mk2InheritedOrder.$autowares? then $mk2InheritedOrder.$autowares else true"/>
+          <set_value name="this.$warebasket" exact="$mk2InheritedOrder.$warebasket"/>
+          <set_value name="this.$ignoretraderules" exact="$mk2InheritedOrder.$ignoretraderules"/>
+          <set_value name="this.$allowillegal" exact="$mk2InheritedOrder.$allowillegal"/>
+          <set_value name="this.$bidirectional" exact="$mk2InheritedOrder.$bidirectional"/>
+          <set_value name="this.$homeStation" exact="$mk2InheritedOrder.$homeStation"/>
+          <set_value name="this.$maxDistance" exact="$mk2InheritedOrder.$maxDistance"/>
+          <set_value name="this.$fleetcoordination" exact="$mk2InheritedOrder.$fleetcoordination"/>
+          <set_value name="this.$notifications" exact="$mk2InheritedOrder.$notifications"/>
+          <set_value name="this.$debuglevel" exact="$mk2InheritedOrder.$debuglevel"/>
+          <set_value name="this.$debugchance" exact="if this.$debuglevel ge 1 then 100 else 0"/>
+          <set_value name="this.$allowlowvolume" exact="if $mk2InheritedOrder.$allowlowvolume? then $mk2InheritedOrder.$allowlowvolume else false"/>
+          <set_value name="this.$lowvolumefloorpercent" exact="if $mk2InheritedOrder.$lowvolumefloorpercent? then [1, [50, $mk2InheritedOrder.$lowvolumefloorpercent].min].max else 10"/>
+        </do_if>
+      </do_elseif>
                   <set_value name="this.$minCargoFillPercent" exact="25"/>
                   <do_if value="global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Distribution? and global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent?">
                     <set_value name="this.$minCargoFillPercent" exact="[10, [100, global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent].min].max"/>
@@ -521,6 +573,7 @@
             </do_all>
             <do_if value="$clearOffer != null and $clearOffer.available and $clearBestAmount gt 0">
               <set_value name="$clearAmount" exact="[$cAmount, $clearBestAmount].min"/>
+              <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync cargo-clear trade creation across ships"/>
               <create_trade_order object="this.ship" tradeoffer="$clearOffer" amount="$clearAmount" immediate="true" internal="false"/>
             </do_if>
           </do_if>
@@ -671,6 +724,26 @@
       <set_value name="$noDestOfferDetailCount" exact="0"/>
       <set_value name="$noNeedDetails" exact="''"/>
       <set_value name="$noNeedDetailCount" exact="0"/>
+      <set_value name="$pilotLevelProfile" exact="1"/>
+      <do_if value="this.ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$Level?">
+        <set_value name="$pilotLevelProfile" exact="global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+      </do_if>
+      <set_value name="$pilotLevelProfile" exact="[1, [15, $pilotLevelProfile].min].max"/>
+      <set_value name="$routeT" exact="$pilotLevelProfile / 15.0"/>
+      <set_value name="$routeAlpha" exact="0.45 - (0.20 * $routeT)"/>
+      <set_value name="$routeBeta" exact="1.00 - (0.40 * $routeT)"/>
+      <set_value name="$routeLaneBonus" exact="1.05 + (0.20 * $routeT)"/>
+      <set_value name="$stickinessTTLProfile" exact="[4, 1 + (($pilotLevelProfile - 1) / 4)i].min"/>
+      <set_value name="$lowFloorProfileMin" exact="[1, 20 - ($pilotLevelProfile / 3)i].max"/>
+      <set_value name="$lowVolumeFloorEffPercent" exact="if this.$allowlowvolume then [this.$lowvolumefloorpercent, $lowFloorProfileMin].max else this.$lowvolumefloorpercent"/>
+      <do_if value="this.$stickyCyclesLeft gt 0">
+        <do_if value="not this.$stickySource? or not this.$stickySource.exists or not this.$stickyDestination? or not this.$stickyDestination.exists">
+          <set_value name="this.$stickySource" exact="null"/>
+          <set_value name="this.$stickyDestination" exact="null"/>
+          <set_value name="this.$stickyWare" exact="null"/>
+          <set_value name="this.$stickyCyclesLeft" exact="0"/>
+        </do_if>
+      </do_if>
 
       <do_all exact="this.$activeSources.count" counter="$sidx">
         <set_value name="$source" exact="this.$activeSources.{$sidx}"/>
@@ -822,7 +895,10 @@
             <set_value name="$skipSourceNoTarget" operation="add"/>
             <continue/>
           </do_if>
-          <set_value name="$sourceRatio" exact="($source.cargo.{$ware}.count * 100) / $sourceTarget"/>
+          <!-- VANILLA reservations: protect source static threshold from in-flight buy orders. -->
+          <get_ware_reservation object="$source" ware="$ware" type="buy" virtual="false" result="$sourceOutgoingReserved"/>
+          <set_value name="$sourceEffectiveCount" exact="[$source.cargo.{$ware}.count - $sourceOutgoingReserved, 0].max"/>
+          <set_value name="$sourceRatio" exact="($sourceEffectiveCount * 100) / $sourceTarget"/>
           <do_if value="$sourceRatio le this.$staticStorage">
             <set_value name="$skipSourceBelowStatic" operation="add"/>
             <do_if value="this.$debuglevel ge 1 and $sourceBelowStaticDetailCount lt 8">
@@ -1007,22 +1083,59 @@
               <set_value name="$destTarget" exact="[$dest.cargo.{$ware}.target, 1].max"/>
               <set_value name="$destRatio" exact="($dest.cargo.{$ware}.count * 100) / $destTarget"/>
 
-              <set_value name="$urgent" exact="false"/>
+              <set_value name="$needBucket" exact="'none'"/>
+              <set_value name="$bucketWeight" exact="1.0"/>
+              <set_value name="$isCriticalNeed" exact="false"/>
               <set_value name="$shouldDistribute" exact="false"/>
-              <do_if value="$destRatio le this.$minStorage">
-                <set_value name="$urgent" exact="true"/>
-                <set_value name="$shouldDistribute" exact="true"/>
+              <do_if value="$pilotLevelProfile ge 4">
+                <do_if value="$destRatio le 5">
+                  <set_value name="$needBucket" exact="'A'"/>
+                  <set_value name="$bucketWeight" exact="3.0"/>
+                  <set_value name="$isCriticalNeed" exact="true"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_if>
+                <do_elseif value="$destRatio le 20">
+                  <set_value name="$needBucket" exact="'B'"/>
+                  <set_value name="$bucketWeight" exact="2.0"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_elseif>
+                <do_elseif value="$destRatio le this.$minStorage">
+                  <set_value name="$needBucket" exact="'C'"/>
+                  <set_value name="$bucketWeight" exact="1.4"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_elseif>
+                <do_elseif value="$sourceRatio gt this.$maxStorage and $sourceRatio gt ($destRatio + 10)">
+                  <set_value name="$needBucket" exact="'D'"/>
+                  <set_value name="$bucketWeight" exact="1.0"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_elseif>
               </do_if>
-              <do_elseif value="$sourceRatio gt this.$maxStorage and $sourceRatio gt ($destRatio + 10)">
-                <set_value name="$shouldDistribute" exact="true"/>
-              </do_elseif>
+              <do_else>
+                <do_if value="$destRatio le 5">
+                  <set_value name="$needBucket" exact="'A'"/>
+                  <set_value name="$bucketWeight" exact="2.4"/>
+                  <set_value name="$isCriticalNeed" exact="true"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_if>
+                <do_elseif value="$destRatio le this.$minStorage">
+                  <set_value name="$needBucket" exact="'C'"/>
+                  <set_value name="$bucketWeight" exact="1.2"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_elseif>
+                <do_elseif value="$sourceRatio gt this.$maxStorage and $sourceRatio gt ($destRatio + 10)">
+                  <set_value name="$needBucket" exact="'D'"/>
+                  <set_value name="$bucketWeight" exact="1.0"/>
+                  <set_value name="$shouldDistribute" exact="true"/>
+                </do_elseif>
+              </do_else>
+              <set_value name="$urgent" exact="$isCriticalNeed"/>
               <do_if value="not $shouldDistribute">
                 <set_value name="$skipNoNeed" operation="add"/>
                 <do_if value="this.$debuglevel ge 1 and $noNeedDetailCount lt 10">
                   <do_if value="$noNeedDetailCount gt 0">
                     <set_value name="$noNeedDetails" exact="$noNeedDetails + '; '"/>
                   </do_if>
-                  <set_value name="$noNeedDetails" exact="$noNeedDetails + $source.idcode + '->' + $dest.idcode + ':' + $ware + ' src=' + $sourceRatio + '% dst=' + $destRatio + '% thresholds(min=' + this.$minStorage + ',max=' + this.$maxStorage + ')'"/>
+              <set_value name="$noNeedDetails" exact="$noNeedDetails + $source.idcode + '->' + $dest.idcode + ':' + $ware + ' src=' + $sourceRatio + '% dst=' + $destRatio + '% bucket=' + $needBucket + ' thresholds(min=' + this.$minStorage + ',max=' + this.$maxStorage + ')'"/>
                   <set_value name="$noNeedDetailCount" operation="add"/>
                 </do_if>
                 <continue/>
@@ -1034,48 +1147,9 @@
               <set_value name="$alreadyReservedByThisShip" exact="false"/>
               <set_value name="$effectiveDestOfferAmount" exact="$destOfferAmount"/>
               <do_if value="this.$fleetcoordination">
-                <do_if value="not global.$GT_MK2_TradeReservations?">
-                  <set_value name="global.$GT_MK2_TradeReservations" exact="table[]"/>
-                </do_if>
-                <do_if value="not global.$GT_MK2_TradeReservationAmounts?">
-                  <set_value name="global.$GT_MK2_TradeReservationAmounts" exact="table[]"/>
-                </do_if>
-                <do_if value="not global.$GT_MK2_TradeReservations.{$dest}?">
-                  <set_value name="$emptyMK2DestReservationTable" exact="table[]"/>
-                  <set_value name="global.$GT_MK2_TradeReservations.{$dest}" exact="$emptyMK2DestReservationTable"/>
-                </do_if>
-                <do_if value="not global.$GT_MK2_TradeReservations.{$dest}.{$ware}?">
-                  <create_list name="$emptyMK2TradeReservationList"/>
-                  <set_value name="global.$GT_MK2_TradeReservations.{$dest}.{$ware}" exact="$emptyMK2TradeReservationList"/>
-                </do_if>
-                <do_if value="not global.$GT_MK2_TradeReservationAmounts.{$dest}?">
-                  <set_value name="$emptyMK2DestReservationAmountTable" exact="table[]"/>
-                  <set_value name="global.$GT_MK2_TradeReservationAmounts.{$dest}" exact="$emptyMK2DestReservationAmountTable"/>
-                </do_if>
-                <do_if value="not global.$GT_MK2_TradeReservationAmounts.{$dest}.{$ware}?">
-                  <set_value name="$emptyMK2TradeReservationAmountTable" exact="table[]"/>
-                  <set_value name="global.$GT_MK2_TradeReservationAmounts.{$dest}.{$ware}" exact="$emptyMK2TradeReservationAmountTable"/>
-                </do_if>
-                <!-- Prune stale entries and compute in-flight incoming amount for this destination ware. -->
-                <create_list name="$prunedMK2Reservations"/>
-                <do_if value="global.$GT_MK2_TradeReservations.{$dest}.{$ware}.count gt 0">
-                  <do_all exact="global.$GT_MK2_TradeReservations.{$dest}.{$ware}.count" counter="$mk2ri">
-                    <set_value name="$rsvShip" exact="global.$GT_MK2_TradeReservations.{$dest}.{$ware}.{$mk2ri}"/>
-                    <do_if value="$rsvShip? and $rsvShip.exists">
-                      <append_to_list name="$prunedMK2Reservations" exact="$rsvShip"/>
-                      <set_value name="$reservedShipCount" operation="add"/>
-                      <do_if value="$rsvShip == this.ship">
-                        <set_value name="$alreadyReservedByThisShip" exact="true"/>
-                      </do_if>
-                      <do_else>
-                        <do_if value="global.$GT_MK2_TradeReservationAmounts.{$dest}.{$ware}.{$rsvShip}?">
-                          <set_value name="$incomingReservedAmount" exact="$incomingReservedAmount + global.$GT_MK2_TradeReservationAmounts.{$dest}.{$ware}.{$rsvShip}"/>
-                        </do_if>
-                      </do_else>
-                    </do_if>
-                  </do_all>
-                  <set_value name="global.$GT_MK2_TradeReservations.{$dest}.{$ware}" exact="$prunedMK2Reservations"/>
-                </do_if>
+                <!-- VANILLA reservations on destination buy offer side (ships selling to destination). -->
+                <get_ware_reservation object="$dest" ware="$ware" type="sell" virtual="false" result="$incomingReservedAmount"/>
+                <set_value name="$reservedShipCount" exact="(($incomingReservedAmount + [1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max - 1) / [1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max)i"/>
               </do_if>
               <set_value name="$shipChunkAmount" exact="[1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max"/>
               <run_script name="'lib.gt.tradematch'" result="$mk2FairnessResult">
@@ -1096,13 +1170,24 @@
                 <set_value name="$skipReserved" operation="add"/>
                 <continue/>
               </do_if>
-              <do_if value="this.$fleetcoordination and not $reservationAllowsTrade">
-                <set_value name="$skipReserved" operation="add"/>
-                <continue/>
-              </do_if>
 
               <set_value name="$tradeAmount" exact="[this.ship.cargo.{$ware}.free, $sourceOfferAmount, $effectiveDestOfferAmount].min"/>
-              <set_value name="$minimumTrade" exact="[1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max"/>
+              <set_value name="$normalMinimumTrade" exact="[1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max"/>
+              <set_value name="$minimumTrade" exact="$normalMinimumTrade"/>
+              <set_value name="$usedLowVolume" exact="false"/>
+              <set_value name="$canLowVolume" exact="false"/>
+              <do_if value="this.$allowlowvolume">
+                <do_if value="$pilotLevelProfile ge 6 or $isCriticalNeed">
+                  <set_value name="$canLowVolume" exact="true"/>
+                </do_if>
+              </do_if>
+              <do_if value="$canLowVolume">
+                <set_value name="$minimumTrade" exact="[1, (($cargoCapacity * $lowVolumeFloorEffPercent) / 100)i].max"/>
+                <do_if value="$isCriticalNeed">
+                  <set_value name="$minimumTrade" exact="[1, ($minimumTrade / 2)i].max"/>
+                </do_if>
+                <set_value name="$usedLowVolume" exact="true"/>
+              </do_if>
               <do_if value="$tradeAmount lt $minimumTrade">
                 <set_value name="$skipMinTrade" operation="add"/>
                 <continue/>
@@ -1116,22 +1201,69 @@
               <do_if value="this.$destUsage? and this.$destUsage.{$dest}?">
                 <set_value name="$destUsage" exact="this.$destUsage.{$dest}"/>
               </do_if>
-              <set_value name="$urgencyMultiplier" exact="if $urgent then 2 else 1"/>
+              <set_value name="$urgencyMultiplier" exact="$bucketWeight"/>
               <set_value name="$balanceFactor" exact="[0, ($sourceRatio - $destRatio)].max / 100"/>
-              <set_value name="$score" exact="(($sourceRatio - this.$staticStorage) * $urgencyMultiplier * ($tradeAmount / [$cargoCapacity, 1].max)) + $balanceFactor - (($sourceUsage + $destUsage) * 0.2)"/>
+              <set_value name="$baseScore" exact="(($sourceRatio - this.$staticStorage) * $urgencyMultiplier * ($tradeAmount / [$cargoCapacity, 1].max)) + $balanceFactor - (($sourceUsage + $destUsage) * 0.2)"/>
+              <set_value name="$shipToSourceGates" exact="this.ship.gatedistance.{$source}"/>
+              <set_value name="$sourceToDestGates" exact="$source.gatedistance.{$dest}"/>
+              <set_value name="$forwardGates" exact="[0, $shipToSourceGates].max + [0, $sourceToDestGates].max"/>
+              <set_value name="$baselineGates" exact="$forwardGates"/>
+              <do_if value="this.$sourceStation? and this.$sourceStation.exists and this.$lastTradeDestination? and this.$lastTradeDestination.exists">
+                <set_value name="$baseShipToSourceGates" exact="this.ship.gatedistance.{this.$sourceStation}"/>
+                <set_value name="$baseSourceToDestGates" exact="this.$sourceStation.gatedistance.{this.$lastTradeDestination}"/>
+                <do_if value="$baseShipToSourceGates ge 0 and $baseSourceToDestGates ge 0">
+                  <set_value name="$baselineGates" exact="$baseShipToSourceGates + $baseSourceToDestGates"/>
+                </do_if>
+              </do_if>
+              <set_value name="$deltaGates" exact="[0, $forwardGates - $baselineGates].max"/>
+              <set_value name="$backtrackPenalty" exact="0"/>
+              <do_if value="this.$lastTradeDestination? and this.$lastTradeDestination.exists">
+                <set_value name="$prevToDestGates" exact="this.$lastTradeDestination.gatedistance.{$dest}"/>
+                <set_value name="$prevToSourceGates" exact="this.$lastTradeDestination.gatedistance.{$source}"/>
+                <do_if value="$prevToDestGates ge 0 and $prevToSourceGates ge 0 and $prevToDestGates gt ($prevToSourceGates + 1)">
+                  <set_value name="$backtrackPenalty" exact="1"/>
+                </do_if>
+              </do_if>
+              <set_value name="$laneBonus" exact="1.0"/>
+              <do_if value="this.$stickyCyclesLeft gt 0 and this.$stickySource? and this.$stickyDestination? and this.$stickyWare? and this.$stickySource == $source and this.$stickyDestination == $dest and this.$stickyWare == $ware">
+                <set_value name="$laneBonus" exact="$routeLaneBonus"/>
+              </do_if>
+              <set_value name="$returnBonus" exact="1.0"/>
+              <do_if value="this.$bidirectional and $pilotLevelProfile ge 6">
+                <set_value name="$returnSourceTarget" exact="[$dest.cargo.{$ware}.target, 1].max"/>
+                <set_value name="$returnDestTarget" exact="[$source.cargo.{$ware}.target, 1].max"/>
+                <set_value name="$returnSourceRatio" exact="($dest.cargo.{$ware}.count * 100) / $returnSourceTarget"/>
+                <set_value name="$returnDestRatio" exact="($source.cargo.{$ware}.count * 100) / $returnDestTarget"/>
+                <do_if value="$returnSourceRatio gt this.$maxStorage and $returnDestRatio le this.$minStorage">
+                  <set_value name="$returnBonus" exact="if $pilotLevelProfile ge 11 then 1.10 else 1.05"/>
+                </do_if>
+              </do_if>
+              <set_value name="$costFactor" exact="1.0"/>
+              <do_if value="$pilotLevelProfile ge 4">
+                <set_value name="$costFactor" exact="1.0 + ($routeAlpha * $deltaGates) + ($routeBeta * $backtrackPenalty)"/>
+              </do_if>
+              <do_else>
+                <set_value name="$costFactor" exact="1.0 + (0.20 * $forwardGates)"/>
+              </do_else>
+              <set_value name="$score" exact="($baseScore * $laneBonus * $returnBonus) / [1.0, $costFactor].max"/>
               <append_to_list name="$mk2TradeList" exact="table[
                 $Ware = $ware,
                 $Source = $source,
                 $Destination = $dest,
                 $Amount = $tradeAmount,
                 $Urgent = $urgent,
+                $NeedBucket = $needBucket,
                 $Score = $score,
                 $SourceOffer = $sourceOffer,
                 $DestOffer = $destOffer,
                 $SourceOfferAmount = $sourceOfferAmount,
                 $DestOfferAmount = $destOfferAmount,
                 $EffectiveDestOfferAmount = $effectiveDestOfferAmount,
-                $IncomingReservedAmount = $incomingReservedAmount
+                $IncomingReservedAmount = $incomingReservedAmount,
+                $NormalMinimumTrade = $normalMinimumTrade,
+                $UsedLowVolume = $usedLowVolume,
+                $DeltaGates = $deltaGates,
+                $BacktrackPenalty = $backtrackPenalty
               ]"/>
             </do_all>
           </do_if>
@@ -1175,10 +1307,7 @@
       </do_if>
 
       <set_value name="$denyTrade" exact="false"/>
-      <set_value name="$pilotLevel" exact="1"/>
-      <do_if value="this.ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$Level?">
-        <set_value name="$pilotLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$Level"/>
-      </do_if>
+      <set_value name="$pilotLevel" exact="$pilotLevelProfile"/>
       <do_if value="$pilotLevel ge 12 and global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.$BlacklistedSectors?">
         <do_all exact="global.$GT_ThreatIntelligence.$BlacklistedSectors.count" counter="$bli">
           <do_if value="global.$GT_ThreatIntelligence.$BlacklistedSectors.{$bli} == $bestTrade.$Destination.sector">
@@ -1196,66 +1325,44 @@
         <do_if value="this.$debuglevel ge 1">
           <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade ' + $bestTrade.$Ware + ' from ' + $bestTrade.$Source.knownname + ' to ' + $bestTrade.$Destination.knownname + ' amount=' + $bestTrade.$Amount + ' score=' + $bestScore + ' incomingReserved=' + (if $bestTrade.$IncomingReservedAmount? then $bestTrade.$IncomingReservedAmount else 0) + ' effectiveNeed=' + $bestDestOfferAmount + ' internal=' + $tradeOrderInternal + ' ignoreRules=' + this.$ignoretraderules" chance="this.$debugchance"/>
         </do_if>
-        <set_value name="this.$lastTradeReservedAmount" exact="0"/>
         <set_value name="this.$lastTradeDestination" exact="null"/>
         <set_value name="this.$lastTradeWare" exact="null"/>
         <do_if value="this.$fleetcoordination">
           <set_value name="this.$lastTradeDestination" exact="$bestTrade.$Destination"/>
           <set_value name="this.$lastTradeWare" exact="$bestTrade.$Ware"/>
-          <do_if value="not global.$GT_MK2_TradeReservations?">
-            <set_value name="global.$GT_MK2_TradeReservations" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_MK2_TradeReservationAmounts?">
-            <set_value name="global.$GT_MK2_TradeReservationAmounts" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}?">
-            <set_value name="$emptyMK2LastTradeDestReservationTable" exact="table[]"/>
-            <set_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}" exact="$emptyMK2LastTradeDestReservationTable"/>
-          </do_if>
-          <do_if value="not global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-            <create_list name="$emptyMK2LastTradeReservationList"/>
-            <set_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="$emptyMK2LastTradeReservationList"/>
-          </do_if>
-          <do_if value="not global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}?">
-            <set_value name="$emptyMK2LastTradeDestReservationAmountTable" exact="table[]"/>
-            <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}" exact="$emptyMK2LastTradeDestReservationAmountTable"/>
-          </do_if>
-          <do_if value="not global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-            <set_value name="$emptyMK2LastTradeReservationAmountTable" exact="table[]"/>
-            <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="$emptyMK2LastTradeReservationAmountTable"/>
-          </do_if>
-          <set_value name="$mk2HasReservationEntry" exact="false"/>
-          <do_if value="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.count gt 0">
-            <do_all exact="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.count" counter="$mkrsi">
-              <do_if value="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.{$mkrsi} == this.ship">
-                <set_value name="$mk2HasReservationEntry" exact="true"/>
-                <break/>
+        </do_if>
+
+        <do_if value="not $denyTrade">
+          <set_command_action commandaction="commandaction.flying"/>
+          <set_value name="$buyAmount" exact="[$bestTrade.$Amount, $bestSourceOfferAmount].min"/>
+          <set_value name="$sellAmount" exact="0"/>
+          <do_if value="$buyAmount gt 0">
+            <!-- Queue buy and sell together so the order UI shows both planned legs. -->
+            <set_value name="$sellAmount" exact="[$buyAmount, $bestDestOfferAmount].min"/>
+            <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync MK2 buy leg creation across ships"/>
+            <create_trade_order object="this.ship" tradeoffer="$bestSourceOffer" amount="$buyAmount" immediate="false" internal="$tradeOrderInternal"/>
+            <do_if value="$sellAmount gt 0">
+              <create_trade_order object="this.ship" tradeoffer="$bestDestOffer" amount="$sellAmount" immediate="false" internal="$tradeOrderInternal"/>
+              <!-- Mirror MK3 queued-trade logging payload for MK2. -->
+              <set_value name="$mk2QueuedAmount" exact="if $sellAmount? and $sellAmount != null then $sellAmount else 0"/>
+              <do_if value="$mk2QueuedAmount gt 0 and $bestSourceOffer != null and $bestDestOffer != null">
+                <set_value name="$mk2QueuedBuyPriceRaw" exact="if $bestSourceOffer.unitprice? and $bestSourceOffer.unitprice != null then $bestSourceOffer.unitprice else 0"/>
+                <set_value name="$mk2QueuedSellPriceRaw" exact="if $bestDestOffer.unitprice? and $bestDestOffer.unitprice != null then $bestDestOffer.unitprice else 0"/>
+                <set_value name="$mk2QueuedProfitRaw" exact="($mk2QueuedSellPriceRaw - $mk2QueuedBuyPriceRaw) * $mk2QueuedAmount"/>
+                <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
+                  $Ship = this.ship,
+                  $BuyOffer = $bestSourceOffer,
+                  $SellOffer = $bestDestOffer,
+                  $Amount = $mk2QueuedAmount,
+                  $Profit = $mk2QueuedProfitRaw,
+                  $BuyPrice = $mk2QueuedBuyPriceRaw / 100,
+                  $SellPrice = $mk2QueuedSellPriceRaw / 100,
+                  $IsSellOnly = false,
+                  $SearchPipeline = 'normal'
+                ]"/>
               </do_if>
-            </do_all>
-          </do_if>
-          <do_if value="not $mk2HasReservationEntry">
-            <append_to_list name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="this.ship"/>
-          </do_if>
-          <!-- Provisional amount until buy phase clamps are known. -->
-          <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}.{this.ship}" exact="$bestTrade.$Amount"/>
-        </do_if>
-
-        <set_command_action commandaction="commandaction.flying"/>
-        <set_value name="$buyAmount" exact="[$bestTrade.$Amount, $bestSourceOfferAmount].min"/>
-        <do_if value="$buyAmount gt 0">
-          <do_if value="this.$fleetcoordination and this.$lastTradeDestination? and this.$lastTradeWare? and global.$GT_MK2_TradeReservationAmounts?">
-            <do_if value="not global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}?">
-              <set_value name="$emptyMK2ActiveTradeDestReservationAmountTable" exact="table[]"/>
-              <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}" exact="$emptyMK2ActiveTradeDestReservationAmountTable"/>
             </do_if>
-            <do_if value="not global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-              <set_value name="$emptyMK2ActiveTradeReservationAmountTable" exact="table[]"/>
-              <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="$emptyMK2ActiveTradeReservationAmountTable"/>
-            </do_if>
-            <set_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}.{this.ship}" exact="$buyAmount"/>
-            <set_value name="this.$lastTradeReservedAmount" exact="$buyAmount"/>
           </do_if>
-          <create_trade_order object="this.ship" tradeoffer="$bestSourceOffer" amount="$buyAmount" immediate="true" internal="$tradeOrderInternal"/>
         </do_if>
         <do_while value="this.ship.orders.count gt 0">
           <wait exact="5s">
@@ -1267,46 +1374,42 @@
           </wait>
         </do_while>
 
-        <set_value name="$sellAmount" exact="[this.ship.cargo.{$bestTrade.$Ware}.count, $bestTrade.$Amount, $bestDestOfferAmount].min"/>
-        <do_if value="$sellAmount gt 0">
-          <create_trade_order object="this.ship" tradeoffer="$bestDestOffer" amount="$sellAmount" immediate="true" internal="$tradeOrderInternal"/>
-        </do_if>
-        <do_while value="this.ship.orders.count gt 0">
-          <wait exact="5s">
-            <interrupt>
-              <conditions>
-                <event_object_order_ready object="this.ship"/>
-              </conditions>
-            </interrupt>
-          </wait>
-        </do_while>
-
-        <do_if value="this.$fleetcoordination and this.$lastTradeDestination? and this.$lastTradeWare? and global.$GT_MK2_TradeReservations? and global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}? and global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-          <create_list name="$mk2ReservationsAfterRelease"/>
-          <do_all exact="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.count" counter="$mk2rri">
-            <set_value name="$mk2RShip" exact="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.{$mk2rri}"/>
-            <do_if value="$mk2RShip? and $mk2RShip.exists and $mk2RShip != this.ship">
-              <append_to_list name="$mk2ReservationsAfterRelease" exact="$mk2RShip"/>
-            </do_if>
-          </do_all>
-          <set_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="$mk2ReservationsAfterRelease"/>
-          <do_if value="$mk2ReservationsAfterRelease.count == 0">
-            <remove_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}"/>
-          </do_if>
-          <do_if value="global.$GT_MK2_TradeReservationAmounts? and global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}? and global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-            <remove_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}.{this.ship}"/>
-            <do_if value="$mk2ReservationsAfterRelease.count == 0">
-              <remove_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}"/>
-            </do_if>
-          </do_if>
-          <set_value name="this.$lastTradeDestination" exact="null"/>
-          <set_value name="this.$lastTradeWare" exact="null"/>
-          <set_value name="this.$lastTradeReservedAmount" exact="0"/>
-        </do_if>
         <!-- Successful trade cycle: reset no-trade backoff. -->
         <set_value name="this.$noTradeRetryCount" exact="0"/>
         <set_value name="this.$sourceUsage.{$bestTrade.$Source}" exact="if this.$sourceUsage? and this.$sourceUsage.{$bestTrade.$Source}? then this.$sourceUsage.{$bestTrade.$Source} + 1 else 1"/>
         <set_value name="this.$destUsage.{$bestTrade.$Destination}" exact="if this.$destUsage? and this.$destUsage.{$bestTrade.$Destination}? then this.$destUsage.{$bestTrade.$Destination} + 1 else 1"/>
+        <set_value name="$stickinessTTLUse" exact="$stickinessTTLProfile"/>
+        <do_if value="$stickinessTTLUse le 0">
+          <set_value name="$stickinessTTLUse" exact="1"/>
+        </do_if>
+        <set_value name="$isSameStickyLane" exact="false"/>
+        <do_if value="this.$stickyCyclesLeft gt 0 and this.$stickySource? and this.$stickyDestination? and this.$stickyWare? and this.$stickySource == $bestTrade.$Source and this.$stickyDestination == $bestTrade.$Destination and this.$stickyWare == $bestTrade.$Ware">
+          <set_value name="$isSameStickyLane" exact="true"/>
+        </do_if>
+        <do_if value="$bestTrade.$NeedBucket? and $bestTrade.$NeedBucket == 'A'">
+          <set_value name="this.$stickySource" exact="$bestTrade.$Source"/>
+          <set_value name="this.$stickyDestination" exact="$bestTrade.$Destination"/>
+          <set_value name="this.$stickyWare" exact="$bestTrade.$Ware"/>
+          <set_value name="this.$stickyCyclesLeft" exact="$stickinessTTLUse"/>
+        </do_if>
+        <do_elseif value="$isSameStickyLane and this.$stickyCyclesLeft gt 0">
+          <set_value name="this.$stickyCyclesLeft" exact="[0, this.$stickyCyclesLeft - 1].max"/>
+          <do_if value="this.$stickyCyclesLeft le 0">
+            <set_value name="this.$stickySource" exact="null"/>
+            <set_value name="this.$stickyDestination" exact="null"/>
+            <set_value name="this.$stickyWare" exact="null"/>
+            <set_value name="this.$stickyCyclesLeft" exact="0"/>
+          </do_if>
+        </do_elseif>
+        <do_else>
+          <set_value name="this.$stickySource" exact="$bestTrade.$Source"/>
+          <set_value name="this.$stickyDestination" exact="$bestTrade.$Destination"/>
+          <set_value name="this.$stickyWare" exact="$bestTrade.$Ware"/>
+          <set_value name="this.$stickyCyclesLeft" exact="$stickinessTTLUse"/>
+        </do_else>
+        <do_if value="this.$debuglevel ge 1">
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': routeProfile lvl=' + $pilotLevelProfile + ' alpha=' + $routeAlpha + ' beta=' + $routeBeta + ' lane=' + $routeLaneBonus + ' stickyTTL=' + this.$stickyCyclesLeft + ' lowFloor=' + $lowVolumeFloorEffPercent + '%'" chance="this.$debugchance"/>
+        </do_if>
 
         <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
           $Message = {77000, 20200}.[$sellAmount, $bestTrade.$Ware.name, $bestTrade.$Source.knownname, $bestTrade.$Destination.knownname],
@@ -1325,27 +1428,47 @@
 
         <do_if value="this.$bidirectional">
           <set_value name="$returnInternal" exact="$bestTrade.$Source.isplayerowned and $bestTrade.$Destination.isplayerowned"/>
+          <set_value name="$returnSell" exact="null"/>
+          <set_value name="$returnBuy" exact="null"/>
           <do_if value="this.$ignoretraderules and $bestTrade.$Destination.isplayerowned">
             <find_sell_offer seller="$bestTrade.$Destination" wares="$bestTrade.$Ware" result="$returnSell"/>
           </do_if>
           <do_else>
             <find_sell_offer tradepartner="this.ship" seller="$bestTrade.$Destination" wares="$bestTrade.$Ware" result="$returnSell"/>
           </do_else>
+          <do_if value="$returnSell == null and this.$ignoretraderules and $bestTrade.$Destination.isplayerowned">
+            <find_sell_offer tradepartner="this.ship" seller="$bestTrade.$Destination" wares="$bestTrade.$Ware" result="$returnSell"/>
+          </do_if>
           <do_if value="this.$ignoretraderules and $bestTrade.$Source.isplayerowned">
             <find_buy_offer buyer="$bestTrade.$Source" wares="$bestTrade.$Ware" result="$returnBuy"/>
           </do_if>
           <do_else>
             <find_buy_offer tradepartner="this.ship" buyer="$bestTrade.$Source" wares="$bestTrade.$Ware" result="$returnBuy"/>
           </do_else>
-          <set_value name="$returnSellAmount" exact="$returnSell.offeramount.{this.ship}"/>
-          <set_value name="$returnBuyAmount" exact="$returnBuy.offeramount.{this.ship}"/>
+          <do_if value="$returnBuy == null and this.$ignoretraderules and $bestTrade.$Source.isplayerowned">
+            <find_buy_offer tradepartner="this.ship" buyer="$bestTrade.$Source" wares="$bestTrade.$Ware" result="$returnBuy"/>
+          </do_if>
+          <set_value name="$returnSellAmount" exact="0"/>
+          <set_value name="$returnBuyAmount" exact="0"/>
+          <do_if value="$returnSell != null">
+            <set_value name="$returnSellAmount" exact="$returnSell.offeramount.{this.ship}"/>
+          </do_if>
+          <do_if value="$returnBuy != null">
+            <set_value name="$returnBuyAmount" exact="$returnBuy.offeramount.{this.ship}"/>
+          </do_if>
+          <do_if value="($returnSellAmount == null or $returnSellAmount le 0) and this.$ignoretraderules and $bestTrade.$Destination.isplayerowned">
+            <set_value name="$returnSellAmount" exact="[$bestTrade.$Destination.cargo.{$bestTrade.$Ware}.count, this.ship.cargo.{$bestTrade.$Ware}.free].min"/>
+          </do_if>
+          <do_if value="($returnBuyAmount == null or $returnBuyAmount le 0) and this.$ignoretraderules and $bestTrade.$Source.isplayerowned">
+            <set_value name="$returnBuyAmount" exact="[0, $bestTrade.$Source.cargo.{$bestTrade.$Ware}.target - $bestTrade.$Source.cargo.{$bestTrade.$Ware}.count].max"/>
+          </do_if>
           <do_if value="$returnSellAmount == null">
             <set_value name="$returnSellAmount" exact="0"/>
           </do_if>
           <do_if value="$returnBuyAmount == null">
             <set_value name="$returnBuyAmount" exact="0"/>
           </do_if>
-          <do_if value="$returnSell.available and $returnSellAmount gt 0 and $returnBuy.available and $returnBuyAmount gt 0">
+          <do_if value="$returnSell != null and $returnSell.available and $returnSellAmount gt 0 and $returnBuy != null and $returnBuy.available and $returnBuyAmount gt 0">
             <set_value name="$returnSourceTarget" exact="[$bestTrade.$Destination.cargo.{$bestTrade.$Ware}.target, 1].max"/>
             <set_value name="$returnDestTarget" exact="[$bestTrade.$Source.cargo.{$bestTrade.$Ware}.target, 1].max"/>
             <set_value name="$returnSourceRatio" exact="($bestTrade.$Destination.cargo.{$bestTrade.$Ware}.count * 100) / $returnSourceTarget"/>
@@ -1361,7 +1484,8 @@
               <set_value name="$returnAmount" exact="[this.ship.cargo.{$bestTrade.$Ware}.free, $returnSellAmount, $returnBuyAmount].min"/>
                           <set_value name="$returnMinAmount" exact="[1, ((this.ship.cargo.{$bestTrade.$Ware}.max * this.$minCargoFillPercent) / 100)i].max"/>
               <do_if value="$returnAmount ge $returnMinAmount">
-                <create_trade_order object="this.ship" tradeoffer="$returnSell" amount="$returnAmount" immediate="true" internal="$returnInternal"/>
+                <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync MK2 return sell leg creation across ships"/>
+                <create_trade_order object="this.ship" tradeoffer="$returnSell" amount="$returnAmount" immediate="false" internal="$returnInternal"/>
                 <do_while value="this.ship.orders.count gt 0">
                   <wait exact="5s">
                     <interrupt>
@@ -1373,7 +1497,25 @@
                 </do_while>
                 <set_value name="$returnDeliverAmount" exact="[this.ship.cargo.{$bestTrade.$Ware}.count, $returnAmount, $returnBuyAmount].min"/>
                 <do_if value="$returnDeliverAmount gt 0">
-                  <create_trade_order object="this.ship" tradeoffer="$returnBuy" amount="$returnDeliverAmount" immediate="true" internal="$returnInternal"/>
+                  <create_trade_order object="this.ship" tradeoffer="$returnBuy" amount="$returnDeliverAmount" immediate="false" internal="$returnInternal"/>
+                  <!-- Mirror MK3 queued-trade logging payload for MK2 return leg. -->
+                  <set_value name="$mk2ReturnAmount" exact="if $returnDeliverAmount? and $returnDeliverAmount != null then $returnDeliverAmount else 0"/>
+                  <do_if value="$mk2ReturnAmount gt 0 and $returnSell != null and $returnBuy != null">
+                    <set_value name="$mk2ReturnBuyPriceRaw" exact="if $returnSell.unitprice? and $returnSell.unitprice != null then $returnSell.unitprice else 0"/>
+                    <set_value name="$mk2ReturnSellPriceRaw" exact="if $returnBuy.unitprice? and $returnBuy.unitprice != null then $returnBuy.unitprice else 0"/>
+                    <set_value name="$mk2ReturnProfitRaw" exact="($mk2ReturnSellPriceRaw - $mk2ReturnBuyPriceRaw) * $mk2ReturnAmount"/>
+                    <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
+                      $Ship = this.ship,
+                      $BuyOffer = $returnSell,
+                      $SellOffer = $returnBuy,
+                      $Amount = $mk2ReturnAmount,
+                      $Profit = $mk2ReturnProfitRaw,
+                      $BuyPrice = $mk2ReturnBuyPriceRaw / 100,
+                      $SellPrice = $mk2ReturnSellPriceRaw / 100,
+                      $IsSellOnly = false,
+                      $SearchPipeline = 'normal'
+                    ]"/>
+                  </do_if>
                   <do_while value="this.ship.orders.count gt 0">
                     <wait exact="5s">
                       <interrupt>
@@ -1400,7 +1542,13 @@
       <do_if value="$denyTrade">
         <resume label="no_trade_retry"/>
       </do_if>
-      <wait min="8s" max="12s"/>
+      <set_value name="$postCycleWaitMin" exact="this.$searchCadenceMinSec * 1s"/>
+      <set_value name="$postCycleWaitMax" exact="this.$searchCadenceMaxSec * 1s"/>
+      <do_if value="not $denyTrade and $bestTrade? and $bestTrade.$UsedLowVolume? and $bestTrade.$UsedLowVolume and $bestTrade.$NormalMinimumTrade? and $bestTrade.$Amount lt $bestTrade.$NormalMinimumTrade">
+        <set_value name="$postCycleWaitMin" exact="(this.$searchCadenceMinSec + 2) * 1s"/>
+        <set_value name="$postCycleWaitMax" exact="(this.$searchCadenceMaxSec + 2) * 1s"/>
+      </do_if>
+      <wait min="$postCycleWaitMin" max="$postCycleWaitMax"/>
       <resume label="main_loop"/>
 
       <label name="no_trade_retry"/>
@@ -1410,6 +1558,15 @@
       <set_value name="$retryJitter" exact="($retryBase / 5)i * 1s"/>
       <set_value name="$retryMin" exact="[8s, $retryBase - $retryJitter].max"/>
       <set_value name="$retryMax" exact="[60s, $retryBase + $retryJitter].min"/>
+      <do_if value="$retryMin lt (this.$searchCadenceMinSec * 1s)">
+        <set_value name="$retryMin" exact="this.$searchCadenceMinSec * 1s"/>
+      </do_if>
+      <do_if value="$retryMax lt (this.$searchCadenceMaxSec * 1s)">
+        <set_value name="$retryMax" exact="this.$searchCadenceMaxSec * 1s"/>
+      </do_if>
+      <do_if value="$retryMax lt $retryMin">
+        <set_value name="$retryMax" exact="$retryMin"/>
+      </do_if>
       <do_if value="this.$debuglevel ge 1">
         <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': retry backoff (count=' + this.$noTradeRetryCount + ', wait=' + ($retryMin / 1s)i + '-' + ($retryMax / 1s)i + 's)'" chance="this.$debugchance"/>
       </do_if>
@@ -1420,27 +1577,5 @@
   </attention>
 
   <on_abort>
-    <do_if value="this.$fleetcoordination and this.$lastTradeDestination? and this.$lastTradeWare? and global.$GT_MK2_TradeReservations? and global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}? and global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-      <create_list name="$mk2AbortReservationsAfterRelease"/>
-      <do_all exact="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.count" counter="$mk2ari">
-        <set_value name="$mk2AShip" exact="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}.{$mk2ari}"/>
-        <do_if value="$mk2AShip? and $mk2AShip.exists and $mk2AShip != this.ship">
-          <append_to_list name="$mk2AbortReservationsAfterRelease" exact="$mk2AShip"/>
-        </do_if>
-      </do_all>
-      <set_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}" exact="$mk2AbortReservationsAfterRelease"/>
-      <do_if value="$mk2AbortReservationsAfterRelease.count == 0">
-        <remove_value name="global.$GT_MK2_TradeReservations.{this.$lastTradeDestination}.{this.$lastTradeWare}"/>
-      </do_if>
-      <do_if value="global.$GT_MK2_TradeReservationAmounts? and global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}? and global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}?">
-        <remove_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}.{this.ship}"/>
-        <do_if value="$mk2AbortReservationsAfterRelease.count == 0">
-          <remove_value name="global.$GT_MK2_TradeReservationAmounts.{this.$lastTradeDestination}.{this.$lastTradeWare}"/>
-        </do_if>
-      </do_if>
-      <set_value name="this.$lastTradeDestination" exact="null"/>
-      <set_value name="this.$lastTradeWare" exact="null"/>
-      <set_value name="this.$lastTradeReservedAmount" exact="0"/>
-    </do_if>
   </on_abort>
 </aiscript>
