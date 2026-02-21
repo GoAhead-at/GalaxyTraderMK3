@@ -688,16 +688,41 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-State] Subordinate removed: ' + $subordinate.idcode + ' from GT commander ' + $commander.idcode + ' - starting Assist order check'" chance="100"/>
           </do_if>
+          <set_value name="$cleanupTraceId" exact="$subordinate.idcode + '|STATE_SUB_REMOVED|' + (player.age / 1s)i"/>
+          <set_value name="$subDefaultOrder" exact="'NONE'"/>
+          <do_if value="$subordinate.defaultorder?">
+            <set_value name="$subDefaultOrder" exact="@$subordinate.defaultorder.id"/>
+          </do_if>
+          <!-- Fallback producer intent: protects detach path when AI on_abort signal is missed. -->
+          <do_if value="not global.$GT_CleanupIntent?">
+            <set_value name="global.$GT_CleanupIntent" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_CleanupIntent.{$subordinate}" exact="table[
+            $Active = true,
+            $StartTime = player.age,
+            $ExpireTime = player.age + 8s,
+            $Source = 'STATE_SUB_REMOVED',
+            $TraceId = $cleanupTraceId,
+            $DefaultOrderAtSignal = $subDefaultOrder,
+            $CommanderAtSignal = if $commander.exists then $commander.idcode else 'NONE'
+          ]"/>
           
           <!-- Initialize delayed verification registry -->
           <do_if value="not global.$GT_DelayedVerification?">
             <set_value name="global.$GT_DelayedVerification" exact="table[]"/>
           </do_if>
           
-          <!-- Signal to start checking -->
+          <!-- Signal orphan-check and delayed verification fallback -->
+          <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
+            $Ship = $subordinate,
+            $Source = 'STATE_SUB_REMOVED',
+            $TraceId = $cleanupTraceId
+          ]"/>
           <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
             $Ship = $subordinate,
-            $CheckTime = player.age
+            $CheckTime = player.age,
+            $Source = 'STATE_SUB_REMOVED',
+            $TraceId = $cleanupTraceId
           ]"/>
         </do_if>
         <do_else>
@@ -851,6 +876,14 @@
       <actions>
         <set_value name="$params" exact="event.param2"/>
         <set_value name="$ship" exact="$params.$Ship"/>
+        <set_value name="$cleanupSource" exact="'STATE_DELAYED_VERIFY'"/>
+        <set_value name="$cleanupTraceId" exact="if $ship? and $ship.exists then $ship.idcode + '|STATE_DELAYED_VERIFY|' + (player.age / 1s)i else 'UNKNOWN|STATE_DELAYED_VERIFY|' + (player.age / 1s)i"/>
+        <do_if value="$params? and $params.$Source?">
+          <set_value name="$cleanupSource" exact="$params.$Source"/>
+        </do_if>
+        <do_if value="$params? and $params.$TraceId?">
+          <set_value name="$cleanupTraceId" exact="$params.$TraceId"/>
+        </do_if>
         
         <!-- Initialize state tracking if first run -->
         <do_if value="not global.$GT_DelayedVerificationState?">
@@ -887,6 +920,7 @@
         </do_if>
         
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-CleanupTrace] trace=' + $cleanupTraceId + ' source=' + $cleanupSource + ' cue=DelayedVerification ship=' + $ship.idcode + ' check=' + $state.$CheckCount + ' elapsed=' + $elapsedTime + ' default=' + (if $defaultOrder then $defaultOrder else 'NONE')" chance="100"/>
           <debug_text text="'[GT-State] CHECK #' + $state.$CheckCount + ' (' + $elapsedTime + 's): ' + $ship.idcode + ' - Default Order: ' + (if $defaultOrder then $defaultOrder else 'NONE') + ', HasDirectGT: ' + $hasDirectGT + ', Commander: ' + (if @$currentCommander.exists then @$currentCommander.idcode else 'NONE') + ' (GT: ' + $hasGTCommander + ')'" chance="100"/>
         </do_if>
         
@@ -905,13 +939,19 @@
           <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
         </do_elseif>
         <do_else>
-          <!-- Check: Is Assist order gone? -->
-          <do_if value="$defaultOrder != 'Assist'">
-            <!-- Assist order is gone - trigger cleanup -->
+          <!-- Unified delayed-verification decision (handles Assist lingering with missing commander). -->
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$verifyStatus">
+            <param name="ship" value="$ship"/>
+            <param name="checkRegistry" value="true"/>
+            <param name="checkState" value="true"/>
+          </run_actions>
+          
+          <do_if value="$verifyStatus.$ShouldCleanup">
+            <!-- Detached cleanup confirmed - trigger cleanup immediately -->
             <do_if value="not $state.$CleanupSent">
               <set_value name="$state.$CleanupSent" exact="true"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-State] Assist order REMOVED for ' + $ship.idcode + ' (check #' + $state.$CheckCount + ', ' + $elapsedTime + 's) - triggering cleanup'" chance="100"/>
+                <debug_text text="'[GT-State] DelayedVerification confirmed DETACHED cleanup for ' + $ship.idcode + ' (check #' + $state.$CheckCount + ', ' + $elapsedTime + 's, default=' + (if $defaultOrder then $defaultOrder else 'NONE') + ')' " chance="100"/>
               </do_if>
               
               <!-- Trigger cleanup signals -->
@@ -929,24 +969,84 @@
               <do_else>
                 <set_value name="$originalName" exact="@$ship.macro.name"/>
               </do_else>
-              
-              <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                $Ship = $ship,
-                $Pilot = $pilot,
-                $Reason = 'Assist order removed - restoring original name',
-                $OriginalName = $originalName
-              ]"/>
+
+              <!-- Idempotency guard: suppress duplicate detached-cleanup signals per ship/time bucket -->
+              <set_value name="$cleanupSignalType" exact="'DETACHED_CLEANUP_REQUIRED'"/>
+              <set_value name="$cleanupTokenBucket" exact="(player.age / 1s)i"/>
+              <set_value name="$cleanupToken" exact="$cleanupSignalType + '|' + $cleanupTokenBucket"/>
+              <do_if value="not global.$GT_CleanupSignalState?">
+                <set_value name="global.$GT_CleanupSignalState" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_CleanupSignalState.{$ship}?">
+                <set_value name="global.$GT_CleanupSignalState.{$ship}" exact="table[
+                  $LastCleanupToken = '',
+                  $LastCleanupTime = 0s
+                ]"/>
+              </do_if>
+              <set_value name="$signalState" exact="global.$GT_CleanupSignalState.{$ship}"/>
+              <do_if value="not $signalState.$LastCleanupToken? or $signalState.$LastCleanupToken != $cleanupToken">
+                <set_value name="$signalState.$LastCleanupToken" exact="$cleanupToken"/>
+                <set_value name="$signalState.$LastCleanupTime" exact="player.age"/>
+                <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                  $Ship = $ship,
+                  $Pilot = $pilot,
+                  $Reason = 'Delayed verification detached cleanup - restoring original name',
+                  $OriginalName = $originalName,
+                  $Source = 'STATE_DELAYED_VERIFY',
+                  $TraceId = $cleanupTraceId
+                ]"/>
+              </do_if>
+              <do_elseif value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-State] Duplicate cleanup signal suppressed for ' + $ship.idcode + ' token=' + $cleanupToken" chance="100"/>
+              </do_elseif>
               
               <!-- Clean up state -->
               <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
             </do_if>
           </do_if>
+          <do_elseif value="$verifyStatus.$IsGTControlled">
+            <set_value name="$intentActive" exact="false"/>
+            <set_value name="$intentExpired" exact="false"/>
+            <do_if value="global.$GT_CleanupIntent? and global.$GT_CleanupIntent.{$ship}?">
+              <set_value name="$intent" exact="global.$GT_CleanupIntent.{$ship}"/>
+              <do_if value="$intent.$Active? and $intent.$Active">
+                <set_value name="$intentActive" exact="true"/>
+              </do_if>
+              <do_if value="$intent.$ExpireTime? and player.age ge $intent.$ExpireTime">
+                <set_value name="$intentExpired" exact="true"/>
+              </do_if>
+            </do_if>
+            <!-- Do not accept stale commander-based control while detach intent is still active. -->
+            <do_if value="$intentActive and not $intentExpired and not $verifyStatus.$HasDirectGTOrder">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-State] DelayedVerification hold for ' + $ship.idcode + ' - intent active, waiting for stable detach/control state'" chance="100"/>
+              </do_if>
+              <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
+                $Ship = $ship,
+                $CheckTime = player.age + 2s,
+                $Source = $cleanupSource,
+                $TraceId = $cleanupTraceId
+              ]"/>
+            </do_if>
+            <do_else>
+              <!-- Ship is GT-controlled again (reassigned or direct order) - stop verification -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-State] DelayedVerification cancelled for ' + $ship.idcode + ' - GT control restored'" chance="100"/>
+              </do_if>
+              <remove_value name="global.$GT_DelayedVerificationState.{$ship}"/>
+            </do_else>
+          </do_elseif>
           <do_else>
-            <!-- Assist order still active - continue checking -->
+            <!-- Still transitional - continue checking -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-State] DelayedVerification requeue for ' + $ship.idcode + ' - transitional status (no cleanup, no stable GT control yet)'" chance="100"/>
+            </do_if>
             <!-- PERFORMANCE FIX: Use 2s interval instead of 1s -->
             <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
               $Ship = $ship,
-              $CheckTime = player.age + 2s
+              $CheckTime = player.age + 2s,
+              $Source = $cleanupSource,
+              $TraceId = $cleanupTraceId
             ]"/>
           </do_else>
         </do_else>
