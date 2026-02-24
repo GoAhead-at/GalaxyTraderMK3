@@ -13,9 +13,7 @@ local function logDebug(message, level)
     if level == "ERROR" then
         DebugError(prefix .. message)
     elseif level == "WARNING" then
-        DebugWarning(prefix .. message)
-    else
-        -- Use DebugError for info messages (appears in log but not as critical error)
+        -- Some runtimes don't expose DebugWarning; use DebugError as safe fallback.
         DebugError(prefix .. message)
     end
 end
@@ -27,6 +25,47 @@ local C = ffi.C
 -- FFI definitions for C API mod removal functions
 ffi.cdef[[
     typedef uint64_t UniverseID;
+    typedef struct {
+        const char* Name;
+        const char* RawName;
+        const char* Ware;
+        uint32_t Quality;
+        const char* PropertyType;
+        float ForwardThrustFactor;
+        float StrafeAccFactor;
+        float StrafeThrustFactor;
+        float RotationThrustFactor;
+        float BoostAccFactor;
+        float BoostThrustFactor;
+        float BoostDurationFactor;
+        float BoostAttackTimeFactor;
+        float BoostReleaseTimeFactor;
+        float BoostChargeTimeFactor;
+        float BoostRechargeTimeFactor;
+        float TravelThrustFactor;
+        float TravelStartThrustFactor;
+        float TravelAttackTimeFactor;
+        float TravelReleaseTimeFactor;
+        float TravelChargeTimeFactor;
+    } UIEngineMod2;
+    typedef struct {
+        const char* Name;
+        const char* RawName;
+        const char* Ware;
+        uint32_t Quality;
+        const char* PropertyType;
+        float MassFactor;
+        float DragFactor;
+        float MaxHullFactor;
+        float RadarRangeFactor;
+        uint32_t AddedUnitCapacity;
+        uint32_t AddedMissileCapacity;
+        uint32_t AddedCountermeasureCapacity;
+        uint32_t AddedDeployableCapacity;
+        float RadarCloakFactor;
+        float RegionDamageProtection;
+        float HideCargoChance;
+    } UIShipMod2;
     void DismantleShipMod(UniverseID shipid);
     void DismantleEngineMod(UniverseID objectid);
     void DismantleShieldMod(UniverseID defensibleid, UniverseID contextid, const char* group);
@@ -35,6 +74,8 @@ ffi.cdef[[
     bool InstallEngineMod(UniverseID objectid, const char* wareid);
     bool InstallShipMod(UniverseID shipid, const char* wareid);
     bool InstallShieldMod(UniverseID defensibleid, UniverseID contextid, const char* group, const char* wareid);
+    bool GetInstalledEngineMod2(UniverseID objectid, UIEngineMod2* enginemod);
+    bool GetInstalledShipMod2(UniverseID shipid, UIShipMod2* shipmod);
 ]]
 
 -- Convert string to 64-bit integer (ship ID from MD)
@@ -63,6 +104,81 @@ local function SplitParams(params, sep)
     return result
 end
 
+local function SafeCString(value, defaultValue)
+    defaultValue = defaultValue or "none"
+    if value == nil then
+        return defaultValue
+    end
+    local ok, text = pcall(ffi.string, value)
+    if ok and text and text ~= "" then
+        return text
+    end
+    return defaultValue
+end
+
+local function IsGTShipModWareId(wareId)
+    return wareId == "mod_ship_gt_level1"
+        or wareId == "mod_ship_gt_level2"
+        or wareId == "mod_ship_gt_level3"
+        or wareId == "mod_penalty_ship_light"
+        or wareId == "mod_penalty_ship_moderate"
+        or wareId == "mod_penalty_ship_severe"
+        or wareId == "mod_penalty_light"
+        or wareId == "mod_penalty_moderate"
+        or wareId == "mod_penalty_severe"
+end
+
+local function IsGTEngineModWareId(wareId)
+    return wareId == "mod_engine_gt_level1"
+        or wareId == "mod_engine_gt_level2"
+        or wareId == "mod_engine_gt_level3"
+        or wareId == "mod_penalty_engine_light"
+        or wareId == "mod_penalty_engine_moderate"
+        or wareId == "mod_penalty_engine_severe"
+        or wareId == "mod_penalty_light"
+        or wareId == "mod_penalty_moderate"
+        or wareId == "mod_penalty_severe"
+end
+
+local function GT_DismantleDetectedGTMods(_, params)
+    -- Format: "shipId|shipIdCode|reason"
+    if not params then
+        logDebug("ERROR: GT_DismantleDetectedGTMods called with nil params", "ERROR")
+        return
+    end
+
+    local tPackets = SplitParams(params, "|")
+    if not tPackets[1] then
+        logDebug(string.format("ERROR: Invalid GT_DismantleDetectedGTMods params format: %s", tostring(params)), "ERROR")
+        return
+    end
+
+    local shipIdStr = tPackets[1]
+    local shipIdCode = tPackets[2] or shipIdStr
+    local reason = tPackets[3] or "manual"
+    local shipId = ConvertStringTo64Bit(shipIdStr)
+
+    local shipBuf = ffi.new("UIShipMod2")
+    local engineBuf = ffi.new("UIEngineMod2")
+    local hasShip = C.GetInstalledShipMod2(shipId, shipBuf)
+    local hasEngine = C.GetInstalledEngineMod2(shipId, engineBuf)
+    local shipWare = hasShip and SafeCString(shipBuf.Ware) or "none"
+    local engineWare = hasEngine and SafeCString(engineBuf.Ware) or "none"
+
+    local removedShip = false
+    local removedEngine = false
+
+    if hasShip and IsGTShipModWareId(shipWare) then
+        C.DismantleShipMod(shipId)
+        removedShip = true
+    end
+    if hasEngine and IsGTEngineModWareId(engineWare) then
+        C.DismantleEngineMod(shipId)
+        removedEngine = true
+    end
+
+end
+
 -- Remove modification from ship
 local function GT_DismantleMod(_, params)
     -- Parse parameters: "type|shipId|shipIdCode|componentId|contextId|group"
@@ -84,15 +200,10 @@ local function GT_DismantleMod(_, params)
     local shipIdCode = tPackets[3] or shipIdStr  -- Use shipIdCode if provided, otherwise fall back to numeric ID
     local shipId = ConvertStringTo64Bit(shipIdStr)
     
-    -- FIX: Include readable ship ID code in log messages
-    logDebug(string.format("Removing %s mod from ship ID string: %s (converted: %s) => %s", type, shipIdStr, tostring(shipId), shipIdCode))
-    
     if type == "ship" then
         C.DismantleShipMod(shipId)
-        logDebug(string.format("Removed ship mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "engine" then
         C.DismantleEngineMod(shipId)
-        logDebug(string.format("Removed engine mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     elseif type == "shield" then
         -- For shield mods, we need context (ship) and group
         -- If group is "null" or not provided, we need to remove from all groups
@@ -103,13 +214,11 @@ local function GT_DismantleMod(_, params)
         
         if group then
             C.DismantleShieldMod(shipId, contextId, group)
-            logDebug(string.format("Removed shield mod from ship ID: %s => %s, group: %s", tostring(shipId), shipIdCode, group))
         else
             -- Cannot pass nil to const char* parameter - FFI will crash
             -- Pass empty string instead (X4 may interpret this as "all groups" or skip if not supported)
             -- Note: This might need iteration through actual shield groups if empty string doesn't work
             C.DismantleShieldMod(shipId, contextId, "")
-            logDebug(string.format("Removed shield mod from ship ID: %s => %s (all groups - using empty string)", tostring(shipId), shipIdCode))
         end
     elseif type == "weapon" then
         -- For weapon mods, we need the component ID
@@ -119,13 +228,11 @@ local function GT_DismantleMod(_, params)
         
         if componentId then
             C.DismantleWeaponMod(componentId)
-            logDebug(string.format("Removed weapon mod from component ID: %s (ship: %s)", tostring(componentId), shipIdCode))
         else
             logDebug(string.format("⚠ WARNING: No component ID provided for weapon mod - cannot remove individual weapon mods without component ID (ship: %s)", shipIdCode), "WARNING")
         end
     elseif type == "thruster" then
         C.DismantleThrusterMod(shipId)
-        logDebug(string.format("Removed thruster mod from ship ID: %s => %s", tostring(shipId), shipIdCode))
     else
         logDebug(string.format("ERROR: Unknown mod type: %s", type), "ERROR")
     end
@@ -140,14 +247,10 @@ local function GT_InstallMod(_, params)
     local shipId = ConvertStringTo64Bit(tostring(tonumber(tPackets[2])))
     local wareId = tPackets[3]
     
-    logDebug(string.format("Installing %s mod (%s) on ship ID: %s", type, wareId, tostring(shipId)))
-    
     if type == "thruster" then
         -- Thruster mods are installed via InstallEngineMod since they affect engine properties
         local success = C.InstallEngineMod(shipId, wareId)
-        if success then
-            logDebug(string.format("Installed thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)))
-        else
+        if not success then
             logDebug(string.format("Failed to install thruster mod (%s) on ship ID: %s", wareId, tostring(shipId)), "ERROR")
         end
     else
@@ -181,6 +284,14 @@ local function init()
         logDebug("Registered event: GT_InstallMod")
     else
         logDebug("Failed to register event: GT_InstallMod", "ERROR")
+        return false
+    end
+
+    local success3 = pcall(RegisterEvent, "GT_DismantleDetectedGTMods", GT_DismantleDetectedGTMods)
+    if success3 then
+        logDebug("Registered event: GT_DismantleDetectedGTMods")
+    else
+        logDebug("Failed to register event: GT_DismantleDetectedGTMods", "ERROR")
         return false
     end
     

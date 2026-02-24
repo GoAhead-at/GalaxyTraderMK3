@@ -654,6 +654,10 @@
         <do_if value="not $ship? or not $ship.exists">
           <return value="false"/>
         </do_if>
+        <!-- Wreck/non-operational components do not reliably expose equipment mod properties. -->
+        <do_if value="@$ship.iswreck or not @$ship.isoperational">
+          <return value="false"/>
+        </do_if>
 
         <!-- Ensure tracking tables exist -->
         <do_if value="not global.$GT_Ships?">
@@ -681,6 +685,13 @@
         <set_value name="$pilotLevel" exact="0"/>
         <do_if value="$pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$Level?">
           <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{$pilot}.$Level"/>
+        </do_if>
+        <!-- Fallback: use actual pilot management skill when GT table entry is missing/stale -->
+        <do_if value="$pilotLevel le 0 and $pilot?">
+          <set_value name="$pilotSkillFallback" exact="@$pilot.skill.management"/>
+          <do_if value="$pilotSkillFallback?">
+            <set_value name="$pilotLevel" exact="$pilotSkillFallback"/>
+          </do_if>
         </do_if>
 
         <!-- Determine ship class -->
@@ -787,6 +798,49 @@
         <!-- Current slot state -->
         <set_value name="$currentShipMod" exact="@$ship.equipmentmods.ship"/>
         <set_value name="$currentEngineMod" exact="@$ship.equipmentmods.engine"/>
+        <set_value name="$hasAnyShipMod" exact="$ship.hasshipmod"/>
+        <set_value name="$hasAnyEngineMod" exact="$ship.hasenginemod"/>
+        <!-- Fallback detection for cases where slot ware introspection can be null -->
+        <do_if value="not $currentShipMod? and $hasAnyShipMod">
+          <do_if value="$ship.hasshipmod.{ware.mod_ship_gt_level1}">
+            <set_value name="$currentShipMod" exact="ware.mod_ship_gt_level1"/>
+          </do_if>
+          <do_elseif value="$ship.hasshipmod.{ware.mod_ship_gt_level2}">
+            <set_value name="$currentShipMod" exact="ware.mod_ship_gt_level2"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasshipmod.{ware.mod_ship_gt_level3}">
+            <set_value name="$currentShipMod" exact="ware.mod_ship_gt_level3"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasshipmod.{ware.mod_penalty_ship_light}">
+            <set_value name="$currentShipMod" exact="ware.mod_penalty_ship_light"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasshipmod.{ware.mod_penalty_ship_moderate}">
+            <set_value name="$currentShipMod" exact="ware.mod_penalty_ship_moderate"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasshipmod.{ware.mod_penalty_ship_severe}">
+            <set_value name="$currentShipMod" exact="ware.mod_penalty_ship_severe"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="not $currentEngineMod? and $hasAnyEngineMod">
+          <do_if value="$ship.hasenginemod.{ware.mod_engine_gt_level1}">
+            <set_value name="$currentEngineMod" exact="ware.mod_engine_gt_level1"/>
+          </do_if>
+          <do_elseif value="$ship.hasenginemod.{ware.mod_engine_gt_level2}">
+            <set_value name="$currentEngineMod" exact="ware.mod_engine_gt_level2"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasenginemod.{ware.mod_engine_gt_level3}">
+            <set_value name="$currentEngineMod" exact="ware.mod_engine_gt_level3"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasenginemod.{ware.mod_penalty_engine_light}">
+            <set_value name="$currentEngineMod" exact="ware.mod_penalty_engine_light"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasenginemod.{ware.mod_penalty_engine_moderate}">
+            <set_value name="$currentEngineMod" exact="ware.mod_penalty_engine_moderate"/>
+          </do_elseif>
+          <do_elseif value="$ship.hasenginemod.{ware.mod_penalty_engine_severe}">
+            <set_value name="$currentEngineMod" exact="ware.mod_penalty_engine_severe"/>
+          </do_elseif>
+        </do_if>
         <run_actions ref="GT_IsGTShipModWare" result="$currentShipIsGT">
           <param name="ware" value="$currentShipMod"/>
         </run_actions>
@@ -795,6 +849,13 @@
         </run_actions>
         <set_value name="$currentShipIsNonGT" exact="$currentShipMod? and not $currentShipIsGT"/>
         <set_value name="$currentEngineIsNonGT" exact="$currentEngineMod? and not $currentEngineIsGT"/>
+        <set_value name="$unresolvedShipMod" exact="$hasAnyShipMod and not $currentShipMod?"/>
+        <set_value name="$unresolvedEngineMod" exact="$hasAnyEngineMod and not $currentEngineMod?"/>
+        <!-- Bridge unresolved MD slot state through Lua API: remove only known GT IDs -->
+        <do_if value="$unresolvedShipMod or $unresolvedEngineMod">
+          <set_value name="$shipIdCode" exact="@$ship.idcode"/>
+          <raise_lua_event name="'GT_DismantleDetectedGTMods'" param="$ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|reconcile-unresolved'"/>
+        </do_if>
 
         <!-- Tracking-derived ownership flags (fallback when runtime slot introspection is ambiguous) -->
         <set_value name="$trackedHasShipSlot" exact="false"/>
@@ -819,11 +880,24 @@
           <set_value name="$trackedPenaltyEngineMod" exact="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyEngineMod"/>
           <set_value name="$trackedHasEngineSlot" exact="true"/>
         </do_if>
+        <set_value name="$hasLegacyPenaltyKey" exact="false"/>
+        <do_if value="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyMod?">
+          <set_value name="$hasLegacyPenaltyKey" exact="true"/>
+        </do_if>
+        <set_value name="$allowUnresolvedShipRemoval" exact="$unresolvedShipMod and ($trackedHasShipSlot or $hasLegacyPenaltyKey)"/>
+        <set_value name="$allowUnresolvedEngineRemoval" exact="$unresolvedEngineMod and ($trackedHasEngineSlot or $hasLegacyPenaltyKey)"/>
+        <!-- If ship has a mod but slot introspection cannot resolve the ware, trust GT tracking ownership -->
+        <do_if value="not $currentShipIsGT and $trackedHasShipSlot and $hasAnyShipMod">
+          <set_value name="$currentShipIsGT" exact="true"/>
+        </do_if>
+        <do_if value="not $currentEngineIsGT and $trackedHasEngineSlot and $hasAnyEngineMod">
+          <set_value name="$currentEngineIsGT" exact="true"/>
+        </do_if>
 
         <!-- Hard-disable mode: remove only GT-managed mods and stop -->
         <do_if value="not $modificationsEnabled">
           <set_value name="$shipIdCode" exact="@$ship.idcode"/>
-          <do_if value="$currentShipIsGT or $trackedHasShipSlot">
+          <do_if value="$currentShipIsGT or $trackedHasShipSlot or $allowUnresolvedShipRemoval">
             <set_value name="$shipModToRemove" exact="null"/>
             <do_if value="$currentShipIsGT">
               <set_value name="$shipModToRemove" exact="$currentShipMod"/>
@@ -833,7 +907,7 @@
             </do_elseif>
             <raise_lua_event name="'GT_DismantleMod'" param="'ship|' + $ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|0|0|' + $shipModToRemove"/>
           </do_if>
-          <do_if value="$currentEngineIsGT or $trackedHasEngineSlot">
+          <do_if value="$currentEngineIsGT or $trackedHasEngineSlot or $allowUnresolvedEngineRemoval">
             <set_value name="$engineModToRemove" exact="null"/>
             <do_if value="$currentEngineIsGT">
               <set_value name="$engineModToRemove" exact="$currentEngineMod"/>
@@ -858,6 +932,13 @@
 
         <!-- Remove stale GT mods if they don't match desired state -->
         <set_value name="$shipIdCode" exact="@$ship.idcode"/>
+        <!-- Legacy/unresolvable slot mods: force-clear slot so desired state can be restored -->
+        <do_if value="$allowUnresolvedShipRemoval">
+          <raise_lua_event name="'GT_DismantleMod'" param="'ship|' + $ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|0|0|null'"/>
+        </do_if>
+        <do_if value="$allowUnresolvedEngineRemoval">
+          <raise_lua_event name="'GT_DismantleMod'" param="'engine|' + $ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|0|0|null'"/>
+        </do_if>
         <do_if value="$currentShipIsGT and ($desiredShipWare == null or $currentShipMod != $desiredShipWare)">
           <raise_lua_event name="'GT_DismantleMod'" param="'ship|' + $ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|0|0|' + $currentShipMod"/>
         </do_if>
@@ -922,7 +1003,7 @@
         <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
           <do_all exact="global.$GT_Ships.keys.count" counter="$idx">
             <set_value name="$ship" exact="global.$GT_Ships.keys.{$idx}"/>
-            <do_if value="$ship? and $ship.exists">
+            <do_if value="$ship? and $ship.exists and not @$ship.iswreck and @$ship.isoperational">
               <run_actions ref="GT_Reconcile_Ship_Modifications">
                 <param name="ship" value="$ship"/>
                 <param name="pilot" value="@$ship.pilot"/>
@@ -1049,7 +1130,9 @@
       </conditions>
       <delay exact="5s"/>
       <actions>
+        <debug_text text="'[GT-Mods] Startup reconcile: begin (event=' + event.name + ')'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
         <run_actions ref="GT_Reconcile_All_GT_Ship_Modifications"/>
+        <debug_text text="'[GT-Mods] Startup reconcile: completed'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
       </actions>
     </cue>
 
@@ -1458,6 +1541,220 @@
             </do_if>
           </do_else>
         </do_if>
+      </actions>
+    </cue>
+
+    <!-- Build startup repair queue from known GT registries -->
+    <library name="GT_Queue_Startup_Repair_Candidates" purpose="run_actions">
+      <actions>
+        <set_value name="global.$GT_ModRepairQueue" exact="[]"/>
+        <set_value name="$queuedFromGTShips" exact="0"/>
+        <set_value name="$queuedFromState" exact="0"/>
+        <set_value name="$skippedMissingFromGTShips" exact="0"/>
+        <set_value name="$skippedMissingFromState" exact="0"/>
+
+        <!-- Primary source: GT ship registry -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <do_all exact="global.$GT_Ships.keys.count" counter="$k1">
+            <set_value name="$ship" exact="global.$GT_Ships.keys.{$k1}"/>
+            <do_if value="$ship? and $ship.exists and not @$ship.iswreck and @$ship.isoperational">
+              <append_to_list name="global.$GT_ModRepairQueue" exact="$ship"/>
+              <set_value name="$queuedFromGTShips" operation="add"/>
+            </do_if>
+            <do_else>
+              <set_value name="$skippedMissingFromGTShips" operation="add"/>
+            </do_else>
+          </do_all>
+        </do_if>
+
+        <!-- Secondary source: ship state registry (captures ships that may have drifted out of GT_Ships) -->
+        <do_if value="global.$GT_Ship_State? and global.$GT_Ship_State.keys.count gt 0">
+          <do_all exact="global.$GT_Ship_State.keys.count" counter="$k2">
+            <set_value name="$ship" exact="global.$GT_Ship_State.keys.{$k2}"/>
+            <do_if value="$ship? and $ship.exists and not @$ship.iswreck and @$ship.isoperational">
+              <set_value name="$alreadyQueued" exact="false"/>
+              <do_all exact="global.$GT_ModRepairQueue.count" counter="$qi">
+                <do_if value="global.$GT_ModRepairQueue.{$qi} == $ship">
+                  <set_value name="$alreadyQueued" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $alreadyQueued">
+                <append_to_list name="global.$GT_ModRepairQueue" exact="$ship"/>
+                <set_value name="$queuedFromState" operation="add"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <set_value name="$skippedMissingFromState" operation="add"/>
+            </do_else>
+          </do_all>
+        </do_if>
+
+        <debug_text text="'[GT-Mods] Startup repair queue sources: GT_Ships=' + $queuedFromGTShips + ' (missing=' + $skippedMissingFromGTShips + '), GT_Ship_State=' + $queuedFromState + ' (missing=' + $skippedMissingFromState + '), total=' + global.$GT_ModRepairQueue.count" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+        <return value="global.$GT_ModRepairQueue.count"/>
+      </actions>
+    </library>
+
+    <!-- Startup repair queue bootstrap -->
+    <cue name="StartupRepairQueueOnLoad" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+        </check_any>
+      </conditions>
+      <delay exact="7s"/>
+      <actions>
+        <run_actions ref="GT_Queue_Startup_Repair_Candidates" result="$queuedCount"/>
+        <set_value name="global.$GT_ModRepairQueueAttempt" exact="0"/>
+        <debug_text text="'[GT-Mods] Startup repair queue prepared: ' + $queuedCount + ' ship(s)'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Mods] Startup repair queue prepared: ' + $queuedCount + ' ship(s)'" chance="100"/>
+        </do_if>
+        <do_if value="$queuedCount gt 0">
+          <signal_cue_instantly cue="md.GT_Ship_Modifications.ProcessStartupRepairQueue"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Multi-pass startup repair queue processing -->
+    <cue name="ProcessStartupRepairQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="500ms"/>
+      <actions>
+        <do_if value="not global.$GT_ModRepairQueueAttempt?">
+          <set_value name="global.$GT_ModRepairQueueAttempt" exact="0"/>
+        </do_if>
+        <set_value name="global.$GT_ModRepairQueueAttempt" operation="add"/>
+
+        <set_value name="$processed" exact="0"/>
+        <set_value name="$queueCount" exact="0"/>
+        <do_if value="global.$GT_ModRepairQueue?">
+          <set_value name="$queueCount" exact="global.$GT_ModRepairQueue.count"/>
+        </do_if>
+
+        <do_if value="$queueCount gt 0">
+          <do_all exact="$queueCount" counter="$ri">
+            <set_value name="$ship" exact="global.$GT_ModRepairQueue.{$ri}"/>
+            <do_if value="$ship? and $ship.exists">
+              <set_value name="$pilot" exact="@$ship.pilot"/>
+              <set_value name="$hasGTPilotEntry" exact="false"/>
+              <set_value name="$gtPilotLevel" exact="-1"/>
+              <do_if value="$pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+                <set_value name="$hasGTPilotEntry" exact="true"/>
+                <do_if value="global.$GT_Pilots.{$pilot}.$Level?">
+                  <set_value name="$gtPilotLevel" exact="@global.$GT_Pilots.{$pilot}.$Level"/>
+                </do_if>
+              </do_if>
+              <set_value name="$preShipMod" exact="@$ship.equipmentmods.ship"/>
+              <set_value name="$preEngineMod" exact="@$ship.equipmentmods.engine"/>
+              <set_value name="$preHasShipMod" exact="false"/>
+              <set_value name="$preHasEngineMod" exact="false"/>
+              <do_if value="not @$ship.iswreck and @$ship.isoperational">
+                <set_value name="$preHasShipMod" exact="$ship.hasshipmod"/>
+                <set_value name="$preHasEngineMod" exact="$ship.hasenginemod"/>
+              </do_if>
+              <set_value name="$preShipModId" exact="null"/>
+              <set_value name="$preEngineModId" exact="null"/>
+              <do_if value="$preShipMod?">
+                <set_value name="$preShipModId" exact="@$preShipMod.id"/>
+              </do_if>
+              <do_if value="$preEngineMod?">
+                <set_value name="$preEngineModId" exact="@$preEngineMod.id"/>
+              </do_if>
+              <run_actions ref="GT_IsGTShipModWare" result="$preShipIsGT">
+                <param name="ware" value="$preShipMod"/>
+              </run_actions>
+              <run_actions ref="GT_IsGTEngineModWare" result="$preEngineIsGT">
+                <param name="ware" value="$preEngineMod"/>
+              </run_actions>
+              <set_value name="$trackedSlotsCount" exact="0"/>
+              <set_value name="$trackedPenaltyShipMod" exact="null"/>
+              <set_value name="$trackedPenaltyEngineMod" exact="null"/>
+              <set_value name="$trackedPenaltyShipModId" exact="null"/>
+              <set_value name="$trackedPenaltyEngineModId" exact="null"/>
+              <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$GTModifications?">
+                <do_if value="global.$GT_Ships.{$ship}.$GTModifications.$GTInstalledSlots?">
+                  <set_value name="$trackedSlotsCount" exact="global.$GT_Ships.{$ship}.$GTModifications.$GTInstalledSlots.count"/>
+                </do_if>
+                <do_if value="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyShipMod?">
+                  <set_value name="$trackedPenaltyShipMod" exact="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyShipMod"/>
+                  <set_value name="$trackedPenaltyShipModId" exact="@$trackedPenaltyShipMod.id"/>
+                </do_if>
+                <do_if value="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyEngineMod?">
+                  <set_value name="$trackedPenaltyEngineMod" exact="global.$GT_Ships.{$ship}.$GTModifications.$GTPenaltyEngineMod"/>
+                  <set_value name="$trackedPenaltyEngineModId" exact="@$trackedPenaltyEngineMod.id"/>
+                </do_if>
+              </do_if>
+              <debug_text text="'[GT-Mods] Startup repair ship ' + $ship.idcode + ': pilot=' + (if $pilot? then $pilot.name else 'NONE') + ', gtPilotEntry=' + $hasGTPilotEntry + ', gtPilotLevel=' + $gtPilotLevel + ', preShip=' + (if $preShipModId? then $preShipModId else 'none') + ' (gt=' + $preShipIsGT + ', has=' + $preHasShipMod + '), preEngine=' + (if $preEngineModId? then $preEngineModId else 'none') + ' (gt=' + $preEngineIsGT + ', has=' + $preHasEngineMod + '), trackedSlots=' + $trackedSlotsCount + ', trackedPenaltyShip=' + (if $trackedPenaltyShipModId? then $trackedPenaltyShipModId else 'none') + ', trackedPenaltyEngine=' + (if $trackedPenaltyEngineModId? then $trackedPenaltyEngineModId else 'none') + ', compareShipSet=[mod_ship_gt_level1,mod_ship_gt_level2,mod_ship_gt_level3,mod_penalty_ship_light,mod_penalty_ship_moderate,mod_penalty_ship_severe], compareEngineSet=[mod_engine_gt_level1,mod_engine_gt_level2,mod_engine_gt_level3,mod_penalty_engine_light,mod_penalty_engine_moderate,mod_penalty_engine_severe]'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+              <set_value name="$shipIdCode" exact="@$ship.idcode"/>
+              <debug_text text="'[GT-Mods] Startup bridge invoked for ' + $ship.idcode + ' (deterministic GT-ID cleanup pass)'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+              <raise_lua_event name="'GT_DismantleDetectedGTMods'" param="$ship + '|' + (if $shipIdCode? then $shipIdCode else 'UNKNOWN') + '|startup-queue-pass'"/>
+
+              <!-- Self-heal missing GT ship registry entries before reconcile -->
+              <do_if value="not global.$GT_Ships?">
+                <set_value name="global.$GT_Ships" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_Ships.{$ship}?">
+                <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+                <set_value name="global.$GT_Ships.{$ship}.$RegisterTime" exact="player.age"/>
+                <debug_text text="'[GT-Mods] Startup repair ship ' + $ship.idcode + ': self-healed missing GT_Ships entry'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+              </do_if>
+
+              <run_actions ref="GT_Reconcile_Ship_Modifications">
+                <param name="ship" value="$ship"/>
+                <param name="pilot" value="@$ship.pilot"/>
+              </run_actions>
+              <set_value name="$postShipMod" exact="@$ship.equipmentmods.ship"/>
+              <set_value name="$postEngineMod" exact="@$ship.equipmentmods.engine"/>
+              <set_value name="$postHasShipMod" exact="false"/>
+              <set_value name="$postHasEngineMod" exact="false"/>
+              <do_if value="not @$ship.iswreck and @$ship.isoperational">
+                <set_value name="$postHasShipMod" exact="$ship.hasshipmod"/>
+                <set_value name="$postHasEngineMod" exact="$ship.hasenginemod"/>
+              </do_if>
+              <set_value name="$postShipModId" exact="null"/>
+              <set_value name="$postEngineModId" exact="null"/>
+              <do_if value="$postShipMod?">
+                <set_value name="$postShipModId" exact="@$postShipMod.id"/>
+              </do_if>
+              <do_if value="$postEngineMod?">
+                <set_value name="$postEngineModId" exact="@$postEngineMod.id"/>
+              </do_if>
+              <run_actions ref="GT_IsGTShipModWare" result="$postShipIsGT">
+                <param name="ware" value="$postShipMod"/>
+              </run_actions>
+              <run_actions ref="GT_IsGTEngineModWare" result="$postEngineIsGT">
+                <param name="ware" value="$postEngineMod"/>
+              </run_actions>
+              <debug_text text="'[GT-Mods] Startup repair result ' + $ship.idcode + ': postShip=' + (if $postShipModId? then $postShipModId else 'none') + ' (gt=' + $postShipIsGT + ', has=' + $postHasShipMod + '), postEngine=' + (if $postEngineModId? then $postEngineModId else 'none') + ' (gt=' + $postEngineIsGT + ', has=' + $postHasEngineMod + '), changed=' + (($preShipMod != $postShipMod) or ($preEngineMod != $postEngineMod))" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+              <set_value name="$processed" operation="add"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Mods] Startup repair queue skip: missing/invalid ship entry at index ' + $ri" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </do_else>
+          </do_all>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Mods] Startup repair pass ' + global.$GT_ModRepairQueueAttempt + ': queue empty'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+        </do_else>
+
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Mods] Startup repair pass ' + global.$GT_ModRepairQueueAttempt + ': processed ' + $processed + '/' + $queueCount + ' ship(s)'" chance="100"/>
+        </do_if>
+        <debug_text text="'[GT-Mods] Startup repair pass ' + global.$GT_ModRepairQueueAttempt + ': processed ' + $processed + '/' + $queueCount + ' ship(s)'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+
+        <!-- Run a few passes to catch late state settling right after load -->
+        <do_if value="global.$GT_ModRepairQueueAttempt lt 3 and $queueCount gt 0">
+          <signal_cue_instantly cue="md.GT_Ship_Modifications.ProcessStartupRepairQueue"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Mods] Startup repair queue completed after pass ' + global.$GT_ModRepairQueueAttempt + ' (final queueCount=' + $queueCount + ')'" chance="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+          <remove_value name="global.$GT_ModRepairQueue"/>
+          <remove_value name="global.$GT_ModRepairQueueAttempt"/>
+        </do_else>
       </actions>
     </cue>
   </cues>
