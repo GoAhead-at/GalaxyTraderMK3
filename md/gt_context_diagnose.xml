@@ -622,6 +622,13 @@
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Trade Rules', $Status = 'INFO', $Detail = if $ignoreTradeRules then 'true' else 'false']"/>
 
+        <!-- Ignore MK1-supplied stations (from order params) -->
+        <set_value name="$ignoreMK1Supply" exact="true"/>
+        <do_if value="$gtOrder? and $gtOrder.$ignoremk1supply?">
+          <set_value name="$ignoreMK1Supply" exact="$gtOrder.$ignoremk1supply"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore MK1 Supply', $Status = 'INFO', $Detail = if $ignoreMK1Supply then 'true' else 'false']"/>
+
         <!-- Ignore build storage (from order params) -->
         <set_value name="$ignoreBuildStorage" exact="false"/>
         <do_if value="$gtOrder? and $gtOrder.$ignorebuildstorage?">
@@ -1020,9 +1027,13 @@
           </do_else>
           <set_value name="$secBuyCount" exact="0"/>
           <do_if value="$secBuyOffers? and $secBuyOffers.count?">
-            <set_value name="$secBuyCount" exact="$secBuyOffers.count"/>
-            <do_all exact="$secBuyCount" counter="$boi">
-              <append_to_list name="$allBuyOffers" exact="$secBuyOffers.{$boi}"/>
+            <do_all exact="$secBuyOffers.count" counter="$boi">
+              <set_value name="$boffer" exact="$secBuyOffers.{$boi}"/>
+              <do_if value="$ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$boffer.owner}?">
+                <continue/>
+              </do_if>
+              <append_to_list name="$allBuyOffers" exact="$boffer"/>
+              <set_value name="$secBuyCount" operation="add"/>
             </do_all>
           </do_if>
 
@@ -1059,6 +1070,9 @@
         <set_value name="$rejectPathBlocked" exact="0"/>
         <set_value name="$rejectIllegal" exact="0"/>
         <set_value name="$rejectBlacklist" exact="0"/>
+        <set_value name="$rejectMK1Supply" exact="0"/>
+        <set_value name="$rejectBuildStorage" exact="0"/>
+        <set_value name="$rejectCarrierAux" exact="0"/>
         <set_value name="$rejectSameStation" exact="0"/>
         <set_value name="$rejectCargoType" exact="0"/>
         <set_value name="$maxPairs" exact="500"/>
@@ -1129,6 +1143,20 @@
             <set_value name="$sellStation" exact="$buyOffer.owner"/>
             <set_value name="$buyPrice" exact="$sellOffer.unitprice"/>
             <set_value name="$sellPrice" exact="$buyOffer.unitprice"/>
+            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
+            <do_if value="$sellOfferAmount == null">
+              <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
+            </do_if>
+            <do_if value="$sellOfferAmount == null">
+              <set_value name="$sellOfferAmount" exact="0"/>
+            </do_if>
+            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
+            <do_if value="$buyOfferAmount == null">
+              <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
+            </do_if>
+            <do_if value="$buyOfferAmount == null">
+              <set_value name="$buyOfferAmount" exact="0"/>
+            </do_if>
 
             <!-- Compute financials upfront so ALL pairs have price/profit/ROI info -->
             <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
@@ -1141,7 +1169,7 @@
             <do_if value="$buyPrice gt 0">
               <set_value name="$maxByMoney" exact="$playerMoney / $buyPrice"/>
             </do_if>
-            <set_value name="$maxByOffer" exact="[$sellOffer.amount, $buyOffer.amount].min"/>
+            <set_value name="$maxByOffer" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
             <set_value name="$maxAmount" exact="[$maxByCargo, $maxByMoney, $maxByOffer].min"/>
             <do_if value="$maxAmount lt 0">
               <set_value name="$maxAmount" exact="0"/>
@@ -1188,7 +1216,30 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 4: Illegal ware -->
+              <!-- Check 4: Runtime station-class exclusions -->
+              <do_if value="$ignoreBuildStorage and ($buyStation.isbuildstorage or $sellStation.isbuildstorage)">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'build_storage_excluded'"/>
+                <set_value name="$rejectBuildStorage" operation="add"/>
+              </do_if>
+              <do_elseif value="$ignoreCarrierAux and (($buyStation.isclass.ship and ($buyStation.type == shiptype.carrier or $buyStation.type == shiptype.resupplier)) or ($sellStation.isclass.ship and ($sellStation.type == shiptype.carrier or $sellStation.type == shiptype.resupplier)))">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'carrier_aux_excluded'"/>
+                <set_value name="$rejectCarrierAux" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 5: MK1 supply exclusion -->
+              <do_if value="$ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$sellStation}?">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'mk1_supply_excluded (' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectMK1Supply" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 6: Illegal ware -->
               <do_if value="not $allowIllegal and @$pairWare.illegal gt 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'ware_illegal (' + $pairWare.name + ')'"/>
@@ -1197,7 +1248,7 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 5: Ship can carry ware type -->
+              <!-- Check 7: Ship can carry ware type -->
               <do_if value="$ship.cargo.{$pairWare}.max le 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'cargo_incompatible (' + $pairWare.name + ')'"/>
@@ -1206,7 +1257,7 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 6: Amount / affordability (values pre-computed above) -->
+              <!-- Check 8: Amount / affordability (values pre-computed above) -->
               <do_if value="$maxAmount le 0">
                 <do_if value="$maxByMoney le 0">
                   <set_value name="$pairVerdict" exact="'FAIL'"/>
@@ -1222,7 +1273,7 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 7: Profit threshold (values pre-computed above) -->
+              <!-- Check 9: Profit threshold (values pre-computed above) -->
               <do_if value="$totalProfit lt $finalProfitThreshold">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'below_profit_threshold (' + ($totalProfit / 100) + ' Cr lt ' + ($finalProfitThreshold / 100) + ' Cr)'"/>
@@ -1231,7 +1282,7 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 8: ROI threshold -->
+              <!-- Check 10: ROI threshold -->
               <do_if value="$roi lt $effectiveROI">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'below_roi (' + $roi + '% lt ' + $effectiveROI + '%)'"/>
@@ -1240,7 +1291,21 @@
             </do_if>
 
             <do_if value="$pairVerdict == 'PASS'">
-              <!-- Check 9: Distance -->
+              <!-- Check 11: Blacklist (explicit object/sector activity checks) -->
+              <do_if value="$blacklistgroup? and (@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship} or @$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship})">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'blacklisted_buy (' + $buyStation.knownname + ')'"/>
+                <set_value name="$rejectBlacklist" operation="add"/>
+              </do_if>
+              <do_elseif value="$blacklistgroup? and (@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship} or @$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship})">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'blacklisted_sell (' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectBlacklist" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 12: Path reachability on both trade legs (ship->buy and buy->sell) -->
               <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$buyDist">
                 <param name="ship" value="$ship"/>
                 <param name="fromSector" value="$ship.sector"/>
@@ -1250,7 +1315,7 @@
               </run_actions>
               <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$sellDist">
                 <param name="ship" value="$ship"/>
-                <param name="fromSector" value="$ship.sector"/>
+                <param name="fromSector" value="$buyStation.sector"/>
                 <param name="toSector" value="$sellStation.sector"/>
                 <param name="blacklistgroup" value="$blacklistgroup"/>
                 <param name="useEscapeMode" value="false"/>
@@ -1303,6 +1368,10 @@
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Zero Amount', $Status = if $rejectZeroAmount gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectZeroAmount]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cant Afford', $Status = if $rejectCantAfford gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCantAfford]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Path Blocked', $Status = if $rejectPathBlocked gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectPathBlocked]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Blacklisted (station/sector)', $Status = if $rejectBlacklist gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBlacklist]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK1 Supply Excluded', $Status = if $rejectMK1Supply gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK1Supply]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Build Storage Excluded', $Status = if $rejectBuildStorage gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBuildStorage]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Carrier/Aux Excluded', $Status = if $rejectCarrierAux gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCarrierAux]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Illegal Ware', $Status = if $rejectIllegal gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectIllegal]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cargo Incompatible', $Status = if $rejectCargoType gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCargoType]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Same Station (skipped)', $Status = 'INFO', $Detail = '' + $rejectSameStation]"/>
@@ -1396,7 +1465,13 @@
                     <set_value name="$clVerdict" exact="'PASS'"/>
                     <set_value name="$clReason" exact="''"/>
                     <set_value name="$clPrice" exact="$clOffer.unitprice"/>
-                    <set_value name="$clDemand" exact="$clOffer.amount"/>
+                    <set_value name="$clDemand" exact="$clOffer.offeramount.{$ship}"/>
+                    <do_if value="$clDemand == null">
+                      <set_value name="$clDemand" exact="$clOffer.amount"/>
+                    </do_if>
+                    <do_if value="$clDemand == null">
+                      <set_value name="$clDemand" exact="0"/>
+                    </do_if>
                     <set_value name="$clTradeAmount" exact="[$clWareAmount, $clDemand].min"/>
 
                     <!-- Check 1: Station operational -->
@@ -1411,7 +1486,21 @@
                       <set_value name="$clReason" exact="'docking denied for this ship size'"/>
                     </do_if>
 
-                    <!-- Check 3: Distance -->
+                    <!-- Check 3: Runtime station-class exclusions -->
+                    <do_if value="$clVerdict == 'PASS' and $ignoreBuildStorage and $clStation.isbuildstorage">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'build storage excluded'"/>
+                    </do_if>
+                    <do_if value="$clVerdict == 'PASS' and $ignoreCarrierAux and $clStation.isclass.ship and ($clStation.type == shiptype.carrier or $clStation.type == shiptype.resupplier)">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'carrier/aux excluded'"/>
+                    </do_if>
+                    <do_if value="$clVerdict == 'PASS' and $ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$clStation}?">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'already supplied by MK1 (excluded)'"/>
+                    </do_if>
+
+                    <!-- Check 4: Distance -->
                     <do_if value="$clVerdict == 'PASS'">
                       <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$clDist">
                         <param name="ship" value="$ship"/>
@@ -1430,7 +1519,7 @@
                       </do_elseif>
                     </do_if>
 
-                    <!-- Check 4: Blacklist (sector) -->
+                    <!-- Check 5: Blacklist (sector) -->
                     <do_if value="$clVerdict == 'PASS' and $diagBlacklistGroup?">
                       <set_value name="$clSectorBL" exact="@$clStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$diagBlacklistGroup}.{$ship}"/>
                       <do_if value="$clSectorBL">
@@ -1439,7 +1528,7 @@
                       </do_if>
                     </do_if>
 
-                    <!-- Check 5: Blacklist (station) -->
+                    <!-- Check 6: Blacklist (station) -->
                     <do_if value="$clVerdict == 'PASS' and $diagBlacklistGroup?">
                       <set_value name="$clStationBL" exact="@$clStation.isblacklisted.{blacklisttype.objectactivity}.{$diagBlacklistGroup}.{$ship}"/>
                       <do_if value="$clStationBL">
@@ -1448,19 +1537,19 @@
                       </do_if>
                     </do_if>
 
-                    <!-- Check 6: Demand amount -->
+                    <!-- Check 7: Demand amount -->
                     <do_if value="$clVerdict == 'PASS' and $clDemand le 0">
                       <set_value name="$clVerdict" exact="'FAIL'"/>
                       <set_value name="$clReason" exact="'station has no demand (0 units wanted)'"/>
                     </do_if>
 
-                    <!-- Check 7: Price sanity -->
+                    <!-- Check 8: Price sanity -->
                     <do_if value="$clVerdict == 'PASS' and $clPrice le 0">
                       <set_value name="$clVerdict" exact="'FAIL'"/>
                       <set_value name="$clReason" exact="'station offers 0 Cr per unit'"/>
                     </do_if>
 
-                    <!-- Check 8: Illegal ware (matches execution-time check in gt_trading_execution.xml) -->
+                    <!-- Check 9: Illegal ware (matches execution-time check in gt_trading_execution.xml) -->
                     <do_if value="$clVerdict == 'PASS' and not $allowIllegal and @$clWare.illegal gt 0">
                       <set_value name="$clVerdict" exact="'FAIL'"/>
                       <set_value name="$clReason" exact="'ware is illegal to a faction (AllowIllegal: false)'"/>
