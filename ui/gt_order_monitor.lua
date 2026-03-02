@@ -209,8 +209,8 @@ function L.OnUpdate()
     end
     
     if currentOrderID ~= previousOrderID then
-        local wasGTOrder = (previousOrderID == "GalaxyTraderMK3" or previousOrderID == "GalaxyTraderMK2")
-        local isGTOrderNow = (currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2")
+        local wasGTOrder = (previousOrderID == "GalaxyTraderMK3" or previousOrderID == "GalaxyTraderMK2" or previousOrderID == "GalaxyTraderMK1" or previousOrderID == "GalaxyMiner")
+        local isGTOrderNow = (currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2" or currentOrderID == "GalaxyTraderMK1" or currentOrderID == "GalaxyMiner")
         if wasGTOrder and not isGTOrderNow then
             -- Only trigger cleanup if ship wasn't promoted to commander
             -- Newly promoted commanders might temporarily lose order while X4 assigns it
@@ -229,7 +229,7 @@ function L.OnUpdate()
     local hasGTOrder = false
     local commanderHasGTOrder = nil  -- nil = unknown, true = yes, false = no
     
-    if currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2" then
+    if currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2" or currentOrderID == "GalaxyTraderMK1" or currentOrderID == "GalaxyMiner" then
         hasGTOrder = true
     elseif currentOrderID == "Assist" then
         -- Ship has Assist order - check commander's order
@@ -240,7 +240,7 @@ function L.OnUpdate()
                 -- Check for NULL pointer before calling ffi.string (prevents crash)
                 local orderdef_ptr = commanderOrderBuf.orderdef
                 local commanderOrderID = (orderdef_ptr ~= nil) and ffi.string(orderdef_ptr) or nil
-                if commanderOrderID == "GalaxyTraderMK3" or commanderOrderID == "GalaxyTraderMK2" then
+                if commanderOrderID == "GalaxyTraderMK3" or commanderOrderID == "GalaxyTraderMK2" or commanderOrderID == "GalaxyTraderMK1" or commanderOrderID == "GalaxyMiner" then
                     hasGTOrder = true
                     commanderHasGTOrder = true
                 else
@@ -254,7 +254,7 @@ function L.OnUpdate()
     end
     
     local shouldKeepShip = false
-    if currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2" then
+    if currentOrderID == "GalaxyTraderMK3" or currentOrderID == "GalaxyTraderMK2" or currentOrderID == "GalaxyTraderMK1" or currentOrderID == "GalaxyMiner" then
         -- Direct GT order - keep if has pilot
         shouldKeepShip = (currentPilotID ~= "NONE")
     elseif currentOrderID == "Assist" then

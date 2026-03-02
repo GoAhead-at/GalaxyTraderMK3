@@ -8,7 +8,7 @@
 -- For GT orders only, temporarily set commander = nil during rendering so vanilla
 -- treats the params as editable, then immediately restore the original value.
 --
--- Scope: Only unlocks editing for GT orders (GalaxyTraderMK1, MK2, MK3).
+-- Scope: Only unlocks editing for GT orders (GalaxyTraderMK1, MK2, MK3, GalaxyMiner).
 -- All other orders (vanilla, other mods) remain read-only when station-assigned.
 
 -- GT order IDs that should have order access when station-assigned
@@ -16,6 +16,7 @@ local GT_OrderIDs = {
     ["GalaxyTraderMK1"] = true,
     ["GalaxyTraderMK2"] = true,
     ["GalaxyTraderMK3"] = true,
+    ["GalaxyMiner"] = true,
 }
 
 -- Find MapMenu
